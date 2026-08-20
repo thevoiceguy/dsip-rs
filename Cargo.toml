@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dsip-core",
+    "crates/dsip-schema",
+    "crates/dsip-session",
+    "crates/dsip-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thevoiceguy/DSIP"
+rust-version = "1.85"
+
+[workspace.dependencies]
+dsip-core = { path = "crates/dsip-core" }
+dsip-schema = { path = "crates/dsip-schema" }
+dsip-session = { path = "crates/dsip-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
+bs58 = "0.5"
+sha2 = "0.10"
+rand = "0.8"
+jsonschema = { version = "0.50", default-features = false }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+lto = "thin"

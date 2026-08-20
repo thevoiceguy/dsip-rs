@@ -1,0 +1,20 @@
+[package]
+name = "dsip-cli"
+description = "DSIP PoC command line: keygen, sign/verify, vector runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dsip"
+path = "src/main.rs"
+
+[dependencies]
+dsip-core.workspace = true
+dsip-schema.workspace = true
+dsip-session.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true

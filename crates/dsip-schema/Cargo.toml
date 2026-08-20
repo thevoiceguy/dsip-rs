@@ -1,0 +1,14 @@
+[package]
+name = "dsip-schema"
+description = "DSIP v0.6 JSON Schemas embedded at build time + stateless semantic checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+dsip-core.workspace = true
+serde_json.workspace = true
+jsonschema.workspace = true
