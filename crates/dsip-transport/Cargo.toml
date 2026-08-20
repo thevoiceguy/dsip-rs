@@ -1,0 +1,27 @@
+[package]
+name = "dsip-transport"
+description = "DSIP ws/1.0 signaling binding: wss connection, hello binding, size cap, reconnection; the Agent that drives dsip-session over it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+dsip-schema.workspace = true
+dsip-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+reqwest.workspace = true

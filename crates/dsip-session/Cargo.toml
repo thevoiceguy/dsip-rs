@@ -11,3 +11,6 @@ rust-version.workspace = true
 dsip-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+proptest = "1"

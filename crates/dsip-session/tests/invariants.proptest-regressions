@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d7fefee42484fcb65ae1f88c543ae8bebcb07870e97c047944a42670ee79d4f6 # shrinks to events = [Local(PlaceCall { session: "01J5Y0Q6K8ZJ4M2N7P9R3S5T7V", to: "did:key:z6MkBob" }), Recv { recv: Message { msg_type: "answer", id: "01J5Y0Q7A1BCD2EF3GH4JK5MN6", from: "did:key:z6MkBobPhone", to: None, session: Some("01J5Y0Q6K8ZJ4M2N7P9R3S5T7V"), status: None, ring_timeout: None, queue_timeout: None, reason: None, answered_by: Some("user"), in_reply_to: None, about: None, expires_at: None } }]
+cc 1153a3f6182df73b56d6396c6a60dbbda7182073a5554a51357ea6afe02dee1a # shrinks to events = [Local(PlaceCall { session: "01J5Y0Q6K8ZJ4M2N7P9R3S5T7V", to: "did:key:z6MkBob" }), Local(Cancel { session: "01J5Y0Q6K8ZJ4M2N7P9R3S5T7V" }), Local(PlaceCall { session: "01J5Y0Q6K8ZJ4M2N7P9R3S5T7V", to: "did:key:z6MkBob" }), Recv { recv: Message { msg_type: "answer", id: "01J5Y0Q7A1BCD2EF3GH4JK5MN6", from: "did:key:z6MkBobPhone", to: None, session: Some("01J5Y0Q6K8ZJ4M2N7P9R3S5T7V"), status: None, ring_timeout: None, queue_timeout: None, reason: None, answered_by: Some("user"), in_reply_to: None, about: None, expires_at: None } }]

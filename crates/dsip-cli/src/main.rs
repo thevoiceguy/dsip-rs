@@ -1,7 +1,7 @@
 //! `dsip` — the DSIP PoC command line.
 //!
 //! Spec: §25.1 "CLI test tool". Subcommands: `keygen`, `sign`, `verify`,
-//! `vectors run`. (`resolve`, `call`, `answer` arrive with `dsip-transport`.)
+//! `vectors run`, `identity init|show`, `resolve`, `call`, `answer`.
 
 use std::path::PathBuf;
 
@@ -13,6 +13,7 @@ use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{self, Envelope};
 use dsip_core::keys::KeyPair;
 
+mod console;
 mod vectors;
 
 #[derive(Parser)]
@@ -60,6 +61,97 @@ enum Cmd {
         #[command(subcommand)]
         cmd: VectorsCmd,
     },
+    /// Identity directories (controller key + device key + delegation).
+    Identity {
+        #[command(subcommand)]
+        cmd: IdentityCmd,
+    },
+    /// Resolve a DID (did:key natively; did:web over HTTPS) and show its DSIP signaling endpoint.
+    Resolve {
+        /// The DID.
+        did: String,
+    },
+    /// Place a signed call through a relay.
+    Call {
+        #[command(flatten)]
+        opts: ConnOpts,
+        /// Callee identity or device DID.
+        #[arg(long)]
+        to: String,
+    },
+    /// Wait for calls through a relay.
+    Answer {
+        #[command(flatten)]
+        opts: ConnOpts,
+        /// Automatic policy: accept | screen | decline | none.
+        #[arg(long, default_value = "none")]
+        auto: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCmd {
+    /// Create a new identity directory.
+    Init {
+        /// Directory.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Display name (a claim, §18.2).
+        #[arg(long, default_value = "DSIP user")]
+        name: String,
+        /// Deterministic vector fixture keys (alice, bob, carol) instead of random.
+        #[arg(long)]
+        fixture: Option<String>,
+        /// Make this a second device of the identity in this directory (reuses its controller key).
+        #[arg(long)]
+        controller_from: Option<PathBuf>,
+    },
+    /// Show an identity directory.
+    Show {
+        /// Directory.
+        #[arg(long)]
+        dir: PathBuf,
+    },
+}
+
+#[derive(clap::Args)]
+struct ConnOpts {
+    /// Identity directory.
+    #[arg(long)]
+    identity: PathBuf,
+    /// Relay URL (wss://…).
+    #[arg(long, default_value = "wss://127.0.0.1:8443/dsip")]
+    relay: String,
+    /// Certificate to trust for the relay (self-signed PEM).
+    #[arg(long)]
+    ca: Option<PathBuf>,
+    /// Offer video in invites.
+    #[arg(long)]
+    video: bool,
+    /// Scripted commands, `;`-separated, e.g. "sleep 2; update; sleep 2; hangup; quit".
+    #[arg(long)]
+    script: Option<String>,
+    /// DID document JSON files for the resolver.
+    #[arg(long)]
+    did_document: Vec<PathBuf>,
+    /// T-Establish seconds (5–60).
+    #[arg(long)]
+    t_establish: Option<i64>,
+    /// T-Ring seconds (30–300).
+    #[arg(long)]
+    t_ring: Option<i64>,
+    /// T-Ring-Local seconds (30–300).
+    #[arg(long)]
+    t_ring_local: Option<i64>,
+}
+
+impl ConnOpts {
+    fn into_console(self) -> console::ConsoleOpts {
+        console::ConsoleOpts {
+            identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
+            did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -81,7 +173,11 @@ enum VectorsCmd {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+    ).init();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Keygen { out, fixture } => {
@@ -143,6 +239,38 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Cmd::Identity { cmd: IdentityCmd::Init { dir, name, fixture, controller_from } } => {
+            let id = dsip_transport::identity::Identity::init(&dir, &name, fixture.as_deref(), controller_from.as_deref())?;
+            println!("identity   {}", id.meta.identity);
+            println!("device     {}", id.meta.device);
+            println!("delegation {}/delegation.json (controller→device, dsip.signaling, 1 year)   §7.4", dir.display());
+        }
+        Cmd::Identity { cmd: IdentityCmd::Show { dir } } => {
+            let id = dsip_transport::identity::Identity::load(&dir)?;
+            println!("{}", serde_json::to_string_pretty(&id.meta)?);
+            println!("delegation: {}", id.delegation.frame());
+        }
+        Cmd::Resolve { did } => {
+            if let Some(pk) = dsip_core::did::public_from_did_key(&did) {
+                println!("method     did:key (self-certifying; no network resolution)          §7.2, §8.5");
+                println!("key        {}", dsip_core::did::multibase_ed25519(&pk));
+                println!("kid        {}", dsip_core::did::did_key_kid(&pk));
+                println!("signaling  — (did:key documents carry no service endpoints; reachability comes from hints or out-of-band)");
+            } else if did.starts_with("did:web:") {
+                println!("method     did:web → {}   (depends on DNS + Web PKI, §8.4)", dsip_transport::resolver::did_web_url(&did)?);
+                let doc = dsip_transport::resolver::fetch_did_web(&did).await?;
+                println!("authority  DID document (§8.1 rule 4)");
+                println!("{}", serde_json::to_string_pretty(&doc)?);
+                match doc.signaling_uri() {
+                    Some(u) => println!("signaling  {u}   (DSIPSignaling, ws/1.0)   §13.2"),
+                    None => println!("signaling  none advertised"),
+                }
+            } else {
+                bail!("unsupported DID method in {did} (v1.0 requires did:key and did:web, §7.2)");
+            }
+        }
+        Cmd::Call { opts, to } => console::run(opts.into_console(), console::Mode::Call { to }).await?,
+        Cmd::Answer { opts, auto } => console::run(opts.into_console(), console::Mode::Answer { auto }).await?,
     }
     Ok(())
 }

@@ -4,6 +4,8 @@ members = [
     "crates/dsip-core",
     "crates/dsip-schema",
     "crates/dsip-session",
+    "crates/dsip-transport",
+    "crates/dsip-relay",
     "crates/dsip-cli",
 ]
 
@@ -18,6 +20,7 @@ rust-version = "1.85"
 dsip-core = { path = "crates/dsip-core" }
 dsip-schema = { path = "crates/dsip-schema" }
 dsip-session = { path = "crates/dsip-session" }
+dsip-transport = { path = "crates/dsip-transport" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
@@ -29,6 +32,17 @@ rand = "0.8"
 jsonschema = { version = "0.50", default-features = false }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "time", "sync", "signal"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+rcgen = "0.13"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [profile.release]
 lto = "thin"
