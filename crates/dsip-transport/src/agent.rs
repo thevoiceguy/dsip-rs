@@ -43,6 +43,8 @@ pub enum AgentEvent {
         identity: String,
         /// Display name claim, if any.
         display_name: Option<String>,
+        /// Full decoded payload (SDP, candidates, policy live here).
+        payload: serde_json::Value,
     },
     /// An inbound frame was rejected (code, detail).
     Rejected(String, String),
@@ -170,6 +172,16 @@ impl Agent {
         self.core.new_id(now_s())
     }
 
+    /// SDP for the next invite/answer/update (§16.3 transport binding object).
+    pub fn set_sdp(&mut self, sdp: Option<String>) {
+        self.core.set_sdp(sdp);
+    }
+
+    /// `data` for the next `info` (ICE candidates, §12.12).
+    pub fn set_info_data(&mut self, data: serde_json::Value) {
+        self.core.set_info_data(data);
+    }
+
     /// Drive a local event through the core and act on its output.
     pub async fn local(&mut self, ev: LocalEvent) -> Result<()> {
         let out = self.core.local(ev, now_s())?;
@@ -191,8 +203,8 @@ impl Agent {
                     self.events.push(AgentEvent::Sent { msg_type, session, to });
                 }
                 CoreEvent::Emission(em) => self.events.push(AgentEvent::Emission(em)),
-                CoreEvent::Received { message, identity, display_name, .. } => {
-                    self.events.push(AgentEvent::Received { message, identity, display_name })
+                CoreEvent::Received { message, identity, display_name, payload } => {
+                    self.events.push(AgentEvent::Received { message, identity, display_name, payload })
                 }
                 CoreEvent::Rejected { code, detail } => self.events.push(AgentEvent::Rejected(code, detail)),
             }

@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use dsip_core::ulid::Ulid;
+use dsip_media::{Candidate, MediaConfig, MediaEvent, MediaLeg, Source};
 use dsip_session::{Emission, LocalEvent};
 use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
 use dsip_transport::identity::Identity;
@@ -43,6 +44,51 @@ pub struct ConsoleOpts {
     pub publish_hint: bool,
     /// Hint TTL.
     pub hint_ttl: i64,
+    /// Media source spec (`none` disables media).
+    pub media: String,
+    /// Record inbound audio here.
+    pub record: Option<PathBuf>,
+    /// STUN servers.
+    pub stun: Vec<String>,
+}
+
+/// Media state for the current session.
+struct Media {
+    leg: MediaLeg,
+    /// Candidates gathered before ACTIVE (§12.12: info is ACTIVE-only).
+    pending: Vec<Option<Candidate>>,
+    /// Remote offer SDP awaiting our answer (invite or update).
+    remote_offer: Option<String>,
+}
+
+async fn next_media(m: &mut Option<Media>) -> MediaEvent {
+    match m {
+        Some(media) => media.leg.next_event().await.unwrap_or_else(|| MediaEvent::State("closed".into())),
+        None => std::future::pending().await,
+    }
+}
+
+fn media_enabled(opts: &ConsoleOpts) -> bool {
+    opts.media != "none" || opts.record.is_some()
+}
+
+async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
+    let source = if screening { Source::None } else { Source::parse(&opts.media)? };
+    let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone() }).await?;
+    Ok(Media { leg, pending: vec![], remote_offer: None })
+}
+
+/// Send buffered candidates in a signed `info` once the session is ACTIVE (§12.12).
+async fn flush_candidates(agent: &mut Agent, media: &mut Option<Media>, current: &Option<String>) -> Result<()> {
+    let (Some(m), Some(sid)) = (media.as_mut(), current) else { return Ok(()) };
+    if m.pending.is_empty() || agent.endpoint().session(sid).map(|s| s.state) != Some(dsip_session::SessionState::Active) {
+        return Ok(());
+    }
+    let batch = std::mem::take(&mut m.pending);
+    let end = batch.iter().any(Option::is_none);
+    let cands: Vec<Candidate> = batch.into_iter().flatten().collect();
+    agent.set_info_data(serde_json::json!({"candidates": cands, "end_of_candidates": end}));
+    agent.local(LocalEvent::Info { session: sid.clone() }).await
 }
 
 const DEFAULT_RELAY: &str = "wss://127.0.0.1:8443/dsip";
@@ -206,10 +252,18 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     };
     let mut intro_deadline: Option<tokio::time::Instant> = None;
     let mut cmds_closed = false;
+    let mut media: Option<Media> = None;
     match &mode {
         Mode::Call { to } => {
             if let Some(g) = agent.endpoint().contacts.held_from(to, dsip_transport::now_s()) {
                 println!("contacts  holding grant …{} from {} — attached to the invite   §19.4", sid8(&g), short(to));
+            }
+            if media_enabled(&opts) {
+                let m = new_leg(&opts, false).await?;
+                let sdp = m.leg.create_offer().await?;
+                println!("media     WebRTC offer created ({} bytes SDP) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len());
+                agent.set_sdp(Some(sdp));
+                media = Some(m);
             }
             let sid = agent.place_call(to).await?;
             current = Some(sid);
@@ -235,7 +289,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             println!("→ {msg_type:<8} to {}  session …{}", short(&to), sid8(&session));
                             print_state(&agent, &session);
                         }
-                        AgentEvent::Received { message, identity, display_name } => {
+                        AgentEvent::Received { message, identity, display_name, payload } => {
                             let name = display_name.map(|n| format!(" \"{n}\"")).unwrap_or_default();
                             let extra = match message.msg_type.as_str() {
                                 "progress" => format!(" status={}", message.status.clone().unwrap_or_default()),
@@ -248,11 +302,25 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             let sid = message.session_id().to_string();
                             print_state(&agent, &sid);
                             let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
+                            let remote_sdp = payload.pointer("/transports/0/sdp").and_then(|v| v.as_str()).map(String::from);
                             if message.msg_type == "invite" && offered {
                                 current = Some(sid.clone());
+                                if media_enabled(&opts) {
+                                    if remote_sdp.is_none() {
+                                        println!("  media   caller offered no SDP; answering without media");
+                                    }
+                                    media = Some(Media { leg: new_leg(&opts, auto == "screen").await?.leg, pending: vec![], remote_offer: remote_sdp.clone() });
+                                }
                                 match auto.as_str() {
                                     "accept" | "screen" => {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
+                                        if let Some(m) = media.as_mut() {
+                                            if let Some(offer) = m.remote_offer.take() {
+                                                let ans = m.leg.accept_offer(&offer).await?;
+                                                println!("  media   WebRTC answer created ({} bytes SDP) → answer.transports[0].sdp", ans.len());
+                                                agent.set_sdp(Some(ans));
+                                            }
+                                        }
                                         let ab = if auto == "screen" { "screening" } else { "user" };
                                         agent.local(LocalEvent::Accept { session: sid.clone(), answered_by: Some(ab.into()) }).await?;
                                     }
@@ -268,7 +336,21 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             }
                             if message.msg_type == "update" {
                                 pending_update = Some(message.id.clone());
+                                if let Some(m) = media.as_mut() { m.remote_offer = remote_sdp.clone(); }
                                 println!("  ☎  update offered — type answer-update / reject-update");
+                            }
+                            if message.msg_type == "answer" {
+                                if let (Some(m), Some(sdp)) = (media.as_ref(), remote_sdp.as_ref()) {
+                                    m.leg.set_answer(sdp).await?;
+                                    println!("  media   remote WebRTC answer applied");
+                                }
+                            }
+                            if message.msg_type == "info" && payload["about"] == "transport:webrtc" {
+                                if let Some(m) = media.as_ref() {
+                                    let cands: Vec<Candidate> = serde_json::from_value(payload["data"]["candidates"].clone()).unwrap_or_default();
+                                    for c in &cands { m.leg.add_remote_candidate(c).await.ok(); }
+                                    println!("  media   {} remote ICE candidate(s) applied from signed info   §12.12", cands.len());
+                                }
                             }
                             if message.msg_type == "introduction" {
                                 println!("  ✉  REQUEST (not a call): \"{}\" — type grant / reject-intro, or ignore (silence is a valid outcome)",
@@ -277,6 +359,22 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         }
                         AgentEvent::Emission(e) => {
                             print_emission(&e);
+                            if let Emission::Media(what) = &e {
+                                match (*what, media.as_mut()) {
+                                    ("start", Some(m)) => {
+                                        m.leg.start_sending();   // §14.1: only now, after the signed answer
+                                        flush_candidates(&mut agent, &mut media, &current).await?;
+                                    }
+                                    ("apply_update", Some(m)) => m.leg.start_sending(),
+                                    ("stop", Some(m)) => {
+                                        let st = m.leg.stats();
+                                        println!("  media   closed — received {} RTP packets / {} bytes, sent {} Opus frames", st.packets_in, st.bytes_in, st.frames_out);
+                                        m.leg.close().await;
+                                        media = None;
+                                    }
+                                    _ => {}
+                                }
+                            }
                             if let Emission::Ui { kind, .. } = &e {
                                 if matches!(*kind, "granted" | "introduction_rejected") && intro_deadline.is_some() {
                                     agent.save_contacts()?;
@@ -291,6 +389,19 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     }
                 }
                 agent.save_contacts()?;
+            }
+            ev = next_media(&mut media) => {
+                match ev {
+                    MediaEvent::Candidate(c) => {
+                        if let Some(m) = media.as_mut() { m.pending.push(c); }
+                        flush_candidates(&mut agent, &mut media, &current).await?;
+                    }
+                    MediaEvent::State(st) => {
+                        println!("  media   webrtc {st}   (DTLS-SRTP)");
+                        if st == "closed" { media = None; }
+                    }
+                    MediaEvent::FirstPacket => println!("  media   ♫ first inbound RTP packet (SRTP decrypted) — media is flowing"),
+                }
             }
             _ = async { tokio::time::sleep_until(intro_deadline.unwrap()).await }, if intro_deadline.is_some() => {
                 println!("·  no response — silence is the default outcome and means nothing (§19.4)");
@@ -348,6 +459,42 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     println!("no session yet");
                     continue;
                 };
+                // Media preparation for commands that carry SDP (§16.3)
+                match cmd.as_str() {
+                    "accept" | "screen" => {
+                        if let Some(m) = media.as_mut() {
+                            if let Some(offer) = m.remote_offer.take() {
+                                if cmd == "screen" {
+                                    // §14.4: a recvonly leg exposes no local media while screening
+                                    let fresh = new_leg(&opts, true).await?;
+                                    m.leg.close().await;
+                                    m.leg = fresh.leg;
+                                }
+                                let ans = m.leg.accept_offer(&offer).await?;
+                                agent.set_sdp(Some(ans));
+                            }
+                        }
+                    }
+                    "update" | "escalate" => {
+                        if let Some(m) = media.as_mut() {
+                            if verb == "escalate" {
+                                // §14.4 step 3: the screening leg was recvonly; add our source and re-offer sendrecv
+                                m.leg.add_source(Source::parse(&opts.media)?).await?;
+                            }
+                            let sdp = m.leg.create_offer().await?;
+                            agent.set_sdp(Some(sdp));
+                        }
+                    }
+                    "answer-update" => {
+                        if let Some(m) = media.as_mut() {
+                            if let Some(offer) = m.remote_offer.take() {
+                                let ans = m.leg.accept_offer(&offer).await?;
+                                agent.set_sdp(Some(ans));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 let ev = match cmd.as_str() {
                     "cancel" => Some(LocalEvent::Cancel { session: sid }),
                     "hangup" => Some(LocalEvent::Hangup { session: sid }),
@@ -367,6 +514,11 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                 }
             }
         }
+    }
+    if let Some(m) = media.take() {
+        let st = m.leg.stats();
+        println!("media     received {} RTP packets / {} bytes, sent {} Opus frames", st.packets_in, st.bytes_in, st.frames_out);
+        m.leg.close().await;
     }
     agent.close().await;
     if let Some(h) = dht {

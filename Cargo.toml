@@ -7,6 +7,7 @@ members = [
     "crates/dsip-endpoint",
     "crates/dsip-transport",
     "crates/dsip-wasm",
+    "crates/dsip-media",
     "crates/dsip-dht",
     "crates/dsip-relay",
     "crates/dsip-cli",
@@ -26,6 +27,7 @@ dsip-session = { path = "crates/dsip-session" }
 dsip-endpoint = { path = "crates/dsip-endpoint" }
 dsip-transport = { path = "crates/dsip-transport" }
 dsip-dht = { path = "crates/dsip-dht" }
+dsip-media = { path = "crates/dsip-media" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

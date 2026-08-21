@@ -158,6 +158,15 @@ struct ConnOpts {
     /// Hint lifetime in seconds.
     #[arg(long, default_value_t = 3600)]
     hint_ttl: i64,
+    /// Media source: `none`, `tone`, `tone:<hz>`, or `file:<path.ogg>`. Anything but none enables WebRTC media.
+    #[arg(long, default_value = "none")]
+    media: String,
+    /// Record inbound audio to this Ogg/Opus file (enables WebRTC media).
+    #[arg(long)]
+    record: Option<PathBuf>,
+    /// STUN server(s) for ICE (none needed on one host).
+    #[arg(long)]
+    stun: Vec<String>,
     /// Certificate to trust for the relay (self-signed PEM).
     #[arg(long)]
     ca: Option<PathBuf>,
@@ -187,6 +196,7 @@ impl ConnOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl,
+            media: self.media, record: self.record, stun: self.stun,
         }
     }
 }

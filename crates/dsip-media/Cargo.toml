@@ -1,0 +1,18 @@
+[package]
+name = "dsip-media"
+description = "DSIP native media endpoint (Phase 2): WebRTC DTLS-SRTP audio via webrtc-rs — offer/answer SDP, trickle ICE, Opus tone/file source, Ogg recording sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+webrtc = "0.13"
+audiopus = "0.3.0-rc.0"
+bytes = "1"
