@@ -3,13 +3,12 @@
 # Alice sends a 440 Hz tone and records Bob; Bob sends 660 Hz and records Alice.
 # SDP rides in transports[].sdp, ICE candidates in signed info after ACTIVE (§12.12, spec-gap 16).
 #
-# Usage: media-demo.sh [CALLER_BACKEND [CALLEE_BACKEND]]   backends: webrtc-rs (default) | forge
-# Any `forge` argument builds the CLI with the `forge` feature (forge-media via git; vendored OpenSSL).
+# Usage: media-demo.sh [CALLER_BACKEND [CALLEE_BACKEND]]   backends: forge (default) | webrtc-rs
+# Both backends are compiled in by default; e.g. `media-demo.sh forge webrtc-rs` pairs them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-BA=${1:-webrtc-rs}; BB=${2:-$BA}
-FEAT=(); case "$BA$BB" in *forge*) FEAT=(--features dsip-cli/forge);; esac
-cargo build -q -p dsip-cli -p dsip-relay "${FEAT[@]}"
+BA=${1:-forge}; BB=${2:-$BA}
+cargo build -q -p dsip-cli -p dsip-relay
 B=target/debug; D=${DEMO_DIR:-/tmp/dsip-media-demo}; rm -rf "$D"; mkdir -p "$D"
 R=wss://127.0.0.1:8443/dsip
 $B/dsip identity init --dir "$D/alice" --name "Alice" >/dev/null

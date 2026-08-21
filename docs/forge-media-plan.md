@@ -62,8 +62,12 @@ backend from webrtc-rs to forge is a one-crate change with the DSIP agent and CL
    directions) and `demos/media-demo.sh forge webrtc-rs` runs the signalled call end to end.
    Browser ↔ native on forge is still to be verified by hand (`demos/browser-demo.sh` with
    `--media-backend forge` on the native side).
-4. ☐ Make `forge` the default once step 3's browser run is green; keep webrtc-rs as the fallback
-   named in plan §7's risk row.
+4. ✅ `forge` is the default (2026-08-21): `dsip-media` default features are `["forge", "webrtc-rs"]`,
+   `Backend::default()` and the CLI `--media-backend` default are `forge`; webrtc-rs stays compiled
+   in as the fallback named in plan §7's risk row and as the reference peer for the cross-backend
+   test (which now runs in the plain workspace test). CI additionally proves the fallback-only build
+   (`--no-default-features --features webrtc-rs`) still compiles and passes. The browser ↔ native
+   run on forge is a manual check (`demos/browser-demo.sh`; native side defaults to forge now).
 
 ## Findings from the swap (2026-08-21)
 

@@ -28,5 +28,6 @@ tracing-subscriber.workspace = true
 
 [features]
 default = []
-# Compile the forge-media backend into the CLI (`--media-backend forge`).
+# Both media backends come from dsip-media's defaults; this passthrough remains for
+# `--no-default-features` builds that want forge explicitly.
 forge = ["dsip-media/forge"]

@@ -23,9 +23,10 @@ use crate::source::Source;
 /// Which media stack a leg runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// webrtc-rs (`webrtc` crate) — the plan §7 fallback.
+    /// webrtc-rs (`webrtc` crate) — the plan §7 fallback and the reference peer
+    /// the cross-backend test checks forge against.
     WebRtcRs,
-    /// forge-media `forge-webrtc` — the project's own stack.
+    /// forge-media `forge-webrtc` — the project's own stack; the default.
     Forge,
 }
 
@@ -59,14 +60,15 @@ impl Backend {
 }
 
 impl Default for Backend {
+    /// forge when compiled in (plan step 4, 2026-08-21); otherwise the fallback.
     fn default() -> Self {
-        #[cfg(feature = "webrtc-rs")]
-        {
-            Backend::WebRtcRs
-        }
-        #[cfg(not(feature = "webrtc-rs"))]
+        #[cfg(feature = "forge")]
         {
             Backend::Forge
+        }
+        #[cfg(not(feature = "forge"))]
+        {
+            Backend::WebRtcRs
         }
     }
 }

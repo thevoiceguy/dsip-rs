@@ -9,10 +9,12 @@
 //! in the WebRTC Media Binding draft (`v0.7/dsip-webrtc-media-binding-v0.7-draft.md`).
 //!
 //! Impl: two interchangeable backends behind one [`MediaLeg`] surface, chosen
-//! at runtime by [`Backend`] (both may be compiled in):
-//! - `webrtc-rs` (feature, default) — plan §7's named fallback;
-//! - `forge` (feature) — forge-media's `forge-webrtc` 0.3 endpoint peer
-//!   connection, the project's own stack (`impl/docs/forge-media-plan.md`).
+//! at runtime by [`Backend`]; both are compiled in by default:
+//! - `forge` (feature; the default backend) — forge-media's `forge-webrtc` 0.3
+//!   endpoint peer connection, the project's own stack
+//!   (`impl/docs/forge-media-plan.md`);
+//! - `webrtc-rs` (feature) — plan §7's named fallback, kept compiled in as the
+//!   reference peer: three forge interop bugs were only visible against it.
 //!
 //! The agent and CLI never see which backend is in use; a cross-backend test
 //! (`tests/cross_backend.rs`) proves a forge leg and a webrtc-rs leg exchange

@@ -276,8 +276,8 @@ struct ConnOpts {
     /// STUN server(s) for ICE (none needed on one host).
     #[arg(long)]
     stun: Vec<String>,
-    /// Media backend: `webrtc-rs` (default) or `forge` (needs the `forge` build feature).
-    #[arg(long, default_value = "webrtc-rs")]
+    /// Media backend: `forge` (default) or `webrtc-rs` (the reference/fallback stack).
+    #[arg(long, default_value = "forge")]
     media_backend: String,
     /// Certificate to trust for the relay (self-signed PEM).
     #[arg(long)]

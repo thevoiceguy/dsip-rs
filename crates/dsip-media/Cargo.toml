@@ -1,6 +1,6 @@
 [package]
 name = "dsip-media"
-description = "DSIP native media endpoint (Phase 2): WebRTC DTLS-SRTP audio — offer/answer SDP, trickle ICE, Opus tone/file source, Ogg recording sink; backends: webrtc-rs (default) and forge-media"
+description = "DSIP native media endpoint (Phase 2): WebRTC DTLS-SRTP audio — offer/answer SDP, trickle ICE, Opus tone/file source, Ogg recording sink; backends: forge-media (default) and webrtc-rs (reference peer / fallback)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,7 +21,11 @@ audiopus = "0.3.0-rc.0"
 bytes = "1"
 
 [features]
-default = ["webrtc-rs"]
+# Both backends are compiled by default: forge is what `Backend::default()` and the CLI pick;
+# webrtc-rs stays in as the reference peer for the cross-backend test and as plan §7's fallback
+# (`--media-backend webrtc-rs`). Build with `--no-default-features --features webrtc-rs` to leave
+# forge (vendored OpenSSL) out.
+default = ["forge", "webrtc-rs"]
 # Backend: webrtc-rs (plan §7's named fallback).
 webrtc-rs = ["dep:webrtc"]
 # Backend: forge-media (the project's own stack; docs/forge-media-plan.md).
