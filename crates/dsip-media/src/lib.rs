@@ -5,21 +5,31 @@
 //! (SDP as a transport binding object — spec-gap 16), §12.12 (ICE candidates
 //! ride in signed `info` after ACTIVE; gathered candidates are handed to the
 //! host as they appear so it can buffer them), §14.4 (screening: a `recvonly`
-//! leg exposes no local media), §17.1 (Opus audio).
+//! leg exposes no local media), §17.1 (Opus audio). The normative shapes are
+//! in the WebRTC Media Binding draft (`v0.7/dsip-webrtc-media-binding-v0.7-draft.md`).
 //!
-//! Impl: backend is webrtc-rs (plan §7 names it the least-proven dependency).
-//! The [`leg::MediaLeg`] surface is deliberately small so that a forge-media
-//! backend can replace it later without touching the agent or CLI —
-//! see `impl/docs/forge-media-plan.md`. No sound card is used: the source is
-//! a generated tone or an Ogg/Opus file, and inbound audio is recorded to
-//! Ogg, which is enough to prove the DTLS-SRTP path end to end (and to test
-//! native↔native headlessly).
+//! Impl: two interchangeable backends behind one [`MediaLeg`] surface, chosen
+//! at runtime by [`Backend`] (both may be compiled in):
+//! - `webrtc-rs` (feature, default) — plan §7's named fallback;
+//! - `forge` (feature) — forge-media's `forge-webrtc` 0.3 endpoint peer
+//!   connection, the project's own stack (`impl/docs/forge-media-plan.md`).
+//!
+//! The agent and CLI never see which backend is in use; a cross-backend test
+//! (`tests/cross_backend.rs`) proves a forge leg and a webrtc-rs leg exchange
+//! SRTP. No sound card is used: the source is a generated tone or an Ogg/Opus
+//! file and inbound audio is recorded to Ogg, which proves the DTLS-SRTP path
+//! end to end headlessly.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(not(any(feature = "webrtc-rs", feature = "forge")))]
+compile_error!("dsip-media needs at least one backend feature: `webrtc-rs` or `forge`");
+
+pub mod backend;
 pub mod leg;
+pub mod ogg;
 pub mod source;
 
-pub use leg::{Candidate, MediaConfig, MediaEvent, MediaLeg, Stats};
+pub use leg::{Backend, Candidate, MediaConfig, MediaEvent, MediaLeg, Stats};
 pub use source::Source;

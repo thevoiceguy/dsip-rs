@@ -52,9 +52,24 @@ backend from webrtc-rs to forge is a one-crate change with the DSIP agent and CL
 
 ## Migration steps
 
-1. Land the four items above in forge-media (behind the existing `dtls` feature).
-2. Add a `forge` feature to `dsip-media` with a second backend implementing the trait; depend on
-   forge-media by git URL + rev.
-3. Run the Phase 2 demos against both backends (browser ↔ native, native ↔ native); the DSIP
-   vectors are unaffected (media is below the signaling contract).
-4. Make `forge` the default; keep webrtc-rs as the fallback named in plan §7's risk row.
+1. ✅ Land the four items above in forge-media — forge-media PR #116 (`forge-webrtc` 0.3.0:
+   endpoint `PeerConnection`, answerer role, trickle events, `AudioSender`, re-offer/rollback).
+   Interop fixes that the cross-backend test then forced: PR #117 (STUN MESSAGE-INTEGRITY/
+   FINGERPRINT per RFC 8489, USERNAME order, ECDSA DTLS suites).
+2. ✅ `dsip-media` `forge` feature: `backend/forge.rs` behind the same `MediaLeg` surface, runtime
+   selection via `Backend` / CLI `--media-backend`; git dep pinned by rev.
+3. ◐ `tests/cross_backend.rs` passes all four pairings native ↔ native (forge↔webrtc-rs both
+   directions) and `demos/media-demo.sh forge webrtc-rs` runs the signalled call end to end.
+   Browser ↔ native on forge is still to be verified by hand (`demos/browser-demo.sh` with
+   `--media-backend forge` on the native side).
+4. ☐ Make `forge` the default once step 3's browser run is green; keep webrtc-rs as the fallback
+   named in plan §7's risk row.
+
+## Findings from the swap (2026-08-21)
+
+What the plan's "four gaps" missed: the old `PeerConnection` had no RTP path at all and ran its
+checks from a second socket, so round one was a rewrite of the transport, not four additions.
+Three forge-ice/forge-rtp bugs were invisible as long as forge only talked to itself (STUN USERNAME
+order, MESSAGE-INTEGRITY/FINGERPRINT inputs, RSA-only DTLS suites) — the cross-backend test is
+what found them, which is the argument for keeping webrtc-rs compiled in as the reference peer
+even after forge becomes the default.

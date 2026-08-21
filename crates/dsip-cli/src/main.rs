@@ -276,6 +276,9 @@ struct ConnOpts {
     /// STUN server(s) for ICE (none needed on one host).
     #[arg(long)]
     stun: Vec<String>,
+    /// Media backend: `webrtc-rs` (default) or `forge` (needs the `forge` build feature).
+    #[arg(long, default_value = "webrtc-rs")]
+    media_backend: String,
     /// Certificate to trust for the relay (self-signed PEM).
     #[arg(long)]
     ca: Option<PathBuf>,
@@ -305,7 +308,7 @@ impl ConnOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl,
-            media: self.media, record: self.record, stun: self.stun,
+            media: self.media, record: self.record, stun: self.stun, media_backend: self.media_backend,
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "dsip-media"
-description = "DSIP native media endpoint (Phase 2): WebRTC DTLS-SRTP audio via webrtc-rs — offer/answer SDP, trickle ICE, Opus tone/file source, Ogg recording sink"
+description = "DSIP native media endpoint (Phase 2): WebRTC DTLS-SRTP audio — offer/answer SDP, trickle ICE, Opus tone/file source, Ogg recording sink; backends: webrtc-rs (default) and forge-media"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,22 @@ tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-webrtc = "0.13"
+webrtc = { version = "0.13", optional = true }
+webrtc-media = "0.10"
+rtp = "0.13"
+forge-webrtc = { git = "https://github.com/thevoiceguy/forge-media", rev = "0729f10514865a345c02ed86b406036db53dd92f", optional = true }
 audiopus = "0.3.0-rc.0"
 bytes = "1"
+
+[features]
+default = ["webrtc-rs"]
+# Backend: webrtc-rs (plan §7's named fallback).
+webrtc-rs = ["dep:webrtc"]
+# Backend: forge-media (the project's own stack; docs/forge-media-plan.md).
+forge = ["dep:forge-webrtc"]
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+# webrtc-rs's DTLS uses rustls; in a workspace build two crypto providers are compiled in
+# (feature unification), so tests must pick one the way dsip-transport does.
+rustls = { workspace = true, features = ["ring"] }

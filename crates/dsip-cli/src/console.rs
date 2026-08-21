@@ -50,6 +50,8 @@ pub struct ConsoleOpts {
     pub record: Option<PathBuf>,
     /// STUN servers.
     pub stun: Vec<String>,
+    /// Media backend: `webrtc-rs` | `forge`.
+    pub media_backend: String,
 }
 
 /// Media state for the current session.
@@ -74,7 +76,8 @@ fn media_enabled(opts: &ConsoleOpts) -> bool {
 
 async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
     let source = if screening { Source::None } else { Source::parse(&opts.media)? };
-    let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone() }).await?;
+    let backend = dsip_media::Backend::parse(&opts.media_backend)?;
+    let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone(), backend }).await?;
     Ok(Media { leg, pending: vec![], remote_offer: None })
 }
 
@@ -261,7 +264,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
             if media_enabled(&opts) {
                 let m = new_leg(&opts, false).await?;
                 let sdp = m.leg.create_offer().await?;
-                println!("media     WebRTC offer created ({} bytes SDP) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len());
+                println!("media     WebRTC offer created ({} bytes SDP, backend {}) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len(), m.leg.backend().name());
                 agent.set_sdp(Some(sdp));
                 media = Some(m);
             }
@@ -317,7 +320,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                         if let Some(m) = media.as_mut() {
                                             if let Some(offer) = m.remote_offer.take() {
                                                 let ans = m.leg.accept_offer(&offer).await?;
-                                                println!("  media   WebRTC answer created ({} bytes SDP) → answer.transports[0].sdp", ans.len());
+                                                println!("  media   WebRTC answer created ({} bytes SDP, backend {}) → answer.transports[0].sdp", ans.len(), m.leg.backend().name());
                                                 agent.set_sdp(Some(ans));
                                             }
                                         }

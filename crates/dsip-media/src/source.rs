@@ -4,7 +4,11 @@
 //! application's business; the protocol only cares that it happens after a
 //! signed answer (§14.1).
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -71,5 +75,57 @@ impl ToneEncoder {
         }
         let n = self.enc.encode(&self.pcm, &mut self.out).context("opus encode")?;
         Ok(Bytes::copy_from_slice(&self.out[..n]))
+    }
+}
+
+/// A boxed future returned by a frame sink: `true` to keep going, `false` to stop.
+pub type SinkFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+/// Drive `source` into `sink` at 20 ms pacing while `sending` stays set,
+/// counting frames in `frames`. Both backends spawn this; only the sink
+/// differs (a webrtc-rs track, a forge `AudioSender`).
+///
+/// Spec: §14.1 — the caller sets `sending` only once the session is ACTIVE.
+pub async fn pump(source: Source, sending: Arc<AtomicBool>, frames: Arc<AtomicU64>, mut sink: impl FnMut(Bytes) -> SinkFuture + Send) {
+    let mut tick = tokio::time::interval(FRAME_DURATION);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    match source {
+        Source::None => {}
+        Source::Tone { hz } => {
+            let mut enc = match ToneEncoder::new(hz) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("tone encoder: {e}");
+                    return;
+                }
+            };
+            while sending.load(Ordering::SeqCst) {
+                tick.tick().await;
+                let Ok(data) = enc.next_frame() else { break };
+                if !sink(data).await {
+                    break;
+                }
+                frames.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Source::File(path) => {
+            while sending.load(Ordering::SeqCst) {
+                let mut file = match crate::ogg::FileSource::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!("{e}");
+                        return;
+                    }
+                };
+                while sending.load(Ordering::SeqCst) {
+                    let Some(page) = file.next_page() else { break };
+                    tick.tick().await;
+                    if !sink(page.freeze()).await {
+                        return;
+                    }
+                    frames.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
