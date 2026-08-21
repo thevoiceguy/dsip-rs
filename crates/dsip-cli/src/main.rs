@@ -14,6 +14,7 @@ use dsip_core::envelope::{self, Envelope};
 use dsip_core::keys::KeyPair;
 
 mod console;
+mod hints;
 mod vectors;
 
 #[derive(Parser)]
@@ -70,6 +71,9 @@ enum Cmd {
     Resolve {
         /// The DID.
         did: String,
+        /// Also consult the DHT hints tier via these bootstrap peers (never authoritative).
+        #[arg(long)]
+        dht: Vec<libp2p::Multiaddr>,
     },
     /// Place a signed call through a relay.
     Call {
@@ -119,9 +123,18 @@ struct ConnOpts {
     /// Identity directory.
     #[arg(long)]
     identity: PathBuf,
-    /// Relay URL (wss://…).
-    #[arg(long, default_value = "wss://127.0.0.1:8443/dsip")]
-    relay: String,
+    /// Relay URL (wss://…). Default wss://127.0.0.1:8443/dsip, or the callee's hint when --dht discovers one.
+    #[arg(long)]
+    relay: Option<String>,
+    /// DHT bootstrap peer(s): join the hints overlay (discover the callee's relay; publish our own with --publish-hint).
+    #[arg(long)]
+    dht: Vec<libp2p::Multiaddr>,
+    /// Publish a signed reachability hint for this identity at the relay we bind to (answer side).
+    #[arg(long)]
+    publish_hint: bool,
+    /// Hint lifetime in seconds.
+    #[arg(long, default_value_t = 3600)]
+    hint_ttl: i64,
     /// Certificate to trust for the relay (self-signed PEM).
     #[arg(long)]
     ca: Option<PathBuf>,
@@ -150,6 +163,7 @@ impl ConnOpts {
         console::ConsoleOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
+            dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl,
         }
     }
 }
@@ -250,12 +264,19 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&id.meta)?);
             println!("delegation: {}", id.delegation.frame());
         }
-        Cmd::Resolve { did } => {
+        Cmd::Resolve { did, dht } => {
             if let Some(pk) = dsip_core::did::public_from_did_key(&did) {
                 println!("method     did:key (self-certifying; no network resolution)          §7.2, §8.5");
                 println!("key        {}", dsip_core::did::multibase_ed25519(&pk));
                 println!("kid        {}", dsip_core::did::did_key_kid(&pk));
-                println!("signaling  — (did:key documents carry no service endpoints; reachability comes from hints or out-of-band)");
+                println!("authority  the key itself (§8.1 step 2); no DID document ⇒ no authoritative service endpoint");
+                if dht.is_empty() {
+                    println!("signaling  — (pass --dht <bootstrap> to consult the hints tier)");
+                } else {
+                    let h = hints::join(&dht).await?;
+                    hints::discover(&h, &did).await?;
+                    h.shutdown().await;
+                }
             } else if did.starts_with("did:web:") {
                 println!("method     did:web → {}   (depends on DNS + Web PKI, §8.4)", dsip_transport::resolver::did_web_url(&did)?);
                 let doc = dsip_transport::resolver::fetch_did_web(&did).await?;

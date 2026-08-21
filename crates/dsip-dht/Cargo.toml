@@ -1,0 +1,27 @@
+[package]
+name = "dsip-dht"
+description = "DSIP DHT reachability hints (experimental, §8.5): signed hint records over libp2p Kademlia, verified, never authoritative"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dsip-dht-node"
+path = "src/bin/dsip-dht-node.rs"
+
+[dependencies]
+dsip-core.workspace = true
+dsip-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+sha2.workspace = true
+libp2p.workspace = true

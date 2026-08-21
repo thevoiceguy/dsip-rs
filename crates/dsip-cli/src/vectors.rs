@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde_json::{json, Map, Value};
 
-use dsip_core::b64;
 use dsip_core::envelope::{self, accept_verdict, Context, Envelope};
-use dsip_core::version::check_version;
 use dsip_core::{RejectCode, Verdict};
 use dsip_schema::{check_payload, validate_against, SemanticContext};
 use dsip_session::{Endpoint, EndpointConfig, Event, Relay, RelayEvent};
@@ -166,41 +164,15 @@ fn envelope_like(v: &Value) -> Value {
     out
 }
 
-fn dht_tail(v: &Value, ver: &envelope::Verified, ctx: &Context) -> Value {
-    let p = &ver.payload;
-    // A hint binds to its subject: whoever signed must be (or be delegated by) the subject.
-    if p.get("subject").and_then(Value::as_str) != Some(ver.identity.as_str()) {
-        return Verdict::reject(RejectCode::HintSubjectMismatch).to_expect();
-    }
-    let vv = check_version(p, &ctx.supported);
-    if !vv.ok() {
-        return vv.to_expect();
-    }
-    if validate_against("reachability-hint", p).is_err() {
-        return Verdict::reject(RejectCode::SchemaInvalid).to_expect();
-    }
-    let mut out = accept_verdict(ver).to_expect();
-    let (mut winner, mut conflict) = ("input", "none");
-    if let Some(existing) = v["context"].get("existing").filter(|e| e.is_object()) {
-        let ex: Value = b64::decode(existing["payload"].as_str().unwrap_or(""))
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(Value::Null);
-        let (seq, ex_seq) = (p["seq"].as_i64().unwrap_or(0), ex["seq"].as_i64().unwrap_or(0));
-        if ex["expires_at"].as_i64().unwrap_or(0) < ctx.now {
-            // §8.3: expired records are invalid
-        } else if seq > ex_seq {
-            (winner, conflict) = ("input", "newer-seq"); // §8.3: newer sequence wins
-        } else if seq < ex_seq {
-            (winner, conflict) = ("existing", "older-seq");
-        } else if existing["payload"] == v["input"]["envelope"]["payload"] {
-            (winner, conflict) = ("existing", "none");
-        } else {
-            (winner, conflict) = ("existing", "same-seq-live"); // §8.3: conflicting live records → warn
-        }
-    }
-    out["winner"] = winner.into();
-    out["conflict"] = conflict.into();
-    out
+fn dht_tail(v: &Value, _ver: &envelope::Verified, ctx: &Context) -> Value {
+    // The crate owns the hint semantics; the runner only feeds it the frame and the existing record.
+    let frame = env_frame(&v["input"]["envelope"]);
+    let existing = v["context"].get("existing").and_then(|e| Envelope::from_value(e).ok());
+    dsip_dht::record::evaluate(&frame, ctx, existing.as_ref()).to_expect()
+}
+
+fn env_frame(env: &Value) -> String {
+    Envelope::from_value(env).map(|e| e.frame()).unwrap_or_default()
 }
 
 fn state(v: &Value) -> Result<(bool, Value, Value)> {

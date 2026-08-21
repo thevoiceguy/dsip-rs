@@ -21,8 +21,8 @@ use dsip_transport::tls;
 pub struct ConsoleOpts {
     /// Identity directory.
     pub identity: PathBuf,
-    /// Relay URL.
-    pub relay: String,
+    /// Relay URL (None = default or hint-discovered).
+    pub relay: Option<String>,
     /// CA/self-signed cert to trust.
     pub ca: Option<PathBuf>,
     /// Offer video.
@@ -37,7 +37,15 @@ pub struct ConsoleOpts {
     pub t_ring: Option<i64>,
     /// T-Ring-Local.
     pub t_ring_local: Option<i64>,
+    /// DHT bootstrap peers.
+    pub dht: Vec<libp2p::Multiaddr>,
+    /// Publish our reachability hint after binding.
+    pub publish_hint: bool,
+    /// Hint TTL.
+    pub hint_ttl: i64,
 }
+
+const DEFAULT_RELAY: &str = "wss://127.0.0.1:8443/dsip";
 
 /// Role-specific behavior.
 pub enum Mode {
@@ -107,8 +115,20 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         _ => vec![],
     };
     let resolver = build_resolver(&opts.did_documents, &fetch).await?;
+
+    // Discovery (§8.1): DID document first; did:key has none, so the hints tier may name the peer's relay.
+    let dht = if opts.dht.is_empty() { None } else { Some(crate::hints::join(&opts.dht).await?) };
+    let mut relay_url = opts.relay.clone();
+    if let (Mode::Call { to }, Some(h)) = (&mode, &dht) {
+        if relay_url.is_none() {
+            if let Some(hint) = crate::hints::discover(h, to).await? {
+                relay_url = hint.endpoints.first().map(|e| e.uri.clone());
+            }
+        }
+    }
+    let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY.to_string());
     let cfg = AgentConfig {
-        relay_url: opts.relay.clone(),
+        relay_url: relay_url.clone(),
         tls: tls::client_config(opts.ca.as_deref())?,
         video: opts.video,
         t_establish: opts.t_establish,
@@ -117,6 +137,12 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     println!("relay     {}  capabilities {}   §13.2 hello bound", short(&agent.relay().did), agent.relay().capabilities);
+    if opts.publish_hint {
+        let Some(h) = &dht else { anyhow::bail!("--publish-hint needs --dht <bootstrap>") };
+        crate::hints::publish(h, &Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl).await?;
+    }
+    let mut republish = tokio::time::interval(Duration::from_secs((opts.hint_ttl.max(3) as u64) * 2 / 3));
+    republish.tick().await;
 
     // command source: script or stdin
     let (ctx, mut crx) = mpsc::unbounded_channel::<String>();
@@ -207,6 +233,12 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     }
                 }
             }
+            _ = republish.tick(), if opts.publish_hint => {
+                // Re-sign before expiry (§8.3: expired records are invalid); the node re-announces in between.
+                if let Some(h) = &dht {
+                    crate::hints::publish(h, &Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl).await?;
+                }
+            }
             cmd = crx.recv() => {
                 let Some(cmd) = cmd else { break };
                 let Some(sid) = current.clone() else {
@@ -235,6 +267,9 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         }
     }
     agent.close().await;
+    if let Some(h) = dht {
+        h.shutdown().await;
+    }
     println!("bye.");
     Ok(())
 }
