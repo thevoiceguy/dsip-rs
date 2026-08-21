@@ -254,6 +254,17 @@ pub enum Emission {
         msg_type: String,
         /// Reason (cancel).
         reason: Option<String>,
+        /// Envelope id, when delivering a queued envelope or a leg added mid-attempt (§13.3).
+        id: Option<String>,
+    },
+    /// Relay: a queued envelope was dropped (`expired` | `cancelled`).
+    Dequeue {
+        /// Recipient.
+        to: String,
+        /// Message type.
+        msg_type: String,
+        /// Why.
+        why: &'static str,
     },
     /// Relay: forward a leg's message to the initiator.
     Forward {
@@ -312,15 +323,19 @@ impl Emission {
             Emission::Info { about } => json!({"info": {"about": about}}),
             Emission::Refused(r) => json!({ "refused": r }),
             Emission::Drop(r) => json!({ "drop": r }),
-            Emission::Deliver { leg, msg_type, reason } => {
+            Emission::Deliver { leg, msg_type, reason, id } => {
                 let mut o = Map::new();
                 o.insert("leg".into(), leg.clone().into());
                 o.insert("type".into(), msg_type.clone().into());
                 if let Some(r) = reason {
                     o.insert("reason".into(), r.clone().into());
                 }
+                if let Some(i) = id {
+                    o.insert("id".into(), i.clone().into());
+                }
                 json!({ "deliver": o })
             }
+            Emission::Dequeue { to, msg_type, why } => json!({"dequeue": {"to": to, "type": msg_type, "why": why}}),
             Emission::Forward { msg_type, status, reason, from } => {
                 let mut o = Map::new();
                 o.insert("type".into(), msg_type.clone().into());

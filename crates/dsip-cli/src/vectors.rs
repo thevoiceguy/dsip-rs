@@ -181,7 +181,7 @@ fn state(v: &Value) -> Result<(bool, Value, Value)> {
     let is_relay = ctx["component"] == "relay";
     let key = if is_relay { "attempts" } else { "sessions" };
     let mut endpoint = (!is_relay).then(|| Endpoint::new(EndpointConfig::from_vector(ctx)));
-    let mut relay = is_relay.then(|| Relay::new(ctx["start"].as_i64().unwrap_or(0)));
+    let mut relay = is_relay.then(|| Relay::with_retention(ctx["start"].as_i64().unwrap_or(0), ctx["offline_retention_s"].as_i64().unwrap_or(86_400)));
     let mut expected = vec![];
     let mut actual = vec![];
     let mut ok = true;

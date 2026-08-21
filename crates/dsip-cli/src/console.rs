@@ -157,7 +157,7 @@ fn print_emission(e: &Emission) {
         Emission::Info { about } => println!("  ℹ  info for {about}                          §12.12"),
         Emission::Refused(r) => println!("  ✗  refused: {r}"),
         Emission::Drop(r) => println!("  ·  dropped: {r}"),
-        Emission::Send(_) | Emission::Deliver { .. } | Emission::Forward { .. } | Emission::Queue { .. } => {}
+        Emission::Send(_) | Emission::Deliver { .. } | Emission::Forward { .. } | Emission::Queue { .. } | Emission::Dequeue { .. } => {}
     }
 }
 

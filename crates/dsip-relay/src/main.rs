@@ -4,9 +4,11 @@
 //! `hello`; the relay answers with its own signed `hello` echoing the client
 //! id; unbound connections receive no session traffic and close after 10 s;
 //! no silent drops on a live connection — refusals are signed `error`s),
-//! §12.7 rules 3 and 6 (leg tracking, per-leg cancel, attempt outcome via
-//! `dsip_session::Relay`), §13.3 (store-and-forward only for `introduction`:
-//! session traffic to unknown recipients gets `transport.unknown-recipient`),
+//! §12.7 rules 3 and 6 (leg tracking, per-leg cancel, attempt outcome, legs
+//! added mid-attempt — all via `dsip_session::Relay`), §13.3 (store-and-forward:
+//! envelopes for known-but-offline recipients are held until
+//! `min(expires_at, offline_retention_s)` and flushed on the next `hello`;
+//! never-seen recipients get `transport.unknown-recipient` — spec-gap 17),
 //! §19.4 (introductions: mandatory per-sender and per-inbox rate limits; unknown
 //! and offline recipients treated identically — Impl, spec-gap 14).
 //!
@@ -41,7 +43,7 @@ use dsip_transport::{now_s, tls, HELLO_TIMEOUT_S};
 mod www;
 
 #[derive(Parser)]
-#[command(name = "dsip-relay", version, about = "DSIP Phase 1 relay (ws/1.0, forking, no store-and-forward)")]
+#[command(name = "dsip-relay", version, about = "DSIP relay (ws/1.0, forking with leg tracking, store-and-forward within the §13.3 boundary)")]
 struct Args {
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:8443")]
@@ -58,9 +60,12 @@ struct Args {
     /// Rate-limit window in seconds.
     #[arg(long, default_value_t = 3600)]
     intro_window: i64,
-    /// Maximum queued introductions per recipient inbox (§13.3 store-and-forward boundary).
+    /// Maximum queued envelopes per recipient (§13.3 store-and-forward boundary).
     #[arg(long, default_value_t = 100)]
     inbox_cap: usize,
+    /// Maximum seconds an envelope is held for an offline recipient (advertised as offline_retention_s).
+    #[arg(long, default_value_t = 86_400)]
+    offline_retention: i64,
     /// Serve static files from this directory on the same TLS port (browser demo; one origin, one cert).
     #[arg(long)]
     www: Option<PathBuf>,
@@ -80,13 +85,14 @@ struct State {
     reject_frames: HashMap<(String, String), String>,
     /// Per session: the initiator device connection.
     initiators: HashMap<String, String>,
-    /// §19.4 inbox: identity → queued (frame, expires_at). Unknown and offline identities alike.
-    inbox: HashMap<String, Vec<(String, i64)>>,
+    /// Every verified frame within the retention window, by envelope id (served for queued deliveries).
+    frames: HashMap<String, (String, i64)>,
     /// §19.4 rate limiting: key (sender identity or recipient) → recent introduction times.
     intro_log: HashMap<String, Vec<i64>>,
     intro_limit: usize,
     intro_window: i64,
     inbox_cap: usize,
+    offline_retention: i64,
 }
 
 impl State {
@@ -115,15 +121,6 @@ impl State {
         }
     }
 
-    fn legs_for(&self, to: &str) -> Vec<String> {
-        if self.devices.contains_key(to) {
-            return vec![to.to_string()];
-        }
-        let mut v: Vec<String> = self.identities.get(to).map(|s| s.iter().cloned().collect()).unwrap_or_default();
-        v.sort();
-        v
-    }
-
     /// §19.4: sliding-window rate limit; returns seconds until a slot frees, or 0 if allowed (and records it).
     fn intro_rate(&mut self, key: &str) -> i64 {
         let now = now_s();
@@ -136,14 +133,57 @@ impl State {
         0
     }
 
-    /// Deliver queued introductions to a newly bound device (§13.3 boundary).
-    fn flush_inbox(&mut self, identity: &str, device: &str) {
+    /// Advance the tracker's clock to now (expires queues) and forget frames past retention.
+    fn tick(&mut self) -> Vec<Emission> {
         let now = now_s();
-        if let Some(q) = self.inbox.remove(identity) {
-            for (frame, exp) in q {
-                if exp >= now {
-                    self.deliver(device, &frame);
+        self.frames.retain(|_, (_, deadline)| *deadline > now);
+        let delta = now - self.tracker.now;
+        if delta > 0 {
+            self.tracker.step(&RelayEvent::Advance { advance: delta })
+        } else {
+            vec![]
+        }
+    }
+
+    /// Act on tracker emissions for a frame that just arrived (or `None` on bind/advance).
+    fn apply(&mut self, em: Vec<Emission>, sender: Option<&str>, inbound: Option<&Inbound>, sid: &str) {
+        for e in em {
+            match e {
+                Emission::Deliver { leg, msg_type, id: Some(id), .. } => {
+                    // A queued envelope, or an invite for a leg added mid-attempt: served from the frame store.
+                    if let Some((frame, _)) = self.frames.get(&id).cloned() {
+                        tracing::info!("deliver stored {msg_type} {id} → {leg}");
+                        self.deliver(&leg, &frame);
+                    }
                 }
+                Emission::Deliver { leg, msg_type, id: None, .. } => {
+                    if let Some(inb) = inbound {
+                        tracing::info!("{msg_type} {sid} → leg {leg}");
+                        self.deliver(&leg, &inb.frame);
+                    }
+                }
+                Emission::Forward { msg_type, from, .. } => {
+                    let Some(initiator) = self.tracker.attempt_initiator(sid).map(String::from) else { continue };
+                    if msg_type == "reject" {
+                        // §12.7 rule 6: forward the most informative leg's reject as the attempt outcome
+                        if let Some(f) = self.reject_frames.get(&(sid.to_string(), from.clone())).cloned() {
+                            tracing::info!("attempt {sid} outcome: reject from {from}");
+                            self.deliver(&initiator, &f);
+                        }
+                    } else if let Some(inb) = inbound {
+                        self.deliver(&initiator, &inb.frame);
+                    }
+                }
+                Emission::Queue { to, msg_type } => tracing::info!("queued {msg_type} for {to} (§13.3)"),
+                Emission::Dequeue { to, msg_type, why } => tracing::info!("dequeued {msg_type} for {to}: {why}"),
+                Emission::Send(m) if m.msg_type == "error" => {
+                    if let Some(s) = sender {
+                        let f = self.error_frame(s, m.reason.as_deref().unwrap_or("transport.routing-refused"), m.in_reply_to.as_deref(), None, None);
+                        self.deliver(s, &f);
+                    }
+                }
+                Emission::Drop(why) => tracing::info!("dropped on {sid}: {why}"),
+                _ => {}
             }
         }
     }
@@ -154,113 +194,45 @@ impl State {
         let t = inbound.verified.msg_type().to_string();
         let id = p["id"].as_str().unwrap_or("").to_string();
         let to = p["to"].as_str().unwrap_or("").to_string();
-        let session = p.get("session").and_then(Value::as_str).map(String::from);
         let Some(msg) = Message::from_payload(p) else { return };
         let sid = msg.session_id().to_string();
-        let tracked = self.initiators.contains_key(&sid);
+        let _ = self.tick();
 
-        match t.as_str() {
-            "introduction" => {
-                // §19.4: relays MUST rate-limit introductions per sender identity and per recipient inbox.
-                let wait = self.intro_rate(&format!("from:{sender_identity}")).max(self.intro_rate(&format!("to:{to}")));
-                if wait > 0 {
-                    let mut f = self.error_frame(sender, "policy.rate-limited", Some(&id), None, None);
-                    // retry_after rides in the signed error payload
-                    if let Ok(mut env) = Envelope::from_frame(&f) {
-                        if let Some(mut payload) = dsip_core::b64::decode(&env.payload)
-                            .and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-                            payload["retry_after"] = wait.into();
-                            env = sign(&payload, &self.key, &self.key.kid());
-                            f = env.frame();
-                        }
-                    }
-                    self.deliver(sender, &f);
-                    return;
-                }
-                // §19.4 anti-enumeration (Impl, spec-gap 14): unknown and offline recipients are treated identically —
-                // queued until the introduction expires, no routing error. Bound devices get it now.
-                let legs = self.legs_for(&to);
-                if legs.is_empty() {
-                    let exp = p["expires_at"].as_i64().unwrap_or(now_s());
-                    let q = self.inbox.entry(to.clone()).or_default();
-                    q.retain(|(_, e)| *e >= now_s());
-                    if q.len() < self.inbox_cap {
-                        q.push((inbound.frame.clone(), exp));
-                    }
-                    tracing::info!("queued introduction for {to} (inbox {})", q.len());
-                } else {
-                    for leg in legs {
-                        self.deliver(&leg, &inbound.frame);
+        if t == "introduction" {
+            // §19.4: relays MUST rate-limit introductions per sender identity and per recipient inbox.
+            let wait = self.intro_rate(&format!("from:{sender_identity}")).max(self.intro_rate(&format!("to:{to}")));
+            if wait > 0 {
+                let mut f = self.error_frame(sender, "policy.rate-limited", Some(&id), None, None);
+                if let Ok(mut env) = Envelope::from_frame(&f) {
+                    if let Some(mut payload) = dsip_core::b64::decode(&env.payload).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                        payload["retry_after"] = wait.into();
+                        env = sign(&payload, &self.key, &self.key.kid());
+                        f = env.frame();
                     }
                 }
-            }
-            "invite" => {
-                let legs = self.legs_for(&to);
-                if legs.is_empty() {
-                    let f = self.error_frame(sender, "transport.unknown-recipient", Some(&id), None, None);
-                    self.deliver(sender, &f);
-                    return;
-                }
-                // §12.7 rule 3: fork with leg tracking
-                self.initiators.insert(sid.clone(), sender.to_string());
-                let em = self.tracker.step(&RelayEvent::Relay(RelayAction::Invite {
-                    session: sid.clone(),
-                    from: sender.to_string(),
-                    to: to.clone(),
-                    legs: legs.clone(),
-                }));
-                for e in em {
-                    if let Emission::Deliver { leg, .. } = e {
-                        tracing::info!("fork invite {sid} → leg {leg}");
-                        self.deliver(&leg, &inbound.frame);
-                    }
-                }
-            }
-            "cancel" if tracked && self.initiators.get(&sid) == Some(&sender.to_string()) => {
-                let em = self.tracker.step(&RelayEvent::Recv { recv: msg });
-                for e in em {
-                    if let Emission::Deliver { leg, .. } = e {
-                        tracing::info!("per-leg cancel {sid} → {leg}");
-                        self.deliver(&leg, &inbound.frame);
-                    }
-                }
-            }
-            "progress" | "answer" | "reject" if tracked && self.initiators.get(&sid) != Some(&sender.to_string()) => {
-                if t == "reject" {
-                    self.reject_frames.insert((sid.clone(), sender.to_string()), inbound.frame.clone());
-                }
-                let initiator = self.initiators[&sid].clone();
-                let em = self.tracker.step(&RelayEvent::Recv { recv: msg });
-                for e in em {
-                    match e {
-                        Emission::Forward { msg_type, from, .. } if msg_type == "reject" => {
-                            // §12.7 rule 6: forward the most informative leg's reject as the attempt outcome
-                            if let Some(f) = self.reject_frames.get(&(sid.clone(), from.clone())).cloned() {
-                                tracing::info!("attempt {sid} outcome: reject from {from}");
-                                self.deliver(&initiator, &f);
-                            }
-                        }
-                        Emission::Forward { .. } => {
-                            self.deliver(&initiator, &inbound.frame);
-                        }
-                        Emission::Drop(why) => tracing::info!("dropped {t} from {sender} on {sid}: {why}"),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {
-                // Plain routing by `to` (device, or every device of an identity).
-                let legs = self.legs_for(&to);
-                if legs.is_empty() {
-                    let f = self.error_frame(sender, "transport.unknown-recipient", Some(&id), session.as_deref(), None);
-                    self.deliver(sender, &f);
-                    return;
-                }
-                for leg in legs {
-                    self.deliver(&leg, &inbound.frame);
-                }
+                self.deliver(sender, &f);
+                return;
             }
         }
+        // Inbox cap (§13.3 boundary): refuse when the recipient's queue is full.
+        if self.tracker.legs_for(&to).is_empty() && self.tracker.inbox.get(&to).map(|q| q.len()).unwrap_or(0) >= self.inbox_cap {
+            if t != "introduction" {
+                let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some("recipient inbox full"));
+                self.deliver(sender, &f);
+            }
+            return;
+        }
+        // Keep the frame within retention so queued deliveries and mid-attempt legs can be served.
+        let deadline = p["expires_at"].as_i64().unwrap_or(now_s()).min(now_s() + self.offline_retention);
+        self.frames.insert(id.clone(), (inbound.frame.clone(), deadline));
+        if t == "invite" {
+            self.initiators.insert(sid.clone(), sender.to_string());
+        }
+        if t == "reject" && self.tracker.attempt_initiator(&sid).is_some_and(|i| i != sender) {
+            self.reject_frames.insert((sid.clone(), sender.to_string()), inbound.frame.clone());
+        }
+        let em = self.tracker.step(&RelayEvent::Recv { recv: msg });
+        self.apply(em, Some(sender), Some(inbound), &sid);
     }
 }
 
@@ -302,14 +274,15 @@ async fn main() -> Result<()> {
         seen: SeenIds::default(),
         devices: HashMap::new(),
         identities: HashMap::new(),
-        tracker: Relay::new(now_s()),
+        tracker: Relay::with_retention(now_s(), args.offline_retention),
         reject_frames: HashMap::new(),
         initiators: HashMap::new(),
-        inbox: HashMap::new(),
+        frames: HashMap::new(),
         intro_log: HashMap::new(),
         intro_limit: args.intro_limit,
         intro_window: args.intro_window,
         inbox_cap: args.inbox_cap,
+        offline_retention: args.offline_retention,
     }));
 
     if let Some(w) = &args.www {
@@ -394,19 +367,22 @@ async fn serve(
             tracing::info!("{peer}: rebinding {device} (replacing prior connection)");
         }
         st.identities.entry(identity.clone()).or_default().insert(device.clone());
-        st.flush_inbox(&identity, &device);
-        st.flush_inbox(&device, &device);
         let now = now_s();
         let hello = json!({
             "dsip": version_block(&st.supported, &[]), "type": "hello", "id": Ulid::generate().as_str(),
             "in_reply_to": hello_id, "from": st.key.did(),
-            "capabilities": {"max_envelope_bytes": dsip_core::WS_MAX_ENVELOPE_BYTES, "store_and_forward": false,
+            "capabilities": {"max_envelope_bytes": dsip_core::WS_MAX_ENVELOPE_BYTES, "store_and_forward": true,
+                             "offline_retention_s": st.offline_retention,
                              "rate_limit": {"envelopes_per_minute": 600, "invites_per_minute": 30}},
             "issued_at": now, "expires_at": now + 30,
         });
         let env: Envelope = sign(&hello, &st.key, &st.key.kid());
         ws.send(WsMessage::Text(env.frame().into())).await?;
         tracing::info!("{peer}: bound device {device} for identity {identity}");
+        // §13.3: binding flushes the store-and-forward queues and adds this device as a leg to live attempts (§12.7 rule 3)
+        let _ = st.tick();
+        let em = st.tracker.step(&RelayEvent::Relay(RelayAction::Bind { device: device.clone(), identity: identity.clone() }));
+        st.apply(em, None, None, "");
     }
 
     // --- steady state
@@ -472,6 +448,7 @@ async fn serve(
     if let Some(set) = st.identities.get_mut(&identity) {
         set.remove(&device);
     }
+    let _ = st.tracker.step(&RelayEvent::Relay(RelayAction::Unbind { device: device.clone(), identity: identity.clone() }));
     tracing::info!("{peer}: unbound {device}");
     result
 }

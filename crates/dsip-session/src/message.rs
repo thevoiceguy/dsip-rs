@@ -43,7 +43,7 @@ pub struct Message {
     /// `info.about`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
-    /// `invite.expires_at` (bounds pre-alerting delivery, §12.9).
+    /// `expires_at` (bounds pre-alerting delivery for invites, §12.9; the store-and-forward deadline at relays, §13.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     /// `invite.grant` — a held contact grant referenced by id (§19.4).
@@ -81,7 +81,7 @@ impl Message {
             answered_by: s("answered_by"),
             in_reply_to: s("in_reply_to"),
             about: s("about"),
-            expires_at: if s("type").as_deref() == Some("invite") { n("expires_at") } else { None },
+            expires_at: n("expires_at"),
             grant: s("grant"),
             purpose: s("purpose"),
             contact_token: s("contact_token"),
