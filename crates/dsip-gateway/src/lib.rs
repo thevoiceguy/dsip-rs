@@ -20,6 +20,8 @@
 #![forbid(unsafe_code)]
 
 pub mod controller;
+#[cfg(feature = "host")]
+pub mod host;
 
 use serde_json::{json, Map, Value};
 

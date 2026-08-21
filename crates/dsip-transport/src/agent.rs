@@ -185,6 +185,11 @@ impl Agent {
         self.core.set_sdp(sdp);
     }
 
+    /// Claims for the next invite's `identity.claims` (§18.1).
+    pub fn set_claims(&mut self, claims: Vec<serde_json::Value>) {
+        self.core.set_claims(claims);
+    }
+
     /// `data` for the next `info` (ICE candidates, §12.12).
     pub fn set_info_data(&mut self, data: serde_json::Value) {
         self.core.set_info_data(data);

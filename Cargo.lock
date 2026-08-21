@@ -702,6 +702,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "combine"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
+dependencies = [
+ "bytes",
+ "memchr",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -929,6 +939,19 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
@@ -1130,9 +1153,28 @@ dependencies = [
 name = "dsip-gateway"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "audiopus",
+ "bytes",
+ "clap",
+ "dsip-core",
+ "dsip-endpoint",
+ "dsip-session",
+ "dsip-transport",
  "dsip-webrtc-binding",
+ "forge-codecs",
+ "forge-rtp",
+ "forge-webrtc",
  "serde",
  "serde_json",
+ "sip-core",
+ "sip-dialog",
+ "sip-parse",
+ "sip-uac",
+ "sip-uas",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1352,7 +1394,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1451,6 +1493,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
+name = "forge-codecs"
+version = "0.2.0"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+dependencies = [
+ "lazy_static",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "forge-core"
 version = "0.2.0"
 source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
@@ -1522,7 +1574,7 @@ dependencies = [
  "forge-ice",
  "forge-rtp",
  "rand 0.10.2",
- "sip-sdp",
+ "sip-sdp 0.3.1 (git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1)",
  "smol_str 0.3.6",
  "thiserror 2.0.20",
 ]
@@ -1533,7 +1585,7 @@ version = "0.3.0"
 source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
 dependencies = [
  "bytes",
- "dashmap",
+ "dashmap 6.2.1",
  "forge-core",
  "forge-ice",
  "forge-rtp",
@@ -1840,6 +1892,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hep-rs"
+version = "0.0.1"
+source = "git+https://github.com/thevoiceguy/hep-rs?branch=main#91e689b0faaa09106483c0305e75f39916d0b78b"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1850,6 +1913,30 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hickory-net"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+dependencies = [
+ "async-trait",
+ "cfg-if",
+ "data-encoding",
+ "futures-channel",
+ "futures-io",
+ "futures-util",
+ "hickory-proto 0.26.1",
+ "idna",
+ "ipnet",
+ "jni",
+ "rand 0.10.2",
+ "thiserror 2.0.20",
+ "tinyvec",
+ "tokio",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "hickory-proto"
@@ -1878,6 +1965,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hickory-proto"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+dependencies = [
+ "data-encoding",
+ "idna",
+ "ipnet",
+ "jni",
+ "once_cell",
+ "prefix-trie",
+ "rand 0.10.2",
+ "ring",
+ "thiserror 2.0.20",
+ "tinyvec",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "hickory-resolver"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1885,7 +1992,7 @@ checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
 dependencies = [
  "cfg-if",
  "futures-util",
- "hickory-proto",
+ "hickory-proto 0.25.2",
  "ipconfig",
  "moka",
  "once_cell",
@@ -1893,6 +2000,32 @@ dependencies = [
  "rand 0.9.5",
  "resolv-conf",
  "smallvec",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hickory-resolver"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
+dependencies = [
+ "cfg-if",
+ "futures-util",
+ "hickory-net",
+ "hickory-proto 0.26.1",
+ "ipconfig",
+ "ipnet",
+ "jni",
+ "moka",
+ "ndk-context",
+ "once_cell",
+ "parking_lot",
+ "rand 0.10.2",
+ "resolv-conf",
+ "smallvec",
+ "system-configuration",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -1965,6 +2098,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2027,7 +2166,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2282,6 +2421,9 @@ name = "ipnet"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -2303,6 +2445,55 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jni"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5efd9a482cf3a427f00d6b35f14332adc7902ce91efb778580e180ff90fa3498"
+dependencies = [
+ "cfg-if",
+ "combine",
+ "jni-macros",
+ "jni-sys",
+ "log",
+ "simd_cesu8",
+ "thiserror 2.0.20",
+ "walkdir",
+ "windows-link",
+]
+
+[[package]]
+name = "jni-macros"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a00109accc170f0bdb141fed3e393c565b6f5e072365c3bd58f5b062591560a3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rustc_version",
+ "simd_cesu8",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "jni-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6377a88cb3910bee9b0fa88d4f42e1d2da8e79915598f65fb0c7ee14c878af2"
+dependencies = [
+ "jni-sys-macros",
+]
+
+[[package]]
+name = "jni-sys-macros"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "jobserver"
@@ -2482,7 +2673,7 @@ checksum = "0b770c1c8476736ca98c578cba4b505104ff8e842c2876b528925f9766379f9a"
 dependencies = [
  "async-trait",
  "futures",
- "hickory-resolver",
+ "hickory-resolver 0.25.2",
  "libp2p-core",
  "libp2p-identity",
  "parking_lot",
@@ -2563,7 +2754,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c66872d0f1ffcded2788683f76931be1c52e27f343edb93bc6d0bcd8887be443"
 dependencies = [
  "futures",
- "hickory-proto",
+ "hickory-proto 0.25.2",
  "if-watch",
  "libp2p-core",
  "libp2p-identity",
@@ -2800,6 +2991,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2918,6 +3115,12 @@ dependencies = [
  "smallvec",
  "unsigned-varint 0.7.2",
 ]
+
+[[package]]
+name = "ndk-context"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "netlink-packet-core"
@@ -3412,6 +3615,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "prefix-trie"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cf6e3177f0684016a5c209b00882e15f8bdd3f3bb48f0491df10cd102d0c6e7"
+dependencies = [
+ "either",
+ "ipnet",
+ "num-traits",
+]
+
+[[package]]
 name = "primeorder"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3536,7 +3750,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3575,9 +3789,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3939,7 +4153,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4035,6 +4249,15 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
 
 [[package]]
 name = "schannel"
@@ -4242,12 +4465,232 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd_cesu8"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11031e251abf8611c80f460e19dbdeb54a66db918e49c65a7065b46ac7aec520"
+dependencies = [
+ "rustc_version",
+ "simdutf8",
+]
+
+[[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "sip-auth"
+version = "0.4.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dashmap 5.5.3",
+ "hex",
+ "md5",
+ "rand 0.10.2",
+ "sha2 0.10.9",
+ "sip-core",
+ "sip-parse",
+ "sip-ratelimit",
+ "smol_str 0.3.6",
+ "subtle",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "sip-core"
+version = "0.7.7"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "bytes",
+ "httpdate",
+ "percent-encoding",
+ "serde",
+ "smol_str 0.3.6",
+ "subtle",
+]
+
+[[package]]
+name = "sip-dialog"
+version = "0.3.4"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dashmap 5.5.3",
+ "parking_lot",
+ "rand 0.10.2",
+ "sip-core",
+ "sip-parse",
+ "smol_str 0.3.6",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sip-dns"
+version = "0.3.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hickory-resolver 0.26.1",
+ "rand 0.10.2",
+ "sip-core",
+ "smol_str 0.3.6",
+ "tokio",
+]
+
+[[package]]
+name = "sip-hep"
+version = "0.0.1"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "bytes",
+ "hep-rs",
+ "once_cell",
+ "tracing",
+]
+
+[[package]]
+name = "sip-observe"
+version = "0.3.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "once_cell",
+ "tracing",
+]
+
+[[package]]
+name = "sip-parse"
+version = "0.3.4"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "bytes",
+ "httpdate",
+ "nom",
+ "serde",
+ "sip-core",
+ "smol_str 0.3.6",
+ "tracing",
+]
+
+[[package]]
+name = "sip-ratelimit"
+version = "0.3.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "dashmap 5.5.3",
+ "parking_lot",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sip-sdp"
+version = "0.3.1"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "nom",
+ "smol_str 0.3.6",
+]
+
+[[package]]
 name = "sip-sdp"
 version = "0.3.1"
 source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
 dependencies = [
  "nom",
  "smol_str 0.3.6",
+]
+
+[[package]]
+name = "sip-transaction"
+version = "0.6.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dashmap 5.5.3",
+ "parking_lot",
+ "rand 0.10.2",
+ "sip-core",
+ "sip-parse",
+ "sip-transport",
+ "smol_str 0.3.6",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sip-transport"
+version = "0.4.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "dashmap 5.5.3",
+ "memchr",
+ "sip-hep",
+ "sip-observe",
+ "sip-ratelimit",
+ "socket2 0.5.10",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sip-uac"
+version = "0.5.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "hex",
+ "rand 0.10.2",
+ "sha1 0.10.7",
+ "sip-auth",
+ "sip-core",
+ "sip-dialog",
+ "sip-dns",
+ "sip-parse",
+ "sip-sdp 0.3.1 (git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0)",
+ "sip-transaction",
+ "sip-transport",
+ "smol_str 0.3.6",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
+name = "sip-uas"
+version = "0.3.0"
+source = "git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0#ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "rand 0.10.2",
+ "sip-auth",
+ "sip-core",
+ "sip-dialog",
+ "sip-parse",
+ "sip-sdp 0.3.1 (git+https://github.com/thevoiceguy/siphon-rs?rev=ad7f3e7e132b1b1d6c0ce9d8e10949a8f3226ce0)",
+ "sip-transaction",
+ "sip-transport",
+ "smol_str 0.3.6",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4483,10 +4926,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4900,6 +5343,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4973,6 +5422,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1f50000a783467e6c0200f9d10642f4bc424e39efc1b770203e88b488f79292"
 dependencies = [
  "atomic-waker",
+]
+
+[[package]]
+name = "walkdir"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+dependencies = [
+ "same-file",
+ "winapi-util",
 ]
 
 [[package]]
@@ -5313,6 +5772,15 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "winapi-x86_64-pc-windows-gnu"

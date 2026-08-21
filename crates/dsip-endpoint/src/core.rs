@@ -127,6 +127,8 @@ pub struct Core {
     offers: HashMap<String, Value>,
     peer_delegations: Vec<Envelope>,
     pending_sdp: Option<String>,
+    /// `identity.claims` to put on the next invite (a gateway's PSTN caller claim, §18.1).
+    pending_claims: Vec<Value>,
     pending_info_data: Option<Value>,
     counter: u64,
 }
@@ -158,6 +160,7 @@ impl Core {
             offers: HashMap::new(),
             peer_delegations: vec![],
             pending_sdp: None,
+            pending_claims: vec![],
             pending_info_data: None,
             counter: 0,
         }
@@ -211,6 +214,12 @@ impl Core {
     /// SDP to embed in the next `invite`/`update`/`answer` transport descriptor (consumed on use).
     pub fn set_sdp(&mut self, sdp: Option<String>) {
         self.pending_sdp = sdp;
+    }
+
+    /// Claims for the next invite's `identity.claims` (§18.1: claims, never badges — e.g. a
+    /// gateway's `tel` claim about a PSTN caller).
+    pub fn set_claims(&mut self, claims: Vec<Value>) {
+        self.pending_claims = claims;
     }
 
     /// `data` object for the next `info` (consumed on use).
@@ -456,7 +465,7 @@ impl Core {
                 let offer = self.media_offer(self.cfg.video);
                 self.offers.insert(session.clone(), offer.clone());
                 p["intent"] = "interactive".into();
-                p["identity"] = json!({"display_name": self.keys.display_name, "claims": []});
+                p["identity"] = json!({"display_name": self.keys.display_name, "claims": std::mem::take(&mut self.pending_claims)});
                 p["media"] = offer["media"].clone();
                 p["transports"] = offer["transports"].clone();
                 p["policy"] = json!({"recording": "consent-required", "ai_processing": "denied"});
