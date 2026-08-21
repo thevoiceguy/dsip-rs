@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use dsip_core::envelope::{self, accept_verdict, Context, Envelope};
 use dsip_core::{RejectCode, Verdict};
-use dsip_schema::{check_payload, validate_against, SemanticContext};
+use dsip_schema::{check_payload, SemanticContext};
 use dsip_broadcast::{evaluate_publication, Authority, AuthorityEvent, Subscriber};
 use dsip_session::{Endpoint, EndpointConfig, Event, Relay, RelayEvent};
 
@@ -120,7 +120,7 @@ fn run_one(v: &Value) -> Result<(bool, Value, Value)> {
         "envelope" | "transport" | "dht" => envelope_like(v),
         "payload" => {
             let schema = v["input"]["schema"].as_str().unwrap_or("");
-            match validate_against(schema, &v["input"]["payload"]) {
+            match dsip_schema::validate_payload_as(schema, &v["input"]["payload"]) {
                 Ok(()) => Verdict::accept().to_expect(),
                 Err(e) => Verdict::reject(RejectCode::SchemaInvalid).detail(e).to_expect(),
             }

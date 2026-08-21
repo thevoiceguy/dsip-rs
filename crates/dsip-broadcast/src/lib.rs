@@ -27,7 +27,5 @@ pub use subscriber::Subscriber;
 
 /// Integrity modes defined by Core v1.0. Spec: §22.2.
 pub const INTEGRITY_MODES: &[&str] = &["metadata-only", "derivative-bound"];
-/// The provenance extension identifier. Spec: §22.1 example, §22.3.
-pub const PROVENANCE_EXTENSION: &str = "broadcast-provenance/1.0";
 /// The broadcast profile identifier. Spec: §22.
 pub const PROFILE: &str = "verified-broadcast/1.0";

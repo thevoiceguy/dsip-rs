@@ -44,6 +44,9 @@ pub enum RejectCode {
     HintSubjectMismatch,
     PublisherMismatch,
     StreamIdNamespace,
+    RotationSubjectMismatch,
+    RotationNextSameAsPrevious,
+    RotationSignerNotPrevious,
 }
 
 /// The outcome of a pipeline stage.

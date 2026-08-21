@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
-use dsip_broadcast::{evaluate_publication, PROFILE, PROVENANCE_EXTENSION};
+use dsip_broadcast::{evaluate_publication, PROFILE};
 use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{Context, Envelope};
 use dsip_schema::SemanticContext;
@@ -34,7 +34,7 @@ fn short(did: &str) -> String {
 }
 
 fn bcast_version() -> Value {
-    json!({"core": "1.0", "min_core": "1.0", "profiles": [PROFILE], "extensions": [PROVENANCE_EXTENSION], "critical": []})
+    json!({"core": "1.0", "min_core": "1.0", "profiles": [PROFILE], "extensions": [], "critical": []})
 }
 
 async fn connect(c: &Conn) -> Result<Agent> {
@@ -89,7 +89,7 @@ pub async fn publish(c: &Conn, stream_suffix: &str, title: &str, state: &str, va
     let stream = format!("{}:{}", agent.identity_did(), stream_suffix);
     let p = json!({
         "dsip": bcast_version(), "type": "publish", "from": agent.identity_did(), "publisher": agent.identity_did(), "stream_id": stream,
-        "title": title, "state": state, "variants": variants, "policy": policy,
+        "title": title, "state": state, "integrity": "metadata-only", "variants": variants, "policy": policy,
     });
     let frame = agent.send_payload(p, ttl).await?;
     let env = Envelope::from_frame(&frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
@@ -125,7 +125,7 @@ pub async fn unpublish(c: &Conn, stream_suffix: &str, publication: Option<String
 pub async fn provenance(c: &Conn, stream: &str, publication: &str, operation: &str, input: &str, output: &str, uri: Option<String>) -> Result<()> {
     let mut agent = connect(c).await?;
     let mut p = json!({
-        "dsip": bcast_version(), "type": "broadcast.provenance", "from": agent.identity_did(), "original_stream": stream, "original_publication": publication,
+        "dsip": bcast_version(), "type": "provenance", "from": agent.identity_did(), "original_stream": stream, "original_publication": publication,
         "processor": agent.identity_did(), "operation": operation, "input_variant": input, "output_variant": output,
     });
     if let Some(u) = uri {
@@ -211,7 +211,7 @@ fn show_record(record: &str, statements: Vec<Value>, resolver: &StaticResolver, 
     let Ok(env) = Envelope::from_frame(record) else { return println!("           record: malformed") };
     let prov: Vec<Envelope> = statements.iter().filter_map(Value::as_str).filter_map(|f| Envelope::from_frame(f).ok()).collect();
     let ctx = Context::new(now_s(), resolver);
-    let sem = SemanticContext { supported: dsip_core::version::Supported::from_json(Some(&json!({"core": "1.0", "profiles": [PROFILE, "interactive-media/1.0"], "extensions": [PROVENANCE_EXTENSION]}))), ..Default::default() };
+    let sem = SemanticContext { supported: dsip_core::version::Supported::from_json(Some(&json!({"core": "1.0", "profiles": [PROFILE, "interactive-media/1.0"], "extensions": []}))), ..Default::default() };
     match evaluate_publication(&env, &prov, codecs, transports, &ctx, &sem) {
         Ok((signer, r)) => {
             let p = &r.publication;

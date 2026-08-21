@@ -110,7 +110,7 @@ impl State {
                 let to = send["to"].as_str().unwrap_or("").to_string();
                 let now = now_s();
                 let mut p = json!({
-                    "dsip": {"core": "1.0", "min_core": "1.0", "profiles": [dsip_broadcast::PROFILE], "extensions": [dsip_broadcast::PROVENANCE_EXTENSION], "critical": []},
+                    "dsip": {"core": "1.0", "min_core": "1.0", "profiles": [dsip_broadcast::PROFILE], "extensions": [], "critical": []},
                     "type": send["type"], "id": Ulid::generate().as_str(), "from": self.key.did(), "to": to,
                     "issued_at": now, "expires_at": now + 30,
                 });
@@ -280,7 +280,7 @@ impl State {
         if t == "reject" && self.tracker.attempt_initiator(&sid).is_some_and(|i| i != sender) {
             self.reject_frames.insert((sid.clone(), sender.to_string()), inbound.frame.clone());
         }
-        if matches!(t.as_str(), "publish" | "unpublish" | "subscribe" | "broadcast.provenance") {
+        if matches!(t.as_str(), "publish" | "unpublish" | "subscribe" | "provenance") {
             // §9.3/§22: addressed to this relay as the target's authority (publish/unpublish carry no `to`).
             if t == "subscribe" && to != self.key.did() {
                 let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some("subscribe must address this relay"));
@@ -288,15 +288,12 @@ impl State {
                 return;
             }
             let mut m = p.clone();
-            if t == "broadcast.provenance" {
-                m["type"] = "provenance".into();
-            }
             m["from"] = sender.into();
             self.authority.learn_identity(sender, sender_identity);
             if t == "publish" {
                 self.records.insert(id.clone(), inbound.frame.clone());
             }
-            if t == "broadcast.provenance" {
+            if t == "provenance" {
                 self.statements.entry(p["original_publication"].as_str().unwrap_or("").to_string()).or_default().push(inbound.frame.clone());
             }
             let _ = self.authority.advance_to(now_s());
@@ -489,7 +486,9 @@ async fn serve(
                             }
                             Err(v) => {
                                 // §13.2: no silent drops on a live connection
-                                let f = st.error_frame(&device, "transport.routing-refused", None, None, Some(&format!("{:?}", v.code)));
+                                // A verdict that names a reason token (e.g. `policy.subscription-lifetime`, §9.3 v0.7) is
+                                // answered with that token; otherwise the generic routing refusal.
+                                let f = st.error_frame(&device, v.reason.unwrap_or("transport.routing-refused"), None, None, Some(&format!("{:?}", v.code)));
                                 st.deliver(&device, &f);
                             }
                         }

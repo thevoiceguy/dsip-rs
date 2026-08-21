@@ -5,7 +5,7 @@
 //!
 //! A hint is a DSIP-JOSE envelope whose payload is
 //! `{"type":"reachability-hint","subject":DID,"endpoints":[{uri,bindings}],"seq":N,…}`
-//! (schema: `impl/schemas/reachability-hint.schema.json`). The DHT key is the
+//! (schema: `reachability-hint.schema.json` in the v0.7 spec set). The DHT key is the
 //! SHA-256 multihash of the normalized subject DID.
 
 use serde::{Deserialize, Serialize};

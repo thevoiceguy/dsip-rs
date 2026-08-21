@@ -1,7 +1,9 @@
 //! Receiver-side verification: the publication record, provenance statements, variant selection.
 //!
 //! Spec: §22.1 (record shape; variant order is the publisher's preference), §22.2
-//! (integrity mode), §22.3 (a statement references the original publication and
+//! (integrity mode: the record declares it, a selected variant may override, unknown
+//! tokens fall back to `metadata-only`, a verified transcode statement makes the delivered
+//! stream `derivative-bound`), §22.3 (a statement references the original publication and
 //! is signed by its processor), §8.1 (the publisher is whoever the signature
 //! verifies as), §16.4 (policy violations are surfaced, not silently enforced).
 
@@ -70,12 +72,15 @@ pub struct Receiver {
     pub delivered_by: Vec<String>,
     /// Processors that transcoded.
     pub transcoded_by: Vec<String>,
+    /// Integrity mode the record (or the selected variant) declares, after registry fallback (§22.2).
+    pub declared_integrity: &'static str,
 }
 
 impl Receiver {
-    /// Integrity mode to display: `derivative-bound` when any accepted transcode statement exists.
+    /// Integrity mode to display: `derivative-bound` when any accepted transcode statement
+    /// exists, else what the record declares (§22.2, v0.7).
     pub fn integrity_mode(&self) -> &'static str {
-        if self.transcoded_by.is_empty() { "metadata-only" } else { "derivative-bound" }
+        if self.transcoded_by.is_empty() { self.declared_integrity } else { "derivative-bound" }
     }
 
     /// The vector `expect` projection.
@@ -123,7 +128,7 @@ pub fn evaluate_publication(
                 let vv = check_version(sp, &sem.supported);
                 if !vv.ok() {
                     vv.to_expect()
-                } else if validate_against("broadcast-provenance", sp).is_err() {
+                } else if validate_against("provenance", sp).is_err() {
                     json!({"verdict": "reject", "code": "schema-invalid"})
                 } else {
                     evaluate_provenance(sp, &pver.identity, &p)
@@ -138,9 +143,23 @@ pub fn evaluate_publication(
     }
     let empty: Vec<Value> = vec![];
     let selected = select_variant(p["variants"].as_array().unwrap_or(&empty), codecs, transports);
+    let mut declared = dsip_core::registry::effective_integrity(p["integrity"].as_str());
+    if let Some(v) = p["variants"].as_array().and_then(|vs| vs.iter().find(|v| v["id"].as_str() == selected.as_deref())) {
+        if let Some(m) = v["integrity"].as_str() {
+            declared = dsip_core::registry::effective_integrity(Some(m)); // variant override (§22.2)
+        }
+    }
     Ok((
         ver.signer_did.clone(),
-        Receiver { publisher: ver.identity.clone(), publication: p, selected_variant: selected, provenance: results, delivered_by: delivered, transcoded_by: transcoded },
+        Receiver {
+            publisher: ver.identity.clone(),
+            publication: p,
+            selected_variant: selected,
+            provenance: results,
+            delivered_by: delivered,
+            transcoded_by: transcoded,
+            declared_integrity: declared,
+        },
     ))
 }
 

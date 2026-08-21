@@ -314,7 +314,7 @@ impl Core {
         }
         let msg = Message::from_payload(&p).context("payload shape")?;
         let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
-        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "broadcast.provenance");
+        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation");
         out.push(CoreEvent::Received { message: msg.clone(), identity, display_name, payload: p });
         if session_scoped {
             // Broadcast/subscription traffic (§9.3, §22) is handled by the host, not the §12 engine.

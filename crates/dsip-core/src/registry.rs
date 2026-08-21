@@ -57,6 +57,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("policy.blocked", &["reject", "cancel"]),
     ("policy.terminated", &["bye"]),
     ("policy.rate-limited", &["reject", "error"]),
+    ("policy.subscription-lifetime", &["error"]), // v0.7 (spec-gap 19): expires_in above the §9.3 cap
     ("transport.envelope-too-large", &["error"]),
     ("transport.hello-required", &["error"]),
     ("transport.hello-rejected", &["error"]),
@@ -94,7 +95,26 @@ pub const GRANT_SCOPES: &[&str] = &["dsip.invite", "dsip.subscribe"];
 pub const MESSAGE_TYPES: &[&str] = &[
     "invite", "progress", "answer", "reject", "cancel", "update", "info", "bye", "introduction", "grant",
     "publish", "subscribe", "notify", "unpublish", "error", "hello",
+    "provenance", "key-rotation", "reachability-hint", // v0.7: §22.3, §7.5, DHT Hints Profile
 ];
+
+/// `dsip-integrity-mode` registered values (§22.2). Unknown values resolve to `metadata-only`.
+pub const INTEGRITY_MODES: &[&str] = &["metadata-only", "derivative-bound"];
+
+/// `dsip-rotation-reason` registered values (§7.5, v0.7).
+pub const ROTATION_REASONS: &[&str] = &["scheduled", "compromised", "lost", "policy"];
+
+/// `dsip-provenance-operation` registered values (§22.3, v0.7).
+pub const PROVENANCE_OPERATIONS: &[&str] = &["transcode", "relay", "repackage"];
+
+/// Registry membership with fallback for `integrity`: an unknown or absent mode is the weaker
+/// claim, `metadata-only` (§22.2; never a rejection).
+pub fn effective_integrity(v: Option<&str>) -> &'static str {
+    match v {
+        Some(m) if INTEGRITY_MODES.contains(&m) => INTEGRITY_MODES.iter().copied().find(|x| *x == m).unwrap_or("metadata-only"),
+        _ => "metadata-only",
+    }
+}
 
 /// Registered `about` namespaces for `info`.
 ///

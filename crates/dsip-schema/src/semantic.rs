@@ -2,13 +2,15 @@
 //!
 //! Spec: §11 (version), §13.2/§20.5 (relay `hello` anti-splicing), §14.2
 //! (selection ⊆ offer), §9.3 (subscription lifetime caps), §19.4
-//! (introduction size, grant references an introduction), §15.1/§14.3/§12.10
-//! (registry membership with fallback). Schema README checks 5, 7, 9, 11.
+//! (introduction size, grant references an introduction), §15.1/§14.3/§12.10/§22.2
+//! (registry membership with fallback), §7.5 (`key-rotation`: `from` = `subject`,
+//! `next` ≠ `previous`, signer = `previous` unless `recovery`). Schema README checks 5, 7, 9, 11, 12.
 
 use serde_json::{Map, Value};
 
 use dsip_core::registry::{
-    effective_answered_by, effective_progress_status, resolve_reason, REASON_BEARING_TYPES, SUBSCRIPTION_EVENTS,
+    effective_answered_by, effective_integrity, effective_progress_status, resolve_reason, INTEGRITY_MODES,
+    REASON_BEARING_TYPES, SUBSCRIPTION_EVENTS,
 };
 use dsip_core::version::{check_version, Supported};
 use dsip_core::{RejectCode, Verdict, INTRODUCTION_MAX_BYTES};
@@ -28,6 +30,8 @@ pub struct SemanticContext {
     pub known_introductions: Option<Vec<String>>,
     /// Encoded envelope size in bytes, when known (introduction cap).
     pub encoded_size: Option<usize>,
+    /// The `kid` that signed the envelope, when known (`key-rotation` signer rule, §7.5).
+    pub signer_kid: Option<String>,
 }
 
 impl SemanticContext {
@@ -41,6 +45,7 @@ impl SemanticContext {
                 a.iter().filter_map(Value::as_str).map(String::from).collect()
             }),
             encoded_size: ctx.get("encoded_size").and_then(Value::as_u64).map(|n| n as usize),
+            signer_kid: ctx.get("signer_kid").and_then(Value::as_str).map(String::from),
         }
     }
 }
@@ -103,7 +108,8 @@ pub fn check_semantic(payload: &Value, ctx: &SemanticContext) -> Verdict {
         for ev in payload.get("events").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
             if let Some((_, cap)) = SUBSCRIPTION_EVENTS.iter().find(|(e, _)| *e == ev) {
                 if expires_in > *cap {
-                    return Verdict::reject(RejectCode::SubscriptionLifetimeExceeded); // §9.3 hard caps
+                    // §9.3 hard caps → `error policy.subscription-lifetime` (v0.7, spec-gap 19)
+                    return Verdict::reject_with(RejectCode::SubscriptionLifetimeExceeded, "policy.subscription-lifetime");
                 }
             }
         }
@@ -119,6 +125,22 @@ pub fn check_semantic(payload: &Value, ctx: &SemanticContext) -> Verdict {
         if let Some(known) = &ctx.known_introductions {
             if !s("session").is_some_and(|sid| known.iter().any(|k| k == sid)) {
                 return Verdict::reject(RejectCode::GrantUnknownIntroduction); // §19.4
+            }
+        }
+    }
+    if t == "key-rotation" {
+        // §7.5 (v0.7, spec-gap 22): only the identity rotates its own keys, by its retiring key
+        // unless a recovery key signs with `recovery: true`.
+        if s("subject") != s("from") {
+            return Verdict::reject(RejectCode::RotationSubjectMismatch);
+        }
+        if s("next") == s("previous") {
+            return Verdict::reject(RejectCode::RotationNextSameAsPrevious);
+        }
+        let recovery = payload.get("recovery").and_then(Value::as_bool).unwrap_or(false);
+        if let Some(signer) = ctx.signer_kid.as_deref() {
+            if !recovery && Some(signer) != s("previous") {
+                return Verdict::reject(RejectCode::RotationSignerNotPrevious);
             }
         }
     }
@@ -154,6 +176,14 @@ pub fn registry_effects(payload: &Value) -> Map<String, Value> {
     if t == "progress" {
         if let Some(st) = payload.get("status").and_then(Value::as_str) {
             eff.insert("status".into(), effective_progress_status(st).into());
+        }
+    }
+    if t == "publish" {
+        if let Some(m) = payload.get("integrity").and_then(Value::as_str) {
+            eff.insert("integrity".into(), effective_integrity(Some(m)).into());
+            if !INTEGRITY_MODES.contains(&m) {
+                warnings.push("integrity-mode-unknown".into()); // §22.2 registry fallback
+            }
         }
     }
     let mut out = Map::new();

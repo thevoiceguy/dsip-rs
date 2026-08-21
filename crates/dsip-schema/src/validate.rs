@@ -17,20 +17,24 @@ use serde_json::Value;
 use dsip_core::registry::MESSAGE_TYPES;
 use dsip_core::{RejectCode, Verdict};
 
-use crate::embedded::{BROADCAST_PROVENANCE, REACHABILITY_HINT, SCHEMAS};
+use crate::embedded::SCHEMAS;
 
 /// Names of the embedded spec schemas.
 pub const SCHEMA_NAMES: &[&str] = &[
     "invite", "progress", "answer", "reject", "cancel", "update", "info", "bye", "error", "hello", "introduction",
-    "grant", "publish", "subscribe", "notify", "unpublish", "envelope", "message",
+    "grant", "publish", "subscribe", "notify", "unpublish", "provenance", "key-rotation", "reachability-hint",
+    "webrtc-info-data", "envelope", "message",
 ];
+
+/// `info.data` schemas by `about` (§12.12): validated for the bindings this implementation
+/// speaks; an unimplemented `about` leaves `data` unchecked (ignored, never rejected).
+pub const BINDING_DATA_SCHEMAS: &[(&str, &str)] = &[("transport:webrtc", "webrtc-info-data")];
 
 fn compiled() -> &'static HashMap<&'static str, Validator> {
     static CELL: OnceLock<HashMap<&'static str, Validator>> = OnceLock::new();
     CELL.get_or_init(|| {
         let mut m = HashMap::new();
-        let extra = [("reachability-hint", REACHABILITY_HINT), ("broadcast-provenance", BROADCAST_PROVENANCE)];
-        for (name, text) in SCHEMAS.iter().chain(extra.iter()) {
+        for (name, text) in SCHEMAS.iter() {
             if *name == "message" {
                 continue; // relative $refs; dispatched natively instead
             }
@@ -59,21 +63,28 @@ pub fn validate_against(name: &str, instance: &Value) -> Result<(), String> {
     }
 }
 
-/// Implementation-local payload types (not in the §12.1 message set) and their schemas.
-pub const LOCAL_TYPES: &[(&str, &str)] = &[("reachability-hint", "reachability-hint"), ("broadcast.provenance", "broadcast-provenance")];
+/// Validate `payload` as message type `schema`, plus — for `info` — its `data` against the
+/// binding schema named by `about` when that binding is in [`BINDING_DATA_SCHEMAS`] (§12.12;
+/// WebRTC Media Binding Appendix A).
+pub fn validate_payload_as(schema: &str, payload: &Value) -> Result<(), String> {
+    validate_against(schema, payload)?;
+    if schema == "info" {
+        if let Some(about) = payload.get("about").and_then(Value::as_str) {
+            if let Some((_, data_schema)) = BINDING_DATA_SCHEMAS.iter().find(|(a, _)| *a == about) {
+                validate_against(data_schema, payload.get("data").unwrap_or(&Value::Null)).map_err(|e| format!("data: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
 
-/// Stage 13: dispatch on `type` and validate. `unknown-type` for types outside the message set
-/// (and the implementation-local extension types listed in [`LOCAL_TYPES`]).
+/// Stage 13: dispatch on `type` and validate. `unknown-type` for types outside the message set.
 pub fn validate(payload: &Value) -> Verdict {
     let Some(t) = payload.get("type").and_then(Value::as_str) else { return Verdict::reject(RejectCode::UnknownType) };
-    let schema = if MESSAGE_TYPES.contains(&t) {
-        t
-    } else if let Some((_, s)) = LOCAL_TYPES.iter().find(|(lt, _)| *lt == t) {
-        s
-    } else {
+    if !MESSAGE_TYPES.contains(&t) {
         return Verdict::reject(RejectCode::UnknownType);
-    };
-    match validate_against(schema, payload) {
+    }
+    match validate_payload_as(t, payload) {
         Ok(()) => Verdict::accept(),
         Err(e) => Verdict::reject(RejectCode::SchemaInvalid).detail(e),
     }
@@ -89,6 +100,7 @@ mod tests {
             assert!(schema_for(n).is_some(), "{n}");
         }
         assert!(schema_for("reachability-hint").is_some());
+        assert!(schema_for("webrtc-info-data").is_some());
         assert_eq!(validate(&serde_json::json!({"type": "transfer"})).code, Some(RejectCode::UnknownType));
         assert_eq!(validate(&serde_json::json!({"type": "bye"})).code, Some(RejectCode::SchemaInvalid));
     }

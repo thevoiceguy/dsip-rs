@@ -283,7 +283,7 @@ impl Authority {
                 self.event(json!({"publication": {"stream": stream, "state": "withdrawn"}}));
                 self.notify_all("publication", &stream);
             }
-            "provenance" | "broadcast.provenance" => {
+            "provenance" => {
                 let stream = m["original_stream"].as_str().unwrap_or("").to_string();
                 let pid = m["original_publication"].as_str().unwrap_or("");
                 let processor = m["processor"].as_str().unwrap_or("").to_string();
