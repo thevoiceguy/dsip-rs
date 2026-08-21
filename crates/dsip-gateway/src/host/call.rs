@@ -11,11 +11,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::controller::GatewayCall;
 use super::dsip_leg::DsipMedia;
-use super::media::{bridge, RtpLeg};
+use super::media::RtpLeg;
 use super::sip_leg::{RemoteRtp, SipEvent, SipLeg};
 
 /// A live call: its controller, DSIP session id, SIP Call-ID, and media handles.
@@ -27,7 +27,8 @@ pub struct Call {
     media: Option<DsipMedia>,
     rtp: Option<Arc<RtpLeg>>,
     remote_rtp: Option<RemoteRtp>,
-    bridged: bool,
+    /// The controller has signalled both legs are up.
+    pub media_ready: bool,
     dial_target: Option<String>,
 }
 
@@ -46,8 +47,10 @@ pub async fn apply(call: &mut Call, emits: Vec<Value>, legs: &Legs<'_>) -> Resul
     for e in emits {
         if let Some(sip) = e.get("sip") {
             apply_sip(call, sip, legs).await?;
-        } else if let Some(_media) = e.get("media") {
-            apply_media(call).await?;
+        } else if e.get("media").is_some() {
+            // Media bridging is started by the host's media pump when both legs are up (round-trip
+            // harness / daemon); the controller's `media` emission only marks readiness.
+            call.media_ready = true;
         } else if let Some(dsip) = e.get("dsip") {
             // Inbound direction: the controller tells the DSIP side to place a call / answer /
             // reject. In a full host these become `Agent` local events; round one logs them so the
@@ -101,25 +104,6 @@ async fn apply_sip(call: &mut Call, s: &Value, legs: &Legs<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn apply_media(call: &mut Call) -> Result<()> {
-    if call.bridged {
-        return Ok(());
-    }
-    let (Some(media), Some(rtp), Some(remote)) = (call.media.as_mut(), call.rtp.clone(), call.remote_rtp.clone()) else {
-        return Ok(());
-    };
-    rtp.set_remote(remote.addr).await;
-    let Some(inbound_rx) = media.take_inbound() else { return Ok(()) };
-    let sender = media.sender()?;
-    let pcma = remote.payload_types.first() == Some(&8);
-    call.bridged = true;
-    tokio::spawn(async move {
-        if let Err(e) = bridge(inbound_rx, sender, rtp, pcma).await {
-            warn!("bridge: {e}");
-        }
-    });
-    Ok(())
-}
 
 impl Call {
     /// A fresh outbound (DSIP→PSTN) call.
@@ -131,7 +115,7 @@ impl Call {
             media: None,
             rtp: Some(rtp),
             remote_rtp: None,
-            bridged: false,
+            media_ready: false,
             dial_target: Some(dial_target),
         }
     }
@@ -145,7 +129,7 @@ impl Call {
             media: None,
             rtp: Some(rtp),
             remote_rtp: remote,
-            bridged: false,
+            media_ready: false,
             dial_target: None,
         }
     }

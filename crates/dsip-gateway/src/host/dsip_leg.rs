@@ -10,32 +10,22 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use forge_webrtc::{AudioSender, PeerConnection, PeerEvent};
+
 use tokio::sync::mpsc;
-use tracing::debug;
 
 /// One call's WebRTC media on the DSIP side.
 pub struct DsipMedia {
     pc: PeerConnection,
     /// Local ICE candidates gathered before ACTIVE (§12.12).
     pub pending_candidates: Vec<serde_json::Value>,
-    /// Decoded inbound Opus payloads → the media bridge.
-    pub inbound_tx: mpsc::UnboundedSender<Bytes>,
-    inbound_rx: Option<mpsc::UnboundedReceiver<Bytes>>,
 }
 
 impl DsipMedia {
     /// New peer connection (answerer or offerer decided by which of `create_offer`/`accept_offer` runs).
     pub async fn new() -> Result<DsipMedia> {
         let pc = PeerConnection::new(vec![]).await.map_err(|e| anyhow!("peer connection: {e}"))?;
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        Ok(DsipMedia { pc, pending_candidates: vec![], inbound_tx, inbound_rx: Some(inbound_rx) })
-    }
-
-    /// Take the inbound-Opus receiver (once) for the media bridge.
-    pub fn take_inbound(&mut self) -> Option<mpsc::UnboundedReceiver<Bytes>> {
-        self.inbound_rx.take()
+        Ok(DsipMedia { pc, pending_candidates: vec![] })
     }
 
     /// An `AudioSender` for the bridge to push transcoded Opus into.
@@ -46,7 +36,6 @@ impl DsipMedia {
     /// Create our SDP offer (gateway places the DSIP call).
     pub async fn offer(&mut self) -> Result<String> {
         let sdp = self.pc.create_offer().await.map_err(|e| anyhow!("offer: {e}"))?;
-        self.spawn_events();
         Ok(sdp)
     }
 
@@ -54,7 +43,6 @@ impl DsipMedia {
     pub async fn answer(&mut self, offer_sdp: &str) -> Result<String> {
         self.pc.set_remote_offer(offer_sdp).await.map_err(|e| anyhow!("set offer: {e}"))?;
         let sdp = self.pc.create_answer().await.map_err(|e| anyhow!("answer: {e}"))?;
-        self.spawn_events();
         Ok(sdp)
     }
 
@@ -68,25 +56,6 @@ impl DsipMedia {
         self.pc.add_ice_candidate_str(cand).await.map_err(|e| anyhow!("candidate: {e}"))
     }
 
-    fn spawn_events(&mut self) {
-        let Some(mut events) = self.pc.take_events() else { return };
-        let inbound = self.inbound_tx.clone();
-        // Local candidates and inbound RTP are pumped to the call loop via the shared channels;
-        // candidates are collected here into a task that the call loop drains through `drain_candidates`.
-        tokio::spawn(async move {
-            while let Some(ev) = events.recv().await {
-                match ev {
-                    PeerEvent::Rtp(pkt) => {
-                        let _ = inbound.send(pkt.payload.clone());
-                    }
-                    PeerEvent::Failed(w) => debug!("dsip media failed: {w}"),
-                    PeerEvent::Closed => break,
-                    _ => {}
-                }
-            }
-        });
-    }
-
     /// Local candidates gathered so far, in the §12.12 `info.data.candidates` shape.
     pub fn drain_candidates(&mut self) -> Vec<serde_json::Value> {
         let cands: Vec<serde_json::Value> = self
@@ -96,6 +65,22 @@ impl DsipMedia {
             .map(|c| serde_json::json!({"candidate": c.to_sdp_attribute(), "sdp_mid": "0", "sdp_m_line_index": 0}))
             .collect();
         cands
+    }
+
+    /// Whether media is established (DTLS-SRTP up).
+    pub fn connected(&self) -> bool {
+        matches!(self.pc.get_state(), forge_webrtc::ConnectionState::Connected)
+    }
+
+    /// Wait until connected or the timeout elapses.
+    pub async fn wait_connected(&self, timeout: std::time::Duration) -> bool {
+        self.pc.wait_connected(timeout).await.is_ok()
+    }
+
+    /// Take the peer connection's event receiver (candidates/connection state) for a driver that
+    /// trickles them out; used by the round-trip harness and the daemon's candidate pump.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<PeerEvent>> {
+        self.pc.take_events()
     }
 
     /// Close the peer connection.
