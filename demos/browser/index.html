@@ -35,8 +35,11 @@
     <div><strong>Incoming call</strong> from <code id="in-identity" class="did"></code></div>
     <div class="small">display name claim: <em id="in-name"></em> <span class="muted">(unverified, §18.2)</span></div>
     <div class="small">verified: delegated device <code id="in-device" class="did"></code> ✓ signature · delegation · replay · schema</div>
+    <div class="small" id="in-caller"></div>
+    <div class="small" id="in-basis"></div>
     <div class="small" id="in-policy"></div>
     <div class="small warn" id="in-unknown">⚠ unknown identity — no grant or prior contact</div>
+    <div class="small warn hidden" id="in-downgrade"></div>
     <div class="row">
       <button id="btn-accept">accept</button>
       <button id="btn-screen">screen (answered_by: screening)</button>

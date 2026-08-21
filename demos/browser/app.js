@@ -5,7 +5,7 @@
 // §14.1 (no media before a signed answer), §14.4 (screening), §16.3 (SDP as a transport binding object),
 // §18.2 (display names are claims), §19.4 (first contact). Impl (spec-gap 16): SDP carriage shape.
 
-import init, { create_identity, Endpoint } from './pkg/dsip_wasm.js';
+import init, { create_identity, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
 
 const $ = (id) => document.getElementById(id);
 const now = () => Date.now() / 1000;
@@ -101,6 +101,12 @@ async function onReceived(r) {
     $('in-identity').textContent = r.identity;
     $('in-name').textContent = r.display_name || '(none)';
     $('in-device').textContent = m.from;
+    // §18.1: the verification basis (never a badge). A gateway's PSTN caller (a `tel` claim)
+    // shows the caller and the attestation basis.
+    const claims = (p.identity && p.identity.claims) || [];
+    const tel = claims.find((c) => c.type === 'tel');
+    $('in-caller').textContent = tel ? '☎ ' + tel_caller_line(JSON.stringify(tel)) + ' (via gateway)' : '';
+    $('in-basis').textContent = '🔎 trust: ' + verification_basis(r.identity, JSON.stringify(claims)) + '  (§18.1)';
     $('in-policy').textContent = p.policy ? 'policy: ' + Object.entries(p.policy).map(([k, v]) => `${k}=${v}`).join(', ') + ' (§16.4)' : '';
     const contacts = JSON.parse(ep.contacts_snapshot());
     const known = contacts.allow.includes(r.identity) || Object.keys(contacts.grants_issued).length > 0 || Object.keys(contacts.grants_held).length > 0;
@@ -117,6 +123,13 @@ async function onReceived(r) {
   if (m.type === 'answer' && role === 'responder' && m.in_reply_to && pc) {
     const sdp = p.transports?.[0]?.sdp;
     if (sdp) await pc.setRemoteDescription({ type: 'answer', sdp });
+  }
+  if (m.type === 'error' && m.reason === 'gateway.downgraded') {
+    const losses = (p.detail && p.detail.losses) || [];
+    const el = $('in-downgrade');
+    el.textContent = '⚠ ' + downgrade_summary(JSON.stringify(losses));
+    el.classList.remove('hidden');
+    log('⚠ ' + downgrade_summary(JSON.stringify(losses)), '§6.3');
   }
   if (m.type === 'update') {
     remoteOffer = p; pendingUpdate = m.id;

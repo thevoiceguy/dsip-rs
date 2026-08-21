@@ -193,15 +193,11 @@ pub fn tel_claim(from_tn: &str, identity: Option<&Value>, cnam: Option<&str>, ga
     if let Some(c) = cnam {
         claim.insert("cnam".into(), c.into());
     }
-    let host = gateway.strip_prefix("did:web:").unwrap_or(gateway);
-    let basis = if verified {
-        format!("Gateway attested by {host} · STIR attestation {attestation} (verified)")
-    } else if attestation != "none" {
-        format!("Gateway attested by {host} · STIR attestation {attestation} (unverified)")
-    } else {
-        format!("Gateway attested by {host} · no attestation")
-    };
-    json!({"claim": Value::Object(claim), "trust_basis": basis})
+    let claim = Value::Object(claim);
+    // §18.1 basis rendered by the one canonical function (dsip-core::trust), so the gateway's
+    // recorded basis and what a callee's client shows are the same string.
+    let basis = dsip_core::trust::tel_basis(&claim).unwrap_or_default();
+    json!({"claim": claim, "trust_basis": basis})
 }
 
 /// §6.3: which crossings emit `gateway.downgraded`; each lost guarantee is named.
@@ -224,6 +220,19 @@ pub fn downgrade(facts: &Value) -> Value {
     json!({"downgraded": !lost.is_empty(), "lost": lost})
 }
 
+/// The `detail` object for a `gateway.downgraded` error (§6.3 / Gateway Profile G§7): the named
+/// losses a callee's client renders via `dsip_core::trust::downgrade_summary`. `None` when the
+/// crossing lost nothing. The gateway sends this as an informational `error` (reason
+/// `gateway.downgraded`) on the DSIP leg; the session continues.
+pub fn downgrade_error_detail(facts: &Value) -> Option<Value> {
+    let d = downgrade(facts);
+    if d["downgraded"].as_bool().unwrap_or(false) {
+        Some(json!({"losses": d["lost"].clone()}))
+    } else {
+        None
+    }
+}
+
 /// Vector runner entry (`kind: gateway`): dispatch on `input.check`.
 pub fn run_vector(v: &Value) -> Value {
     let inp = &v["input"];
@@ -236,6 +245,7 @@ pub fn run_vector(v: &Value) -> Value {
         "descriptors-to-sdp" => descriptors_to_sip_sdp(inp["media"].as_array().map(Vec::as_slice).unwrap_or(&[])),
         "claims" => tel_claim(s("from_tn").unwrap_or(""), inp.get("identity"), s("cnam"), GATEWAY_DID),
         "downgrade" => downgrade(&inp["facts"]),
+        "downgrade-error" => downgrade_error_detail(&inp["facts"]).unwrap_or(Value::Null),
         "trace" => {
             let mut call = controller::GatewayCall::new(&v["context"]);
             let steps: Vec<Value> = inp["steps"].as_array().into_iter().flatten()

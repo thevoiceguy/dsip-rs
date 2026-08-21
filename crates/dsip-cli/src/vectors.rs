@@ -129,6 +129,7 @@ fn run_one(v: &Value) -> Result<(bool, Value, Value)> {
         "broadcast" => broadcast(v),
         "media-binding" => dsip_webrtc_binding::run_vector(v),
         "gateway" => dsip_gateway::run_vector(v),
+        "trust" => dsip_core::trust::run_vector(v),
         "state" => return state(v),
         other => anyhow::bail!("unknown kind {other}"),
     };

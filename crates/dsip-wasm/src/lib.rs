@@ -112,6 +112,28 @@ pub fn verify_frame(frame: &str, context_json: &str) -> String {
     }
 }
 
+/// §18.1 verification basis for an identity + its `identity.claims` (JSON array). The browser
+/// renders exactly what the CLI does, through the one canonical `dsip_core::trust` function.
+#[wasm_bindgen]
+pub fn verification_basis(identity_did: &str, claims_json: &str) -> String {
+    let claims: Vec<Value> = serde_json::from_str(claims_json).unwrap_or_default();
+    dsip_core::trust::verification_basis(identity_did, &claims)
+}
+
+/// The `tel` caller headline for a call surface, or `""` if the claim is not a `tel` claim.
+#[wasm_bindgen]
+pub fn tel_caller_line(claim_json: &str) -> String {
+    let claim: Value = serde_json::from_str(claim_json).unwrap_or(json!({}));
+    dsip_core::trust::tel_caller_line(&claim).unwrap_or_default()
+}
+
+/// A human summary of a `gateway.downgraded` error's losses (JSON array of strings).
+#[wasm_bindgen]
+pub fn downgrade_summary(losses_json: &str) -> String {
+    let losses: Vec<String> = serde_json::from_str(losses_json).unwrap_or_default();
+    dsip_core::trust::downgrade_summary(&losses.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
 /// A browser endpoint: the engine + verifier + builder behind a JSON API.
 #[wasm_bindgen]
 pub struct Endpoint {

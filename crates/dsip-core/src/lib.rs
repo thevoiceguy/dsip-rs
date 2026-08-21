@@ -21,6 +21,7 @@ pub mod did;
 pub mod envelope;
 pub mod keys;
 pub mod registry;
+pub mod trust;
 pub mod ulid;
 pub mod verdict;
 pub mod version;

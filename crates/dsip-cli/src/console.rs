@@ -302,6 +302,23 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             };
                             println!("← {:<8} from {}{name} (device {}){extra}   ✓ signature, delegation, replay, schema",
                                      message.msg_type, short(&identity), short(&message.from));
+                            // §18.1: show the verification basis — never a badge. A gateway's PSTN
+                            // caller (a `tel` claim) shows the caller headline and the attestation.
+                            let claims: Vec<serde_json::Value> = payload.pointer("/identity/claims").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+                            if matches!(message.msg_type.as_str(), "invite" | "introduction") {
+                                if let Some(tel) = claims.iter().find(|c| c["type"] == "tel") {
+                                    if let Some(line) = dsip_core::trust::tel_caller_line(tel) {
+                                        println!("  ☎  {line}   (via gateway {})", short(&identity));
+                                    }
+                                }
+                                println!("  🔎 trust: {}   §18.1", dsip_core::trust::verification_basis(&identity, &claims));
+                            }
+                            // §6.3 / G§7: a gateway.downgraded error names what crossing the PSTN lost.
+                            if message.msg_type == "error" && message.reason.as_deref() == Some("gateway.downgraded") {
+                                let losses: Vec<&str> = payload.pointer("/detail/losses").and_then(|l| l.as_array())
+                                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                                println!("  ⚠  {}", dsip_core::trust::downgrade_summary(&losses));
+                            }
                             let sid = message.session_id().to_string();
                             print_state(&agent, &sid);
                             let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
