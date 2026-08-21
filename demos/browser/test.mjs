@@ -35,13 +35,21 @@ function pump() {
 const kinds = (evs) => evs.map((e) => e.send ? `send:${e.send.type}` : e.received ? `recv:${e.received.message.type}` : e.emission?.ui ? `ui:${e.emission.ui}` : e.emission?.media ? `media:${e.emission.media}` : e.rejected ? `rejected:${e.rejected.code}` : null).filter(Boolean);
 
 // 1. call: alice → bob (identity), bob alerts and accepts
-A.set_sdp('v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n');
+// Binding-valid SDP (WebRTC Media Binding B§2.2): one m=audio section with ICE credentials, a
+// sha-256 fingerprint, a=setup, a=mid, direction, rtcp-mux and an opus rtpmap. The engine now
+// enforces the descriptor/SDP authority rule on inbound SDP, so placeholders no longer pass.
+const FP = 'AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99';
+const sdp = (n, setup, direction = 'sendrecv') => ['v=0', `o=- ${n} 1 IN IP4 127.0.0.1`, 's=-', 't=0 0', 'a=group:BUNDLE 0',
+  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'c=IN IP4 0.0.0.0', 'a=ice-ufrag:0123456789abcdef0123456789abcdef',
+  'a=ice-pwd:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', `a=fingerprint:sha-256 ${FP}`,
+  `a=setup:${setup}`, 'a=mid:0', `a=${direction}`, 'a=rtcp-mux', 'a=rtpmap:111 opus/48000/2'].join('\r\n') + '\r\n';
+A.set_sdp(sdp(1, 'actpass'));
 const sid = A.new_id(now());
 drive('A', A.local(JSON.stringify({ local: 'place_call', session: sid, to: bob.identity }), now()));
 let r = pump();
 check('bob received verified invite', kinds(r.B).includes('recv:invite') && kinds(r.B).includes('ui:offered'), JSON.stringify(kinds(r.B)));
 drive('B', B.local(JSON.stringify({ local: 'alert', session: sid, ring_timeout: 60 }), now()));
-B.set_sdp('v=0\r\no=- 2 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n');
+B.set_sdp(sdp(2, 'active'));
 drive('B', B.local(JSON.stringify({ local: 'accept', session: sid, answered_by: 'user' }), now()));
 r = pump();
 const ka = kinds(r.A);
@@ -58,12 +66,12 @@ r = pump();
 check('bob received info with candidates', r.B.some((e) => e.received?.message.type === 'info' && e.received.payload.data.candidates.length === 1));
 
 // 3. renegotiation: bob adds video via update; alice answers it
-B.set_sdp('v=0\r\no=- 3 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n');
+B.set_sdp(sdp(3, 'actpass'));
 const uid = B.new_id(now());
 drive('B', B.local(JSON.stringify({ local: 'update', session: sid, id: uid }), now()));
 r = pump();
 check('alice: update offered', kinds(r.A).includes('ui:update_offered'));
-A.set_sdp('v=0\r\no=- 4 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n');
+A.set_sdp(sdp(4, 'active'));
 drive('A', A.local(JSON.stringify({ local: 'answer_update', session: sid, in_reply_to: uid }), now()));
 r = pump();
 check('bob: update answered → media apply_update', kinds(r.B).includes('media:apply_update'));
