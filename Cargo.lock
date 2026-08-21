@@ -1067,6 +1067,7 @@ dependencies = [
  "dsip-broadcast",
  "dsip-core",
  "dsip-dht",
+ "dsip-gateway",
  "dsip-media",
  "dsip-schema",
  "dsip-session",
@@ -1120,6 +1121,15 @@ dependencies = [
  "dsip-core",
  "dsip-schema",
  "dsip-session",
+ "dsip-webrtc-binding",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsip-gateway"
+version = "0.1.0"
+dependencies = [
  "dsip-webrtc-binding",
  "serde",
  "serde_json",

@@ -128,6 +128,7 @@ fn run_one(v: &Value) -> Result<(bool, Value, Value)> {
         "semantic" => check_payload(&v["input"]["payload"], &SemanticContext::from_vector(&v["context"])).to_expect(),
         "broadcast" => broadcast(v),
         "media-binding" => dsip_webrtc_binding::run_vector(v),
+        "gateway" => dsip_gateway::run_vector(v),
         "state" => return state(v),
         other => anyhow::bail!("unknown kind {other}"),
     };

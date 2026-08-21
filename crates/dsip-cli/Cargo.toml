@@ -20,6 +20,7 @@ dsip-dht.workspace = true
 dsip-media.workspace = true
 dsip-broadcast.workspace = true
 dsip-webrtc-binding.workspace = true
+dsip-gateway.workspace = true
 libp2p.workspace = true
 serde_json.workspace = true
 clap.workspace = true

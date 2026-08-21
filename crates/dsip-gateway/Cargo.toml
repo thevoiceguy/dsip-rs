@@ -1,0 +1,13 @@
+[package]
+name = "dsip-gateway"
+description = "DSIP SIP/PSTN gateway (Phase 4): §15.5 reason mapping both ways, SDP ⇄ descriptor mapping, PSTN caller claims, the §6.3 downgrade rule and the B2BUA controller — pure rules, no SIP or media I/O"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-webrtc-binding.workspace = true
+serde.workspace = true
+serde_json.workspace = true

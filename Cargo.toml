@@ -9,6 +9,7 @@ members = [
     "crates/dsip-wasm",
     "crates/dsip-media",
     "crates/dsip-webrtc-binding",
+    "crates/dsip-gateway",
     "crates/dsip-broadcast",
     "crates/dsip-dht",
     "crates/dsip-relay",
@@ -31,6 +32,7 @@ dsip-transport = { path = "crates/dsip-transport" }
 dsip-dht = { path = "crates/dsip-dht" }
 dsip-media = { path = "crates/dsip-media" }
 dsip-webrtc-binding = { path = "crates/dsip-webrtc-binding" }
+dsip-gateway = { path = "crates/dsip-gateway" }
 dsip-broadcast = { path = "crates/dsip-broadcast" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
