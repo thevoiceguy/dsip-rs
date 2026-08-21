@@ -42,6 +42,9 @@ pub fn names(deleg: &Envelope) -> Option<(String, String)> {
 /// Spec: §7.4. Checks, in order: envelope validity (signature over bytes),
 /// `type`/`subject`/`device` match, signer is the subject itself,
 /// `dsip.signaling` present, `issued_at ≤ now < expires_at`.
+/// §7.5 — a delegation signed by a key the subject's document no longer lists fails the
+/// first check ("device list update" is implied by rotation; vector
+/// `envelope/rotated-did-web-old-key-delegation-rejected`).
 pub fn verify_delegation(deleg: &Envelope, subject: &str, device: &str, ctx: &Context) -> Verdict {
     let ver = match verify_raw(deleg, ctx, false) {
         Ok(v) => v,

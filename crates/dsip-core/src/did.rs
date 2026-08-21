@@ -123,6 +123,9 @@ pub struct DidDocument {
 
 impl DidDocument {
     /// Resolve a fragment to an Ed25519 key within this document.
+    ///
+    /// Spec: §8.1 (the document is authoritative for verification keys); §7.5 — after key
+    /// rotation a retired fragment names no verification method and resolves to nothing.
     pub fn ed25519_key(&self, kid: &str, frag: &str) -> Option<[u8; 32]> {
         let vm = self
             .verification_method
@@ -220,6 +223,7 @@ impl Resolver for StaticResolver {
 ///
 /// Spec: §10.2 — verifiers resolve `kid` through the DID document. For
 /// `did:key` the document is implicit and the fragment MUST name the key itself.
+/// §7.5 — rotation without destroying identity: the same DID resolves to its current key set.
 pub fn resolve_kid(kid: &str, resolver: &dyn Resolver) -> Option<[u8; 32]> {
     let (did, frag) = split_did_url(kid)?;
     if let Some(mb) = did.strip_prefix("did:key:") {

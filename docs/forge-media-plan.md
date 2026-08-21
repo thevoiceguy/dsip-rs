@@ -1,6 +1,6 @@
 # Follow-on: adopting forge-media as the DSIP media stack
 
-**Status:** plan for later in the project. The PoC's `dsip-media` crate uses webrtc-rs so the
+**Status:** adopted as the next media step (decision 2026-08-21); sequenced after the WebRTC Media Binding draft (`v0.7/dsip-webrtc-media-binding-v0.7-draft.md`), whose Appendix C maps the four upstream items below to binding sections. forge-media is the project's own crate, so the upstream work is a sprint, not a negotiation. The PoC's `dsip-media` crate uses webrtc-rs so the
 Phase 2 browser↔native demo can land now; this document records what was found when
 evaluating `thevoiceguy/forge-media` (2026-08-21) and what it would take to switch.
 

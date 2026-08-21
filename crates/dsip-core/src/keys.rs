@@ -11,8 +11,10 @@ use crate::did;
 
 /// A private Ed25519 key with its derived `did:key`.
 ///
-/// Spec: §7.2, §7.3. Impl: recovery keys (§7.5–§7.6) are out of Phase 1 scope;
-/// they would be ordinary [`KeyPair`]s with a different role.
+/// Spec: §7.2, §7.3. Impl: recovery keys (§7.6) are out of PoC scope; they would be
+/// ordinary [`KeyPair`]s with a different role. Rotation (§7.5) has no wire-level record in
+/// v0.6 (spec-gap 22): what a verifier observes is the DID document after rotation, pinned by
+/// the `envelope/rotated-did-web-*` vectors through [`crate::did`] and [`crate::delegation`].
 #[derive(Clone)]
 pub struct KeyPair {
     sk: SigningKey,

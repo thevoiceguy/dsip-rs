@@ -1,6 +1,8 @@
 //! JSON Schema (draft 2020-12) validation with native `type` dispatch.
 //!
-//! Spec: §10.3. Impl: `message.schema.json`'s `oneOf` dispatcher is not used;
+//! Spec: §10.3; §15.2 (the reason wire structure — `reason` required, `detail` ≤ 1024,
+//! `retry_after` — is enforced here by the payload schemas). Impl: `message.schema.json`'s
+//! `oneOf` dispatcher is not used;
 //! dispatch is a match on `type`, which avoids cross-file `$ref` resolution
 //! and yields the same result because every payload schema pins `type` with
 //! `const`. Format assertions are off, matching the Python harness

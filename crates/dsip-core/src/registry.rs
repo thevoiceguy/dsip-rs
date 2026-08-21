@@ -1,6 +1,7 @@
 //! DSIP Core v1.0 registries: reason tokens, `answered_by`, progress status, subscription events, grant scopes.
 //!
-//! Spec: §15.4 (`dsip-reason`), §14.3 (`dsip-answered-by`), §12.10
+//! Spec: §15.4 (`dsip-reason`), §15.6 (registry policy: extension-namespaced
+//! tokens fall back by category), §14.3 (`dsip-answered-by`), §12.10
 //! (`dsip-progress-status`), §9.3 (`dsip-subscription-event`), §19.4
 //! (`dsip-grant-scope`).
 //!
@@ -112,6 +113,9 @@ pub struct ReasonResolution {
 }
 
 /// Apply the §15.1 fallback rule to a well-formed token carried on `msg_type`.
+///
+/// Spec: §15.1 (category fallback), §15.6 (an extension token such as `x-contactcenter.queue-full`
+/// is an unrecognized category to a receiver without the extension → `session.failed`).
 pub fn resolve_reason(token: &str, msg_type: &str) -> ReasonResolution {
     let category = token.split('.').next().unwrap_or("");
     if let Some((_, valid_on)) = REASONS.iter().find(|(t, _)| *t == token) {
