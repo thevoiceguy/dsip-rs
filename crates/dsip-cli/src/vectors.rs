@@ -188,18 +188,24 @@ fn state(v: &Value) -> Result<(bool, Value, Value)> {
     for st in steps {
         let exp = &st["expect"];
         let names: Vec<String> = exp[key].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
-        let (emit, snap) = if let Some(ep) = endpoint.as_mut() {
+        let (emit, snap, aux) = if let Some(ep) = endpoint.as_mut() {
             let ev: Event = serde_json::from_value(st["event"].clone()).with_context(|| format!("event {}", st["event"]))?;
             let emit: Vec<Value> = ep.step(&ev).iter().map(|e| e.to_json()).collect();
-            (emit, ep.snapshot(names))
+            let aux = exp.get("contacts").map(|_| ("contacts", ep.contacts.snapshot()));
+            (emit, ep.snapshot(names), aux)
         } else {
             let rl = relay.as_mut().expect("relay");
             let ev: RelayEvent = serde_json::from_value(st["event"].clone()).with_context(|| format!("event {}", st["event"]))?;
             let emit: Vec<Value> = rl.step(&ev).iter().map(|e| e.to_json()).collect();
-            (emit, rl.snapshot(names))
+            let aux = exp.get("inbox").map(|_| ("inbox", rl.inbox_snapshot()));
+            (emit, rl.snapshot(names), aux)
         };
-        let exp_norm = json!({"emit": exp["emit"], key: exp[key].as_object().cloned().unwrap_or_default()});
-        let act = json!({"emit": emit, key: snap});
+        let mut exp_norm = json!({"emit": exp["emit"], key: exp[key].as_object().cloned().unwrap_or_default()});
+        let mut act = json!({"emit": emit, key: snap});
+        if let Some((k, v)) = aux {
+            exp_norm[k] = exp[k].clone();
+            act[k] = v;
+        }
         ok &= exp_norm == act;
         expected.push(exp_norm);
         actual.push(act);

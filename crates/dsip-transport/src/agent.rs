@@ -73,6 +73,27 @@ pub struct AgentConfig {
     pub t_ring: Option<i64>,
     /// T-Ring-Local override.
     pub t_ring_local: Option<i64>,
+    /// §19.4: reject invites from identities holding no grant.
+    pub first_contact_required: bool,
+}
+
+/// Persisted first-contact state (`contacts.json` in the identity directory).
+///
+/// Spec: §19.4 — "The recipient's endpoint and relay record the grant; the grantee also holds the signed grant."
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContactFile {
+    /// Identities admitted without a grant.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Grants we issued.
+    #[serde(default)]
+    pub grants_issued: std::collections::BTreeMap<String, dsip_session::endpoint::Grant>,
+    /// Grants we hold.
+    #[serde(default)]
+    pub grants_held: std::collections::BTreeMap<String, dsip_session::endpoint::Grant>,
+    /// Learned device → identity mapping.
+    #[serde(default)]
+    pub identities: std::collections::BTreeMap<String, String>,
 }
 
 /// The agent.
@@ -98,8 +119,39 @@ impl Agent {
         let supported = Supported::default();
         let mut seen = SeenIds::default();
         let conn = Connection::connect(&Self::params(&id, &cfg, &supported), &resolver, &mut seen).await?;
-        let ep = Endpoint::new(Self::ep_config(&id, &cfg));
+        let mut ep = Endpoint::new(Self::ep_config(&id, &cfg));
+        // Seed persisted contacts (§19.4) so grants survive restarts.
+        let file = Self::load_contacts(&id.dir);
+        for a in &file.allow {
+            ep.contacts.allow.insert(a.clone());
+        }
+        ep.contacts.grants_issued = file.grants_issued.clone();
+        ep.contacts.grants_held = file.grants_held.clone();
+        for (d, i) in &file.identities {
+            ep.learn_identity(d, i);
+        }
         Ok(Agent { id, cfg, supported, resolver, conn, ep, seen, offers: HashMap::new(), peer_delegations: vec![], events: vec![] })
+    }
+
+    fn load_contacts(dir: &std::path::Path) -> ContactFile {
+        std::fs::read(dir.join("contacts.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// Persist first-contact state to the identity directory.
+    pub fn save_contacts(&self) -> Result<()> {
+        let file = ContactFile {
+            allow: self.ep.contacts.allow.iter().cloned().collect(),
+            grants_issued: self.ep.contacts.grants_issued.clone(),
+            grants_held: self.ep.contacts.grants_held.clone(),
+            identities: self.ep.identities().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        };
+        std::fs::write(self.id.dir.join("contacts.json"), serde_json::to_string_pretty(&file)?)?;
+        Ok(())
+    }
+
+    /// Pending introductions (id → identity).
+    pub fn requests(&self) -> Vec<(String, String)> {
+        self.ep.contacts.requests.iter().map(|(k, (i, _))| (k.clone(), i.clone())).collect()
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -127,6 +179,7 @@ impl Agent {
         if let Some(t) = cfg.t_ring_local {
             c.t_ring_local = t.clamp(30, 300);
         }
+        c.first_contact_required = cfg.first_contact_required;
         c
     }
 
@@ -247,6 +300,7 @@ impl Agent {
                     let ctx = dsip_core::envelope::Context::new(now_s(), &self.resolver);
                     if dsip_core::delegation::verify_delegation(d, &subject, &device, &ctx).ok() {
                         identity = subject;
+                        self.ep.learn_identity(&device, &identity);
                         if !self.peer_delegations.contains(d) {
                             self.peer_delegations.push(d.clone());
                         }
@@ -284,7 +338,11 @@ impl Agent {
                 Emission::Send(m) => {
                     let env = self.build(&m)?;
                     self.conn.send(&env).await?;
-                    self.events.push(AgentEvent::Sent { msg_type: m.msg_type.clone(), session: m.session.clone(), to: m.to.clone() });
+                    self.events.push(AgentEvent::Sent {
+                        msg_type: m.msg_type.clone(),
+                        session: m.session.clone().or_else(|| m.id.clone()).unwrap_or_default(),
+                        to: m.to.clone(),
+                    });
                 }
                 other => self.events.push(AgentEvent::Emission(other)),
             }
@@ -322,19 +380,33 @@ impl Agent {
 
     fn build(&mut self, m: &SendMsg) -> Result<Envelope> {
         let now = now_s();
-        let id = m.id.clone().unwrap_or_else(|| if m.msg_type == "invite" { m.session.clone() } else { Ulid::generate().to_string() });
+        let session = m.session.clone().unwrap_or_default();
+        let id = m.id.clone().unwrap_or_else(|| if m.msg_type == "invite" { session.clone() } else { Ulid::generate().to_string() });
         let profiles: &[&str] = if m.msg_type == "error" { &[] } else { &[PROFILE] };
         let mut p = json!({
             "dsip": version_block(&self.supported, profiles),
             "type": m.msg_type, "id": id, "from": self.id.meta.device, "to": m.to,
         });
-        if m.msg_type != "invite" {
-            p["session"] = m.session.clone().into();
+        if let Some(s) = &m.session {
+            if m.msg_type != "invite" {
+                p["session"] = s.clone().into();
+            }
+        }
+        for (k, v) in &m.extra {
+            p[*k] = v.clone();
         }
         match m.msg_type.as_str() {
+            "introduction" => {
+                // §19.4: media-less, session-less; identity and purpose are claims; up to 7 days validity
+                p["identity"] = json!({"display_name": self.id.meta.display_name, "claims": []});
+                p["issued_at"] = now.into();
+                p["expires_at"] = (now + 604_800).into();
+                return Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.id.device, &self.id.device.kid(), vec![self.id.delegation.clone()]));
+            }
+            "grant" => {}
             "invite" => {
                 let offer = self.media_offer();
-                self.offers.insert(m.session.clone(), offer.clone());
+                self.offers.insert(session.clone(), offer.clone());
                 p["intent"] = "interactive".into();
                 p["identity"] = json!({"display_name": self.id.meta.display_name, "claims": []});
                 p["media"] = offer["media"].clone();
@@ -348,7 +420,7 @@ impl Agent {
                 }
             }
             "answer" => {
-                let key = m.in_reply_to.clone().unwrap_or_else(|| m.session.clone());
+                let key = m.in_reply_to.clone().unwrap_or_else(|| session.clone());
                 let offer = self.offers.get(&key).cloned().unwrap_or_else(|| self.media_offer());
                 let screening = m.answered_by.as_deref() == Some("screening");
                 let sel = Self::selection(&offer, screening);

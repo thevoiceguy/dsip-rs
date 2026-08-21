@@ -101,6 +101,20 @@ pub enum RelayAction {
         /// Leg device.
         leg: String,
     },
+    /// A device bound via `hello` (§13.2); flushes queued introductions for the identity.
+    Bind {
+        /// Device DID.
+        device: String,
+        /// Identity DID.
+        identity: String,
+    },
+    /// A device unbound.
+    Unbind {
+        /// Device DID.
+        device: String,
+        /// Identity DID.
+        identity: String,
+    },
 }
 
 /// The relay's attempt tracker.
@@ -109,12 +123,28 @@ pub struct Relay {
     pub now: i64,
     attempts: BTreeMap<String, Attempt>,
     out: Vec<Emission>,
+    /// identity → bound devices (§13.2).
+    pub bindings: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// identity → queued introductions (§19.4 anti-enumeration; §13.3 boundary).
+    pub inbox: BTreeMap<String, Vec<Message>>,
 }
 
 impl Relay {
     /// Create a relay tracker.
     pub fn new(start: i64) -> Relay {
-        Relay { now: start, attempts: BTreeMap::new(), out: vec![] }
+        Relay { now: start, attempts: BTreeMap::new(), out: vec![], bindings: BTreeMap::new(), inbox: BTreeMap::new() }
+    }
+
+    /// README `inbox` snapshot: identity → queued count (non-empty only).
+    pub fn inbox_snapshot(&self) -> Value {
+        let m: serde_json::Map<String, Value> =
+            self.inbox.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), json!(v.len()))).collect();
+        Value::Object(m)
+    }
+
+    /// Devices an identity (or device) DID routes to.
+    pub fn legs_for(&self, to: &str) -> Vec<String> {
+        self.bindings.get(to).map(|s| s.iter().cloned().collect()).unwrap_or_default()
     }
 
     /// Snapshot of named attempts.
@@ -154,6 +184,17 @@ impl Relay {
                 }
                 self.attempts.insert(session.clone(), att);
             }
+            RelayAction::Bind { device, identity } => {
+                self.bindings.entry(identity.clone()).or_default().insert(device.clone());
+                for _ in self.inbox.remove(identity).unwrap_or_default() {
+                    self.out.push(Emission::Deliver { leg: device.clone(), msg_type: "introduction".into(), reason: None });
+                }
+            }
+            RelayAction::Unbind { device, identity } => {
+                if let Some(set) = self.bindings.get_mut(identity) {
+                    set.remove(device);
+                }
+            }
             RelayAction::LegExpired { session, leg } => {
                 if let Some(att) = self.attempts.get_mut(session) {
                     if att.legs.get(leg) == Some(&LegState::Delivered) {
@@ -170,6 +211,38 @@ impl Relay {
     }
 
     fn recv(&mut self, m: &Message) {
+        if m.msg_type == "introduction" {
+            // §19.4 anti-enumeration: unknown and offline identities are treated identically — queued, no error.
+            // Impl (spec-gap 14): §13.2 "no silent drops" yields to §19.4 for this one message type.
+            let to = m.to.clone().unwrap_or_default();
+            let devices = self.legs_for(&to);
+            if devices.is_empty() {
+                self.inbox.entry(to.clone()).or_default().push(m.clone());
+                self.out.push(Emission::Queue { to, msg_type: "introduction".into() });
+            } else {
+                for d in devices {
+                    self.out.push(Emission::Deliver { leg: d, msg_type: "introduction".into(), reason: None });
+                }
+            }
+            return;
+        }
+        if m.msg_type == "invite" {
+            // Session traffic to an identity with no bound device is refused with a signed error (§13.2).
+            let to = m.to.clone().unwrap_or_default();
+            let legs = self.legs_for(&to);
+            if legs.is_empty() {
+                self.out.push(Emission::Send(crate::event::SendMsg {
+                    msg_type: "error".into(),
+                    to: m.from.clone(),
+                    reason: Some("transport.unknown-recipient".into()),
+                    in_reply_to: Some(m.id.clone()),
+                    ..Default::default()
+                }));
+                return;
+            }
+            let act = RelayAction::Invite { session: m.id.clone(), from: m.from.clone(), to, legs };
+            return self.action(&act);
+        }
         let Some(sid) = m.session.clone() else {
             self.out.push(Emission::Drop("unknown-attempt"));
             return;

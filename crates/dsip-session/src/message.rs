@@ -46,6 +46,21 @@ pub struct Message {
     /// `invite.expires_at` (bounds pre-alerting delivery, §12.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// `invite.grant` — a held contact grant referenced by id (§19.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    /// `introduction.purpose`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// `introduction.contact_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_token: Option<String>,
+    /// `grant.scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<String>>,
+    /// `grant.valid_until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<i64>,
 }
 
 impl Message {
@@ -67,6 +82,11 @@ impl Message {
             in_reply_to: s("in_reply_to"),
             about: s("about"),
             expires_at: if s("type").as_deref() == Some("invite") { n("expires_at") } else { None },
+            grant: s("grant"),
+            purpose: s("purpose"),
+            contact_token: s("contact_token"),
+            scope: p.get("scope").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()),
+            valid_until: n("valid_until"),
         })
     }
 

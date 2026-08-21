@@ -7,7 +7,7 @@
 //!
 //! Every `Impl (spec-gap N)` comment has an entry in `impl/docs/spec-gaps.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -162,6 +162,10 @@ pub struct EndpointConfig {
     pub t_ring: i64,
     /// T-Ring-Local (clamped to bounds).
     pub t_ring_local: i64,
+    /// §19.4: reject invites from identities holding no grant.
+    pub first_contact_required: bool,
+    /// §19.4: identities admitted without a grant.
+    pub allow: BTreeSet<String>,
 }
 
 impl EndpointConfig {
@@ -180,7 +184,73 @@ impl EndpointConfig {
             t_establish: t("t_establish", T_ESTABLISH),
             t_ring: t("t_ring", T_RING),
             t_ring_local: t("t_ring_local", T_RING_LOCAL),
+            first_contact_required: ctx.pointer("/policy/first_contact_required").and_then(Value::as_bool).unwrap_or(false),
+            allow: ctx
+                .pointer("/policy/allow")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default(),
         }
+    }
+}
+
+/// A contact grant (§19.4), issued or held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    /// Grantee (issued) or grantor (held) identity.
+    pub identity: String,
+    /// Scopes.
+    pub scope: Vec<String>,
+    /// Lifetime.
+    pub valid_until: i64,
+}
+
+/// First-contact state (§19.4): allowlist, grants, requests, pending introductions, tokens.
+#[derive(Debug, Default, Clone)]
+pub struct Contacts {
+    /// Identities admitted without a grant.
+    pub allow: BTreeSet<String>,
+    /// Grants we issued, by id.
+    pub grants_issued: BTreeMap<String, Grant>,
+    /// Grants we hold, by id.
+    pub grants_held: BTreeMap<String, Grant>,
+    /// Pending introductions received: id → (identity, device).
+    pub requests: BTreeMap<String, (String, String)>,
+    /// Introductions we sent: id → recipient.
+    pub pending_sent: BTreeMap<String, String>,
+    /// Contact tokens we issued: token → grant id.
+    pub tokens: HashMap<String, String>,
+    seen_introductions: HashSet<String>,
+}
+
+impl Contacts {
+    /// README snapshot shape.
+    pub fn snapshot(&self) -> Value {
+        json!({
+            "allow": self.allow,
+            "grants_issued": self.grants_issued.keys().collect::<Vec<_>>(),
+            "grants_held": self.grants_held.keys().collect::<Vec<_>>(),
+            "requests": self.requests.keys().collect::<Vec<_>>(),
+            "pending_sent": self.pending_sent.keys().collect::<Vec<_>>(),
+        })
+    }
+
+    /// §19.4: a live `dsip.invite` grant issued to `identity`, matched by reference or by grantee.
+    pub fn admits(&self, identity: &str, grant_ref: Option<&str>, now: i64) -> bool {
+        self.grants_issued.iter().any(|(gid, g)| {
+            g.identity == identity
+                && g.valid_until > now
+                && g.scope.iter().any(|s| s == "dsip.invite")
+                && grant_ref.is_none_or(|r| r == gid)
+        })
+    }
+
+    /// A live grant we hold from `identity`, if any (lowest id first).
+    pub fn held_from(&self, identity: &str, now: i64) -> Option<String> {
+        self.grants_held
+            .iter()
+            .find(|(_, g)| g.identity == identity && g.valid_until > now && g.scope.iter().any(|s| s == "dsip.invite"))
+            .map(|(gid, _)| gid.clone())
     }
 }
 
@@ -195,18 +265,36 @@ pub struct Endpoint {
     timers: Vec<Timer>,
     seq: u64,
     out: Vec<Emission>,
+    /// First-contact state.
+    pub contacts: Contacts,
 }
 
 impl Endpoint {
     /// Create an endpoint.
     pub fn new(cfg: EndpointConfig) -> Endpoint {
         let now = cfg.start;
-        Endpoint { cfg, now, sessions: HashMap::new(), timers: vec![], seq: 0, out: vec![] }
+        let contacts = Contacts { allow: cfg.allow.clone(), ..Default::default() };
+        Endpoint { cfg, now, sessions: HashMap::new(), timers: vec![], seq: 0, out: vec![], contacts }
     }
 
     /// Look up a session.
     pub fn session(&self, id: &str) -> Option<&Session> {
         self.sessions.get(id)
+    }
+
+    /// Record that `device` acts for `identity` (learned from a verified delegation). Spec: §7.4, §12.6.
+    pub fn learn_identity(&mut self, device: &str, identity: &str) {
+        self.cfg.identities.insert(device.into(), identity.into());
+    }
+
+    /// Known device → identity mapping.
+    pub fn identities(&self) -> &HashMap<String, String> {
+        &self.cfg.identities
+    }
+
+    /// Is the first-contact policy on?
+    pub fn first_contact_required(&self) -> bool {
+        self.cfg.first_contact_required
     }
 
     /// Snapshot of the named sessions (`null` for unknown), README shape.
@@ -252,7 +340,7 @@ impl Endpoint {
         self.send(SendMsg {
             msg_type: msg_type.into(),
             to: to.into(),
-            session: session.into(),
+            session: Some(session.into()),
             reason: reason.map(String::from),
             ..Default::default()
         });
@@ -262,7 +350,7 @@ impl Endpoint {
         self.send(SendMsg {
             msg_type: "error".into(),
             to: m.from.clone(),
-            session: m.session.clone().unwrap_or_default(),
+            session: Some(m.session.clone().unwrap_or_default()),
             reason: Some(reason.into()),
             in_reply_to: Some(m.id.clone()),
             ..Default::default()
@@ -270,11 +358,11 @@ impl Endpoint {
     }
 
     fn ui(&mut self, kind: &'static str) {
-        self.emit(Emission::Ui { kind, field: None });
+        self.emit(Emission::Ui { kind, fields: vec![] });
     }
 
     fn ui_with(&mut self, kind: &'static str, key: &'static str, v: &str) {
-        self.emit(Emission::Ui { kind, field: Some((key, v.to_string())) });
+        self.emit(Emission::Ui { kind, fields: vec![(key, v.into())] });
     }
 
     fn running(&self, sid: &str, name: &str) -> bool {
@@ -353,17 +441,82 @@ impl Endpoint {
         }
     }
 
+    /// §19.4 outcome 1: a signed contact grant — the consent receipt (§19.3) in message form.
+    fn issue_grant(&mut self, gid: &str, grantee: &str, scope: Vec<String>, valid_until: i64, introduction: &str) {
+        self.contacts.grants_issued.insert(gid.into(), Grant { identity: grantee.into(), scope: scope.clone(), valid_until });
+        self.send(SendMsg {
+            msg_type: "grant".into(),
+            to: grantee.into(),
+            session: Some(introduction.into()),
+            id: Some(gid.into()),
+            extra: vec![("scope", json!(scope)), ("valid_until", json!(valid_until))],
+            ..Default::default()
+        });
+    }
+
     // ------------------------------------------------------------ local events
 
     fn local(&mut self, ev: &LocalEvent) {
-        if let LocalEvent::PlaceCall { session, to } = ev {
-            let mut s = Session::new(session, Role::Initiator, SessionState::Inviting, to);
-            s.invite_to = Some(to.clone());
-            self.sessions.insert(session.clone(), s);
-            self.send_simple("invite", to, session, None);
-            let t = self.cfg.t_establish;
-            self.start_timer(session, "T-Establish", t); // §12.9: started on sending invite
-            return;
+        match ev {
+            LocalEvent::PlaceCall { session, to } => {
+                let mut s = Session::new(session, Role::Initiator, SessionState::Inviting, to);
+                s.invite_to = Some(to.clone());
+                self.sessions.insert(session.clone(), s);
+                // §19.4: the grantee MAY reference a held grant in a future invite to aid stateless relays
+                let held = self.contacts.held_from(self.identity_of(to), self.now);
+                self.send(SendMsg {
+                    msg_type: "invite".into(),
+                    to: to.clone(),
+                    session: Some(session.clone()),
+                    extra: held.map(|g| vec![("grant", json!(g))]).unwrap_or_default(),
+                    ..Default::default()
+                });
+                let t = self.cfg.t_establish;
+                self.start_timer(session, "T-Establish", t); // §12.9: started on sending invite
+                return;
+            }
+            LocalEvent::Introduce { id, to, purpose, contact_token } => {
+                // §19.4: media-less, session-less request for permission to contact
+                self.contacts.pending_sent.insert(id.clone(), to.clone());
+                let mut extra = vec![];
+                if let Some(p) = purpose {
+                    extra.push(("purpose", json!(p)));
+                }
+                if let Some(t) = contact_token {
+                    extra.push(("contact_token", json!(t)));
+                }
+                self.send(SendMsg { msg_type: "introduction".into(), to: to.clone(), id: Some(id.clone()), extra, ..Default::default() });
+                return;
+            }
+            LocalEvent::Grant { introduction, id, scope, valid_until } => {
+                let Some((identity, _)) = self.contacts.requests.remove(introduction) else {
+                    self.emit(Emission::Refused("unknown-introduction"));
+                    return;
+                };
+                let scope = if scope.is_empty() { vec!["dsip.invite".to_string()] } else { scope.clone() };
+                self.issue_grant(id, &identity, scope, *valid_until, introduction);
+                return;
+            }
+            LocalEvent::RejectIntroduction { introduction, reason } => {
+                let Some((_, device)) = self.contacts.requests.remove(introduction) else {
+                    self.emit(Emission::Refused("unknown-introduction"));
+                    return;
+                };
+                // §19.4 outcome 2: reject addressed to the introduction id; a policy choice, not an obligation
+                self.send_simple("reject", &device, introduction, Some(reason.as_deref().unwrap_or("user.declined")));
+                return;
+            }
+            LocalEvent::Revoke { grant } => {
+                if self.contacts.grants_issued.remove(grant).is_none() {
+                    self.emit(Emission::Refused("unknown-grant"));
+                }
+                return;
+            }
+            LocalEvent::IssueToken { token, grant_id } => {
+                self.contacts.tokens.insert(token.clone(), grant_id.clone());
+                return;
+            }
+            _ => {}
         }
         let Some(s) = self.sessions.get(ev.session()).cloned() else {
             self.emit(Emission::Refused("unknown-session"));
@@ -371,7 +524,12 @@ impl Endpoint {
         };
         let sid = s.id.clone();
         match ev {
-            LocalEvent::PlaceCall { .. } => unreachable!(),
+            LocalEvent::PlaceCall { .. }
+            | LocalEvent::Introduce { .. }
+            | LocalEvent::Grant { .. }
+            | LocalEvent::RejectIntroduction { .. }
+            | LocalEvent::Revoke { .. }
+            | LocalEvent::IssueToken { .. } => unreachable!("handled above"),
             LocalEvent::Cancel { .. } => {
                 if s.role == Role::Initiator && matches!(s.state, SessionState::Inviting | SessionState::Proceeding) {
                     self.stop_all(&sid);
@@ -406,7 +564,7 @@ impl Endpoint {
                     self.send(SendMsg {
                         msg_type: "progress".into(),
                         to: s.peer.clone(),
-                        session: sid.clone(),
+                        session: Some(sid.clone()),
                         status: Some("ringing".into()),
                         ring_timeout: *ring_timeout,
                         ..Default::default()
@@ -433,7 +591,7 @@ impl Endpoint {
                     self.send(SendMsg {
                         msg_type: "answer".into(),
                         to: s.peer.clone(),
-                        session: sid.clone(),
+                        session: Some(sid.clone()),
                         answered_by: Some(answered_by.clone().unwrap_or_else(|| "user".into())),
                         ..Default::default()
                     });
@@ -463,7 +621,7 @@ impl Endpoint {
                     self.send(SendMsg {
                         msg_type: "update".into(),
                         to: s.peer.clone(),
-                        session: sid.clone(),
+                        session: Some(sid.clone()),
                         id: Some(id.clone()),
                         answered_by: answered_by.clone(),
                         ..Default::default()
@@ -484,7 +642,7 @@ impl Endpoint {
                         self.send(SendMsg {
                             msg_type: "answer".into(),
                             to: s.peer.clone(),
-                            session: sid.clone(),
+                            session: Some(sid.clone()),
                             answered_by: Some(answered_by.clone().unwrap_or_else(|| "user".into())),
                             in_reply_to: Some(in_reply_to.clone()),
                             ..Default::default()
@@ -495,7 +653,7 @@ impl Endpoint {
                         self.send(SendMsg {
                             msg_type: "reject".into(),
                             to: s.peer.clone(),
-                            session: sid.clone(),
+                            session: Some(sid.clone()),
                             reason: Some(reason.clone()),
                             in_reply_to: Some(in_reply_to.clone()),
                             ..Default::default()
@@ -525,6 +683,19 @@ impl Endpoint {
         if t == "error" {
             let r = m.reason.clone().unwrap_or_default();
             self.ui_with("error", "reason", &r);
+            return;
+        }
+        if t == "introduction" {
+            return self.recv_introduction(m);
+        }
+        if t == "grant" {
+            return self.recv_grant(m);
+        }
+        if t == "reject" && m.session.as_ref().is_some_and(|sid| self.contacts.pending_sent.contains_key(sid)) {
+            // §19.4 outcome 2: rejection addressed to the introduction id
+            self.contacts.pending_sent.remove(m.session.as_deref().unwrap_or(""));
+            let reason = resolve_reason(m.reason.as_deref().unwrap_or(""), "reject").effective;
+            self.ui_with("introduction_rejected", "reason", &reason);
             return;
         }
         let Some(s) = m.session.as_ref().and_then(|sid| self.sessions.get(sid)).cloned() else {
@@ -562,10 +733,52 @@ impl Endpoint {
         }
     }
 
+    fn recv_introduction(&mut self, m: &Message) {
+        if !self.contacts.seen_introductions.insert(m.id.clone()) {
+            self.emit(Emission::Drop("duplicate-introduction"));
+            return;
+        }
+        let identity = self.identity_of(&m.from).to_string();
+        if let Some(gid) = m.contact_token.as_ref().and_then(|t| self.contacts.tokens.remove(t)) {
+            // §19.4: a valid out-of-band contact token MAY be auto-granted per recipient policy (single use)
+            self.emit(Emission::Ui { kind: "introduction_received", fields: vec![("from", json!(identity)), ("token", json!(true))] });
+            let until = self.now + 31_536_000;
+            self.issue_grant(&gid, &identity, vec!["dsip.invite".into()], until, &m.id);
+            return;
+        }
+        // §19.4 UX requirement: a distinct requests surface — never a ring, never call history
+        self.contacts.requests.insert(m.id.clone(), (identity.clone(), m.from.clone()));
+        self.emit(Emission::Ui { kind: "introduction_received", fields: vec![("from", json!(identity))] });
+    }
+
+    fn recv_grant(&mut self, m: &Message) {
+        let Some(intro) = m.session.clone().filter(|i| self.contacts.pending_sent.contains_key(i)) else {
+            self.emit(Emission::Drop("unknown-introduction"));
+            return;
+        };
+        self.contacts.pending_sent.remove(&intro);
+        let by = self.identity_of(&m.from).to_string();
+        self.contacts.grants_held.insert(
+            m.id.clone(),
+            Grant { identity: by.clone(), scope: m.scope.clone().unwrap_or_default(), valid_until: m.valid_until.unwrap_or(0) },
+        );
+        self.emit(Emission::Ui { kind: "granted", fields: vec![("by", json!(by))] });
+    }
+
     fn recv_invite(&mut self, m: &Message) {
         let sid = m.id.clone();
-        // §12.6 glare: an outbound invite to the identity this invite comes from
         let from_identity = self.identity_of(&m.from).to_string();
+        if self.cfg.first_contact_required
+            && !self.contacts.allow.contains(&from_identity)
+            && !self.contacts.admits(&from_identity, m.grant.as_deref(), self.now)
+        {
+            // §19.4: an invite from an identity holding no grant (and matching no allow policy) is rejected with
+            // policy.first-contact-required. §12.4 responder: "Policy: auto-reject → send reject → ENDED" — no alerting.
+            self.send_simple("reject", &m.from, &sid, Some("policy.first-contact-required"));
+            self.sessions.insert(sid.clone(), Session::new(&sid, Role::Responder, SessionState::Ended, &m.from));
+            return;
+        }
+        // §12.6 glare: an outbound invite to the identity this invite comes from
         let glare = self
             .sessions
             .values()
@@ -775,7 +988,7 @@ impl Endpoint {
                         self.send(SendMsg {
                             msg_type: "reject".into(),
                             to: m.from.clone(),
-                            session: sid,
+                            session: Some(sid),
                             reason: Some("session.glare".into()),
                             in_reply_to: Some(m.id.clone()),
                             ..Default::default()

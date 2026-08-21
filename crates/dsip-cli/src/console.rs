@@ -58,6 +58,21 @@ pub enum Mode {
     Answer {
         /// Automatic policy.
         auto: String,
+        /// §19.4 policy.
+        first_contact: bool,
+        /// Pre-authorized contact tokens.
+        tokens: Vec<String>,
+    },
+    /// Send an introduction and wait for the outcome.
+    Introduce {
+        /// Recipient identity.
+        to: String,
+        /// Purpose.
+        purpose: String,
+        /// Contact token.
+        token: Option<String>,
+        /// Seconds to wait before reporting silence.
+        wait: u64,
     },
 }
 
@@ -76,8 +91,8 @@ fn print_emission(e: &Emission) {
             None => println!("  ⏱  {name} {action}                             §12.9"),
         },
         Emission::Media(m) => println!("  ♫  media {m}                                   §14.1"),
-        Emission::Ui { kind, field } => {
-            let f = field.as_ref().map(|(k, v)| format!("{k}={v}")).unwrap_or_default();
+        Emission::Ui { kind, fields } => {
+            let f = fields.iter().map(|(k, v)| format!("{k}={}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect::<Vec<_>>().join(" ");
             let sec = match *kind {
                 "progress" => "§12.10",
                 "answered" => "§14.3",
@@ -86,6 +101,8 @@ fn print_emission(e: &Emission) {
                 "missed_call" => "§12.11",
                 "ended" => "§12.4",
                 "glare_retry" => "§12.6",
+                "introduction_received" | "granted" | "introduction_rejected" => "§19.4",
+                "error" => "§15",
                 _ => "§12",
             };
             let extra = if *kind == "answered" && f == "answered_by=screening" { "  ← SCREENING MODE (§14.4)" } else { "" };
@@ -94,7 +111,7 @@ fn print_emission(e: &Emission) {
         Emission::Info { about } => println!("  ℹ  info for {about}                          §12.12"),
         Emission::Refused(r) => println!("  ✗  refused: {r}"),
         Emission::Drop(r) => println!("  ·  dropped: {r}"),
-        Emission::Send(_) | Emission::Deliver { .. } | Emission::Forward { .. } => {}
+        Emission::Send(_) | Emission::Deliver { .. } | Emission::Forward { .. } | Emission::Queue { .. } => {}
     }
 }
 
@@ -111,7 +128,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     println!("identity  {}  (\"{}\")", id.meta.identity, id.meta.display_name);
     println!("device    {}", id.meta.device);
     let fetch: Vec<String> = match &mode {
-        Mode::Call { to } => vec![to.clone()],
+        Mode::Call { to } | Mode::Introduce { to, .. } => vec![to.clone()],
         _ => vec![],
     };
     let resolver = build_resolver(&opts.did_documents, &fetch).await?;
@@ -134,8 +151,22 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         t_establish: opts.t_establish,
         t_ring: opts.t_ring,
         t_ring_local: opts.t_ring_local,
+        first_contact_required: matches!(&mode, Mode::Answer { first_contact: true, .. }),
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
+    if let Mode::Answer { first_contact, tokens, .. } = &mode {
+        if *first_contact {
+            println!("policy    first contact required — ungranted invites are rejected policy.first-contact-required   §19.4");
+        }
+        for t in tokens {
+            agent.local(LocalEvent::IssueToken { token: t.clone(), grant_id: Ulid::generate().to_string() }).await?;
+            println!("policy    contact token pre-authorized (auto-grant once)   §19.4");
+        }
+        let held = agent.endpoint().contacts.grants_issued.len();
+        if held > 0 {
+            println!("contacts  {held} grant(s) issued previously (contacts.json)");
+        }
+    }
     println!("relay     {}  capabilities {}   §13.2 hello bound", short(&agent.relay().did), agent.relay().capabilities);
     if opts.publish_hint {
         let Some(h) = &dht else { anyhow::bail!("--publish-hint needs --dht <bootstrap>") };
@@ -170,17 +201,29 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     let mut current: Option<String> = None;
     let mut pending_update: Option<String> = None;
     let auto = match &mode {
-        Mode::Answer { auto } => auto.clone(),
+        Mode::Answer { auto, .. } => auto.clone(),
         _ => String::new(),
     };
-    if let Mode::Call { to } = &mode {
-        let sid = agent.place_call(to).await?;
-        current = Some(sid);
-    } else {
-        println!("waiting for invites… (commands: accept | screen | decline | escalate | answer-update | reject-update | info | hangup | quit)");
-    }
-    if matches!(mode, Mode::Call { .. }) {
-        println!("(commands: cancel | update | answer-update | reject-update | info | hangup | quit)");
+    let mut intro_deadline: Option<tokio::time::Instant> = None;
+    let mut cmds_closed = false;
+    match &mode {
+        Mode::Call { to } => {
+            if let Some(g) = agent.endpoint().contacts.held_from(to, dsip_transport::now_s()) {
+                println!("contacts  holding grant …{} from {} — attached to the invite   §19.4", sid8(&g), short(to));
+            }
+            let sid = agent.place_call(to).await?;
+            current = Some(sid);
+            println!("(commands: cancel | update | answer-update | reject-update | info | hangup | quit)");
+        }
+        Mode::Introduce { to, purpose, token, wait } => {
+            agent.local(LocalEvent::Introduce { id: Ulid::generate().to_string(), to: to.clone(), purpose: Some(purpose.clone()),
+                                                 contact_token: token.clone() }).await?;
+            println!("   purpose \"{purpose}\" — no session, no media; may not ring; silence is a valid outcome   §19.4");
+            intro_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(*wait));
+        }
+        Mode::Answer { .. } => {
+            println!("waiting… (commands: accept | screen | decline | escalate | answer-update | reject-update | info | hangup | requests | grant [id] | reject-intro [id] | revoke <grant> | quit)");
+        }
     }
 
     loop {
@@ -204,7 +247,8 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                      message.msg_type, short(&identity), short(&message.from));
                             let sid = message.session_id().to_string();
                             print_state(&agent, &sid);
-                            if message.msg_type == "invite" {
+                            let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
+                            if message.msg_type == "invite" && offered {
                                 current = Some(sid.clone());
                                 match auto.as_str() {
                                     "accept" | "screen" => {
@@ -226,12 +270,31 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                 pending_update = Some(message.id.clone());
                                 println!("  ☎  update offered — type answer-update / reject-update");
                             }
+                            if message.msg_type == "introduction" {
+                                println!("  ✉  REQUEST (not a call): \"{}\" — type grant / reject-intro, or ignore (silence is a valid outcome)",
+                                         message.purpose.clone().unwrap_or_default());
+                            }
                         }
-                        AgentEvent::Emission(e) => print_emission(&e),
+                        AgentEvent::Emission(e) => {
+                            print_emission(&e);
+                            if let Emission::Ui { kind, .. } = &e {
+                                if matches!(*kind, "granted" | "introduction_rejected") && intro_deadline.is_some() {
+                                    agent.save_contacts()?;
+                                    agent.close().await;
+                                    println!("bye.");
+                                    return Ok(());
+                                }
+                            }
+                        }
                         AgentEvent::Rejected(code, detail) => println!("✗ inbound rejected: {code} {detail}"),
                         AgentEvent::Reconnected { attempts } => println!("↻ reconnected after {attempts} attempt(s)           §13.2"),
                     }
                 }
+                agent.save_contacts()?;
+            }
+            _ = async { tokio::time::sleep_until(intro_deadline.unwrap()).await }, if intro_deadline.is_some() => {
+                println!("·  no response — silence is the default outcome and means nothing (§19.4)");
+                break;
             }
             _ = republish.tick(), if opts.publish_hint => {
                 // Re-sign before expiry (§8.3: expired records are invalid); the node re-announces in between.
@@ -239,8 +302,47 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     crate::hints::publish(h, &Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl).await?;
                 }
             }
-            cmd = crx.recv() => {
-                let Some(cmd) = cmd else { break };
+            cmd = crx.recv(), if !cmds_closed => {
+                let Some(cmd) = cmd else {
+                    // Script finished (without `quit`) → done. Stdin EOF with no script → keep serving.
+                    if opts.script.is_some() { break }
+                    cmds_closed = true;
+                    continue;
+                };
+                let mut parts = cmd.splitn(2, ' ');
+                let verb = parts.next().unwrap_or("");
+                let arg = parts.next().map(str::trim).filter(|a| !a.is_empty()).map(String::from);
+                let latest_request = || agent.requests().last().map(|(id, _)| id.clone());
+                let year = dsip_transport::now_s() + 31_536_000;
+                match verb {
+                    "requests" => {
+                        for (id, identity) in agent.requests() { println!("  ✉  …{}  from {}", sid8(&id), short(&identity)); }
+                        continue;
+                    }
+                    "grant" => {
+                        if let Some(intro) = arg.clone().or_else(latest_request) {
+                            agent.local(LocalEvent::Grant { introduction: intro, id: Ulid::generate().to_string(), scope: vec!["dsip.invite".into()], valid_until: year }).await?;
+                        } else { println!("no pending request"); }
+                        agent.save_contacts()?;
+                        continue;
+                    }
+                    "reject-intro" => {
+                        if let Some(intro) = arg.clone().or_else(latest_request) {
+                            agent.local(LocalEvent::RejectIntroduction { introduction: intro, reason: Some("user.declined".into()) }).await?;
+                        } else { println!("no pending request"); }
+                        continue;
+                    }
+                    "revoke" => {
+                        if let Some(g) = arg.clone() { agent.local(LocalEvent::Revoke { grant: g }).await?; agent.save_contacts()?; }
+                        continue;
+                    }
+                    "token" => {
+                        if let Some(t) = arg.clone() { agent.local(LocalEvent::IssueToken { token: t, grant_id: Ulid::generate().to_string() }).await?; }
+                        continue;
+                    }
+                    "quit" => break,
+                    _ => {}
+                }
                 let Some(sid) = current.clone() else {
                     if cmd == "quit" { break }
                     println!("no session yet");

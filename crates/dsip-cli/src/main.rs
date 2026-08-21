@@ -75,13 +75,30 @@ enum Cmd {
         #[arg(long)]
         dht: Vec<libp2p::Multiaddr>,
     },
-    /// Place a signed call through a relay.
+    /// Place a signed call through a relay (a held grant for the callee is attached automatically).
     Call {
         #[command(flatten)]
         opts: ConnOpts,
         /// Callee identity or device DID.
         #[arg(long)]
         to: String,
+    },
+    /// Send an introduction (§19.4 first contact) and wait for a grant, a rejection, or silence.
+    Introduce {
+        #[command(flatten)]
+        opts: ConnOpts,
+        /// Recipient identity DID.
+        #[arg(long)]
+        to: String,
+        /// Stated purpose (≤ 280 chars; a claim).
+        #[arg(long, default_value = "Hello — may I call you?")]
+        purpose: String,
+        /// Out-of-band contact token issued by the recipient.
+        #[arg(long)]
+        token: Option<String>,
+        /// Seconds to wait for an outcome before treating silence as the answer.
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
     },
     /// Wait for calls through a relay.
     Answer {
@@ -90,6 +107,12 @@ enum Cmd {
         /// Automatic policy: accept | screen | decline | none.
         #[arg(long, default_value = "none")]
         auto: String,
+        /// §19.4: reject invites from identities holding no grant (policy.first-contact-required).
+        #[arg(long)]
+        first_contact: bool,
+        /// Pre-authorize a contact token (auto-grants a matching introduction once).
+        #[arg(long)]
+        token: Vec<String>,
     },
 }
 
@@ -290,10 +313,29 @@ async fn main() -> Result<()> {
                 bail!("unsupported DID method in {did} (v1.0 requires did:key and did:web, §7.2)");
             }
         }
-        Cmd::Call { opts, to } => console::run(opts.into_console(), console::Mode::Call { to }).await?,
-        Cmd::Answer { opts, auto } => console::run(opts.into_console(), console::Mode::Answer { auto }).await?,
+        Cmd::Call { opts, to } => finish(console::run(opts.into_console(), console::Mode::Call { to }).await),
+        Cmd::Introduce { opts, to, purpose, token, wait } => {
+            finish(console::run(opts.into_console(), console::Mode::Introduce { to, purpose, token, wait }).await)
+        }
+        Cmd::Answer { opts, auto, first_contact, token } => {
+            finish(console::run(opts.into_console(), console::Mode::Answer { auto, first_contact, tokens: token }).await)
+        }
     }
     Ok(())
+}
+
+/// Console modes own a blocking stdin reader; exit explicitly so runtime shutdown never waits on it.
+fn finish(r: Result<()>) -> ! {
+    use std::io::Write as _;
+    let code = match r {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            1
+        }
+    };
+    let _ = std::io::stdout().flush();
+    std::process::exit(code)
 }
 
 fn hex(b: &[u8]) -> String {

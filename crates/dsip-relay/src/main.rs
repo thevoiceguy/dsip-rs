@@ -5,8 +5,10 @@
 //! id; unbound connections receive no session traffic and close after 10 s;
 //! no silent drops on a live connection — refusals are signed `error`s),
 //! §12.7 rules 3 and 6 (leg tracking, per-leg cancel, attempt outcome via
-//! `dsip_session::Relay`), §13.3 (no store-and-forward in this form:
-//! unknown recipients get `transport.unknown-recipient`).
+//! `dsip_session::Relay`), §13.3 (store-and-forward only for `introduction`:
+//! session traffic to unknown recipients gets `transport.unknown-recipient`),
+//! §19.4 (introductions: mandatory per-sender and per-inbox rate limits; unknown
+//! and offline recipients treated identically — Impl, spec-gap 14).
 //!
 //! Envelopes are forwarded as the exact text frames received (§10.2: the
 //! signature covers the bytes; a relay never re-serializes).
@@ -48,6 +50,15 @@ struct Args {
     /// Extra hostnames for the self-signed certificate.
     #[arg(long)]
     host: Vec<String>,
+    /// Introductions allowed per sender identity and per recipient inbox within --intro-window (§19.4 mandatory rate limit).
+    #[arg(long, default_value_t = 5)]
+    intro_limit: usize,
+    /// Rate-limit window in seconds.
+    #[arg(long, default_value_t = 3600)]
+    intro_window: i64,
+    /// Maximum queued introductions per recipient inbox (§13.3 store-and-forward boundary).
+    #[arg(long, default_value_t = 100)]
+    inbox_cap: usize,
 }
 
 type Tx = mpsc::UnboundedSender<String>;
@@ -64,6 +75,13 @@ struct State {
     reject_frames: HashMap<(String, String), String>,
     /// Per session: the initiator device connection.
     initiators: HashMap<String, String>,
+    /// §19.4 inbox: identity → queued (frame, expires_at). Unknown and offline identities alike.
+    inbox: HashMap<String, Vec<(String, i64)>>,
+    /// §19.4 rate limiting: key (sender identity or recipient) → recent introduction times.
+    intro_log: HashMap<String, Vec<i64>>,
+    intro_limit: usize,
+    intro_window: i64,
+    inbox_cap: usize,
 }
 
 impl State {
@@ -101,8 +119,32 @@ impl State {
         v
     }
 
-    /// Route one verified frame from `sender` (a bound device).
-    fn route(&mut self, sender: &str, inbound: &Inbound) {
+    /// §19.4: sliding-window rate limit; returns seconds until a slot frees, or 0 if allowed (and records it).
+    fn intro_rate(&mut self, key: &str) -> i64 {
+        let now = now_s();
+        let log = self.intro_log.entry(key.to_string()).or_default();
+        log.retain(|t| *t + self.intro_window > now);
+        if log.len() >= self.intro_limit {
+            return log[0] + self.intro_window - now;
+        }
+        log.push(now);
+        0
+    }
+
+    /// Deliver queued introductions to a newly bound device (§13.3 boundary).
+    fn flush_inbox(&mut self, identity: &str, device: &str) {
+        let now = now_s();
+        if let Some(q) = self.inbox.remove(identity) {
+            for (frame, exp) in q {
+                if exp >= now {
+                    self.deliver(device, &frame);
+                }
+            }
+        }
+    }
+
+    /// Route one verified frame from `sender` (a bound device) acting for `sender_identity`.
+    fn route(&mut self, sender: &str, sender_identity: &str, inbound: &Inbound) {
         let p = &inbound.verified.payload;
         let t = inbound.verified.msg_type().to_string();
         let id = p["id"].as_str().unwrap_or("").to_string();
@@ -113,6 +155,40 @@ impl State {
         let tracked = self.initiators.contains_key(&sid);
 
         match t.as_str() {
+            "introduction" => {
+                // §19.4: relays MUST rate-limit introductions per sender identity and per recipient inbox.
+                let wait = self.intro_rate(&format!("from:{sender_identity}")).max(self.intro_rate(&format!("to:{to}")));
+                if wait > 0 {
+                    let mut f = self.error_frame(sender, "policy.rate-limited", Some(&id), None, None);
+                    // retry_after rides in the signed error payload
+                    if let Ok(mut env) = Envelope::from_frame(&f) {
+                        if let Some(mut payload) = dsip_core::b64::decode(&env.payload)
+                            .and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                            payload["retry_after"] = wait.into();
+                            env = sign(&payload, &self.key, &self.key.kid());
+                            f = env.frame();
+                        }
+                    }
+                    self.deliver(sender, &f);
+                    return;
+                }
+                // §19.4 anti-enumeration (Impl, spec-gap 14): unknown and offline recipients are treated identically —
+                // queued until the introduction expires, no routing error. Bound devices get it now.
+                let legs = self.legs_for(&to);
+                if legs.is_empty() {
+                    let exp = p["expires_at"].as_i64().unwrap_or(now_s());
+                    let q = self.inbox.entry(to.clone()).or_default();
+                    q.retain(|(_, e)| *e >= now_s());
+                    if q.len() < self.inbox_cap {
+                        q.push((inbound.frame.clone(), exp));
+                    }
+                    tracing::info!("queued introduction for {to} (inbox {})", q.len());
+                } else {
+                    for leg in legs {
+                        self.deliver(&leg, &inbound.frame);
+                    }
+                }
+            }
             "invite" => {
                 let legs = self.legs_for(&to);
                 if legs.is_empty() {
@@ -224,6 +300,11 @@ async fn main() -> Result<()> {
         tracker: Relay::new(now_s()),
         reject_frames: HashMap::new(),
         initiators: HashMap::new(),
+        inbox: HashMap::new(),
+        intro_log: HashMap::new(),
+        intro_limit: args.intro_limit,
+        intro_window: args.intro_window,
+        inbox_cap: args.inbox_cap,
     }));
 
     let listener = TcpListener::bind(args.listen).await.with_context(|| format!("binding {}", args.listen))?;
@@ -295,6 +376,8 @@ async fn serve(stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>, p
             tracing::info!("{peer}: rebinding {device} (replacing prior connection)");
         }
         st.identities.entry(identity.clone()).or_default().insert(device.clone());
+        st.flush_inbox(&identity, &device);
+        st.flush_inbox(&device, &device);
         let now = now_s();
         let hello = json!({
             "dsip": version_block(&st.supported, &[]), "type": "hello", "id": Ulid::generate().as_str(),
@@ -328,7 +411,7 @@ async fn serve(stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>, p
                                     let f = st.error_frame(&device, "transport.routing-refused", Some(inb.verified.payload["id"].as_str().unwrap_or("")), None, Some("signer is not the bound device"));
                                     st.deliver(&device, &f);
                                 } else {
-                                    st.route(&device, &inb);
+                                    st.route(&device, &identity, &inb);
                                 }
                             }
                             Err(v) => {
