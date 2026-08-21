@@ -143,7 +143,7 @@ impl BConn {
 
 #[derive(Subcommand)]
 enum BroadcastCmd {
-    /// Publish a signed publication record for <identity>:<stream>.
+    /// Publish a signed publication record for `<identity>:<stream>`.
     Publish {
         #[command(flatten)]
         conn: BConn,
