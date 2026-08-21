@@ -25,10 +25,14 @@ pub enum LocalEvent {
         /// Session id.
         session: String,
     },
-    /// End an ACTIVE session (`bye user.hangup`).
+    /// End an ACTIVE session (`bye`, reason `user.hangup` unless given — the media layer
+    /// ends a failed path with `media.failed`, WebRTC Media Binding B§8).
     Hangup {
         /// Session id.
         session: String,
+        /// Reason token override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Policy admits the invite: alert the user (`progress ringing`).
     Alert {
@@ -150,7 +154,7 @@ impl LocalEvent {
             | LocalEvent::IssueToken { .. } => "",
             LocalEvent::PlaceCall { session, .. }
             | LocalEvent::Cancel { session }
-            | LocalEvent::Hangup { session }
+            | LocalEvent::Hangup { session, .. }
             | LocalEvent::Alert { session, .. }
             | LocalEvent::AutoReject { session, .. }
             | LocalEvent::Accept { session, .. }

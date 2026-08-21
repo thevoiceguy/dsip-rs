@@ -541,12 +541,13 @@ impl Endpoint {
                     self.emit(Emission::Refused("invalid-state"));
                 }
             }
-            LocalEvent::Hangup { .. } => {
+            LocalEvent::Hangup { reason, .. } => {
                 if s.state == SessionState::Active {
                     // Impl (spec-gap 13): ENDING collapsed into ENDED
                     self.stop_all(&sid);
                     self.sessions.get_mut(&sid).expect("exists").outstanding = None;
-                    self.send_simple("bye", &s.peer, &sid, Some("user.hangup"));
+                    let reason = reason.as_deref().unwrap_or("user.hangup");
+                    self.send_simple("bye", &s.peer, &sid, Some(reason));
                     self.emit(Emission::Media("stop"));
                     self.sessions.get_mut(&sid).expect("exists").state = SessionState::Ended;
                 } else {

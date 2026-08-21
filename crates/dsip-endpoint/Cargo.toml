@@ -11,6 +11,7 @@ rust-version.workspace = true
 dsip-core.workspace = true
 dsip-schema.workspace = true
 dsip-session.workspace = true
+dsip-webrtc-binding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "dsip-webrtc-binding"
+description = "WebRTC Media Binding 1.0 (DSIP v0.7 companion): descriptor/SDP authority rule, DTLS role mapping, candidate exchange and renegotiation semantics, one answer per offer — pure, no media stack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

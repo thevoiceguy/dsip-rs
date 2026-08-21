@@ -6,7 +6,7 @@
 //! ride in signed `info` after ACTIVE; gathered candidates are handed to the
 //! host as they appear so it can buffer them), §14.4 (screening: a `recvonly`
 //! leg exposes no local media), §17.1 (Opus audio). The normative shapes are
-//! in the WebRTC Media Binding draft (`v0.7/dsip-webrtc-media-binding-v0.7-draft.md`).
+//! in the WebRTC Media Binding draft (`v0.7/dsip-webrtc-media-binding-v0.7.md`).
 //!
 //! Impl: two interchangeable backends behind one [`MediaLeg`] surface, chosen
 //! at runtime by [`Backend`]; both are compiled in by default:

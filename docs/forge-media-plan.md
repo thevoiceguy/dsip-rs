@@ -1,6 +1,6 @@
 # Follow-on: adopting forge-media as the DSIP media stack
 
-**Status:** adopted as the next media step (decision 2026-08-21); sequenced after the WebRTC Media Binding draft (`v0.7/dsip-webrtc-media-binding-v0.7-draft.md`), whose Appendix C maps the four upstream items below to binding sections. forge-media is the project's own crate, so the upstream work is a sprint, not a negotiation. The PoC's `dsip-media` crate uses webrtc-rs so the
+**Status:** adopted as the next media step (decision 2026-08-21); sequenced after the WebRTC Media Binding draft (`v0.7/dsip-webrtc-media-binding-v0.7.md`), whose Appendix C maps the four upstream items below to binding sections. forge-media is the project's own crate, so the upstream work is a sprint, not a negotiation. The PoC's `dsip-media` crate uses webrtc-rs so the
 Phase 2 browser↔native demo can land now; this document records what was found when
 evaluating `thevoiceguy/forge-media` (2026-08-21) and what it would take to switch.
 
@@ -58,10 +58,10 @@ backend from webrtc-rs to forge is a one-crate change with the DSIP agent and CL
    FINGERPRINT per RFC 8489, USERNAME order, ECDSA DTLS suites).
 2. ✅ `dsip-media` `forge` feature: `backend/forge.rs` behind the same `MediaLeg` surface, runtime
    selection via `Backend` / CLI `--media-backend`; git dep pinned by rev.
-3. ◐ `tests/cross_backend.rs` passes all four pairings native ↔ native (forge↔webrtc-rs both
-   directions) and `demos/media-demo.sh forge webrtc-rs` runs the signalled call end to end.
-   Browser ↔ native on forge is still to be verified by hand (`demos/browser-demo.sh` with
-   `--media-backend forge` on the native side).
+3. ✅ `tests/cross_backend.rs` passes all four pairings native ↔ native and CI runs the signalled
+   `media-demo.sh` for forge→webrtc-rs, webrtc-rs→forge and forge→forge (self-checking: both sides
+   decrypt media, both recordings real). Browser ↔ native on forge remains a manual check
+   (`demos/browser-demo.sh`; the native side defaults to forge).
 4. ✅ `forge` is the default (2026-08-21): `dsip-media` default features are `["forge", "webrtc-rs"]`,
    `Backend::default()` and the CLI `--media-backend` default are `forge`; webrtc-rs stays compiled
    in as the fallback named in plan §7's risk row and as the reference peer for the cross-backend

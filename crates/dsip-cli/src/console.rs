@@ -500,7 +500,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                 }
                 let ev = match cmd.as_str() {
                     "cancel" => Some(LocalEvent::Cancel { session: sid }),
-                    "hangup" => Some(LocalEvent::Hangup { session: sid }),
+                    "hangup" => Some(LocalEvent::Hangup { session: sid, reason: None }),
                     "accept" => Some(LocalEvent::Accept { session: sid, answered_by: Some("user".into()) }),
                     "screen" => Some(LocalEvent::Accept { session: sid, answered_by: Some("screening".into()) }),
                     "decline" => Some(LocalEvent::Decline { session: sid }),

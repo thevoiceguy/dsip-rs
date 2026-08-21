@@ -47,6 +47,20 @@ pub enum RejectCode {
     RotationSubjectMismatch,
     RotationNextSameAsPrevious,
     RotationSignerNotPrevious,
+    BindingIceMode,
+    BindingSdpMissing,
+    BindingSdpInvalid,
+    BindingSectionCount,
+    BindingExtraSection,
+    BindingKindMismatch,
+    BindingDirectionMismatch,
+    BindingCodecMissing,
+    BindingEncryption,
+    BindingRtcpMuxMissing,
+    BindingFingerprintMissing,
+    BindingIceCredentialsMissing,
+    BindingSetupInvalid,
+    BindingIceRestart,
 }
 
 /// The outcome of a pipeline stage.

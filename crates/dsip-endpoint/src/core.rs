@@ -309,6 +309,10 @@ impl Core {
                 }
             }
         }
+        // WebRTC Media Binding B§2.1: descriptors and SDP must agree. Checked only when SDP is
+        // present — Impl: a signalling-only endpoint (no media stack) sends the descriptor without
+        // `sdp`; a media-enabled host treats that absence as `media.offer-required` itself.
+        let binding_failure = self.binding_check(&p);
         if p["type"] == "invite" || p["type"] == "update" {
             self.offers.insert(p["id"].as_str().unwrap_or("").to_string(), json!({"media": p["media"], "transports": p["transports"]}));
         }
@@ -318,10 +322,49 @@ impl Core {
         out.push(CoreEvent::Received { message: msg.clone(), identity, display_name, payload: p });
         if session_scoped {
             // Broadcast/subscription traffic (§9.3, §22) is handled by the host, not the §12 engine.
-            let em = self.ep.step(&Event::Recv { recv: msg });
+            let em = self.ep.step(&Event::Recv { recv: msg.clone() });
             out.extend(self.handle(em, now)?);
+            if let Some((code, reason, detail)) = binding_failure {
+                // B§8: an offer that fails the binding is rejected (`media.unsupported` …); a failed
+                // answer ends that leg with `bye media.failed`.
+                let sid = msg.session.clone().unwrap_or_else(|| msg.id.clone());
+                let local = match msg.msg_type.as_str() {
+                    "invite" => LocalEvent::AutoReject { session: sid, reason: reason.clone() },
+                    "update" => LocalEvent::RejectUpdate { session: sid, in_reply_to: msg.id.clone(), reason: reason.clone() },
+                    _ => LocalEvent::Hangup { session: sid, reason: Some(reason.clone()) },
+                };
+                out.push(CoreEvent::Rejected { code, detail: format!("{reason}: {detail}") });
+                let em = self.ep.step(&Event::Local(local));
+                out.extend(self.handle(em, now)?);
+            }
         }
         Ok(out)
+    }
+
+    /// WebRTC Media Binding checks on an inbound offer or answer that carries SDP:
+    /// `(code, reason token, detail)` on failure.
+    fn binding_check(&self, p: &Value) -> Option<(String, String, String)> {
+        let has_sdp = p.pointer("/transports/0/sdp").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+        if !has_sdp {
+            return None;
+        }
+        let verdict = match p["type"].as_str() {
+            Some("invite") | Some("update") => dsip_webrtc_binding::check_offer(p),
+            Some("answer") => {
+                let key = p.get("in_reply_to").and_then(Value::as_str).or(p.get("session").and_then(Value::as_str)).unwrap_or("");
+                let offer = self.offers.get(key)?;
+                if offer.pointer("/transports/0/sdp").is_none() {
+                    return None;
+                }
+                dsip_webrtc_binding::check_answer(offer, p)
+            }
+            _ => return None,
+        };
+        if verdict.ok() {
+            return None;
+        }
+        let code = serde_json::to_value(verdict.code).ok()?.as_str()?.to_string();
+        Some((code, verdict.reason.unwrap_or("media.unsupported").to_string(), verdict.detail.unwrap_or_default()))
     }
 
     fn handle(&mut self, emissions: Vec<Emission>, now: i64) -> Result<Vec<CoreEvent>> {
@@ -443,8 +486,10 @@ impl Core {
                 }
             }
             "update" => {
-                // Escalation offer: full sendrecv audio + video from this sender (§14.4 step 3)
-                let offer = self.media_offer(true);
+                // Escalation offer (§14.4 step 3): full sendrecv from this sender; video only when this
+                // endpoint actually offers it, so the descriptors match the SDP the media leg re-offers
+                // (WebRTC Media Binding B§2.1).
+                let offer = self.media_offer(self.cfg.video);
                 self.offers.insert(id.clone(), offer.clone());
                 p["media"] = offer["media"].clone();
                 p["transports"] = offer["transports"].clone();
