@@ -16,6 +16,7 @@ dsip-core.workspace = true
 dsip-schema.workspace = true
 dsip-session.workspace = true
 dsip-transport.workspace = true
+dsip-broadcast.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true

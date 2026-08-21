@@ -13,6 +13,7 @@ use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{self, Envelope};
 use dsip_core::keys::KeyPair;
 
+mod broadcast_cli;
 mod console;
 mod hints;
 mod vectors;
@@ -100,6 +101,11 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         wait: u64,
     },
+    /// Verified Broadcast (§22) and subscriptions (§9.3).
+    Broadcast {
+        #[command(subcommand)]
+        cmd: BroadcastCmd,
+    },
     /// Wait for calls through a relay.
     Answer {
         #[command(flatten)]
@@ -113,6 +119,109 @@ enum Cmd {
         /// Pre-authorize a contact token (auto-grants a matching introduction once).
         #[arg(long)]
         token: Vec<String>,
+    },
+}
+
+#[derive(clap::Args)]
+struct BConn {
+    /// Identity directory.
+    #[arg(long)]
+    identity: PathBuf,
+    /// Relay URL (the authority).
+    #[arg(long, default_value = "wss://127.0.0.1:8443/dsip")]
+    relay: String,
+    /// Certificate to trust for the relay.
+    #[arg(long)]
+    ca: Option<PathBuf>,
+}
+
+impl BConn {
+    fn conn(self) -> broadcast_cli::Conn {
+        broadcast_cli::Conn { identity: self.identity, relay: self.relay, ca: self.ca }
+    }
+}
+
+#[derive(Subcommand)]
+enum BroadcastCmd {
+    /// Publish a signed publication record for <identity>:<stream>.
+    Publish {
+        #[command(flatten)]
+        conn: BConn,
+        /// Stream suffix (stream_id = identity DID + ":" + suffix).
+        #[arg(long, default_value = "radio:main")]
+        stream: String,
+        /// Title (a claim).
+        #[arg(long, default_value = "Live")]
+        title: String,
+        /// live | scheduled | ended.
+        #[arg(long, default_value = "live")]
+        state: String,
+        /// Variant `id,codec,transport,uri[,integrity]` (repeatable).
+        #[arg(long = "variant")]
+        variants: Vec<String>,
+        /// Record lifetime in seconds.
+        #[arg(long, default_value_t = 300)]
+        ttl: i64,
+        /// Policy `key=value` (repeatable), e.g. transcoding=allowed.
+        #[arg(long = "policy")]
+        policy: Vec<String>,
+    },
+    /// Withdraw a publication.
+    Unpublish {
+        #[command(flatten)]
+        conn: BConn,
+        /// Stream suffix.
+        #[arg(long, default_value = "radio:main")]
+        stream: String,
+        /// Publication id (default: the last one published from this identity directory).
+        #[arg(long)]
+        publication: Option<String>,
+    },
+    /// Subscribe to publication or presence events and verify what arrives.
+    Subscribe {
+        #[command(flatten)]
+        conn: BConn,
+        /// Stream id or subject DID.
+        #[arg(long)]
+        target: String,
+        /// Event classes (publication | presence).
+        #[arg(long, default_value = "publication")]
+        events: Vec<String>,
+        /// Requested lifetime (capped per event class).
+        #[arg(long, default_value_t = 600)]
+        expires_in: i64,
+        /// Seconds to listen.
+        #[arg(long, default_value_t = 20)]
+        wait: u64,
+        /// Receiver codecs.
+        #[arg(long, default_value = "codec:audio/opus")]
+        codec: Vec<String>,
+        /// Receiver transports.
+        #[arg(long, default_value = "transport:webrtc")]
+        transport: Vec<String>,
+    },
+    /// As a relay/transcoder, attach a signed provenance statement to someone's publication.
+    Provenance {
+        #[command(flatten)]
+        conn: BConn,
+        /// Original stream id.
+        #[arg(long)]
+        stream: String,
+        /// Original publication id.
+        #[arg(long)]
+        publication: String,
+        /// transcode | relay | repackage.
+        #[arg(long, default_value = "transcode")]
+        operation: String,
+        /// Input variant id.
+        #[arg(long)]
+        input: String,
+        /// Output variant id.
+        #[arg(long)]
+        output: String,
+        /// Output URI.
+        #[arg(long)]
+        uri: Option<String>,
     },
 }
 
@@ -326,6 +435,36 @@ async fn main() -> Result<()> {
         Cmd::Call { opts, to } => finish(console::run(opts.into_console(), console::Mode::Call { to }).await),
         Cmd::Introduce { opts, to, purpose, token, wait } => {
             finish(console::run(opts.into_console(), console::Mode::Introduce { to, purpose, token, wait }).await)
+        }
+        Cmd::Broadcast { cmd } => {
+            let r = match cmd {
+                BroadcastCmd::Publish { conn, stream, title, state, variants, ttl, policy } => {
+                    let vs: Result<Vec<_>> = if variants.is_empty() {
+                        Ok(vec![broadcast_cli::parse_variant("main-opus,codec:audio/opus,transport:webrtc,wss://127.0.0.1:8443/dsip/webrtc/main")?])
+                    } else {
+                        variants.iter().map(|v| broadcast_cli::parse_variant(v)).collect()
+                    };
+                    let mut pol = serde_json::Map::new();
+                    for kv in policy {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            pol.insert(k.to_string(), v.into());
+                        }
+                    }
+                    if pol.is_empty() {
+                        pol.insert("redistribution".into(), "allowed-with-attribution".into());
+                        pol.insert("transcoding".into(), "allowed".into());
+                    }
+                    broadcast_cli::publish(&conn.conn(), &stream, &title, &state, vs?, ttl, Value::Object(pol)).await
+                }
+                BroadcastCmd::Unpublish { conn, stream, publication } => broadcast_cli::unpublish(&conn.conn(), &stream, publication).await,
+                BroadcastCmd::Subscribe { conn, target, events, expires_in, wait, codec, transport } => {
+                    broadcast_cli::subscribe(&conn.conn(), &target, events, expires_in, wait, codec, transport).await
+                }
+                BroadcastCmd::Provenance { conn, stream, publication, operation, input, output, uri } => {
+                    broadcast_cli::provenance(&conn.conn(), &stream, &publication, &operation, &input, &output, uri).await
+                }
+            };
+            finish(r)
         }
         Cmd::Answer { opts, auto, first_contact, token } => {
             finish(console::run(opts.into_console(), console::Mode::Answer { auto, first_contact, tokens: token }).await)

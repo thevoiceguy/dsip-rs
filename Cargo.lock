@@ -916,11 +916,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsip-broadcast"
+version = "0.1.0"
+dependencies = [
+ "dsip-core",
+ "dsip-schema",
+ "dsip-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsip-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dsip-broadcast",
  "dsip-core",
  "dsip-dht",
  "dsip-media",
@@ -999,6 +1011,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dsip-broadcast",
  "dsip-core",
  "dsip-schema",
  "dsip-session",

@@ -151,7 +151,7 @@ impl Core {
         Core {
             keys,
             cfg,
-            supported: Supported::default(),
+            supported: Supported::all_known(),
             resolver,
             ep: Endpoint::new(c),
             seen: SeenIds::default(),
@@ -181,6 +181,25 @@ impl Core {
     /// The engine, mutably (contacts seeding).
     pub fn endpoint_mut(&mut self) -> &mut Endpoint {
         &mut self.ep
+    }
+
+    /// Sign an application-built payload (publish, subscribe, provenance, …) with the device key,
+    /// filling `id`/`from`/`issued_at`/`expires_at` when absent. A preset `from` equal to our identity
+    /// is kept: the header delegation then binds the device signature to the identity (§7.4, spec-gap 8).
+    pub fn sign_payload(&mut self, mut p: Value, now: i64, ttl: i64) -> Result<String> {
+        if p.get("id").is_none() {
+            p["id"] = self.new_id(now).into();
+        }
+        if p.get("from").and_then(Value::as_str) != Some(self.keys.identity.as_str()) {
+            p["from"] = self.keys.device.did().into();
+        }
+        if p.get("issued_at").is_none() {
+            p["issued_at"] = now.into();
+        }
+        if p.get("expires_at").is_none() {
+            p["expires_at"] = (now + ttl).into();
+        }
+        Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.keys.device, &self.keys.device.kid(), vec![self.keys.delegation.clone()]).frame())
     }
 
     /// A fresh ULID at `now` (seconds), unique within the second.
@@ -295,9 +314,13 @@ impl Core {
         }
         let msg = Message::from_payload(&p).context("payload shape")?;
         let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
+        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "broadcast.provenance");
         out.push(CoreEvent::Received { message: msg.clone(), identity, display_name, payload: p });
-        let em = self.ep.step(&Event::Recv { recv: msg });
-        out.extend(self.handle(em, now)?);
+        if session_scoped {
+            // Broadcast/subscription traffic (§9.3, §22) is handled by the host, not the §12 engine.
+            let em = self.ep.step(&Event::Recv { recv: msg });
+            out.extend(self.handle(em, now)?);
+        }
         Ok(out)
     }
 

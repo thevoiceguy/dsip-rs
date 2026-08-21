@@ -34,6 +34,7 @@ use dsip_core::envelope::{sign, Envelope};
 use dsip_core::keys::KeyPair;
 use dsip_core::ulid::Ulid;
 use dsip_core::version::{version_block, Supported};
+use dsip_broadcast::Authority;
 use dsip_session::fork::{RelayAction, RelayEvent};
 use dsip_session::{Emission, Message, Relay};
 use dsip_transport::conn::ws_config;
@@ -93,9 +94,57 @@ struct State {
     intro_window: i64,
     inbox_cap: usize,
     offline_retention: i64,
+    /// §9.3/§22: this relay is the authority for identities bound to it.
+    authority: Authority,
+    /// Publication record frames by publication id (notify bodies carry them for third-party verification).
+    records: HashMap<String, String>,
+    /// Provenance statement frames by publication id (statements reference a specific record, §22.3).
+    statements: HashMap<String, Vec<String>>,
 }
 
 impl State {
+    /// Act on authority emissions: sign and deliver notifies/rejects.
+    fn apply_authority(&mut self, em: Vec<Value>) {
+        for e in em {
+            if let Some(send) = e.get("send") {
+                let to = send["to"].as_str().unwrap_or("").to_string();
+                let now = now_s();
+                let mut p = json!({
+                    "dsip": {"core": "1.0", "min_core": "1.0", "profiles": [dsip_broadcast::PROFILE], "extensions": [dsip_broadcast::PROVENANCE_EXTENSION], "critical": []},
+                    "type": send["type"], "id": Ulid::generate().as_str(), "from": self.key.did(), "to": to,
+                    "issued_at": now, "expires_at": now + 30,
+                });
+                if send["type"] == "notify" {
+                    let mut body = send["body"].clone();
+                    // Impl (spec-gap 21): the record and provenance statements ride in the body so the
+                    // subscriber can verify the publisher independently of this relay (§9.3 RECOMMENDED).
+                    if let Some(pid) = body["publication"].as_str().map(String::from) {
+                        if let Some(f) = self.records.get(&pid) {
+                            body["record"] = f.clone().into();
+                        }
+                        if let Some(st) = self.statements.get(&pid) {
+                            body["statements"] = json!(st);
+                        }
+                    }
+                    p["subscription"] = send["subscription"].clone();
+                    p["seq"] = send["seq"].clone();
+                    p["state"] = send["state"].clone();
+                    if let Some(r) = send.get("reason") {
+                        p["reason"] = r.clone();
+                    }
+                    p["body"] = body;
+                } else {
+                    p["session"] = send["session"].clone();
+                    p["reason"] = send["reason"].clone();
+                }
+                let f = sign(&p, &self.key, &self.key.kid()).frame();
+                self.deliver(&to, &f);
+            } else {
+                tracing::info!("authority: {e}");
+            }
+        }
+    }
+
     fn error_frame(&self, to: &str, reason: &str, in_reply_to: Option<&str>, session: Option<&str>, detail: Option<&str>) -> String {
         let now = now_s();
         let mut p = json!({
@@ -231,6 +280,30 @@ impl State {
         if t == "reject" && self.tracker.attempt_initiator(&sid).is_some_and(|i| i != sender) {
             self.reject_frames.insert((sid.clone(), sender.to_string()), inbound.frame.clone());
         }
+        if matches!(t.as_str(), "publish" | "unpublish" | "subscribe" | "broadcast.provenance") {
+            // §9.3/§22: addressed to this relay as the target's authority (publish/unpublish carry no `to`).
+            if t == "subscribe" && to != self.key.did() {
+                let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some("subscribe must address this relay"));
+                self.deliver(sender, &f);
+                return;
+            }
+            let mut m = p.clone();
+            if t == "broadcast.provenance" {
+                m["type"] = "provenance".into();
+            }
+            m["from"] = sender.into();
+            self.authority.learn_identity(sender, sender_identity);
+            if t == "publish" {
+                self.records.insert(id.clone(), inbound.frame.clone());
+            }
+            if t == "broadcast.provenance" {
+                self.statements.entry(p["original_publication"].as_str().unwrap_or("").to_string()).or_default().push(inbound.frame.clone());
+            }
+            let _ = self.authority.advance_to(now_s());
+            let em = self.authority.recv_value(&m);
+            self.apply_authority(em);
+            return;
+        }
         let em = self.tracker.step(&RelayEvent::Recv { recv: msg });
         self.apply(em, Some(sender), Some(inbound), &sid);
     }
@@ -269,7 +342,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(Mutex::new(State {
         key,
-        supported: Supported::default(),
+        supported: Supported::all_known(),
         resolver: StaticResolver::default(),
         seen: SeenIds::default(),
         devices: HashMap::new(),
@@ -283,6 +356,9 @@ async fn main() -> Result<()> {
         intro_window: args.intro_window,
         inbox_cap: args.inbox_cap,
         offline_retention: args.offline_retention,
+        authority: Authority::new(now_s(), HashMap::new()),
+        records: HashMap::new(),
+        statements: HashMap::new(),
     }));
 
     if let Some(w) = &args.www {
@@ -383,6 +459,9 @@ async fn serve(
         let _ = st.tick();
         let em = st.tracker.step(&RelayEvent::Relay(RelayAction::Bind { device: device.clone(), identity: identity.clone() }));
         st.apply(em, None, None, "");
+        let _ = st.authority.advance_to(now_s());
+        let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Bind { device: device.clone(), identity: identity.clone() }));
+        st.apply_authority(em);
     }
 
     // --- steady state
@@ -449,6 +528,10 @@ async fn serve(
         set.remove(&device);
     }
     let _ = st.tracker.step(&RelayEvent::Relay(RelayAction::Unbind { device: device.clone(), identity: identity.clone() }));
+    if !st.identities.get(&identity).is_some_and(|s| !s.is_empty()) {
+        let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Unbind { device: device.clone(), identity: identity.clone() }));
+        st.apply_authority(em);
+    }
     tracing::info!("{peer}: unbound {device}");
     result
 }

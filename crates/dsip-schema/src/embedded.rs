@@ -36,3 +36,6 @@ pub const SCHEMAS: &[(&str, &str)] = &[
 
 /// Implementation-local schema for DHT reachability hints (plan §10; not part of the spec set).
 pub const REACHABILITY_HINT: &str = include_str!("../../../schemas/reachability-hint.schema.json");
+
+/// Implementation-local schema for broadcast provenance statements (§22.3 extension `broadcast-provenance/1.0`).
+pub const BROADCAST_PROVENANCE: &str = include_str!("../../../schemas/broadcast-provenance.schema.json");

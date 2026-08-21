@@ -27,6 +27,16 @@ impl Default for Supported {
 }
 
 impl Supported {
+    /// Everything this implementation speaks: both v1.0 profiles and the provenance extension.
+    /// Live endpoints and relays use this; the vectors pin negotiation with explicit contexts.
+    pub fn all_known() -> Supported {
+        Supported {
+            core: "1.0".into(),
+            profiles: vec!["interactive-media/1.0".into(), "verified-broadcast/1.0".into()],
+            extensions: vec!["broadcast-provenance/1.0".into()],
+        }
+    }
+
     /// From the vector `context.supported` shape.
     pub fn from_json(v: Option<&Value>) -> Supported {
         let Some(v) = v else { return Supported::default() };

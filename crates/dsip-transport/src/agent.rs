@@ -87,7 +87,7 @@ pub struct Agent {
 impl Agent {
     /// Connect and bind.
     pub async fn connect(id: Identity, cfg: AgentConfig, resolver: StaticResolver) -> Result<Agent> {
-        let supported = Supported::default();
+        let supported = Supported::all_known();
         let mut seen = SeenIds::default();
         let conn = Connection::connect(&Self::params(&id, &cfg, &supported), &resolver, &mut seen).await?;
         let keys = IdentityKeys {
@@ -170,6 +170,14 @@ impl Agent {
     /// A fresh ULID.
     pub fn new_id(&mut self) -> String {
         self.core.new_id(now_s())
+    }
+
+    /// Sign and send an application-built payload (publish / subscribe / provenance, …).
+    pub async fn send_payload(&mut self, payload: serde_json::Value, ttl: i64) -> Result<String> {
+        let frame = self.core.sign_payload(payload, now_s(), ttl)?;
+        let env = dsip_core::envelope::Envelope::from_frame(&frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
+        self.conn.send(&env).await?;
+        Ok(frame)
     }
 
     /// SDP for the next invite/answer/update (§16.3 transport binding object).

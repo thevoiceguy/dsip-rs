@@ -147,7 +147,7 @@ impl Endpoint {
         let resolver = StaticResolver::default();
         Ok(Endpoint {
             core: Core::new(keys, cfg, resolver.clone(), now as i64),
-            supported: dsip_core::version::Supported::default(),
+            supported: dsip_core::version::Supported::all_known(),
             resolver,
             seen: SeenIds::default(),
             hello_id: None,

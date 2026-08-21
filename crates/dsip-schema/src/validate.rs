@@ -15,7 +15,7 @@ use serde_json::Value;
 use dsip_core::registry::MESSAGE_TYPES;
 use dsip_core::{RejectCode, Verdict};
 
-use crate::embedded::{REACHABILITY_HINT, SCHEMAS};
+use crate::embedded::{BROADCAST_PROVENANCE, REACHABILITY_HINT, SCHEMAS};
 
 /// Names of the embedded spec schemas.
 pub const SCHEMA_NAMES: &[&str] = &[
@@ -27,7 +27,8 @@ fn compiled() -> &'static HashMap<&'static str, Validator> {
     static CELL: OnceLock<HashMap<&'static str, Validator>> = OnceLock::new();
     CELL.get_or_init(|| {
         let mut m = HashMap::new();
-        for (name, text) in SCHEMAS.iter().chain(std::iter::once(&("reachability-hint", REACHABILITY_HINT))) {
+        let extra = [("reachability-hint", REACHABILITY_HINT), ("broadcast-provenance", BROADCAST_PROVENANCE)];
+        for (name, text) in SCHEMAS.iter().chain(extra.iter()) {
             if *name == "message" {
                 continue; // relative $refs; dispatched natively instead
             }
@@ -56,12 +57,21 @@ pub fn validate_against(name: &str, instance: &Value) -> Result<(), String> {
     }
 }
 
-/// Stage 13: dispatch on `type` and validate. `unknown-type` for types outside the message set.
+/// Implementation-local payload types (not in the §12.1 message set) and their schemas.
+pub const LOCAL_TYPES: &[(&str, &str)] = &[("reachability-hint", "reachability-hint"), ("broadcast.provenance", "broadcast-provenance")];
+
+/// Stage 13: dispatch on `type` and validate. `unknown-type` for types outside the message set
+/// (and the implementation-local extension types listed in [`LOCAL_TYPES`]).
 pub fn validate(payload: &Value) -> Verdict {
-    let Some(t) = payload.get("type").and_then(Value::as_str).filter(|t| MESSAGE_TYPES.contains(t)) else {
+    let Some(t) = payload.get("type").and_then(Value::as_str) else { return Verdict::reject(RejectCode::UnknownType) };
+    let schema = if MESSAGE_TYPES.contains(&t) {
+        t
+    } else if let Some((_, s)) = LOCAL_TYPES.iter().find(|(lt, _)| *lt == t) {
+        s
+    } else {
         return Verdict::reject(RejectCode::UnknownType);
     };
-    match validate_against(t, payload) {
+    match validate_against(schema, payload) {
         Ok(()) => Verdict::accept(),
         Err(e) => Verdict::reject(RejectCode::SchemaInvalid).detail(e),
     }

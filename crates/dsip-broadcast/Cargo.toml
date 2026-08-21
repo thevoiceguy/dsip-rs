@@ -1,0 +1,15 @@
+[package]
+name = "dsip-broadcast"
+description = "DSIP Verified Broadcast (§22) and subscription protocol (§9.3): authority registry, subscriber state, receiver verification with provenance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+dsip-schema.workspace = true
+dsip-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true

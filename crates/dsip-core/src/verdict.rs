@@ -42,6 +42,8 @@ pub enum RejectCode {
     GrantUnknownIntroduction,
     HelloInReplyToMismatch,
     HintSubjectMismatch,
+    PublisherMismatch,
+    StreamIdNamespace,
 }
 
 /// The outcome of a pipeline stage.
