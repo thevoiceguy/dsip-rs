@@ -1,31 +1,25 @@
-//! The endpoint agent: a `dsip_session::Endpoint` driven over a live `ws/1.0` connection.
+//! The native agent: a [`dsip_endpoint::Core`] over a live `ws/1.0` connection with file persistence.
 //!
-//! Spec: §12 (the engine), §13.2 (delivery over one connection, many
-//! sessions), §14.2 (invite carries an offer; answer is a selection), §14.4
-//! (screening selection), §16.2 (structured media descriptors), §12.12
-//! (`info` carries transport data). The agent owns payload construction:
-//! the engine decides *what* to send; this module decides *what it contains*.
+//! Spec: §13.2 (one connection, many sessions; reconnection with a fresh
+//! `hello`), §19.4 (grants persist across restarts). All protocol logic lives in
+//! `dsip-endpoint`; this module adds the socket, the wall clock, and the disk.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
-use serde_json::{json, Value};
+use anyhow::Result;
 
 use dsip_core::did::StaticResolver;
-use dsip_core::envelope::{sign_bytes, Envelope};
-use dsip_core::ulid::Ulid;
-use dsip_core::version::{version_block, Supported};
-use dsip_session::event::SendMsg;
-use dsip_session::{Emission, Endpoint, EndpointConfig, Event, LocalEvent, Message};
+use dsip_core::version::Supported;
+use dsip_endpoint::{ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys};
+use dsip_session::{Emission, Endpoint, LocalEvent, Message};
 
 use crate::conn::{ConnectParams, Connection};
 use crate::identity::Identity;
-use crate::verify::{verify_frame, SeenIds};
+use crate::verify::SeenIds;
 use crate::{now_s, BACKOFF};
 
 /// Interactive Media Profile identifier. Spec: §17.
-pub const PROFILE: &str = "interactive-media/1.0";
+pub const PROFILE: &str = dsip_endpoint::core::PROFILE;
 
 /// Something the application should know about.
 #[derive(Debug)]
@@ -45,9 +39,9 @@ pub enum AgentEvent {
     Received {
         /// The abbreviated message.
         message: Message,
-        /// The signer's identity (subject of a presented, valid delegation, or the signer itself).
+        /// The signer's identity.
         identity: String,
-        /// Display name claim from `identity.display_name`, if any.
+        /// Display name claim, if any.
         display_name: Option<String>,
     },
     /// An inbound frame was rejected (code, detail).
@@ -77,25 +71,6 @@ pub struct AgentConfig {
     pub first_contact_required: bool,
 }
 
-/// Persisted first-contact state (`contacts.json` in the identity directory).
-///
-/// Spec: §19.4 — "The recipient's endpoint and relay record the grant; the grantee also holds the signed grant."
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ContactFile {
-    /// Identities admitted without a grant.
-    #[serde(default)]
-    pub allow: Vec<String>,
-    /// Grants we issued.
-    #[serde(default)]
-    pub grants_issued: std::collections::BTreeMap<String, dsip_session::endpoint::Grant>,
-    /// Grants we hold.
-    #[serde(default)]
-    pub grants_held: std::collections::BTreeMap<String, dsip_session::endpoint::Grant>,
-    /// Learned device → identity mapping.
-    #[serde(default)]
-    pub identities: std::collections::BTreeMap<String, String>,
-}
-
 /// The agent.
 pub struct Agent {
     id: Identity,
@@ -103,13 +78,7 @@ pub struct Agent {
     supported: Supported,
     resolver: StaticResolver,
     conn: Connection,
-    ep: Endpoint,
-    seen: SeenIds,
-    /// Offers by session id (invite) or update id, ours and theirs, for building selections and checking subsets.
-    offers: HashMap<String, Value>,
-    /// Delegations learned from peers' headers (device → delegation), verified at use.
-    peer_delegations: Vec<Envelope>,
-    /// Pending `answered_by` for the next answer we build per session.
+    core: Core,
     events: Vec<AgentEvent>,
 }
 
@@ -119,39 +88,25 @@ impl Agent {
         let supported = Supported::default();
         let mut seen = SeenIds::default();
         let conn = Connection::connect(&Self::params(&id, &cfg, &supported), &resolver, &mut seen).await?;
-        let mut ep = Endpoint::new(Self::ep_config(&id, &cfg));
-        // Seed persisted contacts (§19.4) so grants survive restarts.
-        let file = Self::load_contacts(&id.dir);
-        for a in &file.allow {
-            ep.contacts.allow.insert(a.clone());
-        }
-        ep.contacts.grants_issued = file.grants_issued.clone();
-        ep.contacts.grants_held = file.grants_held.clone();
-        for (d, i) in &file.identities {
-            ep.learn_identity(d, i);
-        }
-        Ok(Agent { id, cfg, supported, resolver, conn, ep, seen, offers: HashMap::new(), peer_delegations: vec![], events: vec![] })
-    }
-
-    fn load_contacts(dir: &std::path::Path) -> ContactFile {
-        std::fs::read(dir.join("contacts.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
-    }
-
-    /// Persist first-contact state to the identity directory.
-    pub fn save_contacts(&self) -> Result<()> {
-        let file = ContactFile {
-            allow: self.ep.contacts.allow.iter().cloned().collect(),
-            grants_issued: self.ep.contacts.grants_issued.clone(),
-            grants_held: self.ep.contacts.grants_held.clone(),
-            identities: self.ep.identities().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        let keys = IdentityKeys {
+            identity: id.meta.identity.clone(),
+            device: id.device.clone(),
+            delegation: id.delegation.clone(),
+            display_name: id.meta.display_name.clone(),
         };
-        std::fs::write(self.id.dir.join("contacts.json"), serde_json::to_string_pretty(&file)?)?;
-        Ok(())
-    }
-
-    /// Pending introductions (id → identity).
-    pub fn requests(&self) -> Vec<(String, String)> {
-        self.ep.contacts.requests.iter().map(|(k, (i, _))| (k.clone(), i.clone())).collect()
+        let core_cfg = CoreConfig {
+            video: cfg.video,
+            t_establish: cfg.t_establish,
+            t_ring: cfg.t_ring,
+            t_ring_local: cfg.t_ring_local,
+            first_contact_required: cfg.first_contact_required,
+        };
+        let mut core = Core::new(keys, core_cfg, resolver.clone(), now_s());
+        // Seed persisted contacts (§19.4) so grants survive restarts.
+        let file: ContactFile =
+            std::fs::read(id.dir.join("contacts.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        core.load_contacts(&file);
+        Ok(Agent { id, cfg, supported, resolver, conn, core, events: vec![] })
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -165,22 +120,15 @@ impl Agent {
         }
     }
 
-    fn ep_config(id: &Identity, cfg: &AgentConfig) -> EndpointConfig {
-        let mut c = EndpointConfig::from_vector(&json!({
-            "self": {"device": id.meta.device, "identity": id.meta.identity},
-            "start": now_s(),
-        }));
-        if let Some(t) = cfg.t_establish {
-            c.t_establish = t.clamp(5, 60);
-        }
-        if let Some(t) = cfg.t_ring {
-            c.t_ring = t.clamp(30, 300);
-        }
-        if let Some(t) = cfg.t_ring_local {
-            c.t_ring_local = t.clamp(30, 300);
-        }
-        c.first_contact_required = cfg.first_contact_required;
-        c
+    /// Persist first-contact state to the identity directory.
+    pub fn save_contacts(&self) -> Result<()> {
+        std::fs::write(self.id.dir.join("contacts.json"), serde_json::to_string_pretty(&self.core.contacts())?)?;
+        Ok(())
+    }
+
+    /// Pending introductions (id → identity).
+    pub fn requests(&self) -> Vec<(String, String)> {
+        self.core.requests()
     }
 
     /// Relay identity and capabilities.
@@ -200,7 +148,7 @@ impl Agent {
 
     /// Read-only engine access (for printing state).
     pub fn endpoint(&self) -> &Endpoint {
-        &self.ep
+        self.core.endpoint()
     }
 
     /// Close the connection gracefully (WebSocket close + TLS close_notify).
@@ -212,24 +160,42 @@ impl Agent {
 
     /// Place a call; returns the new session id.
     pub async fn place_call(&mut self, to: &str) -> Result<String> {
-        let sid = Ulid::generate().to_string();
+        let sid = self.core.new_id(now_s());
         self.local(LocalEvent::PlaceCall { session: sid.clone(), to: to.to_string() }).await?;
         Ok(sid)
     }
 
-    /// Drive a local event through the engine and act on its emissions.
+    /// A fresh ULID.
+    pub fn new_id(&mut self) -> String {
+        self.core.new_id(now_s())
+    }
+
+    /// Drive a local event through the core and act on its output.
     pub async fn local(&mut self, ev: LocalEvent) -> Result<()> {
-        self.tick_and_handle().await?;
-        let emissions = self.ep.step(&Event::Local(ev));
-        self.handle(emissions).await
+        let out = self.core.local(ev, now_s())?;
+        self.dispatch(out).await
     }
 
     /// Advance the engine clock to wall time (fires due timers) and act on emissions.
     pub async fn tick_and_handle(&mut self) -> Result<()> {
-        let delta = now_s() - self.ep.now;
-        if delta > 0 {
-            let emissions = self.ep.step(&Event::Advance { advance: delta });
-            self.handle(emissions).await?;
+        let out = self.core.tick(now_s())?;
+        self.dispatch(out).await
+    }
+
+    async fn dispatch(&mut self, out: Vec<CoreEvent>) -> Result<()> {
+        for e in out {
+            match e {
+                CoreEvent::Send { frame, msg_type, session, to } => {
+                    let env = dsip_core::envelope::Envelope::from_frame(&frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
+                    self.conn.send(&env).await?;
+                    self.events.push(AgentEvent::Sent { msg_type, session, to });
+                }
+                CoreEvent::Emission(em) => self.events.push(AgentEvent::Emission(em)),
+                CoreEvent::Received { message, identity, display_name, .. } => {
+                    self.events.push(AgentEvent::Received { message, identity, display_name })
+                }
+                CoreEvent::Rejected { code, detail } => self.events.push(AgentEvent::Rejected(code, detail)),
+            }
         }
         Ok(())
     }
@@ -241,10 +207,13 @@ impl Agent {
             if !self.events.is_empty() {
                 return Ok(std::mem::take(&mut self.events));
             }
-            let wait = self.ep.next_deadline().map(|d| (d - now_s()).max(0) as u64).unwrap_or(3600);
+            let wait = self.core.endpoint().next_deadline().map(|d| (d - now_s()).max(0) as u64).unwrap_or(3600);
             tokio::select! {
                 frame = self.conn.recv() => match frame {
-                    Ok(Some(text)) => self.inbound(&text).await?,
+                    Ok(Some(text)) => {
+                        let out = self.core.inbound(&text, now_s())?;
+                        self.dispatch(out).await?;
+                    }
                     Ok(None) => self.reconnect().await?,
                     Err(e) => {
                         tracing::warn!("connection error: {e}");
@@ -261,11 +230,12 @@ impl Agent {
         // §13.2: exponential backoff with jitter, fresh hello; sessions are unaffected.
         let (mut delay, factor, max) = BACKOFF;
         let mut attempts = 0u32;
+        let mut seen = SeenIds::default();
         loop {
             attempts += 1;
             let jitter = Duration::from_millis((now_s() as u64 * 7919 + attempts as u64 * 104_729) % (delay * 1000));
             tokio::time::sleep(jitter).await;
-            match Connection::connect(&Self::params(&self.id, &self.cfg, &self.supported), &self.resolver, &mut self.seen).await {
+            match Connection::connect(&Self::params(&self.id, &self.cfg, &self.supported), &self.resolver, &mut seen).await {
                 Ok(c) => {
                     self.conn = c;
                     self.events.push(AgentEvent::Reconnected { attempts });
@@ -277,189 +247,5 @@ impl Agent {
                 }
             }
         }
-    }
-
-    // ------------------------------------------------------------ inbound
-
-    async fn inbound(&mut self, frame: &str) -> Result<()> {
-        let sem = dsip_schema::SemanticContext { supported: self.supported.clone(), ..Default::default() };
-        let inbound = match verify_frame(frame, now_s(), &self.resolver, &self.peer_delegations, &mut self.seen, &sem) {
-            Ok(i) => i,
-            Err(v) => {
-                self.events.push(AgentEvent::Rejected(format!("{:?}", v.code), v.detail.unwrap_or_default()));
-                return Ok(());
-            }
-        };
-        let p = &inbound.verified.payload;
-        // Learn the signer's identity from a presented delegation (header), verified against the signer.
-        let signer = inbound.verified.signer_did.clone();
-        let mut identity = inbound.verified.identity.clone();
-        for d in &inbound.verified.header.delegations {
-            if let Some((subject, device)) = dsip_core::delegation::names(d) {
-                if device == signer {
-                    let ctx = dsip_core::envelope::Context::new(now_s(), &self.resolver);
-                    if dsip_core::delegation::verify_delegation(d, &subject, &device, &ctx).ok() {
-                        identity = subject;
-                        self.ep.learn_identity(&device, &identity);
-                        if !self.peer_delegations.contains(d) {
-                            self.peer_delegations.push(d.clone());
-                        }
-                    }
-                }
-            }
-        }
-        // Subset check for answers against the offer we hold (check 9)
-        if p["type"] == "answer" {
-            let key = p.get("in_reply_to").and_then(Value::as_str).or(p.get("session").and_then(Value::as_str)).unwrap_or("");
-            if let Some(offer) = self.offers.get(key) {
-                if !dsip_schema::selection_is_subset(p, offer) {
-                    self.events.push(AgentEvent::Rejected("selection-not-subset".into(), key.into()));
-                    return Ok(());
-                }
-            }
-        }
-        // Remember offers we receive (invite/update) so our answers select from them
-        if p["type"] == "invite" || p["type"] == "update" {
-            self.offers.insert(p["id"].as_str().unwrap_or("").to_string(), json!({"media": p["media"], "transports": p["transports"]}));
-        }
-        let msg = Message::from_payload(p).context("payload shape")?;
-        let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
-        self.events.push(AgentEvent::Received { message: msg.clone(), identity, display_name });
-        self.tick_and_handle().await?;
-        let emissions = self.ep.step(&Event::Recv { recv: msg });
-        self.handle(emissions).await
-    }
-
-    // ------------------------------------------------------------ outbound
-
-    async fn handle(&mut self, emissions: Vec<Emission>) -> Result<()> {
-        for e in emissions {
-            match e {
-                Emission::Send(m) => {
-                    let env = self.build(&m)?;
-                    self.conn.send(&env).await?;
-                    self.events.push(AgentEvent::Sent {
-                        msg_type: m.msg_type.clone(),
-                        session: m.session.clone().or_else(|| m.id.clone()).unwrap_or_default(),
-                        to: m.to.clone(),
-                    });
-                }
-                other => self.events.push(AgentEvent::Emission(other)),
-            }
-        }
-        Ok(())
-    }
-
-    fn media_offer(&self) -> Value {
-        let mut media = vec![json!({"type": "audio", "direction": "sendrecv",
-            "codecs": [{"id": "codec:audio/opus", "sample_rates": [48000], "channels": [1, 2]}]})];
-        if self.cfg.video {
-            media.push(json!({"type": "video", "direction": "sendrecv", "codecs": [{"id": "codec:video/h264", "profiles": ["baseline"]}]}));
-        }
-        json!({"media": media, "transports": [{"id": "transport:webrtc", "ice": "trickle"}]})
-    }
-
-    /// A selection from `offer`: first codec per descriptor; screening → audio recvonly only (§14.4).
-    fn selection(offer: &Value, screening: bool) -> Value {
-        let mut media = vec![];
-        for m in offer["media"].as_array().into_iter().flatten() {
-            if screening && m["type"] != "audio" {
-                continue;
-            }
-            let direction = if screening { "recvonly" } else { m["direction"].as_str().unwrap_or("sendrecv") };
-            let codec = m["codecs"].as_array().and_then(|c| c.first()).cloned().unwrap_or(json!({}));
-            let mut d = json!({"type": m["type"], "direction": direction, "codecs": [{"id": codec["id"]}]});
-            if let Some(p) = m.get("purpose") {
-                d["purpose"] = p.clone();
-            }
-            media.push(d);
-        }
-        let transport = offer["transports"].as_array().and_then(|t| t.first()).cloned().unwrap_or(json!({"id": "transport:webrtc"}));
-        json!({"media": media, "transports": [{"id": transport["id"]}]})
-    }
-
-    fn build(&mut self, m: &SendMsg) -> Result<Envelope> {
-        let now = now_s();
-        let session = m.session.clone().unwrap_or_default();
-        let id = m.id.clone().unwrap_or_else(|| if m.msg_type == "invite" { session.clone() } else { Ulid::generate().to_string() });
-        let profiles: &[&str] = if m.msg_type == "error" { &[] } else { &[PROFILE] };
-        let mut p = json!({
-            "dsip": version_block(&self.supported, profiles),
-            "type": m.msg_type, "id": id, "from": self.id.meta.device, "to": m.to,
-        });
-        if let Some(s) = &m.session {
-            if m.msg_type != "invite" {
-                p["session"] = s.clone().into();
-            }
-        }
-        for (k, v) in &m.extra {
-            p[*k] = v.clone();
-        }
-        match m.msg_type.as_str() {
-            "introduction" => {
-                // §19.4: media-less, session-less; identity and purpose are claims; up to 7 days validity
-                p["identity"] = json!({"display_name": self.id.meta.display_name, "claims": []});
-                p["issued_at"] = now.into();
-                p["expires_at"] = (now + 604_800).into();
-                return Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.id.device, &self.id.device.kid(), vec![self.id.delegation.clone()]));
-            }
-            "grant" => {}
-            "invite" => {
-                let offer = self.media_offer();
-                self.offers.insert(session.clone(), offer.clone());
-                p["intent"] = "interactive".into();
-                p["identity"] = json!({"display_name": self.id.meta.display_name, "claims": []});
-                p["media"] = offer["media"].clone();
-                p["transports"] = offer["transports"].clone();
-                p["policy"] = json!({"recording": "consent-required", "ai_processing": "denied"});
-            }
-            "progress" => {
-                p["status"] = m.status.clone().unwrap_or_else(|| "ringing".into()).into();
-                if let Some(rt) = m.ring_timeout {
-                    p["ring_timeout"] = rt.into();
-                }
-            }
-            "answer" => {
-                let key = m.in_reply_to.clone().unwrap_or_else(|| session.clone());
-                let offer = self.offers.get(&key).cloned().unwrap_or_else(|| self.media_offer());
-                let screening = m.answered_by.as_deref() == Some("screening");
-                let sel = Self::selection(&offer, screening);
-                p["answered_by"] = m.answered_by.clone().unwrap_or_else(|| "user".into()).into();
-                p["media"] = sel["media"].clone();
-                p["transports"] = sel["transports"].clone();
-                if let Some(irt) = &m.in_reply_to {
-                    p["in_reply_to"] = irt.clone().into();
-                }
-            }
-            "reject" | "cancel" | "bye" | "error" => {
-                p["reason"] = m.reason.clone().unwrap_or_else(|| "session.failed".into()).into();
-                if let Some(irt) = &m.in_reply_to {
-                    p["in_reply_to"] = irt.clone().into();
-                }
-            }
-            "update" => {
-                // Offer escalation: full sendrecv audio (+ video) from this sender
-                let mut offer = self.media_offer();
-                if !self.cfg.video {
-                    offer["media"].as_array_mut().expect("array").push(json!({"type": "video", "direction": "sendrecv",
-                        "codecs": [{"id": "codec:video/h264", "profiles": ["baseline"]}]}));
-                }
-                self.offers.insert(id.clone(), offer.clone());
-                p["media"] = offer["media"].clone();
-                p["transports"] = offer["transports"].clone();
-                if let Some(ab) = &m.answered_by {
-                    p["answered_by"] = ab.clone().into();
-                }
-            }
-            "info" => {
-                p["about"] = "transport:webrtc".into();
-                p["data"] = json!({"candidates": [], "end_of_candidates": true});
-            }
-            other => anyhow::bail!("engine asked to send unsupported type {other}"),
-        }
-        p["issued_at"] = now.into();
-        p["expires_at"] = (now + 30).into();
-        // The device signs; its delegation rides in the header so peers can learn and verify the identity (spec-gap 8).
-        Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.id.device, &self.id.device.kid(), vec![self.id.delegation.clone()]))
     }
 }

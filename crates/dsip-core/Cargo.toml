@@ -16,3 +16,9 @@ base64.workspace = true
 bs58.workspace = true
 sha2.workspace = true
 rand.workspace = true
+getrandom = { workspace = true, optional = true }
+
+[features]
+default = []
+## Browser builds: route OS randomness through `crypto.getRandomValues`.
+wasm = ["dep:getrandom"]

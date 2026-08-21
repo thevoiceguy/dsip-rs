@@ -29,7 +29,7 @@ impl Default for Supported {
 impl Supported {
     /// From the vector `context.supported` shape.
     pub fn from_json(v: Option<&Value>) -> Supported {
-        let Some(v) = v else { return Supported { core: "1.0".into(), profiles: vec![], extensions: vec![] } };
+        let Some(v) = v else { return Supported::default() };
         let strs = |k: &str| {
             v.get(k)
                 .and_then(Value::as_array)

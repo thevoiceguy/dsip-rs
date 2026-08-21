@@ -963,8 +963,9 @@ impl Endpoint {
                 self.end(&sid, Some(&reason), false);
             }
             SessionState::Active => {
-                if !s.post_answer_seen {
-                    // §12.5 rule 2: crossed cancel — teardown, no error. Impl (spec-gap 1).
+                if reason != "session.answered-elsewhere" && !s.post_answer_seen {
+                    // §12.5 rule 2: crossed cancel — teardown, no error. Impl (spec-gap 1): only a
+                    // withdrawal of intent can be "crossed"; answered-elsewhere at the answering leg is misrouted.
                     self.end(&sid, Some(&reason), true);
                 } else {
                     // §12.4/§12.11: cancel for an ACTIVE session

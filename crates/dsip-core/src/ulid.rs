@@ -56,16 +56,21 @@ impl Ulid {
         Ulid(String::from_utf8(out.to_vec()).expect("ascii"))
     }
 
-    /// A fresh ULID for "now" with OS randomness.
+    /// A fresh ULID for "now" with OS randomness (not available on wasm32; use [`Ulid::generate_at`]).
     pub fn generate() -> Ulid {
-        use rand::RngCore;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        Ulid::generate_at(ts)
+    }
+
+    /// A fresh ULID with a caller-supplied millisecond timestamp and OS randomness.
+    pub fn generate_at(ts_ms: u64) -> Ulid {
+        use rand::RngCore;
         let mut r = [0u8; 10];
         rand::thread_rng().fill_bytes(&mut r);
-        Ulid::from_parts(ts, r)
+        Ulid::from_parts(ts_ms, r)
     }
 
     /// The string form.

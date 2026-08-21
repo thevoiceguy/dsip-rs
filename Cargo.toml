@@ -4,7 +4,9 @@ members = [
     "crates/dsip-core",
     "crates/dsip-schema",
     "crates/dsip-session",
+    "crates/dsip-endpoint",
     "crates/dsip-transport",
+    "crates/dsip-wasm",
     "crates/dsip-dht",
     "crates/dsip-relay",
     "crates/dsip-cli",
@@ -21,6 +23,7 @@ rust-version = "1.85"
 dsip-core = { path = "crates/dsip-core" }
 dsip-schema = { path = "crates/dsip-schema" }
 dsip-session = { path = "crates/dsip-session" }
+dsip-endpoint = { path = "crates/dsip-endpoint" }
 dsip-transport = { path = "crates/dsip-transport" }
 dsip-dht = { path = "crates/dsip-dht" }
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +34,10 @@ base64 = "0.22"
 bs58 = "0.5"
 sha2 = "0.10"
 rand = "0.8"
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
 jsonschema = { version = "0.50", default-features = false }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

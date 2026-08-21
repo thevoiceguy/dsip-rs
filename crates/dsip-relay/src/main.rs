@@ -38,6 +38,8 @@ use dsip_transport::conn::ws_config;
 use dsip_transport::verify::{verify_frame, Inbound, SeenIds};
 use dsip_transport::{now_s, tls, HELLO_TIMEOUT_S};
 
+mod www;
+
 #[derive(Parser)]
 #[command(name = "dsip-relay", version, about = "DSIP Phase 1 relay (ws/1.0, forking, no store-and-forward)")]
 struct Args {
@@ -59,6 +61,9 @@ struct Args {
     /// Maximum queued introductions per recipient inbox (§13.3 store-and-forward boundary).
     #[arg(long, default_value_t = 100)]
     inbox_cap: usize,
+    /// Serve static files from this directory on the same TLS port (browser demo; one origin, one cert).
+    #[arg(long)]
+    www: Option<PathBuf>,
 }
 
 type Tx = mpsc::UnboundedSender<String>;
@@ -307,25 +312,38 @@ async fn main() -> Result<()> {
         inbox_cap: args.inbox_cap,
     }));
 
+    if let Some(w) = &args.www {
+        tracing::info!("serving {} at https://{}/", w.display(), args.listen);
+    }
+    let www = args.www.clone();
     let listener = TcpListener::bind(args.listen).await.with_context(|| format!("binding {}", args.listen))?;
     loop {
         let (tcp, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let state = state.clone();
+        let www = www.clone();
         tokio::spawn(async move {
             match acceptor.accept(tcp).await {
-                Ok(tls_stream) => {
-                    if let Err(e) = serve(tls_stream, peer, state).await {
-                        tracing::info!("{peer}: {e}");
+                Ok(tls_stream) => match www::dispatch(tls_stream, www.as_deref()).await {
+                    Ok(www::First::WebSocket(stream)) => {
+                        if let Err(e) = serve(stream, peer, state).await {
+                            tracing::info!("{peer}: {e}");
+                        }
                     }
-                }
+                    Ok(www::First::Served) => {}
+                    Err(e) => tracing::info!("{peer}: {e}"),
+                },
                 Err(e) => tracing::info!("{peer}: TLS handshake failed: {e}"),
             }
         });
     }
 }
 
-async fn serve(stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>, peer: SocketAddr, state: Arc<Mutex<State>>) -> Result<()> {
+async fn serve(
+    stream: www::Prefixed<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    peer: SocketAddr,
+    state: Arc<Mutex<State>>,
+) -> Result<()> {
     let mut ws = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config())).await?;
 
     // --- hello phase (§13.2): first envelope, within HELLO_TIMEOUT_S

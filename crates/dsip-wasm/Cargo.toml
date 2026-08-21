@@ -1,0 +1,21 @@
+[package]
+name = "dsip-wasm"
+description = "DSIP endpoint core for the browser: verifier, §12 engine, payload builder via wasm-bindgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dsip-core = { workspace = true, features = ["wasm"] }
+dsip-schema.workspace = true
+dsip-session.workspace = true
+dsip-endpoint = { workspace = true, features = ["wasm"] }
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+console_error_panic_hook.workspace = true

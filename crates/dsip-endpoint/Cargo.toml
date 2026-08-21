@@ -1,0 +1,20 @@
+[package]
+name = "dsip-endpoint"
+description = "IO-free DSIP endpoint core: verify inbound frames, drive the §12 engine, build and sign outbound payloads. Shared by the native agent and the WASM build."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+dsip-schema.workspace = true
+dsip-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[features]
+default = []
+wasm = ["dsip-core/wasm"]

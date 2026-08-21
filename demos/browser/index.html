@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DSIP browser endpoint</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>DSIP <span class="muted">browser endpoint</span></h1>
+  <div class="muted small">Same verifier, same §12 engine as the native CLI — compiled to WebAssembly. Signaling over <code>wss</code> to this relay; media over WebRTC (DTLS-SRTP). Open this page in two tabs with different <code>?as=</code> names to call yourself.</div>
+</header>
+
+<main>
+<section id="identity" class="card">
+  <h2>Identity <span class="tag">§7.3 · §7.4</span></h2>
+  <div class="row"><label>slot</label><code id="slot"></code></div>
+  <div class="row"><label>display name</label><input id="name" placeholder="Alice"> <button id="save-name">save</button> <span class="muted small">a claim, not truth (§18.2)</span></div>
+  <div class="row"><label>identity</label><code id="did-identity" class="did"></code></div>
+  <div class="row"><label>device</label><code id="did-device" class="did"></code> <span class="muted small">signs every envelope; delegation rides in each header</span></div>
+  <div class="row"><label>relay</label><code id="relay-status">connecting…</code></div>
+  <div class="row"><label>policy</label><label class="small"><input type="checkbox" id="first-contact"> require first contact (§19.4)</label></div>
+</section>
+
+<section id="call" class="card">
+  <h2>Call <span class="tag">§12 · §14</span></h2>
+  <div class="row"><label>callee DID</label><input id="callee" placeholder="did:key:z6Mk…" size="60"></div>
+  <div class="row">
+    <button id="btn-call">call (audio)</button>
+    <button id="btn-call-video">call (audio+video)</button>
+    <button id="btn-introduce">introduce</button>
+  </div>
+  <div id="incoming" class="hidden notice">
+    <div><strong>Incoming call</strong> from <code id="in-identity" class="did"></code></div>
+    <div class="small">display name claim: <em id="in-name"></em> <span class="muted">(unverified, §18.2)</span></div>
+    <div class="small">verified: delegated device <code id="in-device" class="did"></code> ✓ signature · delegation · replay · schema</div>
+    <div class="small" id="in-policy"></div>
+    <div class="small warn" id="in-unknown">⚠ unknown identity — no grant or prior contact</div>
+    <div class="row">
+      <button id="btn-accept">accept</button>
+      <button id="btn-screen">screen (answered_by: screening)</button>
+      <button id="btn-decline">decline</button>
+    </div>
+  </div>
+  <div id="active" class="hidden">
+    <div class="row"><label>session</label><code id="session-id"></code> <span id="session-state" class="tag"></span></div>
+    <div class="row">
+      <button id="btn-hangup">hang up</button>
+      <button id="btn-add-video">add video (update)</button>
+      <button id="btn-escalate" class="hidden">escalate to user (§14.4)</button>
+      <button id="btn-answer-update" class="hidden">accept update</button>
+      <button id="btn-reject-update" class="hidden">reject update</button>
+    </div>
+    <div class="videos">
+      <div><div class="small muted">local</div><video id="local" autoplay muted playsinline></video></div>
+      <div><div class="small muted">remote</div><video id="remote" autoplay playsinline></video></div>
+    </div>
+  </div>
+</section>
+
+<section id="requests" class="card">
+  <h2>Requests <span class="tag">§19.4</span> <span class="muted small">introductions never ring and never appear as calls</span></h2>
+  <ul id="request-list"><li class="muted small">none</li></ul>
+</section>
+
+<section id="log-card" class="card">
+  <h2>Log <span class="muted small">every transition with its spec section</span></h2>
+  <pre id="log"></pre>
+</section>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -18,7 +18,8 @@ pub mod conn;
 pub mod identity;
 pub mod resolver;
 pub mod tls;
-pub mod verify;
+/// Inbound verification (re-exported from `dsip-endpoint`, where it is shared with the WASM build).
+pub use dsip_endpoint::verify;
 
 /// Seconds of inactivity before the client sends a WebSocket Ping. Spec: §13.2 (RECOMMENDED 30 s).
 pub const PING_IDLE_S: u64 = 30;
