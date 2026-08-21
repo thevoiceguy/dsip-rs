@@ -1,6 +1,6 @@
 [package]
 name = "dsip-schema"
-description = "DSIP v0.6 JSON Schemas embedded at build time + stateless semantic checks"
+description = "DSIP v0.7 JSON Schemas embedded at build time + stateless semantic checks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

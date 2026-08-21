@@ -22,13 +22,24 @@ $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --auto accept --media t
 sleep 1.5
 echo "════════ alice ($BA) calls bob ($BB) with media (tone 440 Hz), talks 8 s, hangs up"
 $B/dsip call --identity "$D/alice" --relay $R --ca "$CA" --to "$BOB" --media tone:440 --record "$D/alice-heard-bob.ogg" --media-backend "$BA" \
-  --script "sleep 8; hangup; sleep 1; quit" | grep -E "^(→|←|  ◆|  ♫|  media|media)"
+  --script "sleep 8; hangup; sleep 1; quit" | tee "$D/alice.log" | grep -E "^(→|←|  ◆|  ♫|  media|media)"
 wait $P
 echo; echo "──── bob's side:"; grep -E "^(→|←|  ◆|  ♫|  media|media)" "$D/bob.log"
 echo; echo "──── recordings:"; ls -la "$D"/*.ogg
-python3 - "$D" <<'PY'
-import sys, pathlib
-for f in sorted(pathlib.Path(sys.argv[1]).glob("*.ogg")):
-    b = f.read_bytes()
-    print(f"{f.name}: {len(b)} bytes, {b.count(b'OggS')} Ogg pages, {'OpusHead ok' if b'OpusHead' in b else 'no OpusHead'}")
+# Self-check (also what CI asserts): both sides decrypted media, and both recordings are real Opus with enough pages.
+python3 - "$D" "$BA" "$BB" <<'PY'
+import sys, pathlib, re
+d, ba, bb = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+ok = True
+for f in sorted(d.glob("*.ogg")):
+    b = f.read_bytes(); pages = b.count(b"OggS")
+    good = b"OpusHead" in b and pages >= 50
+    ok &= good
+    print(f"{f.name}: {len(b)} bytes, {pages} Ogg pages, {'OpusHead ok' if b'OpusHead' in b else 'no OpusHead'}{'' if good else '   ✗ expected ≥ 50 pages'}")
+for who in ("alice", "bob"):
+    if "first inbound RTP packet" not in (d / f"{who}.log").read_text():
+        print(f"✗ {who} never decrypted inbound media"); ok = False
+if not ok:
+    print(f"MEDIA DEMO FAILED ({ba} → {bb})"); sys.exit(1)
+print(f"MEDIA DEMO OK ({ba} → {bb})")
 PY
