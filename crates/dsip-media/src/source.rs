@@ -118,9 +118,9 @@ pub async fn pump(source: Source, sending: Arc<AtomicBool>, frames: Arc<AtomicU6
                     }
                 };
                 while sending.load(Ordering::SeqCst) {
-                    let Some(page) = file.next_page() else { break };
+                    let Some(frame) = file.next_frame() else { break };
                     tick.tick().await;
-                    if !sink(page.freeze()).await {
+                    if !sink(frame).await {
                         return;
                     }
                     frames.fetch_add(1, Ordering::Relaxed);
