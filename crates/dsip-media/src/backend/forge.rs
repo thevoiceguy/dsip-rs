@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
-use forge_webrtc::{Direction, PeerConfig, PeerConnection, PeerEvent};
+use forge_webrtc::{Direction, PeerConfig, PeerConnection, PeerEvent, TransportConfig, TurnServer};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::leg::{Candidate, MediaConfig, MediaEvent, Stats};
@@ -50,6 +50,14 @@ impl ForgeLeg {
             direction,
             opus_pt: 111,
             dtmf: false,
+            transport: TransportConfig {
+                turn_servers: cfg
+                    .turn
+                    .iter()
+                    .map(|t| TurnServer::new(t.uri.clone(), t.username.clone(), t.password.clone()))
+                    .collect(),
+                ..TransportConfig::default()
+            },
             ..PeerConfig::default()
         })
         .await

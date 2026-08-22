@@ -1495,7 +1495,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 [[package]]
 name = "forge-codecs"
 version = "0.2.0"
-source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4#b674552e4d22ad206c49eedca556c79bf77affe4"
 dependencies = [
  "lazy_static",
  "thiserror 2.0.20",
@@ -1505,7 +1505,7 @@ dependencies = [
 [[package]]
 name = "forge-core"
 version = "0.2.0"
-source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4#b674552e4d22ad206c49eedca556c79bf77affe4"
 dependencies = [
  "chrono",
  "serde",
@@ -1520,7 +1520,7 @@ dependencies = [
 [[package]]
 name = "forge-ice"
 version = "0.2.0"
-source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4#b674552e4d22ad206c49eedca556c79bf77affe4"
 dependencies = [
  "bytes",
  "forge-core",
@@ -1528,6 +1528,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "if-addrs",
+ "md5",
  "rand 0.10.2",
  "serde",
  "sha1 0.11.0",
@@ -1541,7 +1542,7 @@ dependencies = [
 [[package]]
 name = "forge-rtp"
 version = "0.2.1"
-source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4#b674552e4d22ad206c49eedca556c79bf77affe4"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm 0.11.0",
@@ -1566,7 +1567,7 @@ dependencies = [
 [[package]]
 name = "forge-sdp"
 version = "0.2.0"
-source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4#b674552e4d22ad206c49eedca556c79bf77affe4"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1574,7 +1575,7 @@ dependencies = [
  "forge-ice",
  "forge-rtp",
  "rand 0.10.2",
- "sip-sdp 0.3.1 (git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1)",
+ "sip-sdp 0.3.1 (git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4)",
  "smol_str 0.3.6",
  "thiserror 2.0.20",
 ]
@@ -1582,7 +1583,7 @@ dependencies = [
 [[package]]
 name = "forge-webrtc"
 version = "0.3.0"
-source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4#b674552e4d22ad206c49eedca556c79bf77affe4"
 dependencies = [
  "bytes",
  "dashmap 6.2.1",
@@ -4605,7 +4606,7 @@ dependencies = [
 [[package]]
 name = "sip-sdp"
 version = "0.3.1"
-source = "git+https://github.com/thevoiceguy/forge-media?rev=ec4d766fd8fbfd21d43081cc3ececc39da5c72c1#ec4d766fd8fbfd21d43081cc3ececc39da5c72c1"
+source = "git+https://github.com/thevoiceguy/forge-media?rev=b674552e4d22ad206c49eedca556c79bf77affe4#b674552e4d22ad206c49eedca556c79bf77affe4"
 dependencies = [
  "nom",
  "smol_str 0.3.6",

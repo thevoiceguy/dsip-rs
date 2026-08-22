@@ -28,6 +28,7 @@ async fn run(a: Backend, b: Backend) {
         source: Source::Tone { hz: 440.0 },
         record: Some(dir.join("caller-heard.ogg")),
         stun: vec![],
+        turn: vec![],
         backend: a,
     })
     .await
@@ -36,6 +37,7 @@ async fn run(a: Backend, b: Backend) {
         source: Source::Tone { hz: 660.0 },
         record: Some(dir.join("callee-heard.ogg")),
         stun: vec![],
+        turn: vec![],
         backend: b,
     })
     .await

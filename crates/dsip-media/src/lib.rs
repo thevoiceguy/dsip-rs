@@ -33,5 +33,5 @@ pub mod leg;
 pub mod ogg;
 pub mod source;
 
-pub use leg::{Backend, Candidate, MediaConfig, MediaEvent, MediaLeg, Stats};
+pub use leg::{Backend, Candidate, MediaConfig, MediaEvent, MediaLeg, Stats, TurnConfig};
 pub use source::Source;

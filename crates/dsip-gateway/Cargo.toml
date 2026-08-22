@@ -16,9 +16,9 @@ serde_json.workspace = true
 dsip-session = { workspace = true, optional = true }
 dsip-endpoint = { workspace = true, optional = true }
 dsip-transport = { workspace = true, optional = true }
-forge-webrtc = { git = "https://github.com/thevoiceguy/forge-media", rev = "ec4d766fd8fbfd21d43081cc3ececc39da5c72c1", optional = true }
-forge-rtp = { git = "https://github.com/thevoiceguy/forge-media", rev = "ec4d766fd8fbfd21d43081cc3ececc39da5c72c1", optional = true }
-forge-codecs = { git = "https://github.com/thevoiceguy/forge-media", rev = "ec4d766fd8fbfd21d43081cc3ececc39da5c72c1", optional = true }
+forge-webrtc = { git = "https://github.com/thevoiceguy/forge-media", rev = "b674552e4d22ad206c49eedca556c79bf77affe4", optional = true }
+forge-rtp = { git = "https://github.com/thevoiceguy/forge-media", rev = "b674552e4d22ad206c49eedca556c79bf77affe4", optional = true }
+forge-codecs = { git = "https://github.com/thevoiceguy/forge-media", rev = "b674552e4d22ad206c49eedca556c79bf77affe4", optional = true }
 sip-core = { git = "https://github.com/thevoiceguy/siphon-rs", rev = "8350fd71123f8033e19adf7214d2d2704e9fbd5d", optional = true }
 sip-parse = { git = "https://github.com/thevoiceguy/siphon-rs", rev = "8350fd71123f8033e19adf7214d2d2704e9fbd5d", optional = true }
 sip-uac = { git = "https://github.com/thevoiceguy/siphon-rs", rev = "8350fd71123f8033e19adf7214d2d2704e9fbd5d", optional = true }

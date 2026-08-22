@@ -51,10 +51,19 @@ impl WebRtcRsLeg {
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut me).context("interceptors")?;
         let api = APIBuilder::new().with_media_engine(me).with_interceptor_registry(registry).build();
-        let config = RTCConfiguration {
-            ice_servers: if cfg.stun.is_empty() { vec![] } else { vec![RTCIceServer { urls: cfg.stun.clone(), ..Default::default() }] },
-            ..Default::default()
-        };
+        let mut ice_servers = Vec::new();
+        if !cfg.stun.is_empty() {
+            ice_servers.push(RTCIceServer { urls: cfg.stun.clone(), ..Default::default() });
+        }
+        for t in &cfg.turn {
+            ice_servers.push(RTCIceServer {
+                urls: vec![t.uri.clone()],
+                username: t.username.clone(),
+                credential: t.password.clone(),
+                ..Default::default()
+            });
+        }
+        let config = RTCConfiguration { ice_servers, ..Default::default() };
         let pc = Arc::new(api.new_peer_connection(config).await.context("peer connection")?);
         let (tx, events) = mpsc::unbounded_channel();
 

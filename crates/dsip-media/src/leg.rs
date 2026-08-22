@@ -87,6 +87,18 @@ pub struct Candidate {
     pub sdp_m_line_index: Option<u16>,
 }
 
+/// A TURN server for relay candidates (RFC 8656): the fallback path when STUN
+/// cannot punch a route (symmetric NAT on both ends).
+#[derive(Debug, Clone)]
+pub struct TurnConfig {
+    /// `turn:host:port` (or a bare `host:port`).
+    pub uri: String,
+    /// Long-term-credential username.
+    pub username: String,
+    /// Long-term-credential password.
+    pub password: String,
+}
+
 /// Leg configuration.
 #[derive(Debug, Clone)]
 pub struct MediaConfig {
@@ -96,6 +108,8 @@ pub struct MediaConfig {
     pub record: Option<PathBuf>,
     /// STUN servers (empty for loopback demos).
     pub stun: Vec<String>,
+    /// TURN servers for relay candidates (empty = STUN-only).
+    pub turn: Vec<TurnConfig>,
     /// Media stack.
     pub backend: Backend,
 }

@@ -50,6 +50,8 @@ pub struct ConsoleOpts {
     pub record: Option<PathBuf>,
     /// STUN servers.
     pub stun: Vec<String>,
+    /// TURN servers for relay candidates.
+    pub turn: Vec<dsip_media::TurnConfig>,
     /// Media backend: `webrtc-rs` | `forge`.
     pub media_backend: String,
 }
@@ -77,7 +79,7 @@ fn media_enabled(opts: &ConsoleOpts) -> bool {
 async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
     let source = if screening { Source::None } else { Source::parse(&opts.media)? };
     let backend = dsip_media::Backend::parse(&opts.media_backend)?;
-    let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone(), backend }).await?;
+    let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone(), turn: opts.turn.clone(), backend }).await?;
     Ok(Media { leg, pending: vec![], remote_offer: None })
 }
 

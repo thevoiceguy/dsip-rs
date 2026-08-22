@@ -276,6 +276,16 @@ struct ConnOpts {
     /// STUN server(s) for ICE (none needed on one host).
     #[arg(long)]
     stun: Vec<String>,
+    /// TURN server(s) for relay candidates, e.g. `turn:host:3478` — the fallback
+    /// when STUN cannot punch a path (symmetric NAT on both ends).
+    #[arg(long)]
+    turn: Vec<String>,
+    /// TURN long-term-credential username (applied to every `--turn`).
+    #[arg(long)]
+    turn_user: Option<String>,
+    /// TURN long-term-credential password (applied to every `--turn`).
+    #[arg(long)]
+    turn_pass: Option<String>,
     /// Media backend: `forge` (default) or `webrtc-rs` (the reference/fallback stack).
     #[arg(long, default_value = "forge")]
     media_backend: String,
@@ -308,7 +318,13 @@ impl ConnOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl,
-            media: self.media, record: self.record, stun: self.stun, media_backend: self.media_backend,
+            media: self.media, record: self.record, stun: self.stun,
+            turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
+                uri: uri.clone(),
+                username: self.turn_user.clone().unwrap_or_default(),
+                password: self.turn_pass.clone().unwrap_or_default(),
+            }).collect(),
+            media_backend: self.media_backend,
         }
     }
 }
