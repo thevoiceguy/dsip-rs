@@ -12,6 +12,26 @@ cargo build -q -p dsip-cli -p dsip-relay -p dsip-dht
 B=target/debug; D=${DEMO_DIR:-/tmp/dsip-real-call-dht}; rm -rf "$D"; mkdir -p "$D"
 FAIL=0
 
+# ---- Run 3: force media through a TURN relay (the symmetric-NAT path) --------
+# RUN3=1 stands up coturn and passes `--turn … --relay-only` to both endpoints,
+# so media crosses the relay instead of the direct host path (which always wins
+# on one host). Needs docker. Off by default → the direct localhost proof.
+RUN3=${RUN3:-0}
+TURN_ARGS=""; RUN3ENV=""; CID=""
+if [ "$RUN3" = 1 ]; then
+  command -v docker >/dev/null || { echo "RUN3=1 needs docker (for coturn)"; exit 1; }
+  docker rm -f dsip-run3-turn >/dev/null 2>&1 || true
+  docker run -d --name dsip-run3-turn --network host coturn/coturn \
+    -n --lt-cred-mech --fingerprint --realm=forge.test --user=test:test \
+    --listening-ip=127.0.0.1 --listening-port=3478 --relay-ip=127.0.0.1 \
+    --min-port=49160 --max-port=49200 --no-tls --allow-loopback-peers >/dev/null
+  CID=dsip-run3-turn
+  for i in $(seq 1 20); do docker logs $CID 2>&1 | grep -q 'Relay ports initialization done' && break; sleep 0.3; done
+  TURN_ARGS="--turn turn:127.0.0.1:3478 --turn-user test --turn-pass test --relay-only"
+  RUN3ENV="env RUST_LOG=warn,forge_webrtc=info"   # surfaces the nominated pair
+  echo "Run 3: media forced through TURN relay coturn @127.0.0.1:3478 (relay-only, no direct path)"; echo
+fi
+
 # ---- speech (or tones) -------------------------------------------------------
 ALICE_LINE="Hi Bob, this is Alice, calling you over the DSIP decentralized network."
 BOB_LINE="Hi Alice, I hear you clearly. We found each other through the hash table, no phone company."
@@ -34,7 +54,7 @@ sleep 1; BOOT=$(grep -m1 '^listening: ' "$D/n0.log" | cut -d' ' -f2)
 $B/dsip-dht-node --listen /ip4/127.0.0.1/tcp/4002 --control 127.0.0.1:4102 --bootstrap "$BOOT" >"$D/n1.log" 2>&1 & N1=$!
 $B/dsip-dht-node --listen /ip4/127.0.0.1/tcp/4003 --control 127.0.0.1:4103 --bootstrap "$BOOT" >"$D/n2.log" 2>&1 & N2=$!
 $B/dsip-relay --listen 127.0.0.1:8443 --state "$D/relay" >"$D/relay.log" 2>&1 & RELAY=$!
-trap 'kill $N0 $N1 $N2 $RELAY 2>/dev/null || true' EXIT
+trap 'kill $N0 $N1 $N2 $RELAY 2>/dev/null || true; [ -n "$CID" ] && docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 sleep 1.5; CA="$D/relay/cert.pem"
 echo "════ 1. DHT overlay up (bootstrap $BOOT); relay up (wss, self-signed)"
 
@@ -48,7 +68,7 @@ echo "        Alice  $ALICE"
 echo "        Bob    $BOB"
 
 # ---- 3. Bob binds + publishes a signed reachability hint into the DHT --------
-$B/dsip answer --identity "$D/bob" --relay wss://127.0.0.1:8443/dsip --ca "$CA" --dht "$BOOT" --publish-hint --auto accept \
+$RUN3ENV $B/dsip answer --identity "$D/bob" --relay wss://127.0.0.1:8443/dsip --ca "$CA" --dht "$BOOT" --publish-hint --auto accept $TURN_ARGS \
   --media "$BMEDIA" --record "$D/bob-heard.ogg" --script "sleep 18; quit" >"$D/bob.log" 2>&1 & P=$!
 sleep 4
 echo; echo "════ 3. Bob published a signed, expiring reachability hint into the DHT (§8.3)"
@@ -63,11 +83,24 @@ grep -q 'reachability-hint' "$D/resolve.log" || { echo "        ✗ no hint reso
 
 # ---- 5. Alice calls over the DHT-discovered relay, with media ---------------
 echo; echo "════ 5. Alice places a real media call over the DHT-discovered relay"
-$B/dsip call --identity "$D/alice" --ca "$CA" --dht "$BOOT" --to "$BOB" \
+$RUN3ENV $B/dsip call --identity "$D/alice" --ca "$CA" --dht "$BOOT" --to "$BOB" $TURN_ARGS \
   --media "$AMEDIA" --record "$D/alice-heard.ogg" --script "sleep 10; hangup; sleep 1; quit" >"$D/alice.log" 2>&1
 wait $P 2>/dev/null
 grep -E 'ice connected|closed —' "$D/alice.log" | sed 's/^/        /'
 grep -q 'first inbound RTP' "$D/alice.log" || { echo "        ✗ no media received"; FAIL=1; }
+
+# ---- Run 3: confirm media actually crossed the TURN relay --------------------
+if [ "$RUN3" = 1 ]; then
+  echo; echo "════ Run 3 check: media forced through the TURN relay"
+  # With --relay-only the host path is stripped, so a nominated pair whose remote
+  # is coturn's relay port (49160–49200) proves media went relay↔relay.
+  if grep -qhE 'ICE nominated .* 127\.0\.0\.1:491[0-9][0-9]' "$D/alice.log" "$D/bob.log"; then
+    grep -hE 'ICE nominated .* 127\.0\.0\.1:491[0-9][0-9]' "$D/alice.log" "$D/bob.log" | sed -E 's/.*(ICE nominated.*)/        \1/' | head -2
+    echo "        ✓ nominated pair is a coturn relay address — no direct path used"
+  else
+    echo "        ✗ expected a relay pair with --relay-only + coturn"; FAIL=1
+  fi
+fi
 
 # ---- 6. verify the audio crossed intact -------------------------------------
 echo; echo "════ 6. verify the conversation crossed the call"
@@ -110,7 +143,11 @@ fi
 
 echo
 if [ "$FAIL" = 0 ]; then
-  echo "════ ✓ TWO DIDs FOUND EACH OTHER ON THE DHT AND HELD A REAL CONVERSATION — no DNS, no carrier"
+  if [ "$RUN3" = 1 ]; then
+    echo "════ ✓ RUN 3: TWO DIDs FOUND EACH OTHER ON THE DHT AND TALKED THROUGH A TURN RELAY — no DNS, no carrier, no direct path"
+  else
+    echo "════ ✓ TWO DIDs FOUND EACH OTHER ON THE DHT AND HELD A REAL CONVERSATION — no DNS, no carrier"
+  fi
 else
   echo "════ ✗ something did not check out — see logs in $D"; exit 1
 fi

@@ -52,6 +52,8 @@ pub struct ConsoleOpts {
     pub stun: Vec<String>,
     /// TURN servers for relay candidates.
     pub turn: Vec<dsip_media::TurnConfig>,
+    /// Force ICE to use only relay candidates (symmetric-NAT path).
+    pub relay_only: bool,
     /// Media backend: `webrtc-rs` | `forge`.
     pub media_backend: String,
 }
@@ -174,6 +176,23 @@ fn print_state(agent: &Agent, sid: &str) {
 }
 
 /// Run the console.
+/// With `--relay-only`, drop every non-relay `a=candidate` line from an SDP so
+/// only the TURN-relayed path can pair — forces Run 3's relay↔relay on a host
+/// where the direct (host) path would otherwise win. Relay candidates still
+/// trickle via signed `info` (§12.12).
+fn relay_only_sdp(sdp: String, on: bool) -> String {
+    if !on {
+        return sdp;
+    }
+    let mut out: String = sdp
+        .lines()
+        .filter(|l| !l.starts_with("a=candidate") || l.contains("typ relay"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    out.push_str("\r\n");
+    out
+}
+
 pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     let id = Identity::load(&opts.identity)?;
     println!("identity  {}  (\"{}\")", id.meta.identity, id.meta.display_name);
@@ -265,7 +284,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
             }
             if media_enabled(&opts) {
                 let m = new_leg(&opts, false).await?;
-                let sdp = m.leg.create_offer().await?;
+                let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
                 println!("media     WebRTC offer created ({} bytes SDP, backend {}) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len(), m.leg.backend().name());
                 agent.set_sdp(Some(sdp));
                 media = Some(m);
@@ -338,7 +357,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
                                         if let Some(m) = media.as_mut() {
                                             if let Some(offer) = m.remote_offer.take() {
-                                                let ans = m.leg.accept_offer(&offer).await?;
+                                                let ans = relay_only_sdp(m.leg.accept_offer(&offer).await?, opts.relay_only);
                                                 println!("  media   WebRTC answer created ({} bytes SDP, backend {}) → answer.transports[0].sdp", ans.len(), m.leg.backend().name());
                                                 agent.set_sdp(Some(ans));
                                             }
@@ -370,7 +389,10 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             if message.msg_type == "info" && payload["about"] == "transport:webrtc" {
                                 if let Some(m) = media.as_ref() {
                                     let cands: Vec<Candidate> = serde_json::from_value(payload["data"]["candidates"].clone()).unwrap_or_default();
-                                    for c in &cands { m.leg.add_remote_candidate(c).await.ok(); }
+                                    for c in &cands {
+                                        if opts.relay_only && !c.candidate.contains("typ relay") { continue; }
+                                        m.leg.add_remote_candidate(c).await.ok();
+                                    }
                                     println!("  media   {} remote ICE candidate(s) applied from signed info   §12.12", cands.len());
                                 }
                             }
@@ -415,7 +437,13 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
             ev = next_media(&mut media) => {
                 match ev {
                     MediaEvent::Candidate(c) => {
-                        if let Some(m) = media.as_mut() { m.pending.push(c); }
+                        // --relay-only: signal only relay candidates (keep the
+                        // end-of-candidates `None` marker).
+                        let keep = !opts.relay_only
+                            || c.as_ref().map(|cd| cd.candidate.contains("typ relay")).unwrap_or(true);
+                        if keep {
+                            if let Some(m) = media.as_mut() { m.pending.push(c); }
+                        }
                         flush_candidates(&mut agent, &mut media, &current).await?;
                     }
                     MediaEvent::State(st) => {
@@ -503,7 +531,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                 // §14.4 step 3: the screening leg was recvonly; add our source and re-offer sendrecv
                                 m.leg.add_source(Source::parse(&opts.media)?).await?;
                             }
-                            let sdp = m.leg.create_offer().await?;
+                            let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
                             agent.set_sdp(Some(sdp));
                         }
                     }

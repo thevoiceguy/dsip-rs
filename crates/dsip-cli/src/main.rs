@@ -286,6 +286,10 @@ struct ConnOpts {
     /// TURN long-term-credential password (applied to every `--turn`).
     #[arg(long)]
     turn_pass: Option<String>,
+    /// Force ICE to use only relay (TURN) candidates — the symmetric-NAT path.
+    /// Needs `--turn`; on a single host it forces media through the relay.
+    #[arg(long)]
+    relay_only: bool,
     /// Media backend: `forge` (default) or `webrtc-rs` (the reference/fallback stack).
     #[arg(long, default_value = "forge")]
     media_backend: String,
@@ -325,6 +329,7 @@ impl ConnOpts {
                 password: self.turn_pass.clone().unwrap_or_default(),
             }).collect(),
             media_backend: self.media_backend,
+            relay_only: self.relay_only,
         }
     }
 }
