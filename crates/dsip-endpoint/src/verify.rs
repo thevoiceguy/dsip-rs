@@ -12,23 +12,26 @@ use dsip_core::envelope::{self, Context, Envelope, Verified};
 use dsip_core::{Verdict, REPLAY_WINDOW_S};
 use dsip_schema::{check_payload, SemanticContext};
 
-/// Ids seen within the replay window, with expiry.
+/// Ids seen within the replay window, each with the time it may be forgotten.
 ///
 /// Spec: §12.9 — "Message id values MUST be tracked for deduplication within the window."
+/// Impl (spec-gap 31): an `introduction` is accepted until its `expires_at` (up to
+/// 604,800 s), so its id is tracked until then instead of for the 300 s window.
 #[derive(Debug, Default)]
 pub struct SeenIds {
     ids: HashMap<String, i64>,
 }
 
 impl SeenIds {
-    /// Forget ids older than the replay window.
+    /// Forget ids whose tracking period has ended.
     pub fn sweep(&mut self, now: i64) {
-        self.ids.retain(|_, t| *t + REPLAY_WINDOW_S >= now);
+        self.ids.retain(|_, forget_at| *forget_at >= now);
     }
 
-    /// Record an id as seen at `now`.
-    pub fn insert(&mut self, id: &str, now: i64) {
-        self.ids.insert(id.to_string(), now);
+    /// Record an id as seen at `now`, tracked for the replay window or until
+    /// `track_until`, whichever is later.
+    pub fn insert(&mut self, id: &str, now: i64, track_until: i64) {
+        self.ids.insert(id.to_string(), track_until.max(now + REPLAY_WINDOW_S));
     }
 
     /// The set view used by the verification context.
@@ -75,6 +78,26 @@ pub fn verify_frame(
     if !semantic.ok() {
         return Err(semantic);
     }
-    seen.insert(verified.payload["id"].as_str().unwrap_or(""), now);
+    let p = &verified.payload;
+    // Impl (spec-gap 31): held introductions stay replay-tracked until they expire.
+    let track_until = if verified.msg_type() == "introduction" { p["expires_at"].as_i64().unwrap_or(now) } else { now };
+    seen.insert(p["id"].as_str().unwrap_or(""), now, track_until);
     Ok(Inbound { envelope, frame: frame.to_string(), verified, semantic })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn introduction_ids_outlive_the_replay_window() {
+        let mut seen = SeenIds::default();
+        seen.insert("invite", 1_000, 1_000);
+        seen.insert("intro", 1_000, 1_000 + 604_800);
+        seen.sweep(1_000 + REPLAY_WINDOW_S + 1);
+        assert!(!seen.set().contains("invite"));
+        assert!(seen.set().contains("intro"));
+        seen.sweep(1_000 + 604_800 + 1);
+        assert!(seen.set().is_empty());
+    }
 }

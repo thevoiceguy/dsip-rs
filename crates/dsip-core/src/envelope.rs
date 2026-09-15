@@ -21,7 +21,7 @@ use crate::ulid::Ulid;
 use crate::verdict::{RejectCode, Verdict};
 use crate::version::Supported;
 use crate::wire::parse_payload;
-use crate::{REPLAY_WINDOW_S, ULID_TOLERANCE_S, WS_MAX_ENVELOPE_BYTES};
+use crate::{INTRODUCTION_MAX_VALIDITY_S, REPLAY_WINDOW_S, ULID_TOLERANCE_S, WS_MAX_ENVELOPE_BYTES};
 
 /// The three-member JWS envelope.
 ///
@@ -234,7 +234,17 @@ pub fn verify(env: &Envelope, ctx: &Context, frame: Option<&str>) -> Result<Veri
     if ea <= ia {
         return Err(Verdict::reject(RejectCode::ExpiryOrder));
     }
-    if ia < ctx.now - REPLAY_WINDOW_S || ia > ctx.now + REPLAY_WINDOW_S {
+    if msg_type == "introduction" {
+        // Spec: §19.4 — introductions are held for offline recipients for up to 7 days.
+        // Impl (spec-gap 31): the cap is enforced, the 300 s age bound gives way to
+        // `expires_at` (checked next), and the future bound stays.
+        if ea - ia > INTRODUCTION_MAX_VALIDITY_S {
+            return Err(Verdict::reject(RejectCode::IntroductionValidity));
+        }
+        if ia > ctx.now + REPLAY_WINDOW_S {
+            return Err(Verdict::reject(RejectCode::ReplayWindow));
+        }
+    } else if ia < ctx.now - REPLAY_WINDOW_S || ia > ctx.now + REPLAY_WINDOW_S {
         // Impl (spec-gap 7): symmetric window
         return Err(Verdict::reject(RejectCode::ReplayWindow));
     }

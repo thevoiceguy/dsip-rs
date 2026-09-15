@@ -42,6 +42,13 @@ pub const REPLAY_WINDOW_S: i64 = 300;
 /// replay window"; this PoC rejects beyond 300 s.
 pub const ULID_TOLERANCE_S: i64 = 300;
 
+/// Maximum validity (`expires_at − issued_at`) of an `introduction`.
+///
+/// Spec: §19.4 — introductions MAY be valid up to 604,800 s because they are
+/// store-and-forward friendly. Impl (spec-gap 31): enforced at envelope stage 9,
+/// where it bounds how long a held introduction's id stays replay-tracked.
+pub const INTRODUCTION_MAX_VALIDITY_S: i64 = 604_800;
+
 /// Maximum encoded envelope size on `ws/1.0`, a fixed binding constant.
 ///
 /// Spec: §13.2.

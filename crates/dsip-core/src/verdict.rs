@@ -29,6 +29,7 @@ pub enum RejectCode {
     DelegationCapability,
     ExpiryOrder,
     ReplayWindow,
+    IntroductionValidity,
     Expired,
     DuplicateId,
     UlidIssuedAtMismatch,
