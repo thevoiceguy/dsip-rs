@@ -1092,6 +1092,7 @@ dependencies = [
  "dsip-dht",
  "dsip-gateway",
  "dsip-media",
+ "dsip-messaging",
  "dsip-schema",
  "dsip-session",
  "dsip-transport",
@@ -1194,6 +1195,15 @@ dependencies = [
  "tracing-subscriber",
  "webrtc",
  "webrtc-media",
+]
+
+[[package]]
+name = "dsip-messaging"
+version = "0.1.0"
+dependencies = [
+ "dsip-core",
+ "jsonschema",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,0 +1,369 @@
+//! The mailbox: durable store, sync and live push, KeyPackage directory, group registration.
+//!
+//! Spec: M§4.4 (`sync` retains; `queue` deletes once every registered device has acknowledged),
+//! M§5.4 (cursors, pagination, live push), M§5.5 (single-use KeyPackages, last resort, per-device
+//! bound), M§5.7 (configuration and grant revocation), M§6.6 (pending registration, bound, TTL,
+//! hub match), M§11.2 (ephemeral never stored), M§12.2 (archive first-wins, refused in `queue`),
+//! M§14.2 (first-contact authorization), M§15.5 (unknown recipients).
+//!
+//! Impl: cursors are `c:` plus 16 lowercase hex digits of a per-mailbox counter; a grant is
+//! presented already verified (signature checks are the envelope pipeline's job).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use serde_json::{json, Value};
+
+use crate::checks::MAILBOX_MODES;
+
+/// Maximum one-time KeyPackages kept per device.
+///
+/// Spec: M§5.5 (RECOMMENDED bound).
+pub const KEY_PACKAGES_PER_DEVICE: i64 = 100;
+
+/// Grant scopes that authorize messaging first contact.
+///
+/// Spec: M§14.2 condition 2.
+pub const MESSAGE_GRANT_SCOPES: &[&str] = &["dsip.message", "dsip.invite"];
+
+struct Group {
+    hub: String,
+    state: String,
+    since: i64,
+    items: i64,
+}
+
+struct Item {
+    cursor: String,
+    n: i64,
+    class: String,
+    group: String,
+}
+
+#[derive(Clone, Copy)]
+struct KeyPackages {
+    one_time: i64,
+    last_resort: bool,
+}
+
+/// Mailbox state for one served owner.
+pub struct Mailbox {
+    now: i64,
+    owner: String,
+    serves: BTreeSet<String>,
+    devices: Vec<String>,
+    mode: String,
+    admit: String,
+    pending_ttl: i64,
+    pending_max: i64,
+    groups: BTreeMap<String, Group>,
+    kp: BTreeMap<String, KeyPackages>,
+    revoked: BTreeSet<String>,
+    items: Vec<Item>,
+    counter: i64,
+    acks: HashMap<String, i64>,
+    bound: BTreeSet<String>,
+    archived: HashMap<(String, i64), String>,
+}
+
+fn s(v: &Value) -> String {
+    v.as_str().unwrap_or("").to_string()
+}
+
+/// Cursor text for counter value `n`.
+pub fn cursor(n: i64) -> String {
+    format!("c:{n:016x}")
+}
+
+/// Counter value of a cursor this mailbox format could have issued.
+pub fn cursor_num(c: &Value) -> Option<i64> {
+    let c = c.as_str()?;
+    let hex = c.strip_prefix("c:")?;
+    if hex.len() != 16 {
+        return None;
+    }
+    i64::from_str_radix(hex, 16).ok()
+}
+
+impl Mailbox {
+    /// A mailbox from a vector `context`.
+    pub fn new(ctx: &Value) -> Mailbox {
+        let now = ctx["now"].as_i64().unwrap_or(0);
+        let owner = s(&ctx["owner"]);
+        let serves = match ctx["serves"].as_array() {
+            Some(a) => a.iter().map(s).collect(),
+            None => BTreeSet::from([owner.clone()]),
+        };
+        let mut devices: Vec<String> = ctx["devices"].as_array().into_iter().flatten().map(s).collect();
+        devices.sort();
+        let groups = ctx["groups"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(g, r)| (g.clone(), Group { hub: s(&r["hub"]), state: s(&r["state"]), since: now, items: 0 }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let kp = ctx["key_packages"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(d, k)| {
+                        let k = KeyPackages {
+                            one_time: k["one_time"].as_i64().unwrap_or(0),
+                            last_resort: k["last_resort"].as_bool().unwrap_or(false),
+                        };
+                        (d.clone(), k)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Mailbox {
+            now,
+            owner,
+            serves,
+            devices,
+            mode: ctx["mode"].as_str().unwrap_or("sync").to_string(),
+            admit: ctx["admit"].as_str().unwrap_or("grant").to_string(),
+            pending_ttl: ctx["pending_group_ttl"].as_i64().unwrap_or(604_800),
+            pending_max: ctx["pending_group_max_items"].as_i64().unwrap_or(500),
+            groups,
+            kp,
+            revoked: BTreeSet::new(),
+            items: vec![],
+            counter: 0,
+            acks: HashMap::new(),
+            bound: BTreeSet::new(),
+            archived: HashMap::new(),
+        }
+    }
+
+    /// Apply one event and return what the mailbox emits.
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        let Some((name, e)) = ev.as_object().and_then(|m| m.iter().next()) else { return vec![] };
+        match name.as_str() {
+            "advance" => self.advance(e.as_i64().unwrap_or(0)),
+            "welcome" => self.welcome(e),
+            "hub_deposit" => self.hub_deposit(e),
+            "sync" => self.sync(e),
+            "unbind" => {
+                self.bound.remove(&s(&e["device"]));
+                vec![]
+            }
+            "config" => self.config(e),
+            "archive" => self.archive(e),
+            "kp_upload" => self.kp_upload(e),
+            "kp_fetch" => self.kp_fetch(e),
+            _ => vec![],
+        }
+    }
+
+    fn error(to: &Value, id: &Value, reason: &str) -> Vec<Value> {
+        vec![json!({"error": {"to": to, "in_reply_to": id, "reason": reason}})]
+    }
+
+    fn grant_ok(&self, grant: &Value, grantee: &str, target: &str) -> bool {
+        grant.is_object()
+            && grant["from"].as_str() == Some(target)
+            && grant["to"].as_str() == Some(grantee)
+            && grant["scope"].as_array().into_iter().flatten().any(|sc| MESSAGE_GRANT_SCOPES.contains(&sc.as_str().unwrap_or("")))
+            && grant["valid_until"].as_i64().unwrap_or(0) > self.now
+            && !self.revoked.contains(&s(&grant["id"]))
+    }
+
+    fn store(&mut self, class: &str, group: &str, depositor: Option<&str>) -> (String, Vec<Value>) {
+        self.counter += 1;
+        let c = cursor(self.counter);
+        self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into() });
+        let pushes =
+            self.bound.iter().filter(|d| Some(d.as_str()) != depositor).map(|d| json!({"push": {"to": d, "cursor": c}})).collect();
+        (c, pushes)
+    }
+
+    fn advance(&mut self, n: i64) -> Vec<Value> {
+        self.now += n;
+        let expired: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|(_, r)| r.state == "pending" && r.since + self.pending_ttl < self.now)
+            .map(|(g, _)| g.clone())
+            .collect();
+        for g in expired {
+            // M§6.6: an unconfirmed pending group is dropped with its items
+            self.groups.remove(&g);
+            self.items.retain(|it| !(it.group == g && it.class != "archive"));
+        }
+        vec![]
+    }
+
+    fn welcome(&mut self, e: &Value) -> Vec<Value> {
+        let recipient = s(&e["recipient"]);
+        if !self.serves.contains(&recipient) {
+            return Self::error(&e["from"], &e["id"], "transport.unknown-recipient");
+        }
+        let adder = s(&e["adder_identity"]);
+        let successor = e.get("successor_of").and_then(Value::as_str).is_some_and(|g| self.groups.contains_key(g));
+        let ok = self.admit == "open" || adder == self.owner || self.grant_ok(&e["grant"], &adder, &recipient) || successor;
+        if !ok {
+            return Self::error(&e["from"], &e["id"], "policy.first-contact-required"); // M§14.2
+        }
+        let group = s(&e["group"]);
+        let now = self.now;
+        self.groups.entry(group.clone()).or_insert_with(|| Group { hub: s(&e["hub"]), state: "pending".into(), since: now, items: 0 });
+        let (c, pushes) = self.store("welcome", &group, None);
+        let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
+        out.extend(pushes);
+        out
+    }
+
+    fn hub_deposit(&mut self, e: &Value) -> Vec<Value> {
+        if !self.serves.contains(&s(&e["recipient"])) {
+            return Self::error(&e["from"], &e["id"], "transport.unknown-recipient");
+        }
+        let group = s(&e["group"]);
+        let from = s(&e["from"]);
+        let Some(reg) = self.groups.get(&group).filter(|r| r.hub == from) else {
+            return Self::error(&e["from"], &e["id"], "mailbox.unknown-group"); // M§6.6
+        };
+        let class = s(&e["class"]);
+        if class == "ephemeral" {
+            // M§11.2: pushed to bound devices, never stored, never acknowledged
+            return self.bound.iter().map(|d| json!({"push": {"to": d, "class": "ephemeral"}})).collect();
+        }
+        if reg.state == "pending" && reg.items >= self.pending_max {
+            return Self::error(&e["from"], &e["id"], "mailbox.quota-exceeded");
+        }
+        if let Some(r) = self.groups.get_mut(&group) {
+            r.items += 1;
+        }
+        let (c, pushes) = self.store(&class, &group, None);
+        let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
+        out.extend(pushes);
+        out
+    }
+
+    fn sync(&mut self, e: &Value) -> Vec<Value> {
+        let dev = s(&e["device"]);
+        let mut n_since = 0;
+        if let Some(since) = e.get("since").filter(|v| !v.is_null()) {
+            match cursor_num(since) {
+                Some(n) if n <= self.counter => n_since = n,
+                _ => return Self::error(&e["device"], &e["id"], "mailbox.cursor-invalid"),
+            }
+        }
+        if let Some(ack) = e.get("ack_through") {
+            let Some(n) = cursor_num(ack).filter(|n| *n <= self.counter) else {
+                return Self::error(&e["device"], &e["id"], "mailbox.cursor-invalid");
+            };
+            let a = self.acks.entry(dev.clone()).or_insert(0);
+            *a = (*a).max(n);
+            if self.mode == "queue" {
+                // M§4.4: deleted once every registered device has acknowledged
+                let floor = self.devices.iter().map(|d| self.acks.get(d).copied().unwrap_or(0)).min().unwrap_or(0);
+                self.items.retain(|it| it.n > floor);
+            }
+        }
+        if e["live"].as_bool().unwrap_or(false) {
+            self.bound.insert(dev);
+        }
+        let limit = e["limit"].as_u64().unwrap_or(200) as usize;
+        let avail: Vec<&Item> = self.items.iter().filter(|it| it.n > n_since).collect();
+        let page = &avail[..avail.len().min(limit)];
+        let next = if avail.len() > limit { json!(page.last().map(|it| it.cursor.clone())) } else { Value::Null };
+        let cursors: Vec<&str> = page.iter().map(|it| it.cursor.as_str()).collect();
+        vec![json!({"items": {"to": e["device"], "in_reply_to": e["id"], "cursors": cursors, "next": next}})]
+    }
+
+    fn config(&mut self, e: &Value) -> Vec<Value> {
+        if let Some(mode) = e.get("mode") {
+            let m = mode.as_str().unwrap_or("");
+            if !MAILBOX_MODES.contains(&m) {
+                return Self::error(&e["device"], &e["id"], "mailbox.unsupported-mode");
+            }
+            self.mode = m.to_string();
+        }
+        if let Some(a) = e["admit"].as_str() {
+            self.admit = a.to_string();
+        }
+        for g in e["groups"].as_array().into_iter().flatten() {
+            let group = s(&g["group"]);
+            if g["state"] == "left" {
+                self.groups.remove(&group);
+            } else if let Some(r) = self.groups.get_mut(&group) {
+                r.state = "joined".into();
+            } else if let Some(hub) = g["hub"].as_str() {
+                self.groups.insert(group, Group { hub: hub.into(), state: "joined".into(), since: self.now, items: 0 });
+            }
+        }
+        self.revoked.extend(e["revoked_grants"].as_array().into_iter().flatten().map(s));
+        vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"]}})]
+    }
+
+    fn archive(&mut self, e: &Value) -> Vec<Value> {
+        if self.mode == "queue" {
+            return Self::error(&e["device"], &e["id"], "mailbox.unsupported-class"); // M§12.2
+        }
+        let key = (s(&e["ref_group"]), e["ref_seq"].as_i64().unwrap_or(0));
+        if let Some(c) = self.archived.get(&key) {
+            return vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"], "cursor": c, "duplicate": true}})];
+        }
+        let dev = s(&e["device"]);
+        let (c, pushes) = self.store("archive", &key.0, Some(&dev));
+        self.archived.insert(key, c.clone());
+        let mut out = vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"], "cursor": c}})];
+        out.extend(pushes);
+        out
+    }
+
+    fn kp_upload(&mut self, e: &Value) -> Vec<Value> {
+        let dev = s(&e["device"]);
+        if !self.devices.contains(&dev) {
+            return Self::error(&e["device"], &e["id"], "policy.blocked");
+        }
+        let k = self.kp.entry(dev).or_insert(KeyPackages { one_time: 0, last_resort: false });
+        k.one_time = (k.one_time + e["count"].as_i64().unwrap_or(0)).min(KEY_PACKAGES_PER_DEVICE);
+        if e["last_resort"].as_bool().unwrap_or(false) {
+            k.last_resort = true;
+        }
+        vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"]}})]
+    }
+
+    fn kp_fetch(&mut self, e: &Value) -> Vec<Value> {
+        let target = s(&e["target"]);
+        if !self.serves.contains(&target) {
+            return Self::error(&e["from"], &e["id"], "transport.unknown-recipient");
+        }
+        let who = s(&e["from_identity"]);
+        if !(self.admit == "open" || who == target || self.grant_ok(&e["grant"], &who, &target)) {
+            return Self::error(&e["from"], &e["id"], "policy.first-contact-required");
+        }
+        let mut served = serde_json::Map::new();
+        for d in &self.devices {
+            // M§5.5: one per device, single use, then the last resort
+            match self.kp.get_mut(d) {
+                Some(k) if k.one_time > 0 => {
+                    k.one_time -= 1;
+                    served.insert(d.clone(), json!("one-time"));
+                }
+                Some(k) if k.last_resort => {
+                    served.insert(d.clone(), json!("last-resort"));
+                }
+                _ => {}
+            }
+        }
+        if served.is_empty() {
+            return Self::error(&e["from"], &e["id"], "mailbox.no-key-packages");
+        }
+        vec![json!({"key_packages": {"to": e["from"], "in_reply_to": e["id"], "devices": served}})]
+    }
+
+    /// Snapshot compared by the vectors: stored cursors, group registration states, KeyPackage counts.
+    pub fn snapshot(&self) -> Value {
+        let groups: serde_json::Map<String, Value> = self.groups.iter().map(|(g, r)| (g.clone(), json!(r.state))).collect();
+        let kps: serde_json::Map<String, Value> = self
+            .kp
+            .iter()
+            .map(|(d, k)| (d.clone(), json!({"one_time": k.one_time, "last_resort": k.last_resort})))
+            .collect();
+        json!({"items": self.items.iter().map(|it| it.cursor.as_str()).collect::<Vec<_>>(), "groups": groups, "key_packages": kps})
+    }
+}
