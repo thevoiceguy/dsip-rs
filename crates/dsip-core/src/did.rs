@@ -182,7 +182,7 @@ impl DidDocument {
 /// Spec: §8.1 — step 2: if the input is a DID, resolve it using the DID method;
 /// the DID document is authoritative. Implementations of this trait MUST NOT
 /// consult caches, DHTs, or relays as if they were authoritative.
-pub trait Resolver {
+pub trait Resolver: Send + Sync {
     /// Resolve a DID to its document. `did:key` needs no backend and is handled by [`resolve_kid`].
     fn resolve(&self, did: &str) -> Option<DidDocument>;
 }

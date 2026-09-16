@@ -68,7 +68,7 @@ impl Identity {
             &device.did(),
             now - 60,
             now + 365 * 86_400,
-            &["dsip.signaling", "dsip.media.interactive"],
+            &["dsip.signaling", "dsip.media.interactive", "dsip.messaging"],
         );
         let delegation = sign(&payload, &controller, &controller.kid());
         let meta = IdentityMeta { identity: controller.did(), device: device.did(), display_name: display_name.into() };

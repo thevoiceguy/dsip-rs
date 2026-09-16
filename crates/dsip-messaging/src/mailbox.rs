@@ -137,6 +137,15 @@ impl Mailbox {
         }
     }
 
+    /// Set the owner's registered devices (M§4.4: those that have completed a verified `hello`
+    /// within the retention window). A host calls this as devices bind; vectors set it in `context`.
+    pub fn register_devices(&mut self, devices: &[String]) {
+        let mut d: Vec<String> = devices.to_vec();
+        d.sort();
+        d.dedup();
+        self.devices = d;
+    }
+
     /// Apply one event and return what the mailbox emits.
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         let Some((name, e)) = ev.as_object().and_then(|m| m.iter().next()) else { return vec![] };
@@ -171,6 +180,10 @@ impl Mailbox {
     }
 
     fn store(&mut self, class: &str, group: &str, depositor: Option<&str>) -> (String, Vec<Value>) {
+        if class == "group-info" {
+            // M§5.2: latest per group only
+            self.items.retain(|it| !(it.group == group && it.class == "group-info"));
+        }
         self.counter += 1;
         let c = cursor(self.counter);
         self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into() });

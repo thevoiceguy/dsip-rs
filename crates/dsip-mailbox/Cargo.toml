@@ -1,0 +1,34 @@
+[package]
+name = "dsip-mailbox"
+description = "DSIP Messaging Profile 1.0 over the wire: the mailbox/hub service and a device client, driving the vector-pinned state machines with real MLS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Inherits dsip-mls's floor (OpenMLS 0.9).
+rust-version = "1.91"
+
+[dependencies]
+dsip-core.workspace = true
+dsip-messaging.workspace = true
+dsip-mls.workspace = true
+dsip-transport.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+futures-util.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+openmls = "0.9.0"
+
+[[bin]]
+name = "dsip-mailbox"
+path = "src/bin/dsip-mailbox.rs"
+
+[[bin]]
+name = "dsip-msg"
+path = "src/bin/dsip-msg.rs"

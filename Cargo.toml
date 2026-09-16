@@ -12,6 +12,7 @@ members = [
     "crates/dsip-gateway",
     "crates/dsip-messaging",
     "crates/dsip-mls",
+    "crates/dsip-mailbox",
     "crates/dsip-broadcast",
     "crates/dsip-dht",
     "crates/dsip-relay",
@@ -37,6 +38,7 @@ dsip-webrtc-binding = { path = "crates/dsip-webrtc-binding" }
 dsip-gateway = { path = "crates/dsip-gateway" }
 dsip-messaging = { path = "crates/dsip-messaging" }
 dsip-mls = { path = "crates/dsip-mls" }
+dsip-mailbox = { path = "crates/dsip-mailbox" }
 dsip-broadcast = { path = "crates/dsip-broadcast" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -1275,6 +1275,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsip-mailbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dsip-core",
+ "dsip-messaging",
+ "dsip-mls",
+ "dsip-transport",
+ "futures-util",
+ "openmls",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dsip-media"
 version = "0.1.0"
 dependencies = [
