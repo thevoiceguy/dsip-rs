@@ -182,7 +182,10 @@ pub fn check_object(o: &Value, ctx: &Value) -> Value {
         if o["sender"] != ctx["leaf_identity"] {
             return reject("sender-mismatch", None);
         }
-        if o["conversation"] != ctx["conversation"] {
+        // spec-gap 52: an undisclosed read watermark travels in the personal group (M§10.5) and names the
+        // conversation it describes, not the personal group's own
+        let private_read = name == "receipt" && o["kind"] == "read" && ctx["conversation_kind"] == "personal";
+        if o["conversation"] != ctx["conversation"] && !private_read {
             return reject("conversation-mismatch", None);
         }
     }

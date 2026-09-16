@@ -66,13 +66,17 @@ impl Item {
     }
 
     /// Build a record from a deposit payload.
+    ///
+    /// Impl (spec-gap 51): an `archive` item is filed under `ref_group` and carries `ref_seq` as its `seq`,
+    /// because a device needs both before it can open the record (AAD `group_id ‖ seq`, M§12.2).
     pub fn from_deposit(p: &Value, source: &str, now: i64) -> Item {
         let s = |k: &str| p.get(k).and_then(Value::as_str).map(String::from);
+        let archive = p["class"] == "archive";
         Item {
             class: s("class").unwrap_or_default(),
-            group: s("group").unwrap_or_default(),
+            group: if archive { s("ref_group") } else { s("group") }.unwrap_or_default(),
             source: source.to_string(),
-            seq: p.get("seq").and_then(Value::as_i64),
+            seq: if archive { p["ref_seq"].as_i64() } else { p.get("seq").and_then(Value::as_i64) },
             mls: s("mls"),
             hub: p.get("hub").cloned(),
             archive: s("archive"),
