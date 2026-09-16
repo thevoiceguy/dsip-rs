@@ -1,0 +1,19 @@
+[package]
+name = "dsip-mls"
+description = "DSIP Messaging Profile 1.0 on real MLS (OpenMLS): DSIP device keys as MLS signers, dsip_delegation/dsip_conversation extensions, the DSIP authentication service on leaves, the hub's public view of a group, exporter-derived activity keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# openmls 0.9 requires 1.91; kept out of the rest of the workspace so its MSRV (1.85) is unchanged.
+rust-version = "1.91"
+
+[dependencies]
+dsip-core.workspace = true
+dsip-messaging.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+openmls = "0.9.0"
+openmls_rust_crypto = "0.6.0"
+openmls_traits = "0.6.0"

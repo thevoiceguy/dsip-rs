@@ -91,7 +91,8 @@ pub fn reject(code: &str, reason: Option<&str>) -> Value {
     }
 }
 
-fn has_float(v: &Value) -> bool {
+/// Whether any number in `v` is a float (§10.3).
+pub fn has_float(v: &Value) -> bool {
     match v {
         Value::Number(n) => n.is_f64(),
         Value::Object(m) => m.values().any(has_float),

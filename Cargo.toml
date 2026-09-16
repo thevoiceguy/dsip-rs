@@ -11,6 +11,7 @@ members = [
     "crates/dsip-webrtc-binding",
     "crates/dsip-gateway",
     "crates/dsip-messaging",
+    "crates/dsip-mls",
     "crates/dsip-broadcast",
     "crates/dsip-dht",
     "crates/dsip-relay",
@@ -35,6 +36,7 @@ dsip-media = { path = "crates/dsip-media" }
 dsip-webrtc-binding = { path = "crates/dsip-webrtc-binding" }
 dsip-gateway = { path = "crates/dsip-gateway" }
 dsip-messaging = { path = "crates/dsip-messaging" }
+dsip-mls = { path = "crates/dsip-mls" }
 dsip-broadcast = { path = "crates/dsip-broadcast" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -43,6 +45,8 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 bs58 = "0.5"
 sha2 = "0.10"
+aes-gcm = "0.10"
+hex = "0.4"
 rand = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = "0.2"
