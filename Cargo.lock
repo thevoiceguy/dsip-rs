@@ -1326,9 +1326,11 @@ dependencies = [
  "aes-gcm 0.10.3",
  "dsip-core",
  "hex",
+ "hmac 0.12.1",
  "jsonschema",
  "serde_json",
  "sha2 0.10.9",
+ "x25519-dalek 2.0.1",
 ]
 
 [[package]]
@@ -1338,10 +1340,14 @@ dependencies = [
  "dsip-core",
  "dsip-messaging",
  "hex",
+ "hpke-rs",
+ "hpke-rs-crypto",
+ "hpke-rs-rust-crypto",
  "openmls",
  "openmls_rust_crypto",
  "openmls_sqlite_storage",
  "openmls_traits",
+ "rand 0.8.7",
  "rusqlite",
  "serde",
  "serde_json",

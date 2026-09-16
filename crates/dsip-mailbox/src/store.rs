@@ -29,6 +29,8 @@ pub struct Item {
     pub akid: Option<String>,
     /// When it was stored.
     pub stored_at: i64,
+    /// On an `introduction` or `grant` deposit: the signed core envelope, compact (spec-gap 54).
+    pub envelope: Option<String>,
     /// On an `ephemeral` deposit: the sealed activity (M§11.1).
     pub sealed: Option<String>,
     /// On an `ephemeral` deposit: the originating `expires_at`, carried unchanged (M§11.2, spec-gap 49).
@@ -46,8 +48,13 @@ pub struct Item {
 impl Item {
     /// The `items[]` element for this record.
     pub fn to_value(&self, cursor: &str) -> Value {
-        let mut v = json!({"cursor": cursor, "stored_at": self.stored_at, "class": self.class, "group": self.group,
-                           "source": self.source});
+        let mut v = json!({"cursor": cursor, "stored_at": self.stored_at, "class": self.class, "source": self.source});
+        if !self.group.is_empty() {
+            v["group"] = json!(self.group); // first-contact items have none (spec-gap 54)
+        }
+        if let Some(e) = &self.envelope {
+            v["envelope"] = json!(e);
+        }
         for (k, opt) in [("mls", &self.mls), ("archive", &self.archive), ("akid", &self.akid)] {
             if let Some(s) = opt {
                 v[k] = json!(s);
@@ -84,6 +91,7 @@ impl Item {
             stored_at: now,
             blobs: p.get("blobs").cloned(),
             sealed: s("sealed"),
+            envelope: s("envelope"),
             expires_at: p["expires_at"].as_i64(),
             welcome: s("welcome"),
             grants: p.get("grants").cloned(),

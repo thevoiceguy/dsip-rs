@@ -95,3 +95,69 @@ pub fn verify_frame(frame: &str, ctx: &Context) -> Result<Inbound, Rejection> {
     }
     Ok(Inbound { verified })
 }
+
+/// A presented grant, verified as a credential: its signature, and the binding of the signing device to the grant's
+/// `from` through a delegation in its header (§7.4). Its replay window does not apply — it is presented after its
+/// delivery (§19.4) — and liveness (`valid_until`, revocation) is the caller's rule. The payload, or `None`.
+///
+/// Spec: §19.4, §7.4, M§14.2. Impl: before this check was added a grant signed by any device was accepted as
+/// consent from the identity it named.
+pub fn grant_credential(compact: &str, ctx: &Context) -> Option<serde_json::Value> {
+    let mut parts = compact.split('.');
+    let env = Envelope { protected: parts.next()?.to_string(), payload: parts.next()?.to_string(), signature: parts.next()?.to_string() };
+    let ver = envelope::verify_raw(&env, ctx, false).ok()?;
+    let from = ver.payload.get("from")?.as_str()?;
+    if !dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, ctx).ok() {
+        return None;
+    }
+    (ver.payload.get("type")? == "grant").then(|| ver.payload.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsip_core::delegation::delegation_payload;
+    use dsip_core::did::StaticResolver;
+    use dsip_core::envelope::{encode_payload, sign, sign_bytes};
+    use dsip_core::keys::KeyPair;
+    use serde_json::json;
+
+    const NOW: i64 = 1_790_000_000;
+
+    fn grant(from: &str) -> serde_json::Value {
+        json!({"dsip": {"core": "1.0", "min_core": "1.0", "profiles": ["messaging/1.0"], "extensions": [], "critical": []},
+               "type": "grant", "id": "01M2NE6VSRPZKD9QDNPW24DYCT", "from": from, "to": "did:web:alice.example",
+               "session": "01M2NE6VSRPZKD9QDNPW24DYCT", "scope": ["dsip.message"], "valid_until": NOW + 86400,
+               "issued_at": NOW, "expires_at": NOW + 30})
+    }
+
+    #[test]
+    fn only_a_device_delegated_by_the_granter_can_grant() {
+        let bob = KeyPair::from_fixture_name("bob");
+        let bob_phone = KeyPair::from_fixture_name("bob-phone");
+        let mallory_phone = KeyPair::from_fixture_name("mallory");
+        let mut resolver = StaticResolver::default();
+        resolver.insert(dsip_core::did::DidDocument::minimal_web("did:web:bob.example", &bob.public(), None));
+        let ctx = Context::new(NOW, &resolver);
+        let deleg_caps = |device: &KeyPair, caps: &[&str]| {
+            sign(&delegation_payload("did:web:bob.example", &device.did(), NOW - 60, NOW + 86400, caps), &bob, "did:web:bob.example#key-1")
+        };
+        let deleg = |device: &KeyPair| deleg_caps(device, &["dsip.signaling", "dsip.messaging"]);
+        let compact = |e: Envelope| format!("{}.{}.{}", e.protected, e.payload, e.signature);
+
+        let honest = sign_bytes(&encode_payload(&grant("did:web:bob.example")), &bob_phone, &bob_phone.kid(), vec![deleg(&bob_phone)]);
+        assert!(grant_credential(&compact(honest), &ctx).is_some(), "Bob's delegated phone grants for Bob");
+
+        let bare = sign(&grant("did:web:bob.example"), &bob_phone, &bob_phone.kid());
+        assert!(grant_credential(&compact(bare), &ctx).is_none(), "no delegation presented: not Bob's consent");
+
+        let forged = sign_bytes(&encode_payload(&grant("did:web:bob.example")), &mallory_phone, &mallory_phone.kid(), vec![deleg(&bob_phone)]);
+        assert!(grant_credential(&compact(forged), &ctx).is_none(), "a delegation for another device does not bind Mallory's key");
+
+        // spec-gap 56 (open): core §7.4 binds every envelope under `dsip.signaling`, so a device delegated for
+        // messaging only cannot grant today. This pins the current behavior until the v0.8 core decides.
+        let messaging_only = sign_bytes(&encode_payload(&grant("did:web:bob.example")), &bob_phone, &bob_phone.kid(),
+            vec![deleg_caps(&bob_phone, &["dsip.messaging"])]);
+        assert!(grant_credential(&compact(messaging_only), &ctx).is_none(), "messaging-only delegation: refused under core §7.4 today");
+    }
+}

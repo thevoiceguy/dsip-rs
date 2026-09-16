@@ -41,7 +41,11 @@ pub const MESSAGE_SCHEMAS: &[&str] =
 pub const OBJECT_SCHEMAS: &[&str] = &["content", "receipt", "activity", "archive-key", "call-event", "archive-record"];
 
 /// Registry `dsip-deposit-class` (M§17).
-pub const DEPOSIT_CLASSES: &[&str] = &["handshake", "application", "welcome", "group-info", "ephemeral", "archive"];
+pub const DEPOSIT_CLASSES: &[&str] = &["handshake", "application", "welcome", "group-info", "ephemeral", "archive", "introduction", "grant"];
+/// Deposit classes carrying a signed core envelope for first contact, with a recipient and no group.
+///
+/// Spec: M§14.1. Impl (spec-gap 54).
+pub const FIRST_CONTACT_CLASSES: &[&str] = &["introduction", "grant"];
 /// Registry `dsip-content-kind` (M§17).
 pub const CONTENT_KINDS: &[&str] = &["text", "audio", "video", "image", "file", "contact", "location"];
 /// Registry `dsip-content-purpose` (M§17).
@@ -69,6 +73,7 @@ fn deposit_fields(class: &str) -> (&'static [&'static str], &'static [&'static s
         "welcome" => (&["mls", "hub"], &["mls", "hub", "grants", "origin", "successor_of", "ratchet_tree_blob"]),
         "group-info" => (&["mls"], &["mls", "ratchet_tree_blob"]),
         "ephemeral" => (&["sealed"], &["sealed"]),
+        "introduction" | "grant" => (&["envelope"], &["envelope"]),
         _ => (&["archive", "akid", "ref_group", "ref_seq"], &["archive", "akid", "ref_group", "ref_seq"]),
     }
 }
@@ -156,6 +161,13 @@ fn check_deposit(p: &Value) -> Value {
     let extra = keys.iter().any(|k| !DEPOSIT_BASE.contains(k) && !allowed.contains(k));
     if missing || extra {
         return reject("deposit-fields", None);
+    }
+    let first_contact = FIRST_CONTACT_CLASSES.contains(&class);
+    if first_contact == keys.contains("group") || (first_contact && !keys.contains("recipient")) {
+        return reject("deposit-fields", None); // spec-gap 54: first-contact deposits name a recipient and no group
+    }
+    if class == "introduction" && p["envelope"].as_str().is_some_and(|e| e.len() > dsip_core::INTRODUCTION_MAX_BYTES) {
+        return reject("introduction-too-large", Some("transport.envelope-too-large")); // §19.4
     }
     if SIZED_FIELDS.iter().any(|f| p[*f].as_str().is_some_and(|s| decoded_len(s) > MAX_MLS_BYTES)) {
         return reject("object-too-large", Some("mailbox.object-too-large")); // M§5.1
