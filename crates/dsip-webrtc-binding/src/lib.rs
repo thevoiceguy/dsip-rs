@@ -1,5 +1,5 @@
 //! `dsip-webrtc-binding` — the WebRTC Media Binding 1.0 (v0.7 companion document
-//! `v0.7/dsip-webrtc-media-binding-v0.7.md`), as pure, stack-independent rules.
+//! `v0.8/dsip-webrtc-media-binding-v0.8.md`), as pure, stack-independent rules.
 //!
 //! Spec: sections owned by this crate — B§2 (the `transport:webrtc` descriptor and
 //! where SDP rides), B§2.1 (descriptors are authoritative for *what* was negotiated,

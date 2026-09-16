@@ -1,5 +1,5 @@
 //! `dsip-messaging` — the protocol rules of the DSIP Messaging Profile 1.0 (v0.8 draft,
-//! `v0.8/dsip-messaging-profile-v0.8-draft.md`, cited `M§n`). Pure: no MLS library, no network.
+//! `v0.8/dsip-messaging-profile-v0.8.md`, cited `M§n`). Pure: no MLS library, no network.
 //! MLS is abstracted to what a hub or mailbox can observe, as relay traces abstract signatures.
 //!
 //! Spec: sections owned by this crate — M§5 (profile messages: the two-layer model, lifetimes,
