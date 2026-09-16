@@ -73,6 +73,10 @@ pub fn run_vector(v: &Value) -> Value {
             let mut r = client::Resume::new(&v["context"]);
             trace(inp, |ev| (r.step(ev), r.snapshot()))
         }
+        "commit-retry-trace" => {
+            let mut c = client::CommitRetry::new(&v["context"]);
+            trace(inp, |ev| (c.step(ev), c.snapshot()))
+        }
         "history-trace" => {
             let mut h = client::History::new(&v["context"]);
             trace(inp, |ev| (h.step(ev), h.snapshot()))

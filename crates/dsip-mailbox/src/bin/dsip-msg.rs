@@ -11,7 +11,8 @@
 //! the process can be killed at any point and restarted. A device holds any number of groups: its identity's
 //! personal group and its conversations; commands act on the most recent conversation. Every group deposit
 //! goes to the hub through this device's own mailbox with the delegation in its header (spec-gap 45); a
-//! commit is applied only after the hub's `accepted`; the device's own items fanned back to it are recognised
+//! commit is applied only after the hub's `accepted` and refusals are handled by the vector-pinned `CommitRetry` (spec-gap 58);
+//! the device's own items fanned back to it are recognised
 //! by that `accepted` seq or by their bytes (spec-gap 47). Audio (`voice`, `voicemail`) is an Ogg Opus file
 //! sealed under a fresh key, uploaded to the mailbox blob endpoint and referenced from the content object
 //! (M§8.2, M§8.4, M§5.6). Receipts and activity (M§10, M§11) are decided by the vector-pinned
@@ -48,7 +49,7 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, History, Resume};
+use dsip_messaging::client::{select_mailbox, CommitRetry, History, Resume};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, message_header, Device, MlsError};
@@ -272,6 +273,18 @@ struct Client {
     batch: Vec<(String, Value)>,
     /// What the receipt and history machines asked to send, by group, sent outside frame processing.
     outbox: Vec<(String, Value)>,
+}
+
+/// A membership or key change a device commits (M§6.5, M§7.3, M§12.3–M§12.4).
+enum CommitOp {
+    /// Add a KeyPackage's device: a new identity, or `device` of an existing one.
+    Add { kp: Box<KeyPackage>, grants: Vec<String>, identity: String, device: Option<String> },
+    /// Remove every leaf of an identity.
+    RemoveIdentity(String),
+    /// Remove the leaves whose credential names a device (whether or not they still authenticate).
+    RemoveDevice(String),
+    /// Refresh this device's own leaf key material (post-compromise security).
+    Update,
 }
 
 /// What processing one inbound item produced, reported only once it is committed.
@@ -600,25 +613,109 @@ impl Client {
         self.hub_deposit(group, "application", fields).await
     }
 
-    /// Deposit a commit and apply it only once the hub has accepted it (M§6.5).
-    async fn commit(&mut self, group: &str, commit: MlsMessageOut, welcome: Option<MlsMessageOut>, grants: Vec<String>, what: &str) -> Result<()> {
-        let mut fields = json!({"mls": b64(&commit.tls_serialize_detached()?)});
-        if let Some(w) = welcome {
-            fields["welcome"] = json!(b64(&w.tls_serialize_detached()?));
-        }
-        if !grants.is_empty() {
-            fields["grants"] = json!(grants);
-        }
-        let reply = self.hub_deposit(group, "handshake", fields).await?;
+    /// Build a commit for `op` against the group's current epoch: `(commit, welcome)`.
+    fn build_commit(&mut self, group: &str, op: &CommitOp) -> Result<(MlsMessageOut, Option<MlsMessageOut>)> {
+        let leaves = match op {
+            CommitOp::RemoveIdentity(identity) => self.leaves_where(group, |w| w.identity == *identity)?,
+            CommitOp::RemoveDevice(device) => self.device_leaves(group, device)?,
+            _ => vec![],
+        };
         let c = self.convs.get_mut(group).context("group")?;
-        if reply["type"] != "accepted" {
-            // M§6.5: a refused commit is discarded; on commit-conflict the device syncs and re-proposes.
-            c.group.clear_pending_commit(self.mls.provider().storage()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            bail!("{what} refused by the hub: {}", reply["reason"]);
+        let (provider, signer) = (self.mls.provider(), self.mls.signer());
+        let e = |x: &dyn std::fmt::Debug| anyhow::anyhow!("{x:?}");
+        Ok(match op {
+            CommitOp::Add { kp, .. } => {
+                let (commit, welcome, _) = c.group.add_members(provider, &signer, std::slice::from_ref(kp.as_ref())).map_err(|x| e(&x))?;
+                (commit, Some(welcome))
+            }
+            CommitOp::RemoveIdentity(_) | CommitOp::RemoveDevice(_) => {
+                let (commit, welcome, _) = c.group.remove_members(provider, &signer, &leaves).map_err(|x| e(&x))?;
+                (commit, welcome)
+            }
+            CommitOp::Update => {
+                let (commit, welcome, _) =
+                    c.group.self_update(provider, &signer, LeafNodeParameters::default()).map_err(|x| e(&x))?.into_messages();
+                (commit, welcome)
+            }
+        })
+    }
+
+    /// Whether `op` still needs doing after the device caught up with a winning commit (M§6.5 "if still needed").
+    fn still_needed(&self, group: &str, op: &CommitOp) -> Result<bool> {
+        Ok(match op {
+            CommitOp::Add { identity, device, .. } => match device {
+                Some(d) => self.device_leaves(group, d)?.is_empty(),
+                None => self.leaves_where(group, |w| w.identity == *identity)?.is_empty(),
+            },
+            CommitOp::RemoveIdentity(identity) => !self.leaves_where(group, |w| w.identity == *identity)?.is_empty(),
+            CommitOp::RemoveDevice(device) => !self.device_leaves(group, device)?.is_empty(),
+            CommitOp::Update => true,
+        })
+    }
+
+    /// Commit `op` to a group, applying it only once the hub has accepted it, and handling refusals as the vector-pinned
+    /// [`CommitRetry`] decides (M§6.5, spec-gap 58): a conflict or stale epoch is discarded, the device syncs past the
+    /// winning commit and re-proposes while still needed, boundedly; any other refusal is surfaced.
+    async fn commit_op(&mut self, group: &str, op: CommitOp, what: &str) -> Result<()> {
+        let mut retry = CommitRetry::new(&json!({}));
+        loop {
+            let (commit, welcome) = self.build_commit(group, &op)?;
+            let epoch = self.conv(group)?.group.epoch().as_u64();
+            let mut fields = json!({"mls": b64(&commit.tls_serialize_detached()?)});
+            if let Some(w) = welcome {
+                fields["welcome"] = json!(b64(&w.tls_serialize_detached()?));
+            }
+            if let CommitOp::Add { grants, .. } = &op {
+                if !grants.is_empty() {
+                    fields["grants"] = json!(grants);
+                }
+            }
+            let reply = self.hub_deposit(group, "handshake", fields).await?;
+            let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
+            let mut must_sync = false;
+            for action in retry.answer(reason.as_deref()) {
+                let c = self.convs.get_mut(group).context("group")?;
+                if action.get("merge").is_some() {
+                    c.group.merge_pending_commit(self.mls.provider()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    println!("OK {what} epoch={} seq={}", c.group.epoch().as_u64(), reply["seq"]);
+                    return self.publish_group_info(group).await;
+                } else if action.get("discard").is_some() {
+                    c.group.clear_pending_commit(self.mls.provider().storage()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                } else if let Some(r) = action.get("surface") {
+                    bail!("{what} refused by the hub: {}", r.as_str().unwrap_or(""));
+                } else if action.get("sync").is_some() {
+                    must_sync = true;
+                }
+            }
+            if must_sync {
+                println!("CONFLICT {what}: {} at epoch {epoch}; syncing past the winning commit", reason.as_deref().unwrap_or(""));
+                self.catch_up(group, epoch).await?;
+            }
+            let needed = self.still_needed(group, &op)?;
+            for action in retry.synced(needed) {
+                if action.get("done").is_some() {
+                    println!("OK {what} no longer needed after the winning commit");
+                    return Ok(());
+                }
+                if let Some(a) = action.get("repropose") {
+                    println!("REPROPOSE {what} attempt={} epoch={}", a["attempt"], self.conv(group)?.group.epoch().as_u64());
+                }
+            }
         }
-        c.group.merge_pending_commit(self.mls.provider()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        println!("OK {what} epoch={} seq={}", c.group.epoch().as_u64(), reply["seq"]);
-        self.publish_group_info(group).await
+    }
+
+    /// Sync and process frames until the group has moved past `epoch` (the winning commit is applied).
+    async fn catch_up(&mut self, group: &str, epoch: u64) -> Result<()> {
+        self.sync(false).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while self.conv(group)?.group.epoch().as_u64() <= epoch {
+            let conn = self.conn.as_mut().context("offline")?;
+            let frame = tokio::time::timeout_at(deadline, conn.recv()).await.context("the winning commit never arrived")??.context("mailbox closed")?;
+            if let Err(e) = self.inbound(&frame).await {
+                println!("ERR {e}");
+            }
+        }
+        Ok(())
     }
 
     /// Republish the GroupInfo after a commit, for the hub and for external joins (M§6.5 rule 6, M§6.8).
@@ -688,9 +785,8 @@ impl Client {
             Some(k) => k,
             None => self.fetch_key_package(peer, grant.as_deref(), None).await?,
         };
-        let c = self.convs.get_mut(group).context("no conversation")?;
-        let (commit, welcome, _) = c.group.add_members(self.mls.provider(), &self.mls.signer(), &[kp]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        self.commit(group, commit, Some(welcome), grant.into_iter().collect(), &format!("added {peer}")).await
+        let op = CommitOp::Add { kp: Box::new(kp), grants: grant.into_iter().collect(), identity: peer.to_string(), device: None };
+        self.commit_op(group, op, &format!("added {peer}")).await
     }
 
     fn leaves_where(&self, group: &str, pred: impl Fn(&dsip_messaging::mls_wire::LeafIdentity) -> bool) -> Result<Vec<LeafNodeIndex>> {
@@ -713,11 +809,8 @@ impl Client {
     /// Remove every leaf of `identity` from the active conversation (M§7.3).
     async fn remove(&mut self, identity: &str) -> Result<()> {
         let group = self.active()?;
-        let leaves = self.leaves_where(&group, |w| w.identity == identity)?;
-        anyhow::ensure!(!leaves.is_empty(), "{identity} is not a member");
-        let c = self.convs.get_mut(&group).context("group")?;
-        let (commit, _, _) = c.group.remove_members(self.mls.provider(), &self.mls.signer(), &leaves).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        self.commit(&group, commit, None, vec![], &format!("removed {identity}")).await
+        anyhow::ensure!(!self.leaves_where(&group, |w| w.identity == identity)?.is_empty(), "{identity} is not a member");
+        self.commit_op(&group, CommitOp::RemoveIdentity(identity.to_string()), &format!("removed {identity}")).await
     }
 
     /// M§12.3: add a new device of this identity, first to the personal group (re-sending every archive key in the
@@ -728,10 +821,9 @@ impl Client {
         order.extend(self.convs.keys().filter(|g| **g != personal).cloned());
         for group in order {
             let kp = self.fetch_key_package(&self.identity.clone(), None, Some(device)).await?;
-            let c = self.convs.get_mut(&group).context("group")?;
-            let (commit, welcome, _) = c.group.add_members(self.mls.provider(), &self.mls.signer(), &[kp]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
             let what = format!("added device {device} to {}", self.conv(&group)?.kind);
-            self.commit(&group, commit, Some(welcome), vec![], &what).await?;
+            let op = CommitOp::Add { kp: Box::new(kp), grants: vec![], identity: self.identity.clone(), device: Some(device.to_string()) };
+            self.commit_op(&group, op, &what).await?;
             if group == personal {
                 // M§12.3 step 3: a new member cannot read earlier epochs, so every live archive key is re-sent.
                 let keys: Vec<(String, [u8; 32], i64)> = self.archive_keys.iter().map(|(a, (k, t))| (a.clone(), *k, *t)).collect();
@@ -786,9 +878,7 @@ impl Client {
         if member_identity(&c.group, leaf.index, &ctx).is_ok() {
             bail!("the leaf's delegation still verifies: only its own identity may remove it (M§7.3)");
         }
-        let c = self.convs.get_mut(&group).context("group")?;
-        let (commit, _, _) = c.group.remove_members(self.mls.provider(), &self.mls.signer(), &[leaf.index]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        self.commit(&group, commit, None, vec![], &format!("removed lapsed leaf {device}")).await
+        self.commit_op(&group, CommitOp::RemoveDevice(device.to_string()), &format!("removed lapsed leaf {device}")).await
     }
 
     /// M§12.4: remove a device of this identity from every group, then rotate the archive key.
@@ -801,10 +891,8 @@ impl Client {
             if leaves.is_empty() {
                 continue;
             }
-            let c = self.convs.get_mut(&group).context("group")?;
-            let (commit, _, _) = c.group.remove_members(self.mls.provider(), &self.mls.signer(), &leaves).map_err(|e| anyhow::anyhow!("{e:?}"))?;
             let what = format!("removed device {device} from {}", self.conv(&group)?.kind);
-            self.commit(&group, commit, None, vec![], &what).await?;
+            self.commit_op(&group, CommitOp::RemoveDevice(device.to_string()), &what).await?;
         }
         self.rotate_archive_key(&personal).await
     }
@@ -1695,6 +1783,11 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "revoke-device" => client.revoke_device(rest.trim()).await,
         "remove-leaf" => client.remove_leaf(rest.trim()).await,
         "remove" => client.remove(rest.trim()).await,
+        "rekey" => {
+            // M§6.5: a self-update commit, applied only once the hub accepts it
+            let group = client.active()?;
+            client.commit_op(&group, CommitOp::Update, "rekeyed").await
+        }
         "send" => client.send_text(rest).await,
         "voice" => client.send_audio(rest.trim(), "voice-message", None, None).await,
         "voicemail" => {
