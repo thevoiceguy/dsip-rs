@@ -93,14 +93,14 @@ echo "=== Alice restarts: she applies Bob's commit, then reads Carol"
 device a 2; exec 3>"$DIR/a2.in"
 wait_for "$DIR/a2.log" "OK connected" 20
 echo "live" >&3
-wait_for "$DIR/a2.log" "^EPOCH 2 by=$BOB added=\[\"$CAROL\"\]" 30
+wait_for "$DIR/a2.log" "^EPOCH 2 kind=group by=$BOB added=\[\"$CAROL#" 30
 wait_for "$DIR/a2.log" "^RECV $CAROL: Hi both, thanks Bob" 30
 
 echo "=== Bob disconnects; Alice removes him; Alice and Carol carry on"
 echo "offline" >&4; wait_for "$DIR/b1.log" "OK offline" 10
 echo "remove $BOB" >&3
 wait_for "$DIR/a2.log" "^OK removed $BOB" 30
-wait_for "$DIR/c1.log" "^EPOCH 3 by=$ALICE added=\[\] removed=\[\"$BOB\"\]" 30
+wait_for "$DIR/c1.log" "^EPOCH 3 kind=group by=$ALICE added=\[\] removed=\[\"$BOB#" 30
 echo "send Just the two of us now" >&3
 wait_for "$DIR/c1.log" "^RECV $ALICE: Just the two of us now" 30
 

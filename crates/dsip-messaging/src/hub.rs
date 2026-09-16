@@ -160,7 +160,7 @@ impl Hub {
             }
         }
         let mut out = self.sequence(d, &targets);
-        let before: BTreeSet<String> = self.roster.keys().cloned().collect();
+        let before = self.roster.clone();
         for r in &removes {
             let x = s(&r["identity"]);
             if let Some(devs) = self.roster.get_mut(&x) {
@@ -175,10 +175,14 @@ impl Hub {
         }
         self.epoch += 1;
         if !external {
-            // an external joiner joined by its own commit; welcomes go only to identities others added
-            out.extend(
-                self.roster.keys().filter(|i| !before.contains(*i)).map(|i| json!({"fanout": {"to": i, "class": "welcome"}})),
-            );
+            // an external joiner joined by its own commit; welcomes go only to identities others added — every identity
+            // that gained a device, including a member adding its own new device (spec-gap 50)
+            let gained: BTreeSet<String> = adds
+                .iter()
+                .filter(|a| !before.get(&s(&a["identity"])).is_some_and(|devs| devs.contains(&s(&a["device"]))))
+                .map(|a| s(&a["identity"]))
+                .collect();
+            out.extend(gained.iter().map(|i| json!({"fanout": {"to": i, "class": "welcome"}})));
         }
         out
     }

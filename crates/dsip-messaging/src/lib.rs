@@ -50,6 +50,7 @@ pub fn run_vector(v: &Value) -> Value {
         "conversation-ext" => checks::check_conversation_ext(&inp["extension"]),
         "mailbox-select" => client::select_mailbox(inp),
         "mailbox-switch" => client::mailbox_switch(inp),
+        "registration-on-removal" => client::registration_on_removal(inp),
         "blob-put" => mailbox::blob_put(inp),
         "blob-get" => mailbox::blob_get(inp),
         "voicemail-offer" => client::voicemail_offer(inp),
@@ -67,6 +68,10 @@ pub fn run_vector(v: &Value) -> Value {
         "resume-trace" => {
             let mut r = client::Resume::new(&v["context"]);
             trace(inp, |ev| (r.step(ev), r.snapshot()))
+        }
+        "history-trace" => {
+            let mut h = client::History::new(&v["context"]);
+            trace(inp, |ev| (h.step(ev), h.snapshot()))
         }
         "hub-trace" => {
             let mut h = hub::Hub::new(&v["context"]);

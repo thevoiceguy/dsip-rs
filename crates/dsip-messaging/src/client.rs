@@ -484,6 +484,15 @@ impl GapTracker {
     }
 }
 
+/// Whether a device removed from a group ends its identity's mailbox registration (`left`).
+///
+/// Spec: M§5.7, M§6.6 — registrations are per identity. Impl (spec-gap 53): only when no leaf of the identity
+/// remains in the group.
+pub fn registration_on_removal(inp: &Value) -> Value {
+    let remains = inp["remaining_identities"].as_array().is_some_and(|a| a.contains(&inp["me"]));
+    json!({"left": !remains})
+}
+
 /// The deposit classes the hub sequences.
 ///
 /// Spec: M§6.5 rule 4.
@@ -590,6 +599,12 @@ impl Resume {
                     break;
                 }
                 let dup = self.is_duplicate(item);
+                if !dup && item["sibling"] == json!(true) {
+                    // spec-gap 51: a sibling device's welcome is acknowledged but is not a join
+                    out.push(json!({"sibling": cursor}));
+                    self.commit(item, true);
+                    continue;
+                }
                 out.push(json!({ if dup { "duplicate" } else { "process" }: cursor }));
                 self.commit(item, dup);
             }
@@ -615,5 +630,110 @@ impl Resume {
             .map(|(g, (contiguous, seen))| (g.clone(), json!({"contiguous": contiguous, "seen": seen})))
             .collect();
         json!({"cursor": self.cursor, "groups": groups, "joined": self.joined})
+    }
+}
+
+/// One device's conversation history assembled from MLS items and archive records.
+///
+/// Spec: M§12.2 (archive records, the current archive key), M§12.3 (a new device reads history from archive and MLS
+/// items from its join epoch onward), M§8.5 (archive and MLS copies are duplicates; display in hub `seq` order).
+///
+/// Impl (spec-gap 51): archive records under a key the device does not hold yet are held and released when that key
+/// arrives; MLS items from epochs before the device joined are skipped; a device archives what it shows from MLS,
+/// including its own sent content, under the current key — the greatest `created_at`, ties by `akid`.
+#[derive(Debug, Clone, Default)]
+pub struct History {
+    keys: BTreeMap<String, i64>,
+    joined: BTreeMap<String, i64>,
+    held: Vec<Value>,
+    shown: BTreeMap<String, (String, i64)>,
+}
+
+impl History {
+    /// A history from a vector `context`: `keys` (`[{akid, created_at}]`), `joined` (`{group: epoch}`).
+    pub fn new(ctx: &Value) -> History {
+        History {
+            keys: ctx["keys"].as_array().into_iter().flatten().map(|k| (s(&k["akid"]), k["created_at"].as_i64().unwrap_or(0))).collect(),
+            joined: ctx["joined"].as_object().into_iter().flatten().map(|(g, e)| (g.clone(), e.as_i64().unwrap_or(0))).collect(),
+            held: vec![],
+            shown: BTreeMap::new(),
+        }
+    }
+
+    /// The current archive key id, if any.
+    pub fn current_akid(&self) -> Option<String> {
+        self.keys.iter().max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0))).map(|(k, _)| k.clone())
+    }
+
+    /// Whether an MLS item of `group` at `epoch` predates this device's membership (the `mls` event's `prejoin` rule).
+    pub fn is_prejoin(&self, group: &str, epoch: i64) -> bool {
+        self.joined.get(group).is_some_and(|j| epoch < *j)
+    }
+
+    /// Whether the device holds this archive key.
+    pub fn has_key(&self, akid: &str) -> bool {
+        self.keys.contains_key(akid)
+    }
+
+    fn show(&mut self, e: &Value) -> Value {
+        let id = s(&e["id"]);
+        if self.shown.contains_key(&id) {
+            return json!({"duplicate": id});
+        }
+        self.shown.insert(id.clone(), (s(&e["group"]), e["seq"].as_i64().unwrap_or(0)));
+        json!({"show": id})
+    }
+
+    fn show_from_mls(&mut self, e: &Value) -> Vec<Value> {
+        let shown = self.show(e);
+        let fresh = shown.get("show").is_some();
+        let mut out = vec![shown];
+        if let (true, Some(akid)) = (fresh, self.current_akid()) {
+            out.push(json!({"archive": {"group": e["group"], "seq": e["seq"], "akid": akid}}));
+        }
+        out
+    }
+
+    /// Apply one event (`joined`, `archive_key`, `archive`, `mls`, `sent`) and return the decisions.
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        let Some((name, e)) = ev.as_object().and_then(|m| m.iter().next()) else { return vec![] };
+        match name.as_str() {
+            "joined" => {
+                self.joined.insert(s(&e["group"]), e["epoch"].as_i64().unwrap_or(0));
+                vec![]
+            }
+            "archive_key" => {
+                let akid = s(&e["akid"]);
+                self.keys.insert(akid.clone(), e["created_at"].as_i64().unwrap_or(0));
+                let (release, keep): (Vec<Value>, Vec<Value>) = std::mem::take(&mut self.held).into_iter().partition(|h| h["akid"] == json!(akid));
+                self.held = keep;
+                release.iter().map(|h| self.show(h)).collect()
+            }
+            "archive" => {
+                if !self.keys.contains_key(e["akid"].as_str().unwrap_or("")) {
+                    self.held.push(e.clone());
+                    return vec![json!({"hold": e["cursor"]})];
+                }
+                vec![self.show(e)]
+            }
+            "mls" => {
+                let group = s(&e["group"]);
+                if self.is_prejoin(&group, e["epoch"].as_i64().unwrap_or(0)) {
+                    return vec![json!({"prejoin": e["seq"]})];
+                }
+                self.show_from_mls(e)
+            }
+            "sent" => self.show_from_mls(e),
+            _ => vec![],
+        }
+    }
+
+    /// Snapshot compared by the vectors, and what a device persists: timeline in (group, seq) order, held cursors,
+    /// current key id.
+    pub fn snapshot(&self) -> Value {
+        let mut order: Vec<(&String, &(String, i64))> = self.shown.iter().collect();
+        order.sort_by(|a, b| a.1.cmp(b.1));
+        json!({"timeline": order.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+               "held": self.held.iter().map(|h| h["cursor"].clone()).collect::<Vec<_>>(), "current_akid": self.current_akid()})
     }
 }

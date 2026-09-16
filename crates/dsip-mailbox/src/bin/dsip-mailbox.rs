@@ -556,7 +556,7 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     {
         let mut st = service.lock().await;
         if identity == st.owner {
-            st.bound.insert(device.clone(), tx);
+            st.bound.insert(device.clone(), tx.clone());
             let devices: Vec<String> = st.bound.keys().cloned().collect();
             // The owner's registered devices are the ones that have bound (M§4.4).
             st.mailbox.register_devices(&devices);
@@ -583,9 +583,12 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
         }
     }
     let mut st = service.lock().await;
-    st.bound.remove(&device);
-    st.mailbox.step(&json!({"unbind": {"device": device}}));
-    tracing::info!("unbound {device}");
+    // A device may hold a second, short-lived connection; only its own binding ends here.
+    if st.bound.get(&device).is_some_and(|t| t.same_channel(&tx)) {
+        st.bound.remove(&device);
+        st.mailbox.step(&json!({"unbind": {"device": device}}));
+        tracing::info!("unbound {device}");
+    }
     Ok(())
 }
 
