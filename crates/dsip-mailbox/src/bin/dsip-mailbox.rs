@@ -6,7 +6,12 @@
 //!
 //! Impl: every decision comes from `dsip_messaging::{mailbox::Mailbox, hub::Hub}` and, for commits,
 //! `dsip_mls::HubView`; this binary only moves bytes and keeps the payloads the cursors name.
-//! One instance serves one owner identity and hubs the groups whose deposits name it.
+//! One instance serves one owner identity and hubs the groups whose deposits name it. An owner
+//! device's deposit for a group hubbed elsewhere is forwarded unchanged to the hub registered for that
+//! group, and the hub's answer comes back on the same path (M§5.2, spec-gap 45); the hub takes the
+//! acting identity of a forwarded deposit from the delegation in its header, since the connection it
+//! arrived on belongs to a mailbox. Welcomes a hub fans out carry the adder's deposit as `origin`,
+//! which the receiving mailbox verifies (M§14.2, spec-gap 46).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -25,7 +30,7 @@ use dsip_core::keys::KeyPair;
 use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
 use dsip_mailbox::store::{Item, Store};
-use dsip_mailbox::verify::verify_frame;
+use dsip_mailbox::verify::{delegated_identity, verify_frame};
 use dsip_mailbox::{wire, HELLO_TIMEOUT_S};
 use dsip_messaging::client::select_mailbox;
 use dsip_messaging::hub::Hub;
@@ -79,8 +84,20 @@ struct Service {
     store: Store,
     /// Items the hub has sequenced but whose fan-out is still in flight, by (group, seq).
     fanout: HashMap<(String, i64), Item>,
+    /// `dsip_conversation` of each hubbed group: its kind and the hub reference welcomes carry.
+    conversations: HashMap<String, Value>,
+    /// Hub `{did, uri}` of each group registered for the owner, from its welcome (M§6.6): where to forward.
+    hub_refs: HashMap<String, Value>,
     bound: HashMap<String, mpsc::UnboundedSender<String>>,
-    peers: HashMap<String, mpsc::UnboundedSender<Envelope>>,
+    peers: HashMap<String, mpsc::UnboundedSender<PeerMsg>>,
+}
+
+/// What goes out on a connection to a peer service.
+enum PeerMsg {
+    /// Hub fan-out we originate; its `accepted` releases the next queued item (M§6.5 rule 5).
+    Fanout(Envelope),
+    /// An owner device's deposit, forwarded unchanged; the answer goes back to that device (M§5.2).
+    Forward(Envelope, String),
 }
 
 fn ctx_of<'a>(resolver: &'a StaticResolver, seen: &SeenIds, supported: &Supported) -> Context<'a> {
@@ -172,6 +189,7 @@ impl Service {
     /// Hub emissions → envelopes, with fan-out routed locally or federated (M§6.5 rule 5).
     fn hub_out(&mut self, group: &str, emissions: Vec<Value>, now: i64) -> Vec<Out> {
         let mut out = vec![];
+        let batch_seq = emissions.iter().find_map(|e| e.get("accepted").and_then(|a| a.get("seq")).and_then(Value::as_i64));
         for e in emissions {
             let (kind, body) = e.as_object().and_then(|m| m.iter().next()).map(|(k, v)| (k.clone(), v.clone())).unwrap_or_default();
             let to = body["to"].as_str().unwrap_or("").to_string();
@@ -188,6 +206,21 @@ impl Service {
                 "error" => {
                     let env = wire::error(&self.key, &to, now, body["in_reply_to"].as_str(), body["reason"].as_str().unwrap_or(""), None);
                     out.push(Out::Device(to, env));
+                }
+                "fanout" if body["class"] == "welcome" => {
+                    // M§6.5 rule 5, M§14.2: the welcome the commit carried, with the grants and the
+                    // committer's own deposit as `origin`, so the new member's mailbox can verify the adder.
+                    let Some(item) = batch_seq.and_then(|s| self.fanout.get(&(group.to_string(), s)).cloned()) else { continue };
+                    let Some(welcome) = item.welcome else { continue };
+                    let mut fields = json!({"recipient": to, "mls": welcome,
+                        "hub": self.conversations.get(group).map(|c| c["hub"].clone()).unwrap_or(Value::Null)});
+                    if let Some(g) = item.grants {
+                        fields["grants"] = g;
+                    }
+                    if let Some(o) = item.origin {
+                        fields["origin"] = json!(o);
+                    }
+                    out.push(Out::Identity(to, wire::deposit(&self.key, "", now, group, "welcome", fields)));
                 }
                 "fanout" | "forward" => {
                     let class = body["class"].as_str().unwrap_or("application").to_string();
@@ -242,6 +275,26 @@ impl Service {
     }
 }
 
+/// Verify a hub-forwarded welcome's `origin`: the adder device's signed `handshake` deposit, with its
+/// delegation (M§14.2). Returns what the mailbox machine checks: identity, group, `issued_at`.
+fn origin_of(compact: &str, ctx: &Context) -> Option<Value> {
+    let mut parts = compact.split('.');
+    let env = Envelope {
+        protected: parts.next()?.to_string(),
+        payload: parts.next()?.to_string(),
+        signature: parts.next()?.to_string(),
+    };
+    // Verified as a credential: it is presented after its own delivery, so the replay window does not apply;
+    // the machine bounds its age against the hub deposit instead.
+    let ver = envelope::verify_raw(&env, ctx, false).ok()?;
+    let p = &ver.payload;
+    if p["type"] != "deposit" || p["class"] != "handshake" {
+        return None;
+    }
+    let identity = delegated_identity(&ver, ctx)?;
+    Some(json!({"identity": identity, "group": p["group"], "issued_at": p["issued_at"]}))
+}
+
 fn grant_payload(compact: &str, ctx: &Context) -> Option<Value> {
     // A grant is a credential, not a delivery envelope: verified like a delegation (§19.4, §7.4),
     // so its own replay window does not apply when it is presented later.
@@ -292,6 +345,8 @@ async fn main() -> Result<()> {
         views: HashMap::new(),
         store: Store::default(),
         fanout: HashMap::new(),
+        conversations: HashMap::new(),
+        hub_refs: HashMap::new(),
         bound: HashMap::new(),
         peers: HashMap::new(),
     }));
@@ -391,12 +446,14 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
         }
     };
     st.seen.insert(inb.payload()["id"].as_str().unwrap_or(""), now, now);
-    let outs = dispatch(&mut st, &inb, bound_identity, &resolver, now);
+    let signer = inb.device().to_string();
+    let outs = dispatch(service, &mut st, &inb, &frame, sender, bound_identity, &resolver, now);
     let mut replies = vec![];
     for out in outs {
         match out {
             Out::Device(to, env) => {
-                if to == sender {
+                // A forwarded deposit's signer is not bound here: its answer returns on this connection (M§5.2).
+                if to == sender || to == signer {
                     replies.push(env.frame());
                 } else if let Some(tx) = st.bound.get(&to) {
                     let _ = tx.send(env.frame());
@@ -409,9 +466,13 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
 }
 
 /// Route one verified message to the right state machine (M§5, M§6.5, M§6.6).
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
+    service: &Arc<Mutex<Service>>,
     st: &mut Service,
     inb: &dsip_mailbox::verify::Inbound,
+    frame: &str,
+    hello_device: &str,
     bound_identity: &str,
     resolver: &StaticResolver,
     now: i64,
@@ -419,8 +480,14 @@ fn dispatch(
     let p = inb.payload().clone();
     let device = inb.device().to_string();
     // §13.2: a device acts for the identity it bound as, not for the DID that signs each envelope
-    // (a profile message's `from` is the device, M§5.1).
-    let identity = bound_identity.to_string();
+    // (a profile message's `from` is the device, M§5.1). A deposit forwarded by a mailbox is signed by a
+    // device that did not bind here: it acts for the identity its header delegation proves (M§5.1, M§5.2).
+    let identity = if device == hello_device {
+        bound_identity.to_string()
+    } else {
+        let ctx = ctx_of(resolver, &st.seen, &st.supported);
+        delegated_identity(&inb.verified, &ctx).unwrap_or_else(|| device.clone())
+    };
     let id = p["id"].as_str().unwrap_or("").to_string();
     match inb.msg_type() {
         "deposit" => {
@@ -431,10 +498,25 @@ fn dispatch(
                 let ctx = ctx_of(resolver, &st.seen, &st.supported);
                 let grant = p["grants"].as_array().into_iter().flatten().filter_map(Value::as_str)
                     .find_map(|g| grant_payload(g, &ctx)).unwrap_or(Value::Null);
-                let event = json!({"welcome": {"id": id, "from": device, "adder_identity": identity,
+                let mut w = json!({"id": id, "from": device, "adder_identity": identity,
                     "recipient": st.owner, "group": group, "hub": p["hub"]["did"], "grant": grant,
-                    "successor_of": p["successor_of"]}});
-                let emissions = st.mailbox.step(&event);
+                    "successor_of": p["successor_of"]});
+                // A service-signed welcome (no delegation) came from a hub: only `origin` names the adder (M§14.2).
+                if device == hello_device && bound_identity == device {
+                    w["via_hub"] = json!(true);
+                    w["issued_at"] = p["issued_at"].clone();
+                    w.as_object_mut().expect("object").remove("adder_identity");
+                    if let Some(o) = p["origin"].as_str().and_then(|o| origin_of(o, &ctx)) {
+                        w["origin"] = o;
+                    }
+                }
+                let emissions = st.mailbox.step(&json!({"welcome": w}));
+                if let Some(e) = emissions.iter().find_map(|e| e.get("error")) {
+                    tracing::info!("welcome for {group} refused: {} (origin {})", e["reason"], w.get("origin").is_some());
+                }
+                if emissions.iter().any(|e| e.get("accepted").is_some()) {
+                    st.hub_refs.insert(group.clone(), p["hub"].clone());
+                }
                 st.absorb(&emissions, item);
                 return st.mailbox_out(emissions, now);
             }
@@ -451,6 +533,30 @@ fn dispatch(
                 let emissions = st.mailbox.step(&event);
                 st.absorb(&emissions, item);
                 return st.mailbox_out(emissions, now);
+            }
+            if p["to"].as_str() != Some(st.key.did().as_str()) {
+                // Addressed to another service: forward to the group's hub, or refuse (M§5.2, spec-gap 45).
+                let event = json!({"forward": {"id": id, "device": device, "identity": identity, "group": group, "to": p["to"]}});
+                let emissions = st.mailbox.step(&event);
+                if emissions.iter().any(|e| e.get("forward").is_some()) {
+                    let uri = st.hub_refs.get(&group).and_then(|h| h["uri"].as_str()).map(String::from);
+                    let target = p["to"].as_str().unwrap_or("").to_string();
+                    match (uri, Envelope::from_frame(frame)) {
+                        (Some(uri), Ok(env)) => {
+                            peer_send(service, st, &target, uri, PeerMsg::Forward(env, device.clone()));
+                            return vec![];
+                        }
+                        _ => {
+                            let env = wire::error(&st.key, &device, now, Some(&id), "mailbox.unknown-group", Some("hub not reachable"));
+                            return vec![Out::Device(device, env)];
+                        }
+                    }
+                }
+                return st.mailbox_out(emissions, now);
+            }
+            let mut item = item;
+            if class == "handshake" {
+                item.origin = Envelope::from_frame(frame).ok().map(|e| format!("{}.{}.{}", e.protected, e.payload, e.signature));
             }
             hub_deposit(st, &p, &device, &identity, item, resolver, now)
         }
@@ -520,12 +626,15 @@ fn hub_deposit(
         // Bootstrap or refresh the public view (M§6.5 rule 6).
         match HubView::from_group_info(&bytes) {
             Ok(view) => {
+                let conv = view.conversation().unwrap_or(Value::Null);
                 if !st.hubs.contains_key(&group) {
                     let roster = view.roster(&ctx).unwrap_or(json!({}));
-                    let hub = Hub::new(&json!({"now": now, "kind": "direct", "epoch": view.epoch(), "roster": roster}));
+                    let kind = conv["kind"].as_str().unwrap_or("direct");
+                    let hub = Hub::new(&json!({"now": now, "kind": kind, "epoch": view.epoch(), "roster": roster}));
                     st.hubs.insert(group.clone(), hub);
-                    tracing::info!("hubbing group {group} from epoch {}", view.epoch());
+                    tracing::info!("hubbing {kind} group {group} from epoch {}", view.epoch());
                 }
+                st.conversations.insert(group.clone(), conv);
                 st.views.insert(group.clone(), view);
             }
             Err(e) => tracing::info!("group-info refused: {e}"),
@@ -554,6 +663,14 @@ fn hub_deposit(
     }
     let hub = st.hubs.get_mut(&group).expect("hub");
     let emissions = hub.step(&json!({"deposit": deposit}));
+    for e in &emissions {
+        if let Some(err) = e.get("error") {
+            tracing::info!("hub refused {class} from {identity}: {}", err["reason"]);
+        }
+    }
+    if let Some(seq) = emissions.iter().find_map(|e| e.get("accepted").and_then(|a| a.get("seq"))) {
+        tracing::info!("hub sequenced {class} seq {seq} from {identity} in {group}");
+    }
     // Remember the payload so the fan-out can carry it: by seq, or as the latest of its class.
     let seq = emissions.iter().find_map(|e| e.get("accepted").and_then(|a| a.get("seq")).and_then(Value::as_i64));
     st.fanout.insert((group.clone(), seq.unwrap_or(-1)), item);
@@ -567,7 +684,11 @@ fn hub_deposit(
                 result.extend(st.local_deposit(&dep, now));
                 if let Some(h) = st.hubs.get_mut(&group) {
                     if let Some(s) = dep["seq"].as_i64() {
-                        h.step(&json!({"ack": {"identity": st.owner, "seq": s}}));
+                        // A local ack may release the owner's next queued item; deliver it the same way.
+                        let more = h.step(&json!({"ack": {"identity": st.owner, "seq": s}}));
+                        if !more.is_empty() {
+                            tracing::info!("local fan-out released {} more", more.len());
+                        }
                     }
                 }
             }
@@ -594,25 +715,30 @@ fn federate(service: &Arc<Mutex<Service>>, st: &mut Service, identity: &str, env
         .and_then(|e| e["uri"].as_str())
         .unwrap_or_default()
         .to_string();
-    if !st.peers.contains_key(&mailbox_did) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        st.peers.insert(mailbox_did.clone(), tx);
-        let (key, ca, service2, target) = (st.key.clone(), st.ca.clone(), service.clone(), mailbox_did.clone());
-        tokio::spawn(async move {
-            let name = target.clone();
-            if let Err(e) = peer_task(key, ca, uri, target, rx, service2).await {
-                tracing::info!("federation to {name} ended: {e}");
-            }
-        });
-    }
     let mut env = env;
     // The deposit is addressed to the peer mailbox; re-sign with the resolved `to` (M§5.2).
     if let Some(mut p) = wire::payload_of(&env) {
         p["to"] = json!(mailbox_did);
         env = envelope::sign(&p, &st.key, &st.key.kid());
     }
-    if let Some(tx) = st.peers.get(&mailbox_did) {
-        let _ = tx.send(env);
+    peer_send(service, st, &mailbox_did, uri, PeerMsg::Fanout(env));
+}
+
+/// Send on the connection to a peer service, dialling it first if needed.
+fn peer_send(service: &Arc<Mutex<Service>>, st: &mut Service, peer_did: &str, uri: String, msg: PeerMsg) {
+    if st.peers.get(peer_did).is_none_or(|tx| tx.is_closed()) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        st.peers.insert(peer_did.to_string(), tx);
+        let (key, ca, service2, target) = (st.key.clone(), st.ca.clone(), service.clone(), peer_did.to_string());
+        tokio::spawn(async move {
+            let name = target.clone();
+            if let Err(e) = peer_task(key, ca, uri, target, rx, service2).await {
+                tracing::info!("connection to {name} ended: {e}");
+            }
+        });
+    }
+    if let Some(tx) = st.peers.get(peer_did) {
+        let _ = tx.send(msg);
     }
 }
 
@@ -622,7 +748,7 @@ async fn peer_task(
     ca: Option<PathBuf>,
     uri: String,
     mailbox_did: String,
-    mut rx: mpsc::UnboundedReceiver<Envelope>,
+    mut rx: mpsc::UnboundedReceiver<PeerMsg>,
     service: Arc<Mutex<Service>>,
 ) -> Result<()> {
     let tls = tls::client_config(ca.as_deref())?;
@@ -643,12 +769,14 @@ async fn peer_task(
     // deposit id → (group, recipient identity, seq): an `accepted` names only what it answers, but the
     // hub's fan-out queue is per identity (M§6.5 rule 5), so the recipient has to be remembered here.
     let mut inflight: HashMap<String, (String, String, i64)> = HashMap::new();
+    // forwarded deposit id → the owner device waiting for the hub's answer (M§5.2)
+    let mut forwarded: HashMap<String, String> = HashMap::new();
     anyhow::ensure!(conn.relay.did == mailbox_did, "peer mailbox is {} not {mailbox_did}", conn.relay.did);
     tracing::info!("federating to {mailbox_did}");
     loop {
         tokio::select! {
             next = rx.recv() => match next {
-                Some(env) => {
+                Some(PeerMsg::Fanout(env)) => {
                     if let Some(p) = wire::payload_of(&env) {
                         if let (Some(id), Some(group), Some(to)) =
                             (p["id"].as_str(), p["group"].as_str(), p["recipient"].as_str())
@@ -658,12 +786,30 @@ async fn peer_task(
                     }
                     conn.send(&env).await?
                 }
+                Some(PeerMsg::Forward(env, device)) => {
+                    if let Some(id) = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)) {
+                        forwarded.insert(id, device);
+                    }
+                    tracing::info!("forwarding a deposit to hub {mailbox_did}");
+                    conn.send(&env).await?
+                }
                 None => break,
             },
             frame = conn.recv() => match frame? {
                 Some(text) => {
                     let Ok(env) = Envelope::from_frame(&text) else { continue };
                     let Some(p) = wire::payload_of(&env) else { continue };
+                    if let Some(device) = p["in_reply_to"].as_str().and_then(|id| forwarded.remove(id)) {
+                        // The hub's answer to a forwarded deposit, passed through to the device (M§5.2).
+                        let st = service.lock().await;
+                        if let Some(tx) = st.bound.get(&device) {
+                            let _ = tx.send(text.clone());
+                        }
+                        continue;
+                    }
+                    if p["type"] == "error" {
+                        tracing::info!("{mailbox_did} refused our deposit: {} {}", p["reason"], p["detail"]);
+                    }
                     if p["type"] == "accepted" {
                         let Some((group, identity, seq)) = p["in_reply_to"].as_str().and_then(|id| inflight.remove(id)) else {
                             continue;

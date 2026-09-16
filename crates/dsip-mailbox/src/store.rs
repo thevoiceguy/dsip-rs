@@ -29,6 +29,12 @@ pub struct Item {
     pub akid: Option<String>,
     /// When it was stored.
     pub stored_at: i64,
+    /// On a commit deposit to a hub: the Welcome for the identities it adds (M§5.2).
+    pub welcome: Option<String>,
+    /// On a commit deposit to a hub: the grants authorizing each add (M§14.2).
+    pub grants: Option<Value>,
+    /// On a commit deposit to a hub: the depositing device's envelope, compact, as `origin` (M§14.2).
+    pub origin: Option<String>,
 }
 
 impl Item {
@@ -63,6 +69,9 @@ impl Item {
             archive: s("archive"),
             akid: s("akid"),
             stored_at: now,
+            welcome: s("welcome"),
+            grants: p.get("grants").cloned(),
+            origin: None,
         }
     }
 }

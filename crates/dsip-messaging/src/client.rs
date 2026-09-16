@@ -516,13 +516,23 @@ impl Resume {
         let class = item["class"].as_str().unwrap_or("");
         let group = item["group"].as_str().unwrap_or("").to_string();
         if SEQUENCED_CLASSES.contains(&class) {
-            let (contiguous, seen) = self.groups.entry(group).or_default();
-            seen.insert(item["seq"].as_i64().unwrap_or(0));
-            while seen.remove(&(*contiguous + 1)) {
-                *contiguous += 1;
-            }
+            self.sent(&group, item["seq"].as_i64().unwrap_or(0));
         } else if class == "welcome" {
             self.joined.insert(group);
+        }
+    }
+
+    /// Record a seq as processed without an item: the device's own deposit, from the seq in its `accepted`.
+    ///
+    /// Impl (spec-gap 47): the hub fans a device's own item back to its identity (M§6.5 rule 5) and MLS
+    /// cannot decrypt a device's own message, so the copy must be recognised as already processed.
+    pub fn sent(&mut self, group: &str, seq: i64) {
+        let (contiguous, seen) = self.groups.entry(group.to_string()).or_default();
+        if seq > *contiguous {
+            seen.insert(seq);
+        }
+        while seen.remove(&(*contiguous + 1)) {
+            *contiguous += 1;
         }
     }
 
@@ -539,7 +549,7 @@ impl Resume {
         }
     }
 
-    /// Apply one trace event (`items` with optional `crash_at`, `sync`, `restart`, `cursor_invalid`).
+    /// Apply one trace event (`items` with optional `crash_at`, `sent`, `sync`, `restart`, `cursor_invalid`).
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         if let Some(e) = ev.get("items") {
             let mut out = vec![];
@@ -554,6 +564,10 @@ impl Resume {
                 self.commit(item, dup);
             }
             return out;
+        }
+        if let Some(e) = ev.get("sent") {
+            self.sent(e["group"].as_str().unwrap_or(""), e["seq"].as_i64().unwrap_or(0));
+            return vec![];
         }
         if ev.get("restart").is_some() {
             *self = Resume::new(&self.snapshot()); // only durable state survives

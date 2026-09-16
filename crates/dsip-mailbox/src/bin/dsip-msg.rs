@@ -1,17 +1,21 @@
 //! A messaging device: one identity's device, its MLS state, and a connection to its mailbox.
 //!
 //! Spec: M§4.2 (find the mailbox in the DID document), M§5.4–M§5.5 (sync, KeyPackages), M§6.2–M§6.7
-//! (leaves, groups, welcomes), M§8.1 (content objects), M§9.1 (deposit once), M§14.1–M§14.2 (grants).
+//! (leaves, groups, welcomes), M§7.2–M§7.3 (direct and group conversations, adds and removes rendered
+//! with their committer), M§8.1 (content objects), M§9.1 (deposit once), M§14.1–M§14.2 (grants).
 //!
 //! M§5.4, M§8.5 (durable delivery state across restarts).
 //!
 //! Impl: commands on stdin, events on stdout, so a demo script can drive two of these. MLS state and
 //! the delivery state ([`Resume`]: ack cursor, seq positions, joined groups) live in one SQLite
 //! database under `--state`, and each inbound item is processed and committed in one transaction
-//! (spec-gap 44), so the process can be killed at any point and restarted. `offline` only drops the
+//! (spec-gap 44), so the process can be killed at any point and restarted. Every group deposit goes to
+//! the hub through this device's own mailbox with the delegation in its header (spec-gap 45); a commit
+//! is applied only after the hub's `accepted`; the device's own items fanned back to it are recognised
+//! by that `accepted` seq or by their bytes (spec-gap 47). `offline` only drops the
 //! connection; `crash-next` exits after processing the next new item and before committing it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +33,7 @@ use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, Resume};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, member_identity, Device, MlsError};
+use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
 use dsip_transport::{now_s, tls};
@@ -163,6 +167,11 @@ struct Client {
     group: Option<MlsGroup>,
     conversation: Option<String>,
     group_id: Option<Vec<u8>>,
+    /// `dsip_conversation.kind` and `.hub` (`{did, uri}`) of the conversation (M§6.3).
+    kind: String,
+    hub: Option<(String, String)>,
+    /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
+    own: HashSet<String>,
     resume: Resume,
     grants: HashMap<String, String>,
     crash_next: bool,
@@ -170,10 +179,12 @@ struct Client {
 
 /// What processing one inbound item produced, reported only once it is committed.
 enum Outcome {
-    Joined { conversation: String, members: Vec<String>, group: String },
+    Joined { conversation: String, members: Vec<String>, group: String, conv: Value },
     Text { sender: String, text: String },
     Dropped(String),
-    Epoch(u64),
+    /// M§7.3: every roster change is rendered, attributed to the committing identity.
+    Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String> },
+    Removed { by: String },
     Nothing,
 }
 
@@ -259,16 +270,17 @@ impl Client {
         Ok(())
     }
 
-    /// Create the direct conversation with `peer`: fetch its KeyPackage, commit, welcome it (M§6.7, M§7.2).
-    async fn create(&mut self, peer: &str, grant: Option<String>) -> Result<()> {
+    /// Fetch and authenticate one KeyPackage of `peer` from its mailbox (M§5.5, M§6.2, M§14.2).
+    async fn fetch_key_package(&mut self, peer: &str, grant: Option<&str>) -> Result<KeyPackage> {
         let mut peer_conn = self.peer_connect(peer).await?;
         let mut fields = json!({"target": peer});
-        if let Some(g) = &grant {
+        if let Some(g) = grant {
             fields["grant"] = json!(g);
         }
         let fetch = wire::message(&self.keys.device, "key-package-fetch", &peer_conn.relay.did.clone(), now_s(), wire::TTL_S, fields);
         peer_conn.send(&fetch).await?;
         let reply = peer_conn.recv().await?.context("no reply to key-package-fetch")?;
+        peer_conn.close(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, "done").await;
         let payload = wire::payload_of(&Envelope::from_frame(&reply).map_err(|v| anyhow::anyhow!("{:?}", v.code))?)
             .context("bad reply")?;
         if payload["type"] != "key-packages" {
@@ -285,55 +297,136 @@ impl Client {
         let (kp, who) = authenticate_key_package(&dsip_core::b64::decode(kp_b64).context("bad base64")?, self.mls.provider(), &ctx)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         anyhow::ensure!(who.identity == peer, "key package belongs to {}", who.identity);
+        Ok(kp)
+    }
 
-        let now = now_s();
-        let conversation = wire::new_id(now);
-        let group_id = wire::new_id(now).into_bytes();
-        let conv = json!({"conversation": conversation, "kind": "direct",
-            "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}, "successor_of": null});
-        let mut group = self.mls.create_group(&group_id, &serde_json::to_vec(&conv)?).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let group_b64 = dsip_core::b64::encode(&group_id);
+    fn group_b64(&self) -> Result<String> {
+        Ok(dsip_core::b64::encode(self.group_id.as_deref().context("no conversation")?))
+    }
 
-        // The hub's public view is bootstrapped from the group's first GroupInfo (M§6.5 rule 6).
-        let gi = group
-            .export_group_info(self.mls.provider().crypto(), &self.mls.signer(), true)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let env = wire::deposit(&self.keys.device, &self.mailbox.0, now, &group_b64, "group-info",
-            json!({"mls": dsip_core::b64::encode(&gi.tls_serialize_detached()?)}));
-        self.send(&env).await?;
-
-        let (commit, welcome, _) = group
-            .add_members(self.mls.provider(), &self.mls.signer(), &[kp])
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let (commit, welcome) = (commit.tls_serialize_detached()?, welcome.tls_serialize_detached()?);
-        let env = wire::deposit(&self.keys.device, &self.mailbox.0, now, &group_b64, "handshake",
-            json!({"mls": dsip_core::b64::encode(&commit)}));
-        self.send(&env).await?;
-        group.merge_pending_commit(self.mls.provider()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-        // The welcome goes straight into the peer's mailbox, with the grant that admits it (M§14.2).
-        let mut fields = json!({"recipient": peer, "mls": dsip_core::b64::encode(&welcome),
-            "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}});
-        if let Some(g) = grant {
-            fields["grants"] = json!([g]);
+    /// Deposit to the group's hub through this device's mailbox and wait for the hub's answer (M§5.2,
+    /// M§9.2). The delegation rides in the header because a hub reached by forwarding has not seen it (M§5.1).
+    async fn hub_deposit(&mut self, class: &str, fields: Value) -> Result<Value> {
+        let hub = self.hub.clone().context("no hub")?;
+        let group = self.group_b64()?;
+        if let Some(bytes) = fields["mls"].as_str().and_then(dsip_core::b64::decode) {
+            self.own.insert(digest(&bytes));
         }
-        let env = wire::deposit(&self.keys.device, &peer_conn.relay.did.clone(), now, &group_b64, "welcome", fields);
-        peer_conn.send(&env).await?;
-        let _ = peer_conn.recv().await?;
-        peer_conn.close(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, "done").await;
+        let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], &hub.0, now_s(), &group, class, fields);
+        let id = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)).context("deposit id")?;
+        self.send(&env).await?;
+        let reply = self.await_reply(&id).await?;
+        if let Some(seq) = reply["seq"].as_i64() {
+            // The hub's `accepted` seq marks this device's own copy as processed (spec-gap 47).
+            self.resume.sent(&group, seq);
+            self.save_resume()?;
+        }
+        Ok(reply)
+    }
 
-        self.mls.provider().put_state("group", &json!(group_b64)).map_err(|e| anyhow::anyhow!("{e}"))?;
-        self.group = Some(group);
-        self.conversation = Some(conversation.clone());
-        self.group_id = Some(group_id);
-        println!("OK conversation {conversation} with {peer}");
+    /// Read frames until the answer to `id` arrives, processing everything else as it comes.
+    async fn await_reply(&mut self, id: &str) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let conn = self.conn.as_mut().context("offline")?;
+            let frame = tokio::time::timeout_at(deadline, conn.recv()).await.context("no answer from the hub")??.context("mailbox closed")?;
+            let p = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).unwrap_or_default();
+            if p["in_reply_to"] == json!(id) && (p["type"] == "accepted" || p["type"] == "error") {
+                return Ok(p);
+            }
+            if let Err(e) = self.inbound(&frame).await {
+                println!("ERR {e}");
+            }
+        }
+    }
+
+    /// Deposit a commit and apply it only once the hub has accepted it (M§6.5).
+    async fn commit(&mut self, commit: MlsMessageOut, welcome: Option<MlsMessageOut>, grants: Vec<String>, what: &str) -> Result<()> {
+        let mut fields = json!({"mls": dsip_core::b64::encode(&commit.tls_serialize_detached()?)});
+        if let Some(w) = welcome {
+            fields["welcome"] = json!(dsip_core::b64::encode(&w.tls_serialize_detached()?));
+        }
+        if !grants.is_empty() {
+            fields["grants"] = json!(grants);
+        }
+        let reply = self.hub_deposit("handshake", fields).await?;
+        let group = self.group.as_mut().context("no group")?;
+        if reply["type"] != "accepted" {
+            // M§6.5: a refused commit is discarded; on commit-conflict the device syncs and re-proposes.
+            group.clear_pending_commit(self.mls.provider().storage()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            bail!("{what} refused by the hub: {}", reply["reason"]);
+        }
+        group.merge_pending_commit(self.mls.provider()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        println!("OK {what} epoch={} seq={}", group.epoch().as_u64(), reply["seq"]);
+        self.publish_group_info().await
+    }
+
+    /// Republish the GroupInfo after a commit, for the hub and for external joins (M§6.5 rule 6, M§6.8).
+    async fn publish_group_info(&mut self) -> Result<()> {
+        let group = self.group.as_ref().context("no group")?;
+        let gi = group.export_group_info(self.mls.provider().crypto(), &self.mls.signer(), true).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let reply = self.hub_deposit("group-info", json!({"mls": dsip_core::b64::encode(&gi.tls_serialize_detached()?)})).await?;
+        anyhow::ensure!(reply["type"] == "accepted", "group-info refused: {}", reply["reason"]);
         Ok(())
     }
 
-    async fn send_text(&mut self, text: &str) -> Result<()> {
-        let (Some(conversation), Some(group_id)) = (self.conversation.clone(), self.group_id.clone()) else {
-            bail!("no conversation");
+    /// Create a conversation of `kind` with `peer`, hubbed at this identity's own mailbox (M§7.2, M§7.3).
+    async fn create(&mut self, kind: &str, peer: &str, grant: Option<String>) -> Result<()> {
+        let kp = self.fetch_key_package(peer, grant.as_deref()).await?;
+        let now = now_s();
+        let conversation = wire::new_id(now);
+        let group_id = wire::new_id(now).into_bytes();
+        let conv = json!({"conversation": conversation, "kind": kind,
+            "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}, "successor_of": null});
+        let group = self.mls.create_group(&group_id, &serde_json::to_vec(&conv)?).map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.group = Some(group);
+        self.conversation = Some(conversation.clone());
+        self.group_id = Some(group_id);
+        self.kind = kind.to_string();
+        self.hub = Some(self.mailbox.clone());
+        let group_b64 = self.group_b64()?;
+        self.mls.provider().put_state("group", &json!(group_b64)).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Our own mailbox hubs the group and must admit its fan-out for us (M§6.6).
+        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
+            json!({"subject": self.identity, "groups": [{"group": group_b64, "state": "joined", "hub": self.mailbox.0}]}));
+        self.send(&env).await?;
+        // The hub's public view is bootstrapped from the group's first GroupInfo (M§6.5 rule 6).
+        self.publish_group_info().await?;
+        println!("OK conversation {conversation} kind={kind}");
+        self.add(peer, grant, Some(kp)).await
+    }
+
+    /// Add `peer` to the conversation: the hub fans the welcome out with our deposit as `origin` (M§7.3, M§14.2).
+    async fn add(&mut self, peer: &str, grant: Option<String>, kp: Option<KeyPackage>) -> Result<()> {
+        let kp = match kp {
+            Some(k) => k,
+            None => self.fetch_key_package(peer, grant.as_deref()).await?,
         };
+        let group = self.group.as_mut().context("no conversation")?;
+        let (commit, welcome, _) =
+            group.add_members(self.mls.provider(), &self.mls.signer(), &[kp]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        self.commit(commit, Some(welcome), grant.into_iter().collect(), &format!("added {peer}")).await
+    }
+
+    /// Remove every leaf of `identity` (M§7.3).
+    async fn remove(&mut self, identity: &str) -> Result<()> {
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let group = self.group.as_mut().context("no conversation")?;
+        let leaves: Vec<LeafNodeIndex> = group
+            .members()
+            .filter(|m| member_identity(group, m.index, &ctx).is_ok_and(|w| w.identity == identity))
+            .map(|m| m.index)
+            .collect();
+        anyhow::ensure!(!leaves.is_empty(), "{identity} is not a member");
+        let (commit, _, _) =
+            group.remove_members(self.mls.provider(), &self.mls.signer(), &leaves).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        self.commit(commit, None, vec![], &format!("removed {identity}")).await
+    }
+
+    async fn send_text(&mut self, text: &str) -> Result<()> {
+        let conversation = self.conversation.clone().context("no conversation")?;
         let now = now_s();
         let obj = json!({"object": "content", "id": wire::new_id(now), "conversation": conversation,
             "sender": self.identity, "sent_at": now, "kind": "text", "purpose": "message",
@@ -343,10 +436,11 @@ impl Client {
             .create_message(self.mls.provider(), &self.mls.signer(), &serde_json::to_vec(&obj)?)
             .map_err(|e| anyhow::anyhow!("{e:?}"))?
             .tls_serialize_detached()?;
-        let env = wire::deposit(&self.keys.device, &self.mailbox.0, now, &dsip_core::b64::encode(&group_id), "application",
-            json!({"mls": dsip_core::b64::encode(&msg)}));
-        self.send(&env).await?;
-        println!("OK sent");
+        let reply = self.hub_deposit("application", json!({"mls": dsip_core::b64::encode(&msg)})).await?;
+        match reply["type"].as_str() {
+            Some("accepted") => println!("OK sent seq={}", reply["seq"]),
+            _ => println!("ERR send refused: {}", reply["reason"]),
+        }
         Ok(())
     }
 
@@ -385,6 +479,14 @@ impl Client {
         Ok(())
     }
 
+    fn set_conversation(&mut self, conv: &Value) {
+        self.kind = conv["kind"].as_str().unwrap_or("direct").to_string();
+        self.hub = match (conv["hub"]["did"].as_str(), conv["hub"]["uri"].as_str()) {
+            (Some(d), Some(u)) => Some((d.to_string(), u.to_string())),
+            _ => None,
+        };
+    }
+
     fn save_resume(&self) -> Result<()> {
         self.mls.provider().put_state("resume", &self.resume.snapshot()).map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -405,13 +507,20 @@ impl Client {
             return self.save_resume();
         }
         let bytes = item["mls"].as_str().and_then(dsip_core::b64::decode).unwrap_or_default();
+        if class != "welcome" && self.own.contains(&digest(&bytes)) {
+            // Our own deposit fanned back to our identity (M§6.5 rule 5); arrived before its `accepted` (spec-gap 47).
+            self.resume.commit(item, false);
+            self.save_resume()?;
+            println!("SELF {class} seq={}", item["seq"]);
+            return Ok(());
+        }
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
         let before = self.resume.clone();
         let crash = std::mem::take(&mut self.crash_next);
-        let (mls, group, resume, conversation) = (&self.mls, &mut self.group, &mut self.resume, &self.conversation);
+        let (mls, group, resume, conversation, kind) = (&self.mls, &mut self.group, &mut self.resume, &self.conversation, &self.kind);
         let result = mls.provider().atomically(|| {
-            let outcome = process(mls, group, conversation, &class, &bytes, &ctx)?;
+            let outcome = process(mls, group, conversation, kind, &class, &bytes, &ctx)?;
             if crash {
                 // Processed, MLS state written inside the transaction, never committed.
                 println!("CRASH {class} {cursor} processed, not committed");
@@ -440,9 +549,10 @@ impl Client {
             }
         };
         match outcome {
-            Outcome::Joined { conversation, members, group } => {
+            Outcome::Joined { conversation, members, group, conv } => {
                 self.conversation = Some(conversation.clone());
                 self.group_id = dsip_core::b64::decode(&group);
+                self.set_conversation(&conv);
                 println!("JOINED {conversation} members={members:?}");
                 // Confirm the pending group registration (M§6.6).
                 let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
@@ -451,7 +561,16 @@ impl Client {
             }
             Outcome::Text { sender, text } => println!("RECV {sender}: {text}"),
             Outcome::Dropped(why) => println!("DROP {why}"),
-            Outcome::Epoch(e) => println!("EPOCH {e}"),
+            Outcome::Epoch { epoch, by, added, removed } => {
+                println!("EPOCH {epoch} by={by} added={added:?} removed={removed:?}");
+            }
+            Outcome::Removed { by } => {
+                println!("REMOVED from {} by={by}", self.conversation.clone().unwrap_or_default());
+                let group = self.group_b64()?;
+                let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
+                    json!({"subject": self.identity, "groups": [{"group": group, "state": "left"}]}));
+                self.send(&env).await?;
+            }
             Outcome::Nothing => {}
         }
         Ok(())
@@ -467,6 +586,7 @@ fn process(
     mls: &Device<SqliteProvider>,
     slot: &mut Option<MlsGroup>,
     conversation: &Option<String>,
+    kind: &str,
     class: &str,
     bytes: &[u8],
     ctx: &Context,
@@ -480,6 +600,7 @@ fn process(
             conversation: conv["conversation"].as_str().unwrap_or_default().to_string(),
             members,
             group: dsip_core::b64::encode(group.group_id().as_slice()),
+            conv,
         };
         *slot = Some(group);
         return Ok(out);
@@ -495,7 +616,7 @@ fn process(
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app) => {
             let obj: Value = serde_json::from_slice(&app.into_bytes()).map_err(mls_err("content json"))?;
-            let octx = json!({"conversation": conversation, "conversation_kind": "direct", "leaf_identity": sender});
+            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender});
             let verdict = check_object(&obj, &octx);
             if verdict["verdict"] != "accept" {
                 return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
@@ -503,8 +624,21 @@ fn process(
             Ok(Outcome::Text { sender, text: obj["text"].as_str().unwrap_or("").to_string() })
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
+            let added: Vec<String> = staged
+                .add_proposals()
+                .filter_map(|a| dsip_mls::authenticate_leaf_node(a.add_proposal().key_package().leaf_node(), ctx).ok())
+                .map(|w| w.identity)
+                .collect();
+            let removed: Vec<String> = staged
+                .remove_proposals()
+                .filter_map(|r| member_identity(group, r.remove_proposal().removed(), ctx).ok())
+                .map(|w| w.identity)
+                .collect();
             group.merge_staged_commit(mls.provider(), *staged).map_err(mls_err("merge commit"))?;
-            Ok(Outcome::Epoch(group.epoch().as_u64()))
+            if !group.is_active() {
+                return Ok(Outcome::Removed { by: sender });
+            }
+            Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed })
         }
         _ => Ok(Outcome::Nothing),
     }
@@ -544,11 +678,8 @@ async fn main() -> Result<()> {
         Some(gid) => mls.load_group(gid).map_err(|e| anyhow::anyhow!("{e}"))?,
         None => None,
     };
-    let conversation = group
-        .as_ref()
-        .and_then(conversation_extension)
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|c| c["conversation"].as_str().map(String::from));
+    let conv = group.as_ref().and_then(conversation_extension).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let conversation = conv.as_ref().and_then(|c| c["conversation"].as_str().map(String::from));
     if let Some(c) = &conversation {
         println!("RESTORED {c} since={}", resume.sync_fields()["since"]);
     }
@@ -566,10 +697,16 @@ async fn main() -> Result<()> {
         group,
         conversation,
         group_id,
+        kind: "direct".into(),
+        hub: None,
+        own: HashSet::new(),
         resume,
         grants: HashMap::new(),
         crash_next: false,
     };
+    if let Some(c) = &conv {
+        client.set_conversation(c);
+    }
     client.connect().await?;
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -595,15 +732,18 @@ async fn main() -> Result<()> {
                         println!("GRANT {compact}");
                         Ok(())
                     }
-                    "create" => {
-                        let (peer, grant) = rest.split_once(' ').unwrap_or((rest, ""));
-                        let grant = if grant.trim().is_empty() {
-                            None
-                        } else {
-                            Some(std::fs::read_to_string(grant.trim())?.trim().to_string())
+                    "create" | "add" => {
+                        // create <direct|group> <peer> [grant-file]  /  add <peer> [grant-file]
+                        let mut words = rest.split_whitespace();
+                        let kind = if cmd == "create" { words.next().unwrap_or("direct").to_string() } else { String::new() };
+                        let peer = words.next().unwrap_or("").to_string();
+                        let grant = match words.next() {
+                            Some(f) => Some(std::fs::read_to_string(f)?.trim().to_string()),
+                            None => None,
                         };
-                        client.create(peer.trim(), grant).await
+                        if cmd == "create" { client.create(&kind, &peer, grant).await } else { client.add(&peer, grant, None).await }
                     }
+                    "remove" => client.remove(rest.trim()).await,
                     "send" => client.send_text(rest).await,
                     "sync" => client.sync(false).await,
                     "live" => client.sync(true).await,

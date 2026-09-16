@@ -29,13 +29,27 @@ pub fn new_id(now: i64) -> String {
 
 /// Build and sign a profile payload: `{dsip, type, id, from, to, …fields, issued_at, expires_at}`.
 pub fn message(key: &KeyPair, msg_type: &str, to: &str, now: i64, ttl: i64, fields: Value) -> Envelope {
+    message_delegated(key, vec![], msg_type, to, now, ttl, fields)
+}
+
+/// [`message`] with delegations in the protected header, for a receiver that does not hold them —
+/// a hub reached through the device's own mailbox (M§5.1).
+pub fn message_delegated(
+    key: &KeyPair,
+    delegations: Vec<Envelope>,
+    msg_type: &str,
+    to: &str,
+    now: i64,
+    ttl: i64,
+    fields: Value,
+) -> Envelope {
     let mut p = json!({"dsip": version_block(), "type": msg_type, "id": new_id(now), "from": key.did(), "to": to});
     for (k, v) in fields.as_object().into_iter().flatten() {
         p[k.as_str()] = v.clone();
     }
     p["issued_at"] = json!(now);
     p["expires_at"] = json!(now + ttl);
-    sign(&p, key, &key.kid())
+    dsip_core::envelope::sign_bytes(&dsip_core::envelope::encode_payload(&p), key, &key.kid(), delegations)
 }
 
 /// The decoded payload of an envelope.
@@ -91,12 +105,26 @@ pub fn mailbox_capabilities(hub: bool) -> Value {
 
 /// A `deposit` (M§5.2).
 pub fn deposit(key: &KeyPair, to: &str, now: i64, group: &str, class: &str, fields: Value) -> Envelope {
+    deposit_delegated(key, vec![], to, now, group, class, fields)
+}
+
+/// A `deposit` carrying the device's delegation in its header, as a hub reached by forwarding needs it
+/// (M§5.1, M§5.2).
+pub fn deposit_delegated(
+    key: &KeyPair,
+    delegations: Vec<Envelope>,
+    to: &str,
+    now: i64,
+    group: &str,
+    class: &str,
+    fields: Value,
+) -> Envelope {
     let mut f = json!({"group": group, "class": class});
     for (k, v) in fields.as_object().into_iter().flatten() {
         f[k.as_str()] = v.clone();
     }
     let ttl = if class == "ephemeral" { EPHEMERAL_TTL_S } else { TTL_S };
-    message(key, "deposit", to, now, ttl, f)
+    message_delegated(key, delegations, "deposit", to, now, ttl, f)
 }
 
 /// An `items` response or live push (M§5.4).
