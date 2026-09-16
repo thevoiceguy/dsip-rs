@@ -5,11 +5,13 @@
 //! [`select_direct`], [`check_successor`], [`select_successor`]), M§10.2–M§10.5 (identity-level
 //! receipts, first-by-seq collapse, monotone read watermarks, privacy routing — [`Client`]),
 //! M§11.2 (activity opt-in and refresh bound — [`Client`]), M§6.5 (holding handshake items across
-//! a seq gap and re-joining on timeout — [`GapTracker`]).
+//! a seq gap and re-joining on timeout — [`GapTracker`]), M§5.4 and M§8.5 (what a device keeps
+//! durably across a restart — [`Resume`]).
 //!
 //! Impl: an unregistered `endpoint.*` rejection offers voicemail by category fallback, an
 //! unregistered condition in any other category does not; delivered receipts are decided after a
-//! whole sync batch; the gap timer starts when the first item is held (spec-gaps 41, 42).
+//! whole sync batch; the gap timer starts when the first item is held; delivery state commits atomically with each
+//! item and redelivery is recognised by seq (spec-gaps 41, 42, 44).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -449,5 +451,125 @@ impl GapTracker {
     /// Snapshot compared by the vectors.
     pub fn snapshot(&self) -> Value {
         json!({"contiguous": self.contiguous, "held": self.held})
+    }
+}
+
+/// The deposit classes the hub sequences.
+///
+/// Spec: M§6.5 rule 4.
+pub const SEQUENCED_CLASSES: [&str; 2] = ["handshake", "application"];
+
+/// A device's durable delivery state: the ack cursor, per-group seq positions and joined groups.
+///
+/// Spec: M§5.4 — `ack_through` covers only items the device has durably processed; M§8.5 — duplicates
+/// collapse silently; M§5.4 — on `mailbox.cursor-invalid` the device re-syncs from `null`.
+///
+/// Impl (spec-gap 44): each item is processed and committed together with this state, or not at all,
+/// so a crash rolls an item back with its MLS state and it is redelivered. A redelivered sequenced
+/// item is recognised by its hub `seq` ([`GapTracker`]'s contiguous position plus the seqs seen past
+/// a gap), never by decrypting it, since MLS consumed its secret the first time; a welcome is a
+/// duplicate for a group already joined; unsequenced `group-info` is state and is processed again.
+/// Holding across a gap is [`GapTracker`]'s job and is not modelled here.
+#[derive(Debug, Clone, Default)]
+pub struct Resume {
+    cursor: Option<String>,
+    groups: BTreeMap<String, (i64, BTreeSet<i64>)>,
+    joined: BTreeSet<String>,
+}
+
+impl Resume {
+    /// Durable state from a vector `context` or a previous [`Resume::snapshot`]: `cursor`, `groups`, `joined`.
+    pub fn new(ctx: &Value) -> Resume {
+        let groups = ctx["groups"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(g, p)| {
+                let seen = p["seen"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
+                (g.clone(), (p["contiguous"].as_i64().unwrap_or(0), seen))
+            })
+            .collect();
+        Resume {
+            cursor: ctx["cursor"].as_str().map(String::from),
+            groups,
+            joined: ctx["joined"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect(),
+        }
+    }
+
+    /// Whether an `items[]` element was already durably processed.
+    pub fn is_duplicate(&self, item: &Value) -> bool {
+        let class = item["class"].as_str().unwrap_or("");
+        let group = item["group"].as_str().unwrap_or("");
+        if SEQUENCED_CLASSES.contains(&class) {
+            let seq = item["seq"].as_i64().unwrap_or(0);
+            return self.groups.get(group).is_some_and(|(contiguous, seen)| seq <= *contiguous || seen.contains(&seq));
+        }
+        class == "welcome" && self.joined.contains(group)
+    }
+
+    /// Record an item as committed; `duplicate` items only advance the cursor, so they are acknowledged.
+    pub fn commit(&mut self, item: &Value, duplicate: bool) {
+        self.cursor = item["cursor"].as_str().map(String::from);
+        if duplicate {
+            return;
+        }
+        let class = item["class"].as_str().unwrap_or("");
+        let group = item["group"].as_str().unwrap_or("").to_string();
+        if SEQUENCED_CLASSES.contains(&class) {
+            let (contiguous, seen) = self.groups.entry(group).or_default();
+            seen.insert(item["seq"].as_i64().unwrap_or(0));
+            while seen.remove(&(*contiguous + 1)) {
+                *contiguous += 1;
+            }
+        } else if class == "welcome" {
+            self.joined.insert(group);
+        }
+    }
+
+    /// Forget the cursor after `mailbox.cursor-invalid`; seq positions and joined groups are kept.
+    pub fn cursor_invalid(&mut self) {
+        self.cursor = None;
+    }
+
+    /// The `sync` fields this state allows: `since`, and `ack_through` never ahead of the last commit.
+    pub fn sync_fields(&self) -> Value {
+        match &self.cursor {
+            Some(c) => json!({"since": c, "ack_through": c}),
+            None => json!({"since": null}),
+        }
+    }
+
+    /// Apply one trace event (`items` with optional `crash_at`, `sync`, `restart`, `cursor_invalid`).
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        if let Some(e) = ev.get("items") {
+            let mut out = vec![];
+            for item in e["items"].as_array().into_iter().flatten() {
+                let cursor = item["cursor"].clone();
+                if e.get("crash_at") == Some(&cursor) {
+                    out.push(json!({"crash": cursor})); // processed in memory, never committed
+                    break;
+                }
+                let dup = self.is_duplicate(item);
+                out.push(json!({ if dup { "duplicate" } else { "process" }: cursor }));
+                self.commit(item, dup);
+            }
+            return out;
+        }
+        if ev.get("restart").is_some() {
+            *self = Resume::new(&self.snapshot()); // only durable state survives
+        } else if ev.get("cursor_invalid").is_some() {
+            self.cursor_invalid();
+        }
+        vec![json!({"sync": self.sync_fields()})]
+    }
+
+    /// The durable state, as the vectors compare it and as a device stores it.
+    pub fn snapshot(&self) -> Value {
+        let groups: serde_json::Map<String, Value> = self
+            .groups
+            .iter()
+            .map(|(g, (contiguous, seen))| (g.clone(), json!({"contiguous": contiguous, "seen": seen})))
+            .collect();
+        json!({"cursor": self.cursor, "groups": groups, "joined": self.joined})
     }
 }

@@ -14,7 +14,8 @@
 //! Impl: the protocol rules themselves (extension encoding, the authentication service, the hub and
 //! mailbox state machines, AES-GCM formats) live in `dsip-messaging` and are pinned by
 //! `impl/vectors/messaging/`; this crate binds them to OpenMLS objects and is exercised end to end by
-//! `tests/e2e.rs`. OpenMLS 0.9 needs Rust 1.91, so this crate carries its own `rust-version`.
+//! `tests/e2e.rs`. OpenMLS 0.9 needs Rust 1.91, so this crate carries its own `rust-version`. The
+//! `sqlite` feature adds a persistent provider ([`sqlite::SqliteProvider`]).
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -31,6 +32,9 @@ use sha2::{Digest, Sha256};
 use dsip_core::envelope::Context;
 use dsip_core::keys::KeyPair;
 use dsip_messaging::mls_wire::{authenticate_leaf, LeafIdentity, EXT_DSIP_CONVERSATION, EXT_DSIP_DELEGATION};
+
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 /// The mandatory-to-implement ciphersuite.
 ///
@@ -92,16 +96,26 @@ pub fn capabilities() -> Capabilities {
 /// One messaging device: its DSIP key, its compact `dsip.messaging` delegation, and its MLS provider.
 ///
 /// Spec: M§6.2, M§6.7.
-pub struct Device {
+///
+/// Impl: the provider is in memory by default; with the `sqlite` feature a device can keep its MLS
+/// state on disk ([`sqlite::SqliteProvider`]) and so survive a restart.
+pub struct Device<P: OpenMlsProvider = OpenMlsRustCrypto> {
     key: KeyPair,
     delegation: String,
-    provider: OpenMlsRustCrypto,
+    provider: P,
 }
 
 impl Device {
-    /// A device from its key and the compact delegation envelope that authorizes it.
+    /// A device from its key and the compact delegation envelope that authorizes it, with in-memory MLS state.
     pub fn new(key: KeyPair, delegation_compact: String) -> Device {
-        Device { key, delegation: delegation_compact, provider: OpenMlsRustCrypto::default() }
+        Device::with_provider(key, delegation_compact, OpenMlsRustCrypto::default())
+    }
+}
+
+impl<P: OpenMlsProvider> Device<P> {
+    /// A device whose MLS state lives in `provider`.
+    pub fn with_provider(key: KeyPair, delegation_compact: String, provider: P) -> Device<P> {
+        Device { key, delegation: delegation_compact, provider }
     }
 
     /// The device DID (the credential identity).
@@ -110,7 +124,7 @@ impl Device {
     }
 
     /// The MLS provider (crypto and storage) of this device.
-    pub fn provider(&self) -> &OpenMlsRustCrypto {
+    pub fn provider(&self) -> &P {
         &self.provider
     }
 
@@ -183,6 +197,11 @@ impl Device {
             .into_group(&self.provider)
             .map_err(err("join"))
     }
+
+    /// A group this device already holds in its provider's storage, if any.
+    pub fn load_group(&self, group_id: &[u8]) -> Result<Option<MlsGroup>, MlsError> {
+        MlsGroup::load(self.provider.storage(), &GroupId::from_slice(group_id)).map_err(err("load group"))
+    }
 }
 
 /// Authenticate one leaf node with the DSIP authentication service.
@@ -203,7 +222,7 @@ pub fn authenticate_leaf_node(leaf: &LeafNode, ctx: &Context) -> Result<LeafIden
 }
 
 /// Validate a serialized KeyPackage and authenticate its leaf before adding it (M§5.5, M§6.2).
-pub fn authenticate_key_package(bytes: &[u8], provider: &OpenMlsRustCrypto, ctx: &Context) -> Result<(KeyPackage, LeafIdentity), MlsError> {
+pub fn authenticate_key_package<P: OpenMlsProvider>(bytes: &[u8], provider: &P, ctx: &Context) -> Result<(KeyPackage, LeafIdentity), MlsError> {
     let kp_in = KeyPackageIn::tls_deserialize(&mut &bytes[..]).map_err(err("key package bytes"))?;
     let kp = kp_in.validate(provider.crypto(), ProtocolVersion::Mls10).map_err(err("key package"))?;
     let who = authenticate_leaf_node(kp.leaf_node(), ctx).map_err(|c| MlsError(format!("leaf authentication: {c}")))?;
@@ -239,7 +258,7 @@ pub fn conversation_extension(group: &MlsGroup) -> Option<Vec<u8>> {
 /// The per-epoch activity key.
 ///
 /// Spec: M§11.1 — `MLS-Exporter("dsip activity", group_id, 32)`.
-pub fn activity_key(group: &MlsGroup, provider: &OpenMlsRustCrypto) -> Result<[u8; 32], MlsError> {
+pub fn activity_key<P: OpenMlsProvider>(group: &MlsGroup, provider: &P) -> Result<[u8; 32], MlsError> {
     let k = group
         .export_secret(provider.crypto(), ACTIVITY_EXPORTER_LABEL, group.group_id().as_slice(), 32)
         .map_err(err("export activity key"))?;
