@@ -154,10 +154,10 @@ mod tests {
         let forged = sign_bytes(&encode_payload(&grant("did:web:bob.example")), &mallory_phone, &mallory_phone.kid(), vec![deleg(&bob_phone)]);
         assert!(grant_credential(&compact(forged), &ctx).is_none(), "a delegation for another device does not bind Mallory's key");
 
-        // spec-gap 56 (open): core §7.4 binds every envelope under `dsip.signaling`, so a device delegated for
-        // messaging only cannot grant today. This pins the current behavior until the v0.8 core decides.
+        // spec-gap 56, disposition (b) in the v0.8 core: binding stays `dsip.signaling` for every envelope, so a
+        // device delegated for messaging only cannot grant; the Messaging Profile's devices carry both capabilities.
         let messaging_only = sign_bytes(&encode_payload(&grant("did:web:bob.example")), &bob_phone, &bob_phone.kid(),
             vec![deleg_caps(&bob_phone, &["dsip.messaging"])]);
-        assert!(grant_credential(&compact(messaging_only), &ctx).is_none(), "messaging-only delegation: refused under core §7.4 today");
+        assert!(grant_credential(&compact(messaging_only), &ctx).is_none(), "messaging-only delegation: refused (§7.4, spec-gap 56 (b))");
     }
 }

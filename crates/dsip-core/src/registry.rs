@@ -12,10 +12,10 @@
 /// Message types on which a reason token may be carried, per the §15.4 "valid on" column.
 pub const REASON_BEARING_TYPES: &[&str] = &["reject", "cancel", "bye", "error"];
 
-/// The eight reason categories.
+/// The reason categories.
 ///
-/// Spec: §15.1 token grammar; §15.3 fallback behavior.
-pub const CATEGORIES: &[&str] = &["user", "endpoint", "identity", "session", "media", "policy", "transport", "gateway"];
+/// Spec: §15.1 token grammar; §15.3 fallback behavior. v0.8 adds `mailbox` (spec-gap 38).
+pub const CATEGORIES: &[&str] = &["user", "endpoint", "identity", "session", "media", "policy", "transport", "gateway", "mailbox"];
 
 /// `dsip-reason` registry: (token, valid-on message types).
 ///
@@ -67,6 +67,17 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("gateway.unreachable", &["reject", "error"]),
     ("gateway.downgraded", &["error"]),
     ("gateway.mapped", &["reject", "bye", "error"]),
+    // v0.8 (spec-gaps 38, 48): the Messaging Profile's mailbox conditions (M§16)
+    ("mailbox.commit-conflict", &["error"]),
+    ("mailbox.stale-epoch", &["error"]),
+    ("mailbox.unknown-group", &["error"]),
+    ("mailbox.cursor-invalid", &["error"]),
+    ("mailbox.object-too-large", &["error"]),
+    ("mailbox.quota-exceeded", &["error"]),
+    ("mailbox.no-key-packages", &["error"]),
+    ("mailbox.unsupported-class", &["error"]),
+    ("mailbox.unsupported-mode", &["error"]),
+    ("mailbox.blob-mismatch", &["error"]),
 ];
 
 /// `dsip-answered-by` registered values. Unknown values render as `service`.
@@ -86,8 +97,17 @@ pub const SUBSCRIPTION_EVENTS: &[(&str, i64)] = &[("presence", 3_600), ("publica
 
 /// `dsip-grant-scope` registered values.
 ///
-/// Spec: §19.4.
-pub const GRANT_SCOPES: &[&str] = &["dsip.invite", "dsip.subscribe"];
+/// Spec: §19.4; `dsip.message` v0.8 (spec-gap 36).
+pub const GRANT_SCOPES: &[&str] = &["dsip.invite", "dsip.subscribe", "dsip.message"];
+
+/// `dsip-delegation-capability` registered values.
+///
+/// Spec: §7.4 (v0.8, spec-gap 39). Binding any envelope requires `dsip.signaling`; the Messaging Profile's
+/// devices carry `dsip.messaging` as well (spec-gap 56).
+pub const DELEGATION_CAPABILITIES: &[&str] = &["dsip.signaling", "dsip.media.interactive", "dsip.messaging"];
+
+/// `dsip-revocation-reason` registered values (§7.4, v0.8, spec-gap 57).
+pub const REVOCATION_REASONS: &[&str] = &["lost", "compromised", "retired", "policy"];
 
 /// The core message set plus `hello`.
 ///
@@ -96,6 +116,7 @@ pub const MESSAGE_TYPES: &[&str] = &[
     "invite", "progress", "answer", "reject", "cancel", "update", "info", "bye", "introduction", "grant",
     "publish", "subscribe", "notify", "unpublish", "error", "hello",
     "provenance", "key-rotation", "reachability-hint", // v0.7: §22.3, §7.5, DHT Hints Profile
+    "delegation-revocation",                           // v0.8: §7.4 (spec-gap 57)
 ];
 
 /// `dsip-integrity-mode` registered values (§22.2). Unknown values resolve to `metadata-only`.

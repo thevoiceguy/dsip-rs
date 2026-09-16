@@ -33,6 +33,7 @@ pub const SCHEMAS: &[(&str, &str)] = &[
     schema!("unpublish"),
     schema!("provenance"),
     schema!("key-rotation"),
+    schema!("delegation-revocation"),
     schema!("reachability-hint"),
     schema!("webrtc-info-data"),
     schema!("envelope"),

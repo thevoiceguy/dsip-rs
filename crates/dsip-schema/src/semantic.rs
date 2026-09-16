@@ -120,6 +120,20 @@ pub fn check_semantic(payload: &Value, ctx: &SemanticContext) -> Verdict {
                 return Verdict::reject(RejectCode::IntroductionTooLarge); // §19.4
             }
         }
+        if payload.get("purpose").is_some() && payload.get("sealed").is_some() {
+            return Verdict::reject(RejectCode::IntroductionPurposeAndSealed); // §19.4 (v0.8, spec-gap 36): sealed replaces purpose
+        }
+    }
+    if t == "delegation-revocation" {
+        // §7.4 (v0.8, spec-gap 57): only the identity revokes its own devices' delegations, with its own key
+        if s("subject") != s("from") {
+            return Verdict::reject(RejectCode::RevocationSubjectMismatch);
+        }
+        if let Some(signer) = ctx.signer_kid.as_deref() {
+            if Some(signer.split('#').next().unwrap_or("")) != s("subject") {
+                return Verdict::reject(RejectCode::RevocationSignerNotSubject);
+            }
+        }
     }
     if t == "grant" {
         if let Some(known) = &ctx.known_introductions {

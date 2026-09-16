@@ -27,8 +27,14 @@ pub enum RejectCode {
     DelegationInvalid,
     DelegationExpired,
     DelegationCapability,
-    /// A revocation covers the delegation (v0.8 draft, spec-gap 57).
+    /// A revocation covers the delegation (§7.4, v0.8, spec-gap 57).
     DelegationRevoked,
+    /// An introduction carries both `purpose` and `sealed` (§19.4, v0.8).
+    IntroductionPurposeAndSealed,
+    /// A revocation's `from` is not its `subject` (§7.4, v0.8).
+    RevocationSubjectMismatch,
+    /// A revocation is not signed by a key of its subject (§7.4, v0.8).
+    RevocationSignerNotSubject,
     ExpiryOrder,
     ReplayWindow,
     IntroductionValidity,

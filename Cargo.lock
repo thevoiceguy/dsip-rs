@@ -1325,6 +1325,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "dsip-core",
+ "dsip-schema",
  "hex",
  "hmac 0.12.1",
  "jsonschema",
