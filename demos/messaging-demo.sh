@@ -8,6 +8,10 @@
 # Bob's device process is dead reaches the restarted process without replaying history (M§5.4), and
 # unless a device killed after processing an item but before committing it gets that item again,
 # intact, on restart (spec-gap 44). Device MLS and delivery state live in SQLite under --state.
+# Finally Alice leaves Bob a voicemail after an unanswered call: real speech encoded as Ogg Opus, sealed
+# under a fresh key, uploaded to her mailbox's blob endpoint and fetched, verified and decrypted by Bob
+# byte for byte; her client refuses to offer one after a block (M§13.2), and her mailbox never holds
+# plaintext audio (M§13.1). Needs espeak-ng and ffmpeg (libopus).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -105,14 +109,38 @@ wait_for "$DIR/b3.log" "OK connected" 20
 echo "sync" >&4
 wait_for "$DIR/b3.log" "^RECV .*Fourth, the one that crashes the receiver" 30
 
+echo "=== voicemail: Alice's call went unanswered; her client offers, records, seals and uploads (M§13, M§8.4)"
+espeak-ng -w "$DIR/vm.wav" "Hi Bob, it is Alice. Sorry I missed you. Call me back when you can."
+ffmpeg -loglevel error -y -i "$DIR/vm.wav" -c:a libopus -b:a 24k "$DIR/vm.ogg"
+SESSION=01M2N6A0B1C2D3E4F5G6H7J8K9
+echo "live" >&4
+echo "voicemail $SESSION user.blocked $DIR/vm.ogg" >&3; wait_for "$DIR/a.log" "^NO-OFFER user.blocked" 10
+echo "voicemail $SESSION user.no-answer $DIR/vm.ogg" >&3
+wait_for "$DIR/a.log" "^OK sent audio purpose=voicemail" 30
+wait_for "$DIR/b3.log" "^RECV-AUDIO $ALICE purpose=voicemail .*session=$SESSION" 30
+GOT=$(grep -m1 "^RECV-AUDIO" "$DIR/b3.log" | sed -E 's/.* file=([^ ]+) .*/\1/')
+if ! cmp -s "$DIR/vm.ogg" "$GOT"; then echo "FAIL: Bob's voicemail differs from what Alice recorded"; exit 1; fi
+CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$GOT")
+if [ "$CODEC" != "opus" ]; then echo "FAIL: received voicemail is not Opus ($CODEC)"; exit 1; fi
+if grep -lq OpusHead "$DIR"/mbx-a/blobs/* 2>/dev/null; then echo "FAIL: a mailbox holds plaintext audio"; exit 1; fi
+SHA=$(ls "$DIR"/mbx-a/blobs | head -1)
+code() { curl -s --cacert "$DIR/ca.pem" -o "$DIR/http.out" -w "%{http_code}" "$@"; }
+[ "$(code "https://127.0.0.1:9451/blobs/$SHA")" = 200 ] && cmp -s "$DIR/http.out" "$DIR/mbx-a/blobs/$SHA" \
+  || { echo "FAIL: GET of the stored hash did not return its ciphertext"; exit 1; }
+[ "$(code "https://127.0.0.1:9451/blobs/$(printf '0%.0s' {1..64})")" = 404 ] || { echo "FAIL: unknown hash not 404"; exit 1; }
+[ "$(code -X PUT --data-binary @"$DIR/vm.ogg" "https://127.0.0.1:9451/blobs/$(sha256sum "$DIR/vm.ogg" | cut -c1-64)")" = 401 ] \
+  || { echo "FAIL: an unauthorized PUT was not refused with 401"; exit 1; }
+BLOBS=$(ls "$DIR"/mbx-a/blobs | wc -l)
+echo "voicemail: $(stat -c %s "$GOT") bytes of Opus, identical to the recording; $BLOBS ciphertext blob(s) at Alice's mailbox"
+
 echo "quit" >&3; echo "quit" >&4; sleep 0.5
 if grep -hE "^\?\?" "$DIR"/b*.log; then
   echo "FAIL: Bob's devices hit items they could not process"; exit 1
 fi
 echo
 echo "=== Bob's device saw (three processes, one state directory):"
-grep -hE "^(JOINED|RECV|EPOCH|RESTORED|CRASH|DUP)" "$DIR/b.log" "$DIR/b2.log" "$DIR/b3.log"
+grep -hE "^(JOINED|RECV|RECV-AUDIO|EPOCH|RESTORED|CRASH|DUP)" "$DIR/b.log" "$DIR/b2.log" "$DIR/b3.log"
 echo "=== hub (Alice's mailbox) sequenced:"; grep -E "hubbing|federating" "$DIR/mbx-a.log" || true
 echo
 echo "PASS: two mailboxes, federated hub fan-out, MLS-encrypted text delivered live, after a disconnect,"
-echo "      after a device restart, and after a crash between processing and commit."
+echo "      after a device restart, after a crash between processing and commit, and a sealed Opus voicemail."

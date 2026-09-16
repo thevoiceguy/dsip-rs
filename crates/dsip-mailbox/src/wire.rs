@@ -88,7 +88,7 @@ pub fn service_hello(key: &KeyPair, to_hello_id: &str, now: i64, capabilities: V
 }
 
 /// The `capabilities.mailbox` object a mailbox advertises (M§4.3).
-pub fn mailbox_capabilities(hub: bool) -> Value {
+pub fn mailbox_capabilities(hub: bool, blob_endpoint: &str, max_blob_bytes: i64) -> Value {
     json!({
         "max_envelope_bytes": dsip_core::WS_MAX_ENVELOPE_BYTES,
         "store_and_forward": true,
@@ -99,6 +99,8 @@ pub fn mailbox_capabilities(hub: bool) -> Value {
             "ciphersuites": [1],
             "max_mls_bytes": dsip_messaging::checks::MAX_MLS_BYTES,
             "mls_retention_s": 2_592_000,
+            "blob_endpoint": blob_endpoint,
+            "max_blob_bytes": max_blob_bytes,
         }
     })
 }

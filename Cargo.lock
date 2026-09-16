@@ -1289,6 +1289,8 @@ dependencies = [
  "dsip-transport",
  "futures-util",
  "openmls",
+ "rand 0.8.7",
+ "reqwest",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

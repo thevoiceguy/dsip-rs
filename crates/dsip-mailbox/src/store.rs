@@ -29,6 +29,8 @@ pub struct Item {
     pub akid: Option<String>,
     /// When it was stored.
     pub stored_at: i64,
+    /// The ciphertext manifest of blobs the content references (M§5.2, M§8.4): no keys.
+    pub blobs: Option<Value>,
     /// On a commit deposit to a hub: the Welcome for the identities it adds (M§5.2).
     pub welcome: Option<String>,
     /// On a commit deposit to a hub: the grants authorizing each add (M§14.2).
@@ -50,6 +52,9 @@ impl Item {
         if let Some(seq) = self.seq {
             v["seq"] = json!(seq);
         }
+        if let Some(b) = &self.blobs {
+            v["blobs"] = b.clone();
+        }
         if let Some(h) = &self.hub {
             v["hub"] = h.clone();
         }
@@ -69,6 +74,7 @@ impl Item {
             archive: s("archive"),
             akid: s("akid"),
             stored_at: now,
+            blobs: p.get("blobs").cloned(),
             welcome: s("welcome"),
             grants: p.get("grants").cloned(),
             origin: None,

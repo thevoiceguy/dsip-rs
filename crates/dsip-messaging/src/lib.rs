@@ -50,6 +50,8 @@ pub fn run_vector(v: &Value) -> Value {
         "conversation-ext" => checks::check_conversation_ext(&inp["extension"]),
         "mailbox-select" => client::select_mailbox(inp),
         "mailbox-switch" => client::mailbox_switch(inp),
+        "blob-put" => mailbox::blob_put(inp),
+        "blob-get" => mailbox::blob_get(inp),
         "voicemail-offer" => client::voicemail_offer(inp),
         "direct-select" => client::select_direct(inp["candidates"].as_array().map(Vec::as_slice).unwrap_or(&[])),
         "successor-check" => client::check_successor(inp),

@@ -15,6 +15,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod http;
 pub mod store;
 pub mod verify;
 pub mod wire;
