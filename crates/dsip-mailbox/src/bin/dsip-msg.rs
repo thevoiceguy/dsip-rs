@@ -3,9 +3,13 @@
 //! Spec: M§4.2 (find the mailbox in the DID document), M§5.4–M§5.5 (sync, KeyPackages), M§6.2–M§6.7
 //! (leaves, groups, welcomes), M§8.1 (content objects), M§9.1 (deposit once), M§14.1–M§14.2 (grants).
 //!
-//! Impl: commands on stdin, events on stdout, so a demo script can drive two of these. MLS state
-//! lives in the process, so `offline` drops the connection rather than the group (persistent MLS
-//! storage is future work).
+//! M§5.4, M§8.5 (durable delivery state across restarts).
+//!
+//! Impl: commands on stdin, events on stdout, so a demo script can drive two of these. MLS state and
+//! the delivery state ([`Resume`]: ack cursor, seq positions, joined groups) live in one SQLite
+//! database under `--state`, and each inbound item is processed and committed in one transaction
+//! (spec-gap 44), so the process can be killed at any point and restarted. `offline` only drops the
+//! connection; `crash-next` exits after processing the next new item and before committing it.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -23,8 +27,9 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::select_mailbox;
-use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, member_identity, Device};
+use dsip_messaging::client::{select_mailbox, Resume};
+use dsip_mls::sqlite::SqliteProvider;
+use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
 use dsip_transport::{now_s, tls};
@@ -35,7 +40,7 @@ use openmls::prelude::*;
 #[derive(Parser)]
 #[command(name = "dsip-msg", about = "A DSIP messaging device (Messaging Profile 1.0)")]
 struct Args {
-    /// State directory (keys).
+    /// State directory (keys, and `device.sqlite`: MLS and delivery state).
     #[arg(long)]
     state: PathBuf,
     /// This device's identity, a `did:web` whose document is published.
@@ -149,7 +154,7 @@ struct Client {
     keys: Keys,
     identity: String,
     delegation: Envelope,
-    mls: Device,
+    mls: Device<SqliteProvider>,
     resolver_files: Vec<PathBuf>,
     ca: Option<PathBuf>,
     conn: Option<Connection>,
@@ -158,8 +163,18 @@ struct Client {
     group: Option<MlsGroup>,
     conversation: Option<String>,
     group_id: Option<Vec<u8>>,
-    cursor: Value,
+    resume: Resume,
     grants: HashMap<String, String>,
+    crash_next: bool,
+}
+
+/// What processing one inbound item produced, reported only once it is committed.
+enum Outcome {
+    Joined { conversation: String, members: Vec<String>, group: String },
+    Text { sender: String, text: String },
+    Dropped(String),
+    Epoch(u64),
+    Nothing,
 }
 
 impl Client {
@@ -307,6 +322,7 @@ impl Client {
         let _ = peer_conn.recv().await?;
         peer_conn.close(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, "done").await;
 
+        self.mls.provider().put_state("group", &json!(group_b64)).map_err(|e| anyhow::anyhow!("{e}"))?;
         self.group = Some(group);
         self.conversation = Some(conversation.clone());
         self.group_id = Some(group_id);
@@ -335,10 +351,9 @@ impl Client {
     }
 
     async fn sync(&mut self, live: bool) -> Result<()> {
-        let mut fields = json!({"since": self.cursor.clone(), "live": live});
-        if self.cursor.is_string() {
-            fields["ack_through"] = self.cursor.clone();
-        }
+        // M§5.4: `ack_through` is the last committed item, never ahead of it (spec-gap 44).
+        let mut fields = self.resume.sync_fields();
+        fields["live"] = json!(live);
         let env = wire::message(&self.keys.device, "sync", &self.mailbox.0, now_s(), wire::TTL_S, fields);
         self.send(&env).await
     }
@@ -351,77 +366,147 @@ impl Client {
             "items" => {
                 for item in p["items"].as_array().into_iter().flatten() {
                     self.item(item).await?;
-                    self.cursor = item["cursor"].clone();
                 }
                 if p["next"].is_string() {
                     self.sync(false).await?;
                 }
             }
             "accepted" => {}
+            "error" if p["reason"] == "mailbox.cursor-invalid" => {
+                // M§5.4: re-sync from null; seq positions make the redelivery collapse (M§8.5).
+                self.resume.cursor_invalid();
+                self.save_resume()?;
+                println!("RESYNC from null");
+                self.sync(false).await?;
+            }
             "error" => println!("ERR {} {}", p["reason"], p["detail"]),
             other => println!("?? {other}"),
         }
         Ok(())
     }
 
+    fn save_resume(&self) -> Result<()> {
+        self.mls.provider().put_state("resume", &self.resume.snapshot()).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Process one item and commit it with the delivery state, or not at all (M§5.4, spec-gap 44).
     async fn item(&mut self, item: &Value) -> Result<()> {
-        let class = item["class"].as_str().unwrap_or("");
+        let cursor = item["cursor"].as_str().unwrap_or("").to_string();
+        let class = item["class"].as_str().unwrap_or("").to_string();
+        if self.resume.is_duplicate(item) {
+            // M§8.5: already durably processed; collapse silently, but acknowledge it.
+            self.resume.commit(item, true);
+            self.save_resume()?;
+            println!("DUP {class} {cursor}");
+            return Ok(());
+        }
+        if !matches!(class.as_str(), "welcome" | "handshake" | "application") {
+            self.resume.commit(item, false);
+            return self.save_resume();
+        }
         let bytes = item["mls"].as_str().and_then(dsip_core::b64::decode).unwrap_or_default();
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
-        match class {
-            "welcome" => {
-                let group = self.mls.join(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let members: Vec<String> =
-                    authenticate_members(&group, &ctx).map_err(|e| anyhow::anyhow!("{e}"))?.into_iter().map(|m| m.identity).collect();
-                let conv: Value = serde_json::from_slice(&conversation_extension(&group).context("no dsip_conversation")?)?;
-                self.conversation = conv["conversation"].as_str().map(String::from);
-                self.group_id = Some(group.group_id().as_slice().to_vec());
-                let group_b64 = dsip_core::b64::encode(group.group_id().as_slice());
-                self.group = Some(group);
-                println!("JOINED {} members={:?}", self.conversation.clone().unwrap_or_default(), members);
+        let before = self.resume.clone();
+        let crash = std::mem::take(&mut self.crash_next);
+        let (mls, group, resume, conversation) = (&self.mls, &mut self.group, &mut self.resume, &self.conversation);
+        let result = mls.provider().atomically(|| {
+            let outcome = process(mls, group, conversation, &class, &bytes, &ctx)?;
+            if crash {
+                // Processed, MLS state written inside the transaction, never committed.
+                println!("CRASH {class} {cursor} processed, not committed");
+                let _ = std::io::stdout().flush();
+                std::process::exit(137);
+            }
+            resume.commit(item, false);
+            mls.provider().put_state("resume", &resume.snapshot())?;
+            if let Outcome::Joined { group, .. } = &outcome {
+                mls.provider().put_state("group", &json!(group))?;
+            }
+            Ok(outcome)
+        });
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                // Rolled back: OpenMLS's in-memory group may be ahead of the database, so reload it.
+                self.resume = before;
+                if let Some(gid) = self.group_id.clone() {
+                    self.group = self.mls.load_group(&gid).map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                // Not processable at all (not a duplicate by seq): record it as handled so it is acknowledged.
+                println!("?? unprocessable {class} {cursor}: {e}");
+                self.resume.commit(item, false);
+                return self.save_resume();
+            }
+        };
+        match outcome {
+            Outcome::Joined { conversation, members, group } => {
+                self.conversation = Some(conversation.clone());
+                self.group_id = dsip_core::b64::decode(&group);
+                println!("JOINED {conversation} members={members:?}");
                 // Confirm the pending group registration (M§6.6).
                 let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
-                    json!({"subject": self.identity, "groups": [{"group": group_b64, "state": "joined"}]}));
+                    json!({"subject": self.identity, "groups": [{"group": group, "state": "joined"}]}));
                 self.send(&env).await?;
             }
-            "handshake" | "application" => {
-                let Some(group) = self.group.as_mut() else { return Ok(()) };
-                let msg = MlsMessageIn::tls_deserialize_exact(&bytes)?;
-                let Ok(pm) = msg.try_into_protocol_message() else { return Ok(()) };
-                let processed = match group.process_message(self.mls.provider(), pm) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("?? undecryptable {class}: {e:?}");
-                        return Ok(());
-                    }
-                };
-                let sender = match processed.sender() {
-                    Sender::Member(idx) => member_identity(group, *idx, &ctx).map(|w| w.identity).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                match processed.into_content() {
-                    ProcessedMessageContent::ApplicationMessage(app) => {
-                        let obj: Value = serde_json::from_slice(&app.into_bytes())?;
-                        let octx = json!({"conversation": self.conversation, "conversation_kind": "direct",
-                            "leaf_identity": sender});
-                        let verdict = check_object(&obj, &octx);
-                        if verdict["verdict"] != "accept" {
-                            println!("DROP {} {}", verdict["code"], obj["id"]);
-                            return Ok(());
-                        }
-                        println!("RECV {sender}: {}", obj["text"].as_str().unwrap_or(""));
-                    }
-                    ProcessedMessageContent::StagedCommitMessage(staged) => {
-                        group.merge_staged_commit(self.mls.provider(), *staged).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                        println!("EPOCH {}", group.epoch().as_u64());
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
+            Outcome::Text { sender, text } => println!("RECV {sender}: {text}"),
+            Outcome::Dropped(why) => println!("DROP {why}"),
+            Outcome::Epoch(e) => println!("EPOCH {e}"),
+            Outcome::Nothing => {}
         }
         Ok(())
+    }
+}
+
+fn mls_err<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> MlsError {
+    move |x| MlsError(format!("{what}: {x:?}"))
+}
+
+/// The MLS side of one item, with no I/O, so it can run inside the item's transaction.
+fn process(
+    mls: &Device<SqliteProvider>,
+    slot: &mut Option<MlsGroup>,
+    conversation: &Option<String>,
+    class: &str,
+    bytes: &[u8],
+    ctx: &Context,
+) -> Result<Outcome, MlsError> {
+    if class == "welcome" {
+        let group = mls.join(bytes)?;
+        let members: Vec<String> = authenticate_members(&group, ctx)?.into_iter().map(|m| m.identity).collect();
+        let conv: Value = serde_json::from_slice(&conversation_extension(&group).ok_or_else(|| MlsError("no dsip_conversation".into()))?)
+            .map_err(mls_err("dsip_conversation"))?;
+        let out = Outcome::Joined {
+            conversation: conv["conversation"].as_str().unwrap_or_default().to_string(),
+            members,
+            group: dsip_core::b64::encode(group.group_id().as_slice()),
+        };
+        *slot = Some(group);
+        return Ok(out);
+    }
+    let Some(group) = slot.as_mut() else { return Ok(Outcome::Nothing) };
+    let msg = MlsMessageIn::tls_deserialize_exact(bytes).map_err(mls_err("mls bytes"))?;
+    let pm = msg.try_into_protocol_message().map_err(mls_err("protocol message"))?;
+    let processed = group.process_message(mls.provider(), pm).map_err(mls_err("undecryptable"))?;
+    let sender = match processed.sender() {
+        Sender::Member(idx) => member_identity(group, *idx, ctx).map(|w| w.identity).unwrap_or_default(),
+        _ => String::new(),
+    };
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app) => {
+            let obj: Value = serde_json::from_slice(&app.into_bytes()).map_err(mls_err("content json"))?;
+            let octx = json!({"conversation": conversation, "conversation_kind": "direct", "leaf_identity": sender});
+            let verdict = check_object(&obj, &octx);
+            if verdict["verdict"] != "accept" {
+                return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
+            }
+            Ok(Outcome::Text { sender, text: obj["text"].as_str().unwrap_or("").to_string() })
+        }
+        ProcessedMessageContent::StagedCommitMessage(staged) => {
+            group.merge_staged_commit(mls.provider(), *staged).map_err(mls_err("merge commit"))?;
+            Ok(Outcome::Epoch(group.epoch().as_u64()))
+        }
+        _ => Ok(Outcome::Nothing),
     }
 }
 
@@ -446,9 +531,27 @@ async fn main() -> Result<()> {
         &["dsip.signaling", "dsip.messaging"]);
     let delegation = sign(&deleg, &keys.controller, &format!("{}#key-1", args.identity));
     let compact = format!("{}.{}.{}", delegation.protected, delegation.payload, delegation.signature);
-    let mls = Device::new(KeyPair::from_seed(keys.device.seed()), compact);
+    let provider = SqliteProvider::open(&args.state.join("device.sqlite")).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mls = Device::with_provider(KeyPair::from_seed(keys.device.seed()), compact, provider);
     let r = resolver(&args.resolver_files);
     let mailbox = mailbox_of(&args.identity, &r)?;
+
+    // Restart: everything below comes from the database, exactly as last committed.
+    let get = |k: &str| mls.provider().get_state(k).map_err(|e| anyhow::anyhow!("{e}"));
+    let resume = Resume::new(&get("resume")?.unwrap_or(Value::Null));
+    let group_id = get("group")?.and_then(|g| g.as_str().and_then(dsip_core::b64::decode));
+    let group = match &group_id {
+        Some(gid) => mls.load_group(gid).map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => None,
+    };
+    let conversation = group
+        .as_ref()
+        .and_then(conversation_extension)
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|c| c["conversation"].as_str().map(String::from));
+    if let Some(c) = &conversation {
+        println!("RESTORED {c} since={}", resume.sync_fields()["since"]);
+    }
 
     let mut client = Client {
         keys,
@@ -460,11 +563,12 @@ async fn main() -> Result<()> {
         conn: None,
         mailbox,
         seen: SeenIds::default(),
-        group: None,
-        conversation: None,
-        group_id: None,
-        cursor: Value::Null,
+        group,
+        conversation,
+        group_id,
+        resume,
         grants: HashMap::new(),
+        crash_next: false,
     };
     client.connect().await?;
 
@@ -509,6 +613,11 @@ async fn main() -> Result<()> {
                         Ok(())
                     }
                     "online" => client.connect().await,
+                    "crash-next" => {
+                        client.crash_next = true;
+                        println!("OK crash-next");
+                        Ok(())
+                    }
                     "quit" => break,
                     other => {
                         println!("?? unknown command {other}");

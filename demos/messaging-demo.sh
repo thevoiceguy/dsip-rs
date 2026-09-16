@@ -3,11 +3,11 @@
 #
 # Alice and Bob each have their own mailbox service. Alice's mailbox is the hub for the
 # conversation, so every message crosses a mailbox-to-mailbox federation hop (M§6.5 rule 5).
-# The script is self-verifying: it fails unless the text arrives end to end, and unless a message
-# sent while Bob is disconnected reaches him when he returns (M§9.1).
-#
-# Offline here means "Bob's device drops its connection", not "Bob's device restarts": MLS state
-# lives in the process, so restart-persistence is future work.
+# The script is self-verifying: it fails unless the text arrives end to end, unless a message
+# sent while Bob is disconnected reaches him when he returns (M§9.1), unless a message sent while
+# Bob's device process is dead reaches the restarted process without replaying history (M§5.4), and
+# unless a device killed after processing an item but before committing it gets that item again,
+# intact, on restart (spec-gap 44). Device MLS and delivery state live in SQLite under --state.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -51,7 +51,11 @@ $MSG --state "$DIR/dev-b" --identity "$BOB" --write-doc "${DOCS[1]}" \
 echo "=== devices"
 mkfifo "$DIR/a.in" "$DIR/b.in"
 $MSG --state "$DIR/dev-a" --identity "$ALICE" "${RESOLVER[@]}" --ca "$DIR/ca.pem" <"$DIR/a.in" >"$DIR/a.log" 2>&1 &
-$MSG --state "$DIR/dev-b" --identity "$BOB" "${RESOLVER[@]}" --ca "$DIR/ca.pem" <"$DIR/b.in" >"$DIR/b.log" 2>&1 &
+bob_device() { # fifo log
+  $MSG --state "$DIR/dev-b" --identity "$BOB" "${RESOLVER[@]}" --ca "$DIR/ca.pem" <"$1" >"$2" 2>&1 &
+  BOB_PID=$!
+}
+bob_device "$DIR/b.in" "$DIR/b.log"
 exec 3>"$DIR/a.in"; exec 4>"$DIR/b.in"
 wait_for "$DIR/a.log" "OK connected" 20
 wait_for "$DIR/b.log" "OK connected" 20
@@ -77,9 +81,38 @@ echo "online" >&4; wait_for "$DIR/b.log" "OK connected" 15
 echo "sync" >&4
 wait_for "$DIR/b.log" "^RECV .*Second one while you were away" 30
 
+echo "=== restart: Bob's device process is killed; Alice sends; a new process resumes from disk (M§5.4)"
+kill -9 "$BOB_PID"; wait "$BOB_PID" 2>/dev/null || true; exec 4>&-
+echo "send Third, while your device was down" >&3
+sleep 1
+mkfifo "$DIR/b2.in"; bob_device "$DIR/b2.in" "$DIR/b2.log"; exec 4>"$DIR/b2.in"
+wait_for "$DIR/b2.log" "^RESTORED " 20
+wait_for "$DIR/b2.log" "OK connected" 20
+echo "sync" >&4
+wait_for "$DIR/b2.log" "^RECV .*Third, while your device was down" 30
+if grep -qE "^RECV .*(Dinner at 7|Second one)" "$DIR/b2.log"; then
+  echo "FAIL: the restarted device replayed history it had already committed"; cat "$DIR/b2.log"; exit 1
+fi
+
+echo "=== crash between processing and commit: the item is rolled back and redelivered (spec-gap 44)"
+echo "live" >&4
+echo "crash-next" >&4; wait_for "$DIR/b2.log" "OK crash-next" 10
+echo "send Fourth, the one that crashes the receiver" >&3
+wait_for "$DIR/b2.log" "^CRASH application" 30
+wait "$BOB_PID" 2>/dev/null || true; exec 4>&-
+mkfifo "$DIR/b3.in"; bob_device "$DIR/b3.in" "$DIR/b3.log"; exec 4>"$DIR/b3.in"
+wait_for "$DIR/b3.log" "OK connected" 20
+echo "sync" >&4
+wait_for "$DIR/b3.log" "^RECV .*Fourth, the one that crashes the receiver" 30
+
 echo "quit" >&3; echo "quit" >&4; sleep 0.5
+if grep -hE "^\?\?" "$DIR"/b*.log; then
+  echo "FAIL: Bob's devices hit items they could not process"; exit 1
+fi
 echo
-echo "=== Bob's device saw:"; grep -E "^(JOINED|RECV|EPOCH)" "$DIR/b.log"
+echo "=== Bob's device saw (three processes, one state directory):"
+grep -hE "^(JOINED|RECV|EPOCH|RESTORED|CRASH|DUP)" "$DIR/b.log" "$DIR/b2.log" "$DIR/b3.log"
 echo "=== hub (Alice's mailbox) sequenced:"; grep -E "hubbing|federating" "$DIR/mbx-a.log" || true
 echo
-echo "PASS: two mailboxes, federated hub fan-out, MLS-encrypted text delivered live and after a disconnect."
+echo "PASS: two mailboxes, federated hub fan-out, MLS-encrypted text delivered live, after a disconnect,"
+echo "      after a device restart, and after a crash between processing and commit."
