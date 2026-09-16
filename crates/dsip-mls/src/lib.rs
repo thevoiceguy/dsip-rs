@@ -182,6 +182,21 @@ impl<P: OpenMlsProvider> Device<P> {
             .map_err(err("create group"))
     }
 
+    /// A GroupContextExtensions commit moving `group` to `hub` (`{did, uri}`), everything else in `dsip_conversation`
+    /// unchanged. Staged as the pending commit: merge it only on the hub's `accepted`.
+    ///
+    /// Spec: M§7.4, M§6.4 (a PublicMessage the old hub validates).
+    pub fn move_hub_commit(&self, group: &mut MlsGroup, hub: &Value) -> Result<MlsMessageOut, MlsError> {
+        let mut conv: Value = serde_json::from_slice(&conversation_extension(group).ok_or_else(|| MlsError("no dsip_conversation".into()))?)
+            .map_err(err("dsip_conversation"))?;
+        conv["hub"] = hub.clone();
+        let mut ext = group.extensions().clone();
+        ext.add_or_replace(Extension::Unknown(EXT_DSIP_CONVERSATION, UnknownExtension(serde_json::to_vec(&conv).map_err(err("json"))?)))
+            .map_err(err("group context extensions"))?;
+        let (commit, _, _) = group.update_group_context_extensions(&self.provider, ext, &self.signer()).map_err(err("move hub commit"))?;
+        Ok(commit)
+    }
+
     /// Join a group from a TLS-serialized Welcome message.
     ///
     /// Spec: M§6.6, M§6.7. The caller authenticates every member afterwards ([`authenticate_members`]).
@@ -253,6 +268,19 @@ pub fn member_identity(group: &MlsGroup, index: LeafNodeIndex, ctx: &Context) ->
 /// Spec: M§6.3.
 pub fn conversation_extension(group: &MlsGroup) -> Option<Vec<u8>> {
     group.extensions().unknown(EXT_DSIP_CONVERSATION).map(|u| u.0.clone())
+}
+
+/// What a staged commit does to `dsip_conversation`, given the value before it: `None` when it leaves it unchanged,
+/// otherwise the `conversation-update` verdict (`effective.moves_to`, `effective.hub`, or a rejection).
+///
+/// Spec: M§6.3, M§7.4 — a GroupContextExtensions commit is the only way to change the hub.
+pub fn conversation_update(before: Option<&[u8]>, staged: &StagedCommit) -> Option<Value> {
+    let after = staged.group_context().extensions().unknown(EXT_DSIP_CONVERSATION).map(|u| u.0.as_slice());
+    if after == before {
+        return None;
+    }
+    let parse = |b: Option<&[u8]>| b.and_then(|b| serde_json::from_slice::<Value>(b).ok()).unwrap_or(Value::Null);
+    Some(dsip_messaging::checks::check_conversation_update(&parse(before), &parse(after)))
 }
 
 /// The per-epoch activity key.
@@ -357,8 +385,8 @@ impl HubView {
         Ok(json!(roster))
     }
 
-    /// Validate a commit and describe it as the hub state machine's `deposit.commit` (M§6.5, M§7.3):
-    /// `{adds: [{identity, device}], removes: [{identity, device, delegation_valid}], valid, external}`.
+    /// Validate a commit and describe it as the hub state machine's `deposit.commit` (M§6.5, M§7.3, M§7.4):
+    /// `{adds: [{identity, device}], removes: [{identity, device, delegation_valid}], valid, external, moves_to?}`.
     /// A commit that fails MLS validation or leaf authentication is `valid: false`; a valid one is merged.
     pub fn observe_commit(&mut self, bytes: &[u8], ctx: &Context) -> Result<Value, MlsError> {
         let msg = MlsMessageIn::tls_deserialize(&mut &bytes[..]).map_err(err("commit bytes"))?;
@@ -371,6 +399,15 @@ impl HubView {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Err(MlsError("not a commit".into()));
         };
+        let before = self.group.group_context().extensions().unknown(EXT_DSIP_CONVERSATION).map(|u| u.0.clone());
+        let mut moves_to = None;
+        if let Some(update) = conversation_update(before.as_deref(), &staged) {
+            // M§7.4, spec-gap 60: only the hub may change; a commit rewriting anything else is not ordered
+            if update["verdict"] != "accept" {
+                return Ok(json!({"adds": [], "removes": [], "valid": false}));
+            }
+            moves_to = update["effective"]["moves_to"].as_str().map(String::from);
+        }
         let mut adds = vec![];
         for add in staged.add_proposals() {
             match authenticate_leaf_node(add.add_proposal().key_package().leaf_node(), ctx) {
@@ -389,6 +426,10 @@ impl HubView {
             }
         }
         self.group.merge_commit(&self.storage, *staged).map_err(err("merge commit"))?;
-        Ok(json!({"adds": adds, "removes": removes, "valid": true, "external": external}))
+        let mut out = json!({"adds": adds, "removes": removes, "valid": true, "external": external});
+        if let Some(to) = moves_to {
+            out["moves_to"] = json!(to);
+        }
+        Ok(out)
     }
 }

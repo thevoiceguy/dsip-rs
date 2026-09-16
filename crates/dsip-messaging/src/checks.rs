@@ -71,7 +71,7 @@ fn deposit_fields(class: &str) -> (&'static [&'static str], &'static [&'static s
         "handshake" => (&["mls"], &["mls", "seq", "welcome", "group_info", "ratchet_tree_blob", "grants"]),
         "application" => (&["mls"], &["mls", "seq", "blobs"]),
         "welcome" => (&["mls", "hub"], &["mls", "hub", "grants", "origin", "successor_of", "ratchet_tree_blob"]),
-        "group-info" => (&["mls"], &["mls", "ratchet_tree_blob"]),
+        "group-info" => (&["mls"], &["mls", "ratchet_tree_blob", "handover_seq"]),
         "ephemeral" => (&["sealed"], &["sealed"]),
         "introduction" | "grant" => (&["envelope"], &["envelope"]),
         _ => (&["archive", "akid", "ref_group", "ref_seq"], &["archive", "akid", "ref_group", "ref_seq"]),
@@ -280,6 +280,22 @@ fn check_content(o: &Value) -> Value {
     }
     let eff_purpose = if CONTENT_PURPOSES.contains(&purpose) { purpose } else { "message" };
     accept_effective(json!({"kind": eff_kind, "purpose": eff_purpose}))
+}
+
+/// What a GroupContextExtensions commit may change in `dsip_conversation`: `effective.moves_to` names a new hub DID
+/// (null when the hub is the same, possibly at a new `uri`), `effective.hub` the hub members use from then on.
+///
+/// Spec: M§6.3 (`conversation` is stable), M§7.4. Impl (spec-gap 60): `kind` and `successor_of` are fixed too; a commit
+/// changing any of the three is `conversation-immutable`.
+pub fn check_conversation_update(before: &Value, after: &Value) -> Value {
+    if !schema_ok("dsip-conversation", before) || !schema_ok("dsip-conversation", after) {
+        return reject("schema-invalid", None);
+    }
+    if ["conversation", "kind", "successor_of"].iter().any(|k| before.get(*k) != after.get(*k)) {
+        return reject("conversation-immutable", None);
+    }
+    let moved = before["hub"]["did"] != after["hub"]["did"];
+    accept_effective(json!({"moves_to": if moved { after["hub"]["did"].clone() } else { Value::Null }, "hub": after["hub"]}))
 }
 
 /// Schema plus kind fallback for the `dsip_conversation` GroupContext extension.

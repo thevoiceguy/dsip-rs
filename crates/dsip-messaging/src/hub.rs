@@ -3,7 +3,8 @@
 //! Spec: M§6.5 (authenticate depositors, first valid commit per epoch wins, application messages
 //! for the current or previous epoch, per-group `seq`, per-mailbox fan-out in `seq` order with
 //! retry before later items), M§6.8 (external joins), M§7.3 (membership rules), M§9.3
-//! (idempotent re-deposit), M§11.2 (ephemeral activity is forwarded, never sequenced).
+//! (idempotent re-deposit), M§11.2 (ephemeral activity is forwarded, never sequenced), M§7.4 (a commit with `moves_to`
+//! is the group's last here: later deposits are refused `mailbox.unknown-group` while the queues drain; spec-gap 60).
 //!
 //! Impl: MLS is abstracted — a deposit event carries the epoch, a digest of the MLS bytes, and for
 //! a commit its adds, removes, validity and whether it is external. Refusals without a
@@ -27,6 +28,8 @@ pub struct Hub {
     seq_class: HashMap<i64, String>,
     pending: BTreeMap<String, Vec<i64>>,
     group_info: bool,
+    #[serde(default)]
+    moved_to: Option<String>,
 }
 
 fn s(v: &Value) -> String {
@@ -51,6 +54,7 @@ impl Hub {
             seq_class: HashMap::new(),
             pending: BTreeMap::new(),
             group_info: false,
+            moved_to: None,
         }
     }
 
@@ -102,6 +106,10 @@ impl Hub {
     fn deposit(&mut self, d: &Value) -> Vec<Value> {
         let class = s(&d["class"]);
         let ident = s(&d["identity"]);
+        if self.moved_to.is_some() {
+            // M§7.4: after ordering the commit that moved the group, the old hub refuses further deposits for it
+            return Self::error(d, "mailbox.unknown-group");
+        }
         if !matches!(class.as_str(), "handshake" | "application" | "ephemeral" | "group-info") {
             return Self::error(d, "mailbox.unsupported-class");
         }
@@ -205,6 +213,9 @@ impl Hub {
             self.roster.entry(s(&a["identity"])).or_default().insert(s(&a["device"]));
         }
         self.epoch += 1;
+        if let Some(to) = commit["moves_to"].as_str() {
+            self.moved_to = Some(to.to_string()); // M§7.4: everything after this commit goes to the new hub
+        }
         if !external {
             // an external joiner joined by its own commit; welcomes go only to identities others added — every identity
             // that gained a device, including a member adding its own new device (spec-gap 50)
@@ -260,6 +271,6 @@ impl Hub {
         let pending: serde_json::Map<String, Value> =
             self.pending.iter().filter(|(_, q)| !q.is_empty()).map(|(i, q)| (i.clone(), json!(q))).collect();
         json!({"epoch": self.epoch, "next_seq": self.next_seq, "roster": roster, "pending": pending,
-               "group_info": self.group_info})
+               "group_info": self.group_info, "moved_to": self.moved_to})
     }
 }

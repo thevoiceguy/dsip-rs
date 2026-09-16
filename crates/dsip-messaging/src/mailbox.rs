@@ -42,6 +42,9 @@ struct Group {
     items: i64,
     #[serde(default)]
     high_seq: i64,
+    /// The hub the group moved from and the seq of the commit that moved it (M§7.4, spec-gap 60).
+    #[serde(default)]
+    previous: Option<(String, i64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -138,7 +141,7 @@ impl Mailbox {
             .as_object()
             .map(|m| {
                 m.iter()
-                    .map(|(g, r)| (g.clone(), Group { hub: s(&r["hub"]), state: s(&r["state"]), since: now, items: 0, high_seq: 0 }))
+                    .map(|(g, r)| (g.clone(), Group { hub: s(&r["hub"]), state: s(&r["state"]), since: now, items: 0, high_seq: 0, previous: None }))
                     .collect()
             })
             .unwrap_or_default();
@@ -337,7 +340,7 @@ impl Mailbox {
         }
         let group = s(&e["group"]);
         let now = self.now;
-        self.groups.entry(group.clone()).or_insert_with(|| Group { hub: s(&e["hub"]), state: "pending".into(), since: now, items: 0, high_seq: 0 });
+        self.groups.entry(group.clone()).or_insert_with(|| Group { hub: s(&e["hub"]), state: "pending".into(), since: now, items: 0, high_seq: 0, previous: None });
         let (c, pushes) = self.store("welcome", &group, None);
         let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
         out.extend(pushes);
@@ -362,9 +365,29 @@ impl Mailbox {
         }
         let group = s(&e["group"]);
         let from = s(&e["from"]);
-        let Some(reg) = self.groups.get(&group).filter(|r| r.hub == from) else {
+        let Some(reg) = self.groups.get(&group) else {
             return Self::error(&e["from"], &e["id"], "mailbox.unknown-group"); // M§6.6
         };
+        let seq_in = e["seq"].as_i64();
+        match &reg.previous {
+            Some((prev, through)) if *prev == from && reg.hub != from => {
+                // spec-gap 60: the previous hub still delivers what it ordered, through the commit that moved the group
+                if seq_in.is_none_or(|n| n > *through) {
+                    return Self::error(&e["from"], &e["id"], "mailbox.unknown-group");
+                }
+            }
+            _ if reg.hub != from => return Self::error(&e["from"], &e["id"], "mailbox.unknown-group"), // M§6.6
+            Some((_, through)) => {
+                if reg.high_seq < *through {
+                    // spec-gap 60: not before the previous hub's items through the move are stored (the new hub retries)
+                    return Self::error(&e["from"], &e["id"], "mailbox.unknown-group");
+                }
+                if seq_in.is_some_and(|n| n <= *through) {
+                    return Self::error(&e["from"], &e["id"], "policy.blocked"); // spec-gap 60: numbering continues
+                }
+            }
+            None => {}
+        }
         let class = s(&e["class"]);
         if class == "ephemeral" {
             // M§11.2: pushed to bound devices, never stored, never acknowledged; dropped at the
@@ -451,8 +474,14 @@ impl Mailbox {
                 self.groups.remove(&group);
             } else if let Some(r) = self.groups.get_mut(&group) {
                 r.state = "joined".into();
+                if let Some(hub) = g["hub"].as_str().filter(|h| *h != r.hub) {
+                    // M§7.4 (spec-gap 60): an owner device that processed the commit moving the group names the new hub
+                    // and that commit's seq; the old hub's items through it are still admitted
+                    let through = g["handover_seq"].as_i64().unwrap_or(r.high_seq);
+                    r.previous = Some((std::mem::replace(&mut r.hub, hub.to_string()), through));
+                }
             } else if let Some(hub) = g["hub"].as_str() {
-                self.groups.insert(group, Group { hub: hub.into(), state: "joined".into(), since: self.now, items: 0, high_seq: 0 });
+                self.groups.insert(group, Group { hub: hub.into(), state: "joined".into(), since: self.now, items: 0, high_seq: 0, previous: None });
             }
         }
         self.revoked.extend(e["revoked_grants"].as_array().into_iter().flatten().map(s));

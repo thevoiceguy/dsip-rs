@@ -52,7 +52,7 @@ use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, CommitRetry, History, Resume};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, message_header, Device, MlsError};
+use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, member_identity, message_header, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
 use dsip_transport::{now_s, tls};
@@ -285,6 +285,8 @@ enum CommitOp {
     RemoveDevice(String),
     /// Refresh this device's own leaf key material (post-compromise security).
     Update,
+    /// Move the group to another hub, `{did, uri}` (M§7.4).
+    MoveHub(Value),
 }
 
 /// What processing one inbound item produced, reported only once it is committed.
@@ -294,8 +296,9 @@ enum Outcome {
     NotForDevice,
     Object { sender: String, sender_device: String, object: Value },
     Dropped(String),
-    /// M§7.3: every roster change is rendered, attributed to the committing identity.
-    Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String> },
+    /// M§7.3: every roster change is rendered, attributed to the committing identity. `hub` is set when the commit
+    /// changed the group's hub reference (M§7.4).
+    Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String>, hub: Option<Value> },
     /// This device was removed; `remaining` are the member identities left in the group.
     Removed { by: String, remaining: Vec<String> },
     Nothing,
@@ -599,18 +602,37 @@ impl Client {
     }
 
     /// Encrypt an application object for a group and deposit it; returns the hub's answer.
+    ///
+    /// A refusal is handled as the vector-pinned [`CommitRetry`] decides: in particular `mailbox.unknown-group` from a
+    /// hub the group has left is followed by a sync and, if it shows the move, the object is encrypted again and sent to
+    /// the new hub (M§7.4, spec-gap 60).
     async fn send_object(&mut self, group: &str, obj: &Value, extra: Value) -> Result<Value> {
-        let c = self.convs.get_mut(group).context("not a member of that group")?;
-        let msg = c
-            .group
-            .create_message(self.mls.provider(), &self.mls.signer(), &serde_json::to_vec(obj)?)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?
-            .tls_serialize_detached()?;
-        let mut fields = json!({"mls": b64(&msg)});
-        for (k, v) in extra.as_object().into_iter().flatten() {
-            fields[k.as_str()] = v.clone();
+        let mut retry = CommitRetry::new(&json!({}));
+        loop {
+            let hub_before = self.conv(group)?.hub.0.clone();
+            let c = self.convs.get_mut(group).context("not a member of that group")?;
+            let msg = c
+                .group
+                .create_message(self.mls.provider(), &self.mls.signer(), &serde_json::to_vec(obj)?)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                .tls_serialize_detached()?;
+            let mut fields = json!({"mls": b64(&msg)});
+            for (k, v) in extra.as_object().into_iter().flatten() {
+                fields[k.as_str()] = v.clone();
+            }
+            let reply = self.hub_deposit(group, "application", fields).await?;
+            let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
+            let actions = retry.answer(reason.as_deref());
+            if !actions.iter().any(|a| a.get("sync").is_some()) {
+                return Ok(reply); // accepted, or surfaced to the caller
+            }
+            println!("RETRY send: {} from {hub_before}; syncing", reason.as_deref().unwrap_or(""));
+            self.sync_all().await?;
+            let moved = self.conv(group)?.hub.0 != hub_before;
+            if retry.synced(true, moved).iter().any(|a| a.get("surface").is_some()) {
+                return Ok(reply);
+            }
         }
-        self.hub_deposit(group, "application", fields).await
     }
 
     /// Build a commit for `op` against the group's current epoch: `(commit, welcome)`.
@@ -637,6 +659,7 @@ impl Client {
                     c.group.self_update(provider, &signer, LeafNodeParameters::default()).map_err(|x| e(&x))?.into_messages();
                 (commit, welcome)
             }
+            CommitOp::MoveHub(hub) => (self.mls.move_hub_commit(&mut c.group, hub).map_err(|x| e(&x))?, None),
         })
     }
 
@@ -650,6 +673,7 @@ impl Client {
             CommitOp::RemoveIdentity(identity) => !self.leaves_where(group, |w| w.identity == *identity)?.is_empty(),
             CommitOp::RemoveDevice(device) => !self.device_leaves(group, device)?.is_empty(),
             CommitOp::Update => true,
+            CommitOp::MoveHub(hub) => self.conv(group)?.hub.0 != hub["did"].as_str().unwrap_or(""),
         })
     }
 
@@ -659,6 +683,7 @@ impl Client {
     async fn commit_op(&mut self, group: &str, op: CommitOp, what: &str) -> Result<()> {
         let mut retry = CommitRetry::new(&json!({}));
         loop {
+            let hub_before = self.conv(group)?.hub.0.clone();
             let (commit, welcome) = self.build_commit(group, &op)?;
             let epoch = self.conv(group)?.group.epoch().as_u64();
             let mut fields = json!({"mls": b64(&commit.tls_serialize_detached()?)});
@@ -678,6 +703,13 @@ impl Client {
                 if action.get("merge").is_some() {
                     c.group.merge_pending_commit(self.mls.provider()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     println!("OK {what} epoch={} seq={}", c.group.epoch().as_u64(), reply["seq"]);
+                    if let CommitOp::MoveHub(hub) = &op {
+                        // M§7.4 (spec-gap 60): our mailbox follows the move, then the new hub is bootstrapped with the
+                        // GroupInfo and the seq the old hub gave this commit, so it continues the numbering
+                        let seq = reply["seq"].as_i64().unwrap_or(0);
+                        self.hub_moved(group, hub, seq).await?;
+                        return self.publish_group_info_at(group, Some(seq)).await;
+                    }
                     return self.publish_group_info(group).await;
                 } else if action.get("discard").is_some() {
                     c.group.clear_pending_commit(self.mls.provider().storage()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -687,19 +719,66 @@ impl Client {
                     must_sync = true;
                 }
             }
-            if must_sync {
+            let unknown_group = reason.as_deref() == Some("mailbox.unknown-group");
+            if must_sync && unknown_group {
+                // spec-gap 60: the hub may have handed the group on; everything stored shows whether it did
+                println!("MOVED? {what}: mailbox.unknown-group from {hub_before}; syncing");
+                self.sync_all().await?;
+            } else if must_sync {
                 println!("CONFLICT {what}: {} at epoch {epoch}; syncing past the winning commit", reason.as_deref().unwrap_or(""));
                 self.catch_up(group, epoch).await?;
             }
             let needed = self.still_needed(group, &op)?;
-            for action in retry.synced(needed) {
+            let moved = self.conv(group)?.hub.0 != hub_before;
+            for action in retry.synced(needed, moved) {
                 if action.get("done").is_some() {
                     println!("OK {what} no longer needed after the winning commit");
                     return Ok(());
                 }
+                if let Some(r) = action.get("surface") {
+                    bail!("{what} refused by the hub: {}", r.as_str().unwrap_or(""));
+                }
                 if let Some(a) = action.get("repropose") {
                     println!("REPROPOSE {what} attempt={} epoch={}", a["attempt"], self.conv(group)?.group.epoch().as_u64());
                 }
+            }
+        }
+    }
+
+    /// The group moved to `hub` (`{did, uri}`) at `seq`: use it from now on and have this identity's mailbox follow, so it
+    /// admits the new hub's fan-out and forwards to it (M§7.4, M§6.6; spec-gap 60).
+    async fn hub_moved(&mut self, group: &str, hub: &Value, seq: i64) -> Result<()> {
+        let (did, uri) = (hub["did"].as_str().unwrap_or("").to_string(), hub["uri"].as_str().unwrap_or("").to_string());
+        let c = self.convs.get_mut(group).context("group")?;
+        let moved = c.hub.0 != did;
+        c.hub = (did.clone(), uri.clone());
+        let mut g = json!({"group": group, "state": "joined", "hub": did});
+        if uri.starts_with("wss://") {
+            g["hub_uri"] = json!(uri);
+        }
+        if moved {
+            g["handover_seq"] = json!(seq);
+            println!("HUB-MOVED {} to {did} at seq={seq}", c.conversation);
+        }
+        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
+            json!({"subject": self.identity, "groups": [g]}));
+        self.send(&env).await
+    }
+
+    /// Sync and process everything stored, until the mailbox has no more (M§5.4).
+    async fn sync_all(&mut self) -> Result<()> {
+        self.sync(false).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let conn = self.conn.as_mut().context("offline")?;
+            let frame = tokio::time::timeout_at(deadline, conn.recv()).await.context("sync never completed")??.context("mailbox closed")?;
+            let p = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).unwrap_or_default();
+            let last_page = p["type"] == "items" && p["in_reply_to"].is_string() && p["next"].is_null();
+            if let Err(e) = self.inbound(&frame).await {
+                println!("ERR {e}");
+            }
+            if last_page {
+                return Ok(());
             }
         }
     }
@@ -720,9 +799,18 @@ impl Client {
 
     /// Republish the GroupInfo after a commit, for the hub and for external joins (M§6.5 rule 6, M§6.8).
     async fn publish_group_info(&mut self, group: &str) -> Result<()> {
+        self.publish_group_info_at(group, None).await
+    }
+
+    /// The GroupInfo deposit; `handover_seq` bootstraps a group's new hub (M§7.4, spec-gap 60).
+    async fn publish_group_info_at(&mut self, group: &str, handover_seq: Option<i64>) -> Result<()> {
         let c = self.conv(group)?;
         let gi = c.group.export_group_info(self.mls.provider().crypto(), &self.mls.signer(), true).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let reply = self.hub_deposit(group, "group-info", json!({"mls": b64(&gi.tls_serialize_detached()?)})).await?;
+        let mut fields = json!({"mls": b64(&gi.tls_serialize_detached()?)});
+        if let Some(h) = handover_seq {
+            fields["handover_seq"] = json!(h);
+        }
+        let reply = self.hub_deposit(group, "group-info", fields).await?;
         anyhow::ensure!(reply["type"] == "accepted", "group-info refused: {}", reply["reason"]);
         Ok(())
     }
@@ -1362,9 +1450,12 @@ impl Client {
             Outcome::Object { sender, sender_device, object } => self.object_in(&gid, item, &sender, &sender_device, object).await?,
             Outcome::Dropped(why) => println!("DROP {why}"),
             Outcome::NotForDevice => println!("SIBLING welcome {cursor}"),
-            Outcome::Epoch { epoch, by, added, removed } => {
+            Outcome::Epoch { epoch, by, added, removed, hub } => {
                 let kind = self.conv(&gid).map(|c| c.kind.clone()).unwrap_or_default();
                 println!("EPOCH {epoch} kind={kind} by={by} added={added:?} removed={removed:?}");
+                if let Some(h) = hub {
+                    self.hub_moved(&gid, &h, item["seq"].as_i64().unwrap_or(0)).await?;
+                }
             }
             Outcome::Removed { by, remaining } => {
                 let c = self.convs.remove(&gid);
@@ -1553,11 +1644,20 @@ fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &st
                 .filter_map(|m| member_identity(group, m.index, ctx).ok())
                 .map(|w| w.identity)
                 .collect();
+            let before = conversation_extension(group);
+            let mut hub = None;
+            if let Some(update) = conversation_update(before.as_deref(), &staged) {
+                // M§6.3, M§7.4 (spec-gap 60): a commit may change the hub and nothing else in dsip_conversation
+                if update["verdict"] != "accept" {
+                    return Ok(Outcome::Dropped(format!("commit {} dsip_conversation", update["code"])));
+                }
+                hub = Some(update["effective"]["hub"].clone());
+            }
             group.merge_staged_commit(mls.provider(), *staged).map_err(mls_err("merge commit"))?;
             if !group.is_active() {
                 return Ok(Outcome::Removed { by: sender, remaining });
             }
-            Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed })
+            Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed, hub })
         }
         _ => Ok(Outcome::Nothing),
     }
@@ -1783,6 +1883,18 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "revoke-device" => client.revoke_device(rest.trim()).await,
         "remove-leaf" => client.remove_leaf(rest.trim()).await,
         "remove" => client.remove(rest.trim()).await,
+        "move-hub" => {
+            // M§7.4: move the active group to another hub, by default this identity's own mailbox
+            let group = client.active()?;
+            let w: Vec<&str> = rest.split_whitespace().collect();
+            let hub = match w.as_slice() {
+                [did, uri] => json!({"did": did, "uri": uri}),
+                [] => json!({"did": client.mailbox.0, "uri": client.mailbox.1}),
+                _ => bail!("usage: move-hub [<hub did> <wss uri>]"),
+            };
+            let what = format!("moved to {}", hub["did"].as_str().unwrap_or(""));
+            client.commit_op(&group, CommitOp::MoveHub(hub), &what).await
+        }
         "rekey" => {
             // M§6.5: a self-update commit, applied only once the hub accepts it
             let group = client.active()?;
