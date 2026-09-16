@@ -5,7 +5,8 @@
 //! bound), M§5.7 (configuration and grant revocation), M§6.6 (pending registration, bound, TTL,
 //! hub match), M§11.2 (ephemeral never stored), M§12.2 (archive first-wins, refused in `queue`),
 //! M§14.2 (first-contact authorization, `origin` on hub-forwarded welcomes), M§15.5 (unknown recipients),
-//! M§5.2 (forwarding an owner device's deposit to its group's hub).
+//! M§5.2 (forwarding an owner device's deposit to its group's hub), M§5.6 and M§8.4 (the blob endpoint —
+//! [`blob_put`], [`blob_get`]).
 //!
 //! Impl: cursors are `c:` plus 16 lowercase hex digits of a per-mailbox counter; a grant is
 //! presented already verified (signature checks are the envelope pipeline's job), and so is an `origin`
@@ -408,4 +409,49 @@ impl Mailbox {
             .collect();
         json!({"items": self.items.iter().map(|it| it.cursor.as_str()).collect::<Vec<_>>(), "groups": groups, "key_packages": kps})
     }
+}
+
+/// What a mailbox answers to `PUT {blob_endpoint}/{sha256}`: `{status, reason}` or `{status, accepted}`.
+///
+/// Spec: M§5.6 (verify the envelope, the device delegated by a served identity, SHA-256 and length of the
+/// body; `201` with a signed `accepted`), M§8.4, M§16 (`mailbox.object-too-large` over `max_blob_bytes`).
+///
+/// Impl (spec-gap 48): the profile names no statuses for refusals and no token for a body that does not
+/// match. `authorization` is the verified envelope (`{identity, payload}`) or null; checks run in the order
+/// a server can make them — credential (401), addressee and served identity (403), URL bound to the
+/// authorized hash (400), declared size before the body is read (413), body (400
+/// `mailbox.blob-mismatch`) — and a hash already stored is an idempotent `200` with `duplicate`.
+pub fn blob_put(inp: &Value) -> Value {
+    let (mbx, req, auth) = (&inp["mailbox"], &inp["request"], &inp["authorization"]);
+    if !auth.is_object() {
+        return json!({"status": 401, "reason": "policy.blocked"});
+    }
+    let p = &auth["payload"];
+    if p["to"] != mbx["did"] {
+        return json!({"status": 403, "reason": "policy.blocked"});
+    }
+    if !mbx["serves"].as_array().is_some_and(|a| a.contains(&auth["identity"])) {
+        return json!({"status": 403, "reason": "transport.unknown-recipient"});
+    }
+    if req["path_sha256"] != p["sha256"] {
+        return json!({"status": 400, "reason": "policy.blocked"});
+    }
+    if p["size"].as_i64().unwrap_or(i64::MAX) > mbx["max_blob_bytes"].as_i64().unwrap_or(0) {
+        return json!({"status": 413, "reason": "mailbox.object-too-large"});
+    }
+    if req["body_size"] != p["size"] || req["body_sha256"] != p["sha256"] {
+        return json!({"status": 400, "reason": "mailbox.blob-mismatch"});
+    }
+    if inp["stored"].as_array().is_some_and(|a| a.contains(&p["sha256"])) {
+        return json!({"status": 200, "accepted": {"in_reply_to": p["id"], "duplicate": true}});
+    }
+    json!({"status": 201, "accepted": {"in_reply_to": p["id"]}})
+}
+
+/// What a mailbox answers to `GET {blob_endpoint}/{sha256}`.
+///
+/// Spec: M§8.4 rule 5 — the hash is a capability; the mailbox serves what it stored under it.
+pub fn blob_get(inp: &Value) -> Value {
+    let stored = inp["stored"].as_array().is_some_and(|a| a.contains(&inp["path_sha256"]));
+    json!({"status": if stored { 200 } else { 404 }})
 }

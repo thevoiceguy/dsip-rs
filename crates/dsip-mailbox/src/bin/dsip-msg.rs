@@ -12,7 +12,10 @@
 //! (spec-gap 44), so the process can be killed at any point and restarted. Every group deposit goes to
 //! the hub through this device's own mailbox with the delegation in its header (spec-gap 45); a commit
 //! is applied only after the hub's `accepted`; the device's own items fanned back to it are recognised
-//! by that `accepted` seq or by their bytes (spec-gap 47). `offline` only drops the
+//! by that `accepted` seq or by their bytes (spec-gap 47). Audio (`voice`, `voicemail`) is an Ogg Opus
+//! file sealed under a fresh key, uploaded to this identity's mailbox blob endpoint and referenced from
+//! the content object (M§8.2, M§8.4, M§5.6); a receiver fetches, verifies and decrypts it into
+//! `--state`/media. `voicemail` is offered only when M§13.2 allows it for the given call outcome. `offline` only drops the
 //! connection; `crash-next` exits after processing the next new item and before committing it.
 
 use std::collections::{HashMap, HashSet};
@@ -175,12 +178,16 @@ struct Client {
     resume: Resume,
     grants: HashMap<String, String>,
     crash_next: bool,
+    state: PathBuf,
+    http: reqwest::Client,
 }
 
 /// What processing one inbound item produced, reported only once it is committed.
 enum Outcome {
     Joined { conversation: String, members: Vec<String>, group: String, conv: Value },
     Text { sender: String, text: String },
+    /// Content carrying a blob: fetched and decrypted once the item is committed (M§8.4).
+    Media { sender: String, object: Value },
     Dropped(String),
     /// M§7.3: every roster change is rendered, attributed to the committing identity.
     Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String> },
@@ -425,6 +432,102 @@ impl Client {
         self.commit(commit, None, vec![], &format!("removed {identity}")).await
     }
 
+    /// Send an Ogg Opus recording: seal, upload, reference (M§8.2, M§8.4, M§5.6).
+    async fn send_audio(&mut self, path: &str, purpose: &str, session: Option<String>, max_duration_s: Option<i64>) -> Result<()> {
+        let conversation = self.conversation.clone().context("no conversation")?;
+        let plain = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+        let duration_ms = ogg_opus_duration_ms(&plain).context("not an Ogg Opus file")?;
+        if let Some(max) = max_duration_s {
+            // M§13.2: recording stops at the callee's max_duration_s.
+            anyhow::ensure!(duration_ms <= max * 1000, "recording is {duration_ms} ms, over the callee's {max} s");
+        }
+        // M§8.4 rule 1: a fresh single-use key, AES-256-GCM, nonce ‖ ciphertext ‖ tag.
+        let key: [u8; 32] = rand::random();
+        let nonce: [u8; 12] = rand::random();
+        let sealed = dsip_messaging::mls_wire::seal(&key, &nonce, &plain, dsip_messaging::mls_wire::SealUse::Blob);
+        let sha = digest(&sealed);
+        let conn = self.conn.as_ref().context("offline")?;
+        let endpoint = conn.relay.capabilities["mailbox"]["blob_endpoint"].as_str().context("mailbox advertises no blob_endpoint")?;
+        let uri = format!("{endpoint}/{sha}");
+
+        // M§5.6: one upload, authorized by a signed blob-put carrying the device's delegation.
+        let auth = wire::message_delegated(&self.keys.device, vec![self.delegation.clone()], "blob-put", &self.mailbox.0, now_s(),
+            wire::TTL_S, json!({"sha256": sha, "size": sealed.len()}));
+        let resp = self
+            .http
+            .put(&uri)
+            .header("Authorization", format!("DSIP {}.{}.{}", auth.protected, auth.payload, auth.signature))
+            .body(sealed.clone())
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let answer = Envelope::from_frame(&resp.text().await?).ok().and_then(|e| wire::payload_of(&e)).unwrap_or_default();
+        anyhow::ensure!(matches!(status, 200 | 201) && answer["type"] == "accepted", "blob upload refused: {status} {}", answer["reason"]);
+
+        let now = now_s();
+        let mut obj = json!({"object": "content", "id": wire::new_id(now), "conversation": conversation,
+            "sender": self.identity, "sent_at": now, "kind": "audio", "purpose": purpose, "duration_ms": duration_ms,
+            "blob": {"uri": uri, "sha256": sha, "size": sealed.len(), "key": dsip_core::b64::encode(&key), "alg": "A256GCM",
+                     "content_type": "audio/ogg; codecs=opus"}});
+        if let Some(s) = session {
+            obj["session"] = json!(s);
+        }
+        let group = self.group.as_mut().context("no group")?;
+        let msg = group
+            .create_message(self.mls.provider(), &self.mls.signer(), &serde_json::to_vec(&obj)?)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .tls_serialize_detached()?;
+        // M§8.4 rule 4: the deposit's manifest names the blob without its key.
+        let manifest = json!([{"uri": uri, "sha256": sha, "size": sealed.len()}]);
+        let reply = self.hub_deposit("application", json!({"mls": dsip_core::b64::encode(&msg), "blobs": manifest})).await?;
+        match reply["type"].as_str() {
+            Some("accepted") => println!("OK sent audio purpose={purpose} duration_ms={duration_ms} blob={sha} seq={}", reply["seq"]),
+            _ => println!("ERR send refused: {}", reply["reason"]),
+        }
+        Ok(())
+    }
+
+    /// M§13.2: after a call attempt to the conversation's peer ended with `reason`, may we leave a voicemail?
+    async fn voicemail(&mut self, session: &str, reason: &str, path: &str) -> Result<()> {
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let group = self.group.as_ref().context("no conversation with the callee")?;
+        let peer = authenticate_members(group, &ctx)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_iter()
+            .map(|m| m.identity)
+            .find(|i| *i != self.identity)
+            .context("no callee in the conversation")?;
+        let doc = dsip_core::did::Resolver::resolve(&r, &peer).with_context(|| format!("no document for {peer}"))?;
+        let entry = doc.service.iter().find(|s| s.service_type == "DSIPMailbox").map(|s| s.service_endpoint.clone()).unwrap_or_default();
+        let outcome_type = if reason == "session.timeout" { "cancel" } else { "reject" };
+        let offer = dsip_messaging::client::voicemail_offer(&json!({"voicemail": entry["voicemail"], "can_send": true,
+            "outcome": {"type": outcome_type, "reason": reason}}));
+        if offer["offer"] != json!(true) {
+            println!("NO-OFFER {reason}");
+            return Ok(());
+        }
+        println!("OFFER {reason} max_duration_s={}", offer["max_duration_s"]);
+        self.send_audio(path, "voicemail", Some(session.to_string()), offer["max_duration_s"].as_i64()).await
+    }
+
+    /// Fetch, verify and decrypt a content object's blob into `--state`/media (M§8.4 rule 7).
+    async fn fetch_media(&self, object: &Value) -> Result<(PathBuf, String)> {
+        let b = &object["blob"];
+        let uri = b["uri"].as_str().context("blob without uri")?;
+        let key: [u8; 32] = b["key"].as_str().and_then(dsip_core::b64::decode).and_then(|k| k.try_into().ok()).context("blob key")?;
+        let resp = self.http.get(uri).send().await?;
+        anyhow::ensure!(resp.status().is_success(), "GET {uri}: {}", resp.status());
+        let stored = resp.bytes().await?;
+        let plain = dsip_messaging::mls_wire::open_blob(&key, &stored, b["size"].as_u64().unwrap_or(0) as usize, b["sha256"].as_str().unwrap_or(""))
+            .map_err(|c| anyhow::anyhow!("{c}"))?;
+        let dir = self.state.join("media");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.ogg", object["id"].as_str().unwrap_or("blob")));
+        std::fs::write(&path, &plain)?;
+        Ok((path, digest(&plain)))
+    }
+
     async fn send_text(&mut self, text: &str) -> Result<()> {
         let conversation = self.conversation.clone().context("no conversation")?;
         let now = now_s();
@@ -560,6 +663,17 @@ impl Client {
                 self.send(&env).await?;
             }
             Outcome::Text { sender, text } => println!("RECV {sender}: {text}"),
+            Outcome::Media { sender, object } => {
+                // The item is committed; a failed fetch leaves the content visible and the blob re-fetchable.
+                match self.fetch_media(&object).await {
+                    Ok((path, sha)) => println!(
+                        "RECV-AUDIO {sender} purpose={} duration_ms={} session={} file={} sha256={sha}",
+                        object["purpose"].as_str().unwrap_or("message"), object["duration_ms"],
+                        object["session"].as_str().unwrap_or("-"), path.display()
+                    ),
+                    Err(e) => println!("ERR blob {}: {e}", object["id"]),
+                }
+            }
             Outcome::Dropped(why) => println!("DROP {why}"),
             Outcome::Epoch { epoch, by, added, removed } => {
                 println!("EPOCH {epoch} by={by} added={added:?} removed={removed:?}");
@@ -579,6 +693,31 @@ impl Client {
 
 fn mls_err<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> MlsError {
     move |x| MlsError(format!("{what}: {x:?}"))
+}
+
+/// Duration of an Ogg Opus file from its last granule position less the pre-skip (RFC 7845 §4).
+fn ogg_opus_duration_ms(bytes: &[u8]) -> Option<i64> {
+    let mut pos = 0;
+    let (mut last_granule, mut pre_skip) = (None, None);
+    while pos + 27 <= bytes.len() && &bytes[pos..pos + 4] == b"OggS" {
+        let granule = i64::from_le_bytes(bytes[pos + 6..pos + 14].try_into().ok()?);
+        let segments = bytes[pos + 26] as usize;
+        let table = bytes.get(pos + 27..pos + 27 + segments)?;
+        let data = pos + 27 + segments;
+        let len: usize = table.iter().map(|&b| b as usize).sum();
+        if pre_skip.is_none() {
+            let head = bytes.get(data..data + 19)?;
+            if &head[..8] != b"OpusHead" {
+                return None;
+            }
+            pre_skip = Some(u16::from_le_bytes([head[10], head[11]]) as i64);
+        }
+        if granule >= 0 {
+            last_granule = Some(granule);
+        }
+        pos = data + len;
+    }
+    Some((last_granule? - pre_skip?).max(0) * 1000 / 48_000)
 }
 
 /// The MLS side of one item, with no I/O, so it can run inside the item's transaction.
@@ -621,6 +760,9 @@ fn process(
             if verdict["verdict"] != "accept" {
                 return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
             }
+            if obj.get("blob").is_some() {
+                return Ok(Outcome::Media { sender, object: obj });
+            }
             Ok(Outcome::Text { sender, text: obj["text"].as_str().unwrap_or("").to_string() })
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
@@ -642,6 +784,17 @@ fn process(
         }
         _ => Ok(Outcome::Nothing),
     }
+}
+
+/// HTTPS for blobs, trusting the same anchors as the `wss` connections (M§5.6: TLS as in §13.2).
+fn http_client(ca: Option<&Path>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder().use_rustls_tls().https_only(true);
+    if let Some(ca) = ca {
+        for cert in reqwest::Certificate::from_pem_bundle(&std::fs::read(ca)?)? {
+            b = b.add_root_certificate(cert);
+        }
+    }
+    Ok(b.build()?)
 }
 
 #[tokio::main]
@@ -703,6 +856,8 @@ async fn main() -> Result<()> {
         resume,
         grants: HashMap::new(),
         crash_next: false,
+        state: args.state.clone(),
+        http: http_client(args.ca.as_deref())?,
     };
     if let Some(c) = &conv {
         client.set_conversation(c);
@@ -745,6 +900,15 @@ async fn main() -> Result<()> {
                     }
                     "remove" => client.remove(rest.trim()).await,
                     "send" => client.send_text(rest).await,
+                    "voice" => client.send_audio(rest.trim(), "voice-message", None, None).await,
+                    "voicemail" => {
+                        // voicemail <session> <call outcome reason> <file.ogg>
+                        let w: Vec<&str> = rest.split_whitespace().collect();
+                        match w.as_slice() {
+                            [session, reason, file] => client.voicemail(session, reason, file).await,
+                            _ => Err(anyhow::anyhow!("usage: voicemail <session> <reason> <file.ogg>")),
+                        }
+                    }
                     "sync" => client.sync(false).await,
                     "live" => client.sync(true).await,
                     "offline" => {

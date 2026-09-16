@@ -31,7 +31,7 @@ use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
 use dsip_mailbox::store::{Item, Store};
 use dsip_mailbox::verify::{delegated_identity, verify_frame};
-use dsip_mailbox::{wire, HELLO_TIMEOUT_S};
+use dsip_mailbox::{http, wire, HELLO_TIMEOUT_S};
 use dsip_messaging::client::select_mailbox;
 use dsip_messaging::hub::Hub;
 use dsip_messaging::mailbox::Mailbox;
@@ -61,6 +61,9 @@ struct Args {
     /// Admit policy (M§5.7): `grant` (default) or `open`.
     #[arg(long, default_value = "grant")]
     admit: String,
+    /// Largest blob accepted on the blob endpoint, bytes (M§4.3 `max_blob_bytes`).
+    #[arg(long, default_value_t = 16_777_216)]
+    max_blob_bytes: i64,
 }
 
 /// What a handled message produces.
@@ -90,6 +93,11 @@ struct Service {
     hub_refs: HashMap<String, Value>,
     bound: HashMap<String, mpsc::UnboundedSender<String>>,
     peers: HashMap<String, mpsc::UnboundedSender<PeerMsg>>,
+    /// Ciphertext blobs, one file per SHA-256 (M§8.4).
+    blob_dir: PathBuf,
+    /// `https://…/blobs` as advertised (M§4.3).
+    blob_endpoint: String,
+    max_blob_bytes: i64,
 }
 
 /// What goes out on a connection to a peer service.
@@ -244,6 +252,9 @@ impl Service {
                     if let Some(h) = &item.hub {
                         fields["hub"] = h.clone();
                     }
+                    if let Some(b) = &item.blobs {
+                        fields["blobs"] = b.clone();
+                    }
                     out.push(Out::Identity(to, wire::deposit(&self.key, "", now, group, &class, fields)));
                 }
                 _ => {}
@@ -349,7 +360,11 @@ async fn main() -> Result<()> {
         hub_refs: HashMap::new(),
         bound: HashMap::new(),
         peers: HashMap::new(),
+        blob_dir: args.state.join("blobs"),
+        blob_endpoint: format!("https://{}/blobs", args.listen),
+        max_blob_bytes: args.max_blob_bytes,
     }));
+    std::fs::create_dir_all(args.state.join("blobs"))?;
 
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("binding {}", args.listen))?;
     loop {
@@ -359,7 +374,12 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             match acceptor.accept(tcp).await {
                 Ok(tls) => {
-                    if let Err(e) = serve(tls, service).await {
+                    let result = match http::classify(tls).await {
+                        Ok(http::First::WebSocket(stream)) => serve(stream, service).await,
+                        Ok(http::First::Http(req)) => blob_request(req, service).await,
+                        Err(e) => Err(e.into()),
+                    };
+                    if let Err(e) = result {
                         tracing::info!("{peer}: {e}");
                     }
                 }
@@ -370,7 +390,115 @@ async fn main() -> Result<()> {
 }
 
 /// One client connection: `hello`, then profile messages until it closes (M§4.3).
-async fn serve(tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>, service: Arc<Mutex<Service>>) -> Result<()> {
+type Tls = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+
+/// One blob request: `PUT` authorized by a `blob-put` envelope, or `GET` by hash (M§5.6, M§8.4).
+async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>) -> Result<()> {
+    let Some(sha) = req.path.strip_prefix(http::BLOB_PATH).map(String::from) else {
+        return Ok(http::respond(&mut req.stream, 404, "text/plain", b"not found").await?);
+    };
+    let valid_name = sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match req.method.as_str() {
+        "GET" => {
+            let (path, stored) = {
+                let st = service.lock().await;
+                let path = st.blob_dir.join(&sha);
+                (path.clone(), valid_name && path.exists())
+            };
+            let verdict = dsip_messaging::mailbox::blob_get(&json!({"path_sha256": sha, "stored": if stored { vec![sha.clone()] } else { vec![] }}));
+            if verdict["status"] == 200 {
+                let body = std::fs::read(&path)?;
+                http::respond(&mut req.stream, 200, "application/octet-stream", &body).await?;
+            } else {
+                http::respond(&mut req.stream, 404, "text/plain", b"not found").await?;
+            }
+            Ok(())
+        }
+        "PUT" => {
+            let now = now_s();
+            // The credential: the full envelope pipeline, the device's delegation, the message rules (M§5.1).
+            let (authorization, mbx, stored) = {
+                let mut st = service.lock().await;
+                let resolver = st.resolver();
+                let ctx = ctx_of(&resolver, &st.seen, &st.supported);
+                let auth = req
+                    .header("authorization")
+                    .and_then(|h| h.strip_prefix("DSIP "))
+                    .and_then(|compact| {
+                        let mut parts = compact.trim().split('.');
+                        let env = Envelope {
+                            protected: parts.next()?.to_string(),
+                            payload: parts.next()?.to_string(),
+                            signature: parts.next()?.to_string(),
+                        };
+                        let ver = envelope::verify(&env, &ctx, None).ok()?;
+                        if ver.msg_type() != "blob-put" || dsip_messaging::checks::check_message(&ver.payload)["verdict"] != "accept" {
+                            return None;
+                        }
+                        let identity = delegated_identity(&ver, &ctx)?;
+                        Some(json!({"identity": identity, "payload": ver.payload}))
+                    });
+                if let Some(a) = &auth {
+                    let id = a["payload"]["id"].as_str().unwrap_or("").to_string();
+                    st.seen.insert(&id, now, now);
+                }
+                let mbx = json!({"did": st.key.did(), "serves": [st.owner], "max_blob_bytes": st.max_blob_bytes});
+                let stored = valid_name && st.blob_dir.join(&sha).exists();
+                (auth.unwrap_or(Value::Null), mbx, stored)
+            };
+            let stored_list = if stored { vec![sha.clone()] } else { vec![] };
+            // Decide everything that does not need the body first (413 before reading it).
+            let declared = authorization["payload"]["size"].as_i64().unwrap_or(-1);
+            let pre = dsip_messaging::mailbox::blob_put(&json!({"mailbox": mbx, "authorization": authorization, "stored": stored_list,
+                "request": {"path_sha256": sha, "body_size": authorization["payload"]["size"], "body_sha256": authorization["payload"]["sha256"]}}));
+            let verdict = if pre["status"].as_i64().is_some_and(|s| s >= 400) {
+                pre
+            } else {
+                let content_length: i64 = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let body = if content_length == declared { http::read_body(&mut req, declared as usize).await? } else { vec![] };
+                let body_sha = hex_sha256(&body);
+                let v = dsip_messaging::mailbox::blob_put(&json!({"mailbox": mbx, "authorization": authorization, "stored": stored_list,
+                    "request": {"path_sha256": sha, "body_size": body.len(), "body_sha256": body_sha}}));
+                if v["status"] == 201 {
+                    let st = service.lock().await;
+                    let tmp = st.blob_dir.join(format!(".{sha}.part"));
+                    std::fs::write(&tmp, &body)?;
+                    std::fs::rename(&tmp, st.blob_dir.join(&sha))?;
+                    tracing::info!("stored blob {sha} ({} bytes) for {}", body.len(), authorization["identity"]);
+                }
+                v
+            };
+            let st = service.lock().await;
+            let to = authorization["payload"]["from"].as_str().unwrap_or("").to_string();
+            let status = verdict["status"].as_u64().unwrap_or(500) as u16;
+            let env = match verdict.get("accepted") {
+                Some(a) => {
+                    let mut extra = json!({});
+                    if a.get("duplicate").is_some() {
+                        extra["duplicate"] = json!(true);
+                    }
+                    wire::accepted(&st.key, &to, now, a["in_reply_to"].as_str().unwrap_or(""), extra)
+                }
+                None => {
+                    tracing::info!("blob PUT {sha} refused: {status} {}", verdict["reason"]);
+                    let in_reply_to = authorization["payload"]["id"].as_str();
+                    wire::error(&st.key, &to, now, in_reply_to, verdict["reason"].as_str().unwrap_or("policy.blocked"), None)
+                }
+            };
+            drop(st);
+            http::respond(&mut req.stream, status, "application/json", env.frame().as_bytes()).await?;
+            Ok(())
+        }
+        _ => Ok(http::respond(&mut req.stream, 405, "text/plain", b"method not allowed").await?),
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result<()> {
     let mut ws = tokio_tungstenite::accept_async_with_config(tls, Some(dsip_transport::conn::ws_config())).await?;
     let first = match tokio::time::timeout(std::time::Duration::from_secs(HELLO_TIMEOUT_S), ws.next()).await {
         Ok(Some(Ok(WsMessage::Text(t)))) => t.to_string(),
@@ -385,7 +513,7 @@ async fn serve(tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>, serv
         let (device, identity) = (inb.device().to_string(), inb.identity().to_string());
         let id = inb.payload()["id"].as_str().unwrap_or("").to_string();
         let hub = true;
-        let env = wire::service_hello(&st.key, &id, now_s(), wire::mailbox_capabilities(hub));
+        let env = wire::service_hello(&st.key, &id, now_s(), wire::mailbox_capabilities(hub, &st.blob_endpoint, st.max_blob_bytes));
         st.seen.insert(&id, now_s(), now_s());
         (device, identity, env)
     };
