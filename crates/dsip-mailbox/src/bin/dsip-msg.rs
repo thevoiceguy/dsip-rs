@@ -21,6 +21,11 @@
 //! archive records are shown once, MLS items from before this device joined a group are skipped, and archive
 //! records under a key the device does not hold yet are kept (durably, encrypted) until the key arrives
 //! (spec-gap 51). A second device of an identity is started with `--controller` pointing at the identity key.
+//! First contact (M§14.1, spec-gap 54): `introduce` sends a core §19.4 introduction, its purpose sealed with HPKE
+//! to the recipient's key agreement key (M§6.9), as a deposit to the recipient's mailbox; the recipient sees it as a
+//! request — never as a message — and `accept-request` returns a `dsip.message` grant the same way, which the
+//! requester holds and presents when it creates the conversation. Grants carry the signing device's delegation.
+//! The identity's key agreement key is derived from its identity key (spec-gap 55).
 //! `offline` only drops the connection; `crash-next` exits after processing the next new item and before
 //! committing it.
 
@@ -129,7 +134,13 @@ impl Keys {
 
 /// The `did:web` document for this identity, carrying its mailbox entry (M§4.2).
 fn did_document(identity: &str, controller: &KeyPair, mailbox_did: &str, mailbox_uri: &str) -> Value {
+    // M§6.9: the key sealed introductions are encrypted to (spec-gap 55: derived from the identity key).
+    let x25519 = dsip_messaging::first_contact::x25519_public(&dsip_messaging::first_contact::x25519_from_ed25519_seed(&controller.seed()));
     json!({
+        "keyAgreement": [{
+            "id": format!("{identity}#key-agreement-1"), "type": "Multikey", "controller": identity,
+            "publicKeyMultibase": dsip_core::did::multibase_x25519(&x25519),
+        }],
         "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
         "id": identity,
         "verificationMethod": [{
@@ -246,6 +257,10 @@ struct Client {
     own: HashSet<String>,
     resume: Resume,
     grants: HashMap<String, String>,
+    /// Grants other identities issued to this one, by granter (M§14.1): presented when creating a conversation.
+    grants_held: BTreeMap<String, String>,
+    /// Introductions received and not yet answered, by id (M§14.1: requests, never messages).
+    requests: BTreeMap<String, Value>,
     crash_next: bool,
     state: PathBuf,
     http: reqwest::Client,
@@ -328,13 +343,111 @@ impl Client {
         Ok(conn)
     }
 
-    /// Issue a contact grant for `peer` (§19.4, scope `dsip.message`).
-    fn grant(&self, peer: &str) -> Envelope {
+    /// Issue a contact grant for `peer` (§19.4, scope `dsip.message`), answering introduction `session` if any. The
+    /// device's delegation rides in the header, so a verifier can bind the signer to the granting identity (§7.4).
+    fn grant(&self, peer: &str, session: Option<&str>) -> Envelope {
         let now = now_s();
         let p = json!({"dsip": wire::version_block(), "type": "grant", "id": wire::new_id(now), "from": self.identity,
-            "to": peer, "session": wire::new_id(now), "scope": ["dsip.message"], "valid_until": now + 30 * 86400,
-            "issued_at": now, "expires_at": now + 30});
-        sign(&p, &self.keys.device, &self.keys.device.kid())
+            "to": peer, "session": session.map(String::from).unwrap_or_else(|| wire::new_id(now)), "scope": ["dsip.message"],
+            "valid_until": now + 30 * 86400, "issued_at": now, "expires_at": now + 30});
+        self.sign_delegated(&p)
+    }
+
+    fn sign_delegated(&self, p: &Value) -> Envelope {
+        dsip_core::envelope::sign_bytes(&dsip_core::envelope::encode_payload(p), &self.keys.device, &self.keys.device.kid(), vec![self.delegation.clone()])
+    }
+
+    /// Deposit a first-contact envelope for `recipient` at that identity's mailbox (spec-gap 54); the mailbox's answer.
+    async fn deposit_first_contact(&mut self, class: &str, recipient: &str, envelope: &Envelope) -> Result<Value> {
+        let mut conn = self.peer_connect(recipient).await?;
+        let dep = wire::message(&self.keys.device, "deposit", &conn.relay.did.clone(), now_s(), wire::TTL_S,
+            json!({"class": class, "recipient": recipient, "envelope": compact(envelope)}));
+        conn.send(&dep).await?;
+        let reply = conn.recv().await?.context("no answer from the mailbox")?;
+        conn.close(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, "done").await;
+        wire::payload_of(&Envelope::from_frame(&reply).map_err(|v| anyhow::anyhow!("{:?}", v.code))?).context("bad answer")
+    }
+
+    /// M§14.1: ask `target` for permission to message, the purpose sealed to its key agreement key unless `plain`.
+    async fn introduce(&mut self, target: &str, purpose: &str, plain: bool) -> Result<()> {
+        let now = now_s();
+        let mut p = json!({"dsip": wire::version_block(), "type": "introduction", "id": wire::new_id(now), "from": self.identity,
+            "to": target, "identity": {"display_name": self.identity}, "purpose": purpose, "issued_at": now,
+            "expires_at": now + 7 * 86_400});
+        if !plain {
+            let r = resolver(&self.resolver_files);
+            let doc = dsip_core::did::Resolver::resolve(&r, target).with_context(|| format!("no document for {target}"))?;
+            let pk = doc.x25519_key_agreement().context("the recipient publishes no key agreement key: use introduce-plain")?;
+            dsip_messaging::first_contact::seal_introduction(&mut p, purpose, &pk, &rand::random());
+        }
+        let env = self.sign_delegated(&p);
+        let id = p["id"].as_str().unwrap_or("").to_string();
+        let answer = self.deposit_first_contact("introduction", target, &env).await?;
+        match answer["type"].as_str() {
+            Some("accepted") => println!("OK introduction {id} to {target} accepted sealed={}", !plain),
+            _ => println!("ERR introduction {id} refused: {} retry_after={}", answer["reason"], answer["retry_after"]),
+        }
+        Ok(())
+    }
+
+    /// M§14.1: answer a request with a `dsip.message` grant, deposited at the requester's mailbox.
+    async fn accept_request(&mut self, id: &str) -> Result<()> {
+        let intro = self.requests.get(id).cloned().context("no such request")?;
+        let requester = intro["from"].as_str().unwrap_or("").to_string();
+        let grant = self.grant(&requester, Some(id));
+        let answer = self.deposit_first_contact("grant", &requester, &grant).await?;
+        anyhow::ensure!(answer["type"] == "accepted", "grant refused: {}", answer["reason"]);
+        self.requests.remove(id);
+        self.mls.provider().put_state("requests", &json!(self.requests)).map_err(Self::state_err)?;
+        println!("OK granted {requester} dsip.message for request {id}");
+        Ok(())
+    }
+
+    /// A signed introduction or grant from the mailbox, verified as a credential: its signature and the binding of
+    /// its signer to `from` (§7.4); it was checked fresh when deposited, and has been held since (spec-gap 54).
+    fn first_contact_in(&mut self, item: &Value) -> Result<()> {
+        let class = item["class"].as_str().unwrap_or("");
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let env = from_compact(item["envelope"].as_str().unwrap_or(""));
+        let checked = dsip_core::envelope::verify_raw(&env, &ctx, false).ok().filter(|ver| {
+            let from = ver.payload["from"].as_str().unwrap_or("");
+            ver.payload["type"] == class
+                && ver.payload["to"] == json!(self.identity)
+                // an introduction lives until its expires_at; a grant's delivery expiry has passed, its valid_until has not (§19.4)
+                && ver.payload[if class == "grant" { "valid_until" } else { "expires_at" }].as_i64().unwrap_or(0) >= now_s()
+                && dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, &ctx).ok()
+        });
+        let Some(ver) = checked else {
+            println!("DROP-{} {}: does not verify", class.to_uppercase(), item["cursor"]);
+            return Ok(());
+        };
+        let p = ver.payload;
+        let from = p["from"].as_str().unwrap_or("").to_string();
+        if class == "introduction" {
+            let opened = dsip_messaging::first_contact::open_sealed_introduction(&p, &self.keys.controller.seed());
+            if opened["verdict"] != "accept" {
+                println!("DROP-INTRODUCTION {} from {from}: {}", p["id"], opened["code"]);
+                return Ok(());
+            }
+            let purpose = opened["purpose"].as_str().unwrap_or("").to_string();
+            let on_wire = String::from_utf8(dsip_core::b64::decode(&env.payload).unwrap_or_default()).unwrap_or_default();
+            let id = p["id"].as_str().unwrap_or("").to_string();
+            println!("REQUEST {id} from {from}: \"{purpose}\" sealed={} purpose_on_wire={}", p.get("sealed").is_some(),
+                !purpose.is_empty() && on_wire.contains(&purpose));
+            self.requests.insert(id, p);
+            self.mls.provider().put_state("requests", &json!(self.requests)).map_err(Self::state_err)?;
+        } else {
+            let scope = p["scope"].clone();
+            if !scope.as_array().is_some_and(|s| s.iter().any(|x| x == "dsip.message")) {
+                println!("DROP-GRANT {} from {from}: no dsip.message scope", p["id"]);
+                return Ok(());
+            }
+            self.grants_held.insert(from.clone(), compact(&env));
+            self.mls.provider().put_state("grants_held", &json!(self.grants_held)).map_err(Self::state_err)?;
+            println!("GRANTED by {from} scope={scope} request={}", p["session"].as_str().unwrap_or(""));
+        }
+        Ok(())
     }
 
     async fn upload_key_packages(&mut self, n: usize) -> Result<()> {
@@ -532,8 +645,9 @@ impl Client {
         Ok(gid)
     }
 
-    /// Create a conversation of `kind` with `peer` (M§7.2, M§7.3).
+    /// Create a conversation of `kind` with `peer` (M§7.2, M§7.3), presenting a held grant when none is given.
     async fn create(&mut self, kind: &str, peer: &str, grant: Option<String>) -> Result<()> {
+        let grant = grant.or_else(|| self.grants_held.get(peer).cloned());
         let kp = self.fetch_key_package(peer, grant.as_deref(), None).await?;
         let gid = self.new_group(kind).await?;
         self.add(&gid, peer, grant, Some(kp)).await
@@ -1011,6 +1125,11 @@ impl Client {
         if class == "archive" {
             return self.archive_in(item);
         }
+        if matches!(class.as_str(), "introduction" | "grant") {
+            self.first_contact_in(item)?;
+            self.resume.commit(item, false);
+            return self.save_resume();
+        }
         if !matches!(class.as_str(), "welcome" | "handshake" | "application") {
             self.resume.commit(item, false);
             return self.save_resume();
@@ -1340,6 +1459,8 @@ async fn main() -> Result<()> {
         own: HashSet::new(),
         resume,
         grants: HashMap::new(),
+        grants_held: BTreeMap::new(),
+        requests: BTreeMap::new(),
         crash_next: false,
         state: args.state.clone(),
         http: http_client(args.ca.as_deref())?,
@@ -1378,6 +1499,12 @@ async fn main() -> Result<()> {
     }
     if let Some(Value::Object(h)) = client.mls.provider().get_state("held").map_err(Client::state_err)? {
         client.held = h.into_iter().collect();
+    }
+    if let Some(Value::Object(g)) = client.mls.provider().get_state("grants_held").map_err(Client::state_err)? {
+        client.grants_held = g.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect();
+    }
+    if let Some(Value::Object(r)) = client.mls.provider().get_state("requests").map_err(Client::state_err)? {
+        client.requests = r.into_iter().collect();
     }
     client.connect().await?;
 
@@ -1454,8 +1581,20 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
     match cmd {
         "" => Ok(()),
         "kp" => client.upload_key_packages(rest.trim().parse().unwrap_or(2)).await,
+        "introduce" | "introduce-plain" => {
+            // introduce <did> <purpose…>: sealed to the recipient's key agreement key; introduce-plain: not sealed
+            let (target, purpose) = rest.trim().split_once(' ').context("usage: introduce <did> <purpose>")?;
+            client.introduce(target, purpose.trim(), cmd == "introduce-plain").await
+        }
+        "requests" => {
+            for (id, p) in &client.requests {
+                println!("PENDING {id} from {}", p["from"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        "accept-request" => client.accept_request(rest.trim()).await,
         "grant" => {
-            let g = client.grant(rest.trim());
+            let g = client.grant(rest.trim(), None);
             client.grants.insert(rest.trim().to_string(), compact(&g));
             println!("GRANT {}", compact(&g));
             Ok(())

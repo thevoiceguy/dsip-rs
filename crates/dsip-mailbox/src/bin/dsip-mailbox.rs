@@ -61,6 +61,15 @@ struct Args {
     /// Admit policy (M§5.7): `grant` (default) or `open`.
     #[arg(long, default_value = "grant")]
     admit: String,
+    /// Introductions (and grants) allowed per sender identity and per recipient inbox within `--intro-window` (§19.4).
+    #[arg(long, default_value_t = 5)]
+    intro_limit: usize,
+    /// Rate-limit window for introductions, seconds (§19.4).
+    #[arg(long, default_value_t = 3600)]
+    intro_window: i64,
+    /// Introductions held per recipient inbox (§19.4, RECOMMENDED 16).
+    #[arg(long, default_value_t = 16)]
+    inbox_cap: usize,
     /// Largest blob accepted on the blob endpoint, bytes (M§4.3 `max_blob_bytes`).
     #[arg(long, default_value_t = 16_777_216)]
     max_blob_bytes: i64,
@@ -148,8 +157,13 @@ impl Service {
                     out.push(Out::Device(to, env));
                 }
                 "error" => {
-                    let env = wire::error(&self.key, &to, now, body["in_reply_to"].as_str(), body["reason"].as_str().unwrap_or(""), None);
-                    out.push(Out::Device(to, env));
+                    let mut fields = json!({"reason": body["reason"]});
+                    for k in ["in_reply_to", "retry_after"] {
+                        if let Some(v) = body.get(k) {
+                            fields[k] = v.clone(); // §19.4: policy.rate-limited carries retry_after
+                        }
+                    }
+                    out.push(Out::Device(to.clone(), wire::message(&self.key, "error", &to, now, wire::TTL_S, fields)));
                 }
                 "items" => {
                     let list: Vec<Value> = body["cursors"]
@@ -339,16 +353,28 @@ fn origin_of(compact: &str, ctx: &Context) -> Option<Value> {
 }
 
 fn grant_payload(compact: &str, ctx: &Context) -> Option<Value> {
-    // A grant is a credential, not a delivery envelope: verified like a delegation (§19.4, §7.4),
-    // so its own replay window does not apply when it is presented later.
+    dsip_mailbox::verify::grant_credential(compact, ctx)
+}
+
+/// Verify the signed envelope a first-contact deposit carries, fresh at deposit time (§19.4 pipeline: signature,
+/// delegation binding, introduction validity, expiry, ULID), and the profile's introduction rules (M§14.1).
+/// Returns `(sender identity, recipient, expires_at)`.
+fn first_contact_envelope(kind: &str, compact: &str, ctx: &Context) -> Result<(String, String, i64), String> {
     let mut parts = compact.split('.');
-    let env = Envelope {
-        protected: parts.next()?.to_string(),
-        payload: parts.next()?.to_string(),
-        signature: parts.next()?.to_string(),
-    };
-    let ver = envelope::verify_raw(&env, ctx, false).ok()?;
-    (ver.payload.get("type")? == "grant").then(|| ver.payload.clone())
+    let mut next = || parts.next().unwrap_or("").to_string();
+    let env = Envelope { protected: next(), payload: next(), signature: next() };
+    let ver = envelope::verify(&env, ctx, None).map_err(|v| format!("{:?}", v.code))?;
+    let p = &ver.payload;
+    if p["type"] != kind {
+        return Err(format!("carried {} is not a {kind}", p["type"]));
+    }
+    if kind == "introduction" {
+        let v = dsip_messaging::first_contact::check_introduction(p);
+        if v["verdict"] != "accept" {
+            return Err(v["code"].as_str().unwrap_or("introduction").to_string());
+        }
+    }
+    Ok((ver.identity.clone(), p["to"].as_str().unwrap_or("").to_string(), p["expires_at"].as_i64().unwrap_or(0)))
 }
 
 #[tokio::main]
@@ -375,7 +401,7 @@ async fn main() -> Result<()> {
     tracing::info!("mailbox {} for {} on wss://{}/dsip (ca {})", key.did(), args.owner, args.listen, cert.display());
 
     let mailbox = Mailbox::new(&json!({"now": now_s(), "owner": args.owner, "serves": [args.owner], "devices": [],
-        "admit": args.admit}));
+        "admit": args.admit, "intro_limit": args.intro_limit, "intro_window": args.intro_window, "inbox_cap": args.inbox_cap}));
     let service = Arc::new(Mutex::new(Service {
         key,
         owner: args.owner.clone(),
@@ -656,7 +682,35 @@ fn dispatch(
         "deposit" => {
             let class = p["class"].as_str().unwrap_or("");
             let group = p["group"].as_str().unwrap_or("").to_string();
-            let item = Item::from_deposit(&p, &device, now);
+            let mut item = Item::from_deposit(&p, &device, now);
+            if matches!(class, "introduction" | "grant") {
+                // First contact (M§14.1, spec-gap 54): a signed introduction or grant for an identity, under §19.4's rules.
+                let ctx = ctx_of(resolver, &st.seen, &st.supported);
+                let (sender, to, expires_at) = match first_contact_envelope(class, p["envelope"].as_str().unwrap_or(""), &ctx) {
+                    Ok(v) => v,
+                    Err(why) => {
+                        tracing::info!("{class} refused: {why}");
+                        return vec![Out::Device(device.clone(), wire::error(&st.key, &device, now, Some(&id), "policy.blocked", Some(&why)))];
+                    }
+                };
+                if to != p["recipient"].as_str().unwrap_or("") {
+                    return vec![Out::Device(device.clone(), wire::error(&st.key, &device, now, Some(&id), "policy.blocked", Some("recipient is not the envelope's to")))];
+                }
+                item.expires_at = Some(expires_at);
+                let event = json!({"first_contact": {"id": id, "from": device, "sender_identity": sender, "recipient": to,
+                    "kind": class, "expires_at": expires_at}});
+                let emissions = st.mailbox.step(&event);
+                for e in &emissions {
+                    match (e.get("accepted"), e.get("error")) {
+                        (Some(a), _) if a.get("cursor").is_some() => tracing::info!("held {class} from {sender} for {to}"),
+                        (Some(_), _) => tracing::info!("{class} from {sender} for {to} accepted, not held"),
+                        (_, Some(err)) => tracing::info!("{class} from {sender} refused: {}", err["reason"]),
+                        _ => {}
+                    }
+                }
+                st.absorb(&emissions, item);
+                return st.mailbox_out(emissions, now);
+            }
             if class == "welcome" && p["recipient"].as_str() == Some(st.owner.as_str()) {
                 let ctx = ctx_of(resolver, &st.seen, &st.supported);
                 let grant = p["grants"].as_array().into_iter().flatten().filter_map(Value::as_str)

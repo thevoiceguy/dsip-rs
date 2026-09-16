@@ -45,6 +45,7 @@ struct Item {
     n: i64,
     class: String,
     group: String,
+    expires_at: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +72,10 @@ pub struct Mailbox {
     acks: HashMap<String, i64>,
     bound: BTreeSet<String>,
     archived: HashMap<(String, i64), String>,
+    intro_limit: usize,
+    intro_window: i64,
+    inbox_cap: usize,
+    intro_log: HashMap<String, Vec<i64>>,
 }
 
 fn s(v: &Value) -> String {
@@ -142,6 +147,10 @@ impl Mailbox {
             acks: HashMap::new(),
             bound: BTreeSet::new(),
             archived: HashMap::new(),
+            intro_limit: ctx["intro_limit"].as_u64().unwrap_or(5) as usize,
+            intro_window: ctx["intro_window"].as_i64().unwrap_or(3600),
+            inbox_cap: ctx["inbox_cap"].as_u64().unwrap_or(16) as usize,
+            intro_log: HashMap::new(),
         }
     }
 
@@ -161,6 +170,7 @@ impl Mailbox {
             "advance" => self.advance(e.as_i64().unwrap_or(0)),
             "welcome" => self.welcome(e),
             "forward" => self.forward(e),
+            "first_contact" => self.first_contact(e),
             "hub_deposit" => self.hub_deposit(e),
             "sync" => self.sync(e),
             "unbind" => {
@@ -195,14 +205,50 @@ impl Mailbox {
         }
         self.counter += 1;
         let c = cursor(self.counter);
-        self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into() });
+        self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into(), expires_at: None });
         let pushes =
             self.bound.iter().filter(|d| Some(d.as_str()) != depositor).map(|d| json!({"push": {"to": d, "cursor": c}})).collect();
         (c, pushes)
     }
 
+    /// Spec: core §19.4 carried to mailboxes. Impl (spec-gap 54): rate-limited per sender identity and per recipient
+    /// inbox; an unknown recipient or a full inbox is accepted without holding (indistinguishable from delivery); held
+    /// until the envelope expires.
+    fn first_contact(&mut self, e: &Value) -> Vec<Value> {
+        let keys = [format!("sender:{}", s(&e["sender_identity"])), format!("inbox:{}", s(&e["recipient"]))];
+        let (now, window) = (self.now, self.intro_window);
+        for k in &keys {
+            let log = self.intro_log.entry(k.clone()).or_default();
+            log.retain(|t| *t > now - window);
+            if log.len() >= self.intro_limit {
+                let retry = log[0] + window - now;
+                return vec![json!({"error": {"to": e["from"], "in_reply_to": e["id"], "reason": "policy.rate-limited", "retry_after": retry}})];
+            }
+        }
+        for k in &keys {
+            self.intro_log.entry(k.clone()).or_default().push(now);
+        }
+        let accepted = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"]}})];
+        if !self.serves.contains(&s(&e["recipient"])) {
+            return accepted;
+        }
+        let kind = s(&e["kind"]);
+        if kind == "introduction" && self.items.iter().filter(|it| it.class == kind).count() >= self.inbox_cap {
+            return accepted;
+        }
+        let (c, pushes) = self.store(&kind, "", None);
+        if let Some(it) = self.items.last_mut() {
+            it.expires_at = e["expires_at"].as_i64();
+        }
+        let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
+        out.extend(pushes);
+        out
+    }
+
     fn advance(&mut self, n: i64) -> Vec<Value> {
         self.now += n;
+        let now = self.now;
+        self.items.retain(|it| it.expires_at.is_none_or(|t| t >= now)); // §19.4: held until the envelope expires
         let expired: Vec<String> = self
             .groups
             .iter()

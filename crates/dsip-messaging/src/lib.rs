@@ -21,6 +21,7 @@
 
 pub mod checks;
 pub mod client;
+pub mod first_contact;
 pub mod hub;
 pub mod mailbox;
 pub mod mls_wire;
@@ -34,6 +35,9 @@ use serde_json::{json, Value};
 pub fn run_vector(v: &Value) -> Value {
     let inp = &v["input"];
     if let Some(out) = mls_wire::run_check(inp["check"].as_str().unwrap_or(""), v) {
+        return out;
+    }
+    if let Some(out) = first_contact::run_check(inp["check"].as_str().unwrap_or(""), inp) {
         return out;
     }
     match inp["check"].as_str().unwrap_or("") {

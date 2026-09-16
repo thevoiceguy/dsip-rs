@@ -47,6 +47,26 @@ pub fn multibase_ed25519(public: &[u8; 32]) -> String {
     format!("z{}", bs58::encode(raw).into_string())
 }
 
+/// Multicodec prefix for an X25519 public key (`x25519-pub`, 0xec as varint).
+const X25519_PUB_MULTICODEC: [u8; 2] = [0xec, 0x01];
+
+/// `z…` base58btc multibase of an X25519 public key.
+pub fn multibase_x25519(public: &[u8; 32]) -> String {
+    let mut raw = Vec::with_capacity(34);
+    raw.extend_from_slice(&X25519_PUB_MULTICODEC);
+    raw.extend_from_slice(public);
+    format!("z{}", bs58::encode(raw).into_string())
+}
+
+/// Decode a `z…` multibase string to an X25519 public key, if it is one.
+pub fn x25519_from_multibase(mb: &str) -> Option<[u8; 32]> {
+    let raw = bs58::decode(mb.strip_prefix('z')?).into_vec().ok()?;
+    if raw.len() != 34 || raw[..2] != X25519_PUB_MULTICODEC {
+        return None;
+    }
+    raw[2..].try_into().ok()
+}
+
 /// Decode a `z…` multibase string to an Ed25519 public key, if it is one.
 pub fn ed25519_from_multibase(mb: &str) -> Option<[u8; 32]> {
     let rest = mb.strip_prefix('z')?;
@@ -119,6 +139,9 @@ pub struct DidDocument {
     /// Services.
     #[serde(default)]
     pub service: Vec<Service>,
+    /// Key agreement methods, embedded (M§6.9 reads an X25519 key here); references are not followed.
+    #[serde(rename = "keyAgreement", default, skip_serializing_if = "Vec::is_empty")]
+    pub key_agreement: Vec<Value>,
 }
 
 impl DidDocument {
@@ -137,6 +160,13 @@ impl DidDocument {
             }
         }
         ed25519_from_multibase(vm.public_key_multibase.as_deref()?)
+    }
+
+    /// The first embedded X25519 key agreement key, if any.
+    ///
+    /// Spec: M§6.9 (v0.8 Messaging Profile draft) — sealed introductions are encrypted to it.
+    pub fn x25519_key_agreement(&self) -> Option<[u8; 32]> {
+        self.key_agreement.iter().find_map(|k| x25519_from_multibase(k.get("publicKeyMultibase")?.as_str()?))
     }
 
     /// First `DSIPSignaling` service endpoint `uri` advertising `ws/1.0`, if any.
@@ -173,6 +203,7 @@ impl DidDocument {
                     }]
                 })
                 .unwrap_or_default(),
+            key_agreement: vec![],
         }
     }
 }

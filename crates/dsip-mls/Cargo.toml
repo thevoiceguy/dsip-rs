@@ -22,6 +22,13 @@ openmls_traits = "0.6.0"
 openmls_sqlite_storage = { version = "0.3.0", optional = true }
 rusqlite = { version = "0.37", optional = true }
 
+[dev-dependencies]
+# Cross-check of the profile's own HPKE (dsip-messaging::first_contact) against an independent implementation.
+hpke-rs = { version = "0.7", features = ["rustcrypto"] }
+hpke-rs-crypto = "0.7"
+hpke-rs-rust-crypto = "0.7"
+rand.workspace = true
+
 [features]
 sqlite = ["dep:openmls_sqlite_storage", "dep:rusqlite", "dep:serde"]
 
