@@ -388,7 +388,16 @@ impl Mailbox {
             }
         }
         self.revoked.extend(e["revoked_grants"].as_array().into_iter().flatten().map(s));
-        vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"]}})]
+        let mut out = vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"]}})];
+        for d in e["revoked_devices"].as_array().into_iter().flatten().map(s) {
+            // spec-gap 57: a revoked device loses its binding now, its registration and its KeyPackages
+            if self.bound.remove(&d) {
+                out.push(json!({"close": {"device": d, "reason": "delegation-revoked"}}));
+            }
+            self.devices.retain(|x| *x != d);
+            self.kp.remove(&d);
+        }
+        out
     }
 
     fn archive(&mut self, e: &Value) -> Vec<Value> {

@@ -109,12 +109,15 @@ pub struct Context<'a> {
     pub seen_ids: HashSet<String>,
     /// Supported versions/profiles/extensions.
     pub supported: Supported,
+    /// `delegation-revocation` records the receiver holds (v0.8 draft, spec-gap 57); the subject's DID document is
+    /// consulted too.
+    pub revocations: Vec<Envelope>,
 }
 
 impl<'a> Context<'a> {
     /// A context over a resolver with no delegations and nothing seen.
     pub fn new(now: i64, resolver: &'a dyn Resolver) -> Context<'a> {
-        Context { now, resolver, delegations: vec![], seen_ids: HashSet::new(), supported: Supported::default() }
+        Context { now, resolver, delegations: vec![], seen_ids: HashSet::new(), supported: Supported::default(), revocations: vec![] }
     }
 
     /// Build the resolver and context from a vector's `context` object.
@@ -141,6 +144,11 @@ impl<'a> Context<'a> {
             delegations,
             seen_ids,
             supported: Supported::from_json(ctx.get("supported")),
+            revocations: ctx
+                .get("revocations")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|d| Envelope::from_value(d).ok()).collect())
+                .unwrap_or_default(),
         }
     }
 }

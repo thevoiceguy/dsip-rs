@@ -113,6 +113,10 @@ impl Connection {
         })?;
         if inbound.verified.msg_type() != "hello" {
             let _ = ws.close(None).await;
+            let p = &inbound.verified.payload;
+            if inbound.verified.msg_type() == "error" {
+                bail!("hello refused: {} {}", p["reason"].as_str().unwrap_or(""), p["detail"].as_str().unwrap_or(""));
+            }
             bail!("first frame from relay was {}, not hello", inbound.verified.msg_type());
         }
         // The schema enforces relay form (in_reply_to ⇔ capabilities, max_envelope_bytes const).

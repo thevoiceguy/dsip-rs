@@ -55,6 +55,36 @@ pub fn run_vector(v: &Value) -> Value {
         "mailbox-select" => client::select_mailbox(inp),
         "mailbox-switch" => client::mailbox_switch(inp),
         "registration-on-removal" => client::registration_on_removal(inp),
+        "delegation" | "binding" => {
+            let resolver = dsip_core::envelope::Context::resolver_from_vector(&v["context"]);
+            let ctx = dsip_core::envelope::Context::from_vector(&v["context"], &resolver);
+            let verdict = if inp["check"] == "delegation" {
+                match dsip_core::envelope::Envelope::from_value(&inp["delegation"]) {
+                    Ok(d) => dsip_core::delegation::verify_delegation_for(&d, s(&inp["subject"]), s(&inp["device"]), s(&inp["capability"]), &ctx),
+                    Err(_) => return checks::reject("delegation-invalid", None),
+                }
+            } else {
+                let presented: Vec<_> = inp["presented"].as_array().into_iter().flatten()
+                    .filter_map(|d| dsip_core::envelope::Envelope::from_value(d).ok()).collect();
+                dsip_core::delegation::check_binding(s(&inp["subject"]), s(&inp["device"]), &presented, &ctx)
+            };
+            if verdict.ok() {
+                checks::accept()
+            } else {
+                let code = verdict.code.and_then(|c| serde_json::to_value(c).ok()).and_then(|c| c.as_str().map(String::from)).unwrap_or_default();
+                checks::reject(&code, None)
+            }
+        }
+        "revocation-record" => {
+            let p = &inp["payload"];
+            if !schemas::schema_ok("delegation-revocation", p) {
+                checks::reject("schema-invalid", None)
+            } else if p["from"] != p["subject"] {
+                checks::reject("revocation-from-not-subject", None) // only the identity revokes its own delegations
+            } else {
+                checks::accept()
+            }
+        }
         "blob-put" => mailbox::blob_put(inp),
         "blob-get" => mailbox::blob_get(inp),
         "voicemail-offer" => client::voicemail_offer(inp),
@@ -100,4 +130,8 @@ fn trace(inp: &Value, mut step: impl FnMut(&Value) -> (Vec<Value>, Value)) -> Va
         })
         .collect();
     json!({"steps": steps})
+}
+
+fn s(v: &Value) -> &str {
+    v.as_str().unwrap_or("")
 }

@@ -102,6 +102,8 @@ struct Service {
     hub_refs: HashMap<String, Value>,
     bound: HashMap<String, mpsc::UnboundedSender<String>>,
     peers: HashMap<String, mpsc::UnboundedSender<PeerMsg>>,
+    /// `delegation-revocation` records from the owner identity (spec-gap 57).
+    revocations: Vec<Envelope>,
     /// Ciphertext blobs, one file per SHA-256 (M§8.4).
     blob_dir: PathBuf,
     /// `https://…/blobs` as advertised (M§4.3).
@@ -117,12 +119,17 @@ enum PeerMsg {
     Forward(Envelope, String),
 }
 
-fn ctx_of<'a>(resolver: &'a StaticResolver, seen: &SeenIds, supported: &Supported) -> Context<'a> {
+fn ctx_of<'a>(resolver: &'a StaticResolver, seen: &SeenIds, supported: &Supported, revocations: &[Envelope]) -> Context<'a> {
     let mut ctx = Context::new(now_s(), resolver);
     ctx.seen_ids = seen.set();
     ctx.supported = supported.clone();
+    // spec-gap 57: revocations the owner sent are applied to every binding, beside those in DID documents
+    ctx.revocations = revocations.to_vec();
     ctx
 }
+
+/// Sent down a bound device's channel to end its connection (spec-gap 57).
+const CLOSE_SENTINEL: &str = "\u{0}close";
 
 impl Service {
     fn resolver(&self) -> StaticResolver {
@@ -418,6 +425,7 @@ async fn main() -> Result<()> {
         hub_refs: HashMap::new(),
         bound: HashMap::new(),
         peers: HashMap::new(),
+        revocations: vec![],
         blob_dir: args.state.join("blobs"),
         blob_endpoint: format!("https://{}/blobs", args.listen),
         max_blob_bytes: args.max_blob_bytes,
@@ -478,7 +486,7 @@ async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>)
             let (authorization, mbx, stored) = {
                 let mut st = service.lock().await;
                 let resolver = st.resolver();
-                let ctx = ctx_of(&resolver, &st.seen, &st.supported);
+                let ctx = ctx_of(&resolver, &st.seen, &st.supported, &st.revocations);
                 let auth = req
                     .header("authorization")
                     .and_then(|h| h.strip_prefix("DSIP "))
@@ -565,8 +573,27 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     let (device, identity, hello_env) = {
         let mut st = service.lock().await;
         let resolver = st.resolver();
-        let ctx = ctx_of(&resolver, &st.seen, &st.supported);
-        let inb = verify_frame(&first, &ctx).map_err(|r| anyhow::anyhow!("hello rejected: {r}"))?;
+        let ctx = ctx_of(&resolver, &st.seen, &st.supported, &st.revocations);
+        let inb = match verify_frame(&first, &ctx) {
+            Ok(i) => i,
+            Err(r) => {
+                tracing::info!("hello rejected: {r}");
+                // Answered like the service's own hello (core version block), so the client can read why (§13.2).
+                let now = now_s();
+                // Addressed from the rejected hello's own (unverified) fields: it is only ever sent back on this socket.
+                let claimed = Envelope::from_frame(&first).ok().and_then(|e| wire::payload_of(&e)).unwrap_or_default();
+                let mut body = json!({"dsip": {"core": "1.0", "min_core": "1.0", "profiles": [], "extensions": [], "critical": []},
+                    "type": "error", "id": wire::new_id(now), "from": st.key.did(), "to": claimed["from"],
+                    "reason": "transport.hello-rejected", "detail": r.code, "issued_at": now, "expires_at": now + wire::TTL_S});
+                if let Some(h) = claimed["id"].as_str() {
+                    body["in_reply_to"] = json!(h);
+                }
+                let env = envelope::sign(&body, &st.key, &st.key.kid());
+                drop(st);
+                let _ = ws.send(WsMessage::Text(env.frame().into())).await;
+                anyhow::bail!("hello rejected: {r}");
+            }
+        };
         anyhow::ensure!(inb.msg_type() == "hello", "first envelope was {}", inb.msg_type());
         let (device, identity) = (inb.device().to_string(), inb.identity().to_string());
         let id = inb.payload()["id"].as_str().unwrap_or("").to_string();
@@ -592,6 +619,11 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     loop {
         tokio::select! {
             outbound = rx.recv() => match outbound {
+                Some(frame) if frame == CLOSE_SENTINEL => {
+                    // The device's delegation was revoked: end the binding now (M§12.4, spec-gap 57).
+                    let _ = ws.close(None).await;
+                    break;
+                }
                 Some(frame) => ws.send(WsMessage::Text(frame.into())).await?,
                 None => break,
             },
@@ -624,7 +656,7 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
     let mut st = service.lock().await;
     let resolver = st.resolver();
     let inb = {
-        let ctx = ctx_of(&resolver, &st.seen, &st.supported);
+        let ctx = ctx_of(&resolver, &st.seen, &st.supported, &st.revocations);
         match verify_frame(&frame, &ctx) {
             Ok(i) => i,
             Err(r) => {
@@ -674,7 +706,7 @@ fn dispatch(
     let identity = if device == hello_device {
         bound_identity.to_string()
     } else {
-        let ctx = ctx_of(resolver, &st.seen, &st.supported);
+        let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
         delegated_identity(&inb.verified, &ctx).unwrap_or_else(|| device.clone())
     };
     let id = p["id"].as_str().unwrap_or("").to_string();
@@ -685,7 +717,7 @@ fn dispatch(
             let mut item = Item::from_deposit(&p, &device, now);
             if matches!(class, "introduction" | "grant") {
                 // First contact (M§14.1, spec-gap 54): a signed introduction or grant for an identity, under §19.4's rules.
-                let ctx = ctx_of(resolver, &st.seen, &st.supported);
+                let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
                 let (sender, to, expires_at) = match first_contact_envelope(class, p["envelope"].as_str().unwrap_or(""), &ctx) {
                     Ok(v) => v,
                     Err(why) => {
@@ -712,7 +744,7 @@ fn dispatch(
                 return st.mailbox_out(emissions, now);
             }
             if class == "welcome" && p["recipient"].as_str() == Some(st.owner.as_str()) {
-                let ctx = ctx_of(resolver, &st.seen, &st.supported);
+                let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
                 let grant = p["grants"].as_array().into_iter().flatten().filter_map(Value::as_str)
                     .find_map(|g| grant_payload(g, &ctx)).unwrap_or(Value::Null);
                 let mut w = json!({"id": id, "from": device, "adder_identity": identity,
@@ -800,7 +832,7 @@ fn dispatch(
             st.mailbox_out(emissions, now)
         }
         "key-package-fetch" => {
-            let ctx = ctx_of(resolver, &st.seen, &st.supported);
+            let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
             let grant = p["grant"].as_str().and_then(|g| grant_payload(g, &ctx)).unwrap_or(Value::Null);
             let event = json!({"kp_fetch": {"id": id, "from": device, "from_identity": identity,
                 "target": p["target"], "grant": grant}});
@@ -814,7 +846,40 @@ fn dispatch(
                     e[k] = v.clone();
                 }
             }
+            // spec-gap 57: revocations from the owner identity, each signed directly by one of its keys
+            let mut revoked_devices = vec![];
+            for c in p["revoked_delegations"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let mut parts = c.split('.');
+                let mut next = || parts.next().unwrap_or("").to_string();
+                let rev = Envelope { protected: next(), payload: next(), signature: next() };
+                let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
+                let device_of = envelope::verify_raw(&rev, &ctx, false).ok().and_then(|ver| {
+                    let q = &ver.payload;
+                    (q["type"] == "delegation-revocation" && q["subject"] == json!(st.owner) && q["from"] == json!(st.owner)
+                        && ver.signer_did == st.owner)
+                        .then(|| q["device"].as_str().map(String::from))
+                        .flatten()
+                });
+                match device_of {
+                    Some(d) => {
+                        tracing::info!("delegation of {d} revoked by {}", st.owner);
+                        st.revocations.push(rev);
+                        revoked_devices.push(d);
+                    }
+                    None => tracing::info!("revocation refused: not signed by {}", st.owner),
+                }
+            }
+            if !revoked_devices.is_empty() {
+                e["revoked_devices"] = json!(revoked_devices);
+            }
             let emissions = st.mailbox.step(&json!({"config": e}));
+            for c in emissions.iter().filter_map(|x| x.get("close")) {
+                let d = c["device"].as_str().unwrap_or("");
+                if let Some(tx) = st.bound.remove(d) {
+                    let _ = tx.send(CLOSE_SENTINEL.to_string());
+                    tracing::info!("closed the binding of revoked device {d}");
+                }
+            }
             st.mailbox_out(emissions, now)
         }
         other => {
@@ -839,7 +904,7 @@ fn hub_deposit(
     let id = p["id"].as_str().unwrap_or("").to_string();
     let mls = p["mls"].as_str().unwrap_or("");
     let bytes = dsip_core::b64::decode(mls).unwrap_or_default();
-    let ctx = ctx_of(resolver, &st.seen, &st.supported);
+    let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
 
     if class == "group-info" {
         // Bootstrap or refresh the public view (M§6.5 rule 6).
