@@ -29,6 +29,10 @@ pub struct Item {
     pub akid: Option<String>,
     /// When it was stored.
     pub stored_at: i64,
+    /// On an `ephemeral` deposit: the sealed activity (M§11.1).
+    pub sealed: Option<String>,
+    /// On an `ephemeral` deposit: the originating `expires_at`, carried unchanged (M§11.2, spec-gap 49).
+    pub expires_at: Option<i64>,
     /// The ciphertext manifest of blobs the content references (M§5.2, M§8.4): no keys.
     pub blobs: Option<Value>,
     /// On a commit deposit to a hub: the Welcome for the identities it adds (M§5.2).
@@ -75,6 +79,8 @@ impl Item {
             akid: s("akid"),
             stored_at: now,
             blobs: p.get("blobs").cloned(),
+            sealed: s("sealed"),
+            expires_at: p["expires_at"].as_i64(),
             welcome: s("welcome"),
             grants: p.get("grants").cloned(),
             origin: None,

@@ -230,6 +230,17 @@ impl Service {
                     }
                     out.push(Out::Identity(to, wire::deposit(&self.key, "", now, group, "welcome", fields)));
                 }
+                "forward" if body["class"] == "ephemeral" => {
+                    // M§11.2: never stored, no seq, no accepted; the envelope never outlives the originating
+                    // deposit (spec-gap 49), so an expired activity is dropped here.
+                    let Some(item) = self.fanout.get(&(group.to_string(), -1)).cloned() else { continue };
+                    let (Some(sealed), Some(exp)) = (item.sealed, item.expires_at) else { continue };
+                    if exp <= now {
+                        continue;
+                    }
+                    let fields = json!({"recipient": to, "group": group, "class": "ephemeral", "sealed": sealed});
+                    out.push(Out::Identity(to, wire::message(&self.key, "deposit", "", now, exp - now, fields)));
+                }
                 "fanout" | "forward" => {
                     let class = body["class"].as_str().unwrap_or("application").to_string();
                     let seq = body["seq"].as_i64();
@@ -267,10 +278,31 @@ impl Service {
     fn local_deposit(&mut self, dep: &Value, now: i64) -> Vec<Out> {
         let item = Item::from_deposit(dep, &self.key.did(), now);
         let event = json!({"hub_deposit": {"id": dep["id"], "from": self.key.did(), "recipient": self.owner,
-            "group": dep["group"], "seq": dep["seq"], "class": dep["class"]}});
+            "group": dep["group"], "seq": dep["seq"], "class": dep["class"], "expires_at": dep["expires_at"]}});
         let emissions = self.mailbox.step(&event);
+        let mut out = self.ephemeral_pushes(&emissions, dep, &self.key.did(), now);
         self.absorb(&emissions, item);
-        self.mailbox_out(emissions, now)
+        out.extend(self.mailbox_out(emissions, now));
+        out
+    }
+
+    /// Ephemeral pushes (no cursor) become `items` carrying the sealed activity and its originating expiry.
+    ///
+    /// Spec: M§11.2. Impl (spec-gap 49): the pushed item is `{class, group, source, sealed, expires_at}`.
+    fn ephemeral_pushes(&self, emissions: &[Value], dep: &Value, source: &str, now: i64) -> Vec<Out> {
+        let exp = dep["expires_at"].as_i64().unwrap_or(0);
+        let Some(sealed) = dep["sealed"].as_str() else { return vec![] };
+        emissions
+            .iter()
+            .filter_map(|e| e.get("push"))
+            .filter(|p| p["class"] == "ephemeral" && exp > now)
+            .map(|p| {
+                let to = p["to"].as_str().unwrap_or("").to_string();
+                let item = json!({"class": "ephemeral", "group": dep["group"], "source": source, "sealed": sealed, "expires_at": exp});
+                let env = wire::message(&self.key, "items", &to, now, exp - now, json!({"items": [item], "next": null}));
+                Out::Device(to, env)
+            })
+            .collect()
     }
 
     /// Record the payload behind whatever cursor the machine just assigned.
@@ -657,10 +689,12 @@ fn dispatch(
             if p["recipient"].as_str() == Some(st.owner.as_str()) {
                 // Fan-out from another hub for our owner.
                 let event = json!({"hub_deposit": {"id": id, "from": identity, "recipient": st.owner,
-                    "group": group, "seq": p["seq"], "class": class}});
+                    "group": group, "seq": p["seq"], "class": class, "expires_at": p["expires_at"]}});
                 let emissions = st.mailbox.step(&event);
+                let mut out = st.ephemeral_pushes(&emissions, &p, &identity, now);
                 st.absorb(&emissions, item);
-                return st.mailbox_out(emissions, now);
+                out.extend(st.mailbox_out(emissions, now));
+                return out;
             }
             if p["to"].as_str() != Some(st.key.did().as_str()) {
                 // Addressed to another service: forward to the group's hub, or refuse (M§5.2, spec-gap 45).

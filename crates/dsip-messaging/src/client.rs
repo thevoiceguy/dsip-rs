@@ -206,6 +206,7 @@ pub struct Client {
     last_read_sent: Option<i64>,
     pending_read: bool,
     last_activity: BTreeMap<String, i64>,
+    shown: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
 impl Client {
@@ -227,6 +228,7 @@ impl Client {
             last_read_sent: None,
             pending_read: false,
             last_activity: BTreeMap::new(),
+            shown: BTreeMap::new(),
         }
     }
 
@@ -234,7 +236,7 @@ impl Client {
         self.policy[k].as_bool().unwrap_or(false)
     }
 
-    /// Apply one event (`sync`, `read`, `play`, `activity`, `advance`) and return what the device sends.
+    /// Apply one event (`sync`, `read`, `play`, `activity`, `activity_in`, `advance`) and return what the device sends.
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         let Some((name, e)) = ev.as_object().and_then(|m| m.iter().next()) else { return vec![] };
         match name.as_str() {
@@ -242,6 +244,7 @@ impl Client {
             "read" => self.read(e),
             "play" => self.play(e),
             "activity" => self.activity(e),
+            "activity_in" => self.activity_in(e),
             "advance" => self.advance(e.as_i64().unwrap_or(0)),
             _ => vec![],
         }
@@ -334,8 +337,30 @@ impl Client {
         self.read_send()
     }
 
+    /// Spec: M§11.2 — a received activity is shown until its last refresh's `expires_at`; `stopped` clears it.
+    /// Impl (spec-gap 49): that `expires_at` is the originating deposit's, carried unchanged to the device.
+    fn activity_in(&mut self, e: &Value) -> Vec<Value> {
+        let sender = s(&e["sender"]);
+        let acts = self.shown.entry(sender.clone()).or_default();
+        let exp = e["expires_at"].as_i64().unwrap_or(i64::MIN);
+        if e["state"] == "stopped" {
+            acts.remove(&s(&e["activity"]));
+        } else if exp >= self.now {
+            acts.insert(s(&e["activity"]), exp);
+        }
+        if acts.is_empty() {
+            self.shown.remove(&sender);
+        }
+        vec![]
+    }
+
     fn advance(&mut self, n: i64) -> Vec<Value> {
         self.now += n;
+        let now = self.now;
+        for acts in self.shown.values_mut() {
+            acts.retain(|_, t| *t >= now);
+        }
+        self.shown.retain(|_, a| !a.is_empty());
         if self.pending_read && self.last_read_sent.is_some_and(|t| self.now - t >= READ_MIN_INTERVAL_S) {
             return self.read_send();
         }
@@ -378,7 +403,12 @@ impl Client {
             Value::Object(m)
         };
         json!({"timeline": self.timeline, "delivered": book(&self.delivered), "played": book(&self.played),
-               "read_through": self.read_through})
+               "read_through": self.read_through, "activity": self.shown})
+    }
+
+    /// The machine's clock, seconds; a host advances it to wall time with `advance` events.
+    pub fn now(&self) -> i64 {
+        self.now
     }
 }
 

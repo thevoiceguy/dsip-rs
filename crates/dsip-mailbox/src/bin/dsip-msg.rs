@@ -15,7 +15,14 @@
 //! by that `accepted` seq or by their bytes (spec-gap 47). Audio (`voice`, `voicemail`) is an Ogg Opus
 //! file sealed under a fresh key, uploaded to this identity's mailbox blob endpoint and referenced from
 //! the content object (M§8.2, M§8.4, M§5.6); a receiver fetches, verifies and decrypts it into
-//! `--state`/media. `voicemail` is offered only when M§13.2 allows it for the given call outcome. `offline` only drops the
+//! `--state`/media. `voicemail` is offered only when M§13.2 allows it for the given call outcome.
+//! Receipts and activity (M§10, M§11) are decided by the vector-pinned `dsip_messaging::client::Client`:
+//! the device feeds it each committed sync batch, its own accepted content, local reads, plays and
+//! typing, and received activity; whatever it emits is sent. Activity travels as an `ephemeral`
+//! deposit sealed under the epoch's exporter key and signed by the device, and reaches devices as a
+//! pushed item carrying the originating `expires_at` (spec-gap 49). `read` and `played` go to the
+//! conversation only with `--disclose`; without a personal group (M§7.1, not built here) a private read
+//! watermark stays on the device. `offline` only drops the
 //! connection; `crash-next` exits after processing the next new item and before committing it.
 
 use std::collections::{HashMap, HashSet};
@@ -68,6 +75,13 @@ struct Args {
     /// Mailbox `wss://` URI, for `--write-doc`.
     #[arg(long)]
     mailbox_uri: Option<String>,
+    /// Behavior disclosed to other identities (M§10.5): any of `read`, `played`, `activity`. `delivered` is on
+    /// unless `--no-delivered`.
+    #[arg(long, value_delimiter = ',')]
+    disclose: Vec<String>,
+    /// Do not send `delivered` receipts.
+    #[arg(long)]
+    no_delivered: bool,
 }
 
 /// The device's persistent keys: an identity controller key and a device key.
@@ -180,12 +194,20 @@ struct Client {
     crash_next: bool,
     state: PathBuf,
     http: reqwest::Client,
+    /// Receipt and activity decisions (M§10, M§11).
+    receipts: dsip_messaging::client::Client,
+    /// Content and receipt objects of the sync batch being processed (M§10.2 decides per batch).
+    batch: Vec<Value>,
+    /// What the receipt machine asked to send, sent outside frame processing.
+    outbox: Vec<Value>,
+    last_media: Option<String>,
 }
 
 /// What processing one inbound item produced, reported only once it is committed.
 enum Outcome {
     Joined { conversation: String, members: Vec<String>, group: String, conv: Value },
-    Text { sender: String, text: String },
+    Text { sender: String, object: Value },
+    Receipt { sender: String, object: Value },
     /// Content carrying a blob: fetched and decrypted once the item is committed (M§8.4).
     Media { sender: String, object: Value },
     Dropped(String),
@@ -480,6 +502,10 @@ impl Client {
         // M§8.4 rule 4: the deposit's manifest names the blob without its key.
         let manifest = json!([{"uri": uri, "sha256": sha, "size": sealed.len()}]);
         let reply = self.hub_deposit("application", json!({"mls": dsip_core::b64::encode(&msg), "blobs": manifest})).await?;
+        if reply["type"] == "accepted" {
+            self.tick();
+            self.receipts.step(&json!({"sync": {"items": [{"seq": reply["seq"], "object": obj}]}}));
+        }
         match reply["type"].as_str() {
             Some("accepted") => println!("OK sent audio purpose={purpose} duration_ms={duration_ms} blob={sha} seq={}", reply["seq"]),
             _ => println!("ERR send refused: {}", reply["reason"]),
@@ -528,6 +554,132 @@ impl Client {
         Ok((path, digest(&plain)))
     }
 
+    /// Advance the receipt machine to wall time; report indicators that expired (M§10.3 pending reads, M§11.2).
+    fn tick(&mut self) {
+        let before = self.receipts.snapshot()["activity"].clone();
+        let delta = now_s() - self.receipts.now();
+        if delta > 0 {
+            let emissions = self.receipts.step(&json!({"advance": delta}));
+            self.outbox.extend(emissions);
+        }
+        let after = &self.receipts.snapshot()["activity"];
+        for (who, acts) in before.as_object().into_iter().flatten() {
+            for a in acts.as_object().into_iter().flatten().map(|(a, _)| a) {
+                if after[who.as_str()].get(a).is_none() {
+                    println!("ACTIVITY-CLEARED {who} {a}");
+                }
+            }
+        }
+    }
+
+    /// Send what the receipt machine emitted: receipts as MLS application messages, activity as sealed
+    /// ephemeral deposits (M§10, M§11). Never called while a frame is being processed.
+    async fn flush_outbox(&mut self) -> Result<()> {
+        while !self.outbox.is_empty() {
+            let e = self.outbox.remove(0);
+            let send = &e["send"];
+            if let Some(a) = send["activity"].as_str() {
+                self.send_activity(a, send["state"].as_str().unwrap_or("active")).await?;
+                continue;
+            }
+            let kind = send["receipt"].as_str().unwrap_or("");
+            if send["to"] == "personal" {
+                // M§10.5: an undisclosed watermark goes only to the identity's personal group (M§7.1), which this
+                // device does not have; it stays local.
+                println!("READ-PRIVATE through={}", send["through"]);
+                continue;
+            }
+            let conversation = self.conversation.clone().context("no conversation")?;
+            let now = now_s();
+            let mut obj = json!({"object": "receipt", "id": wire::new_id(now), "conversation": conversation,
+                "sender": self.identity, "sent_at": now, "kind": kind});
+            for k in ["targets", "through"] {
+                if let Some(v) = send.get(k) {
+                    obj[k] = v.clone();
+                }
+            }
+            let group = self.group.as_mut().context("no group")?;
+            let msg = group
+                .create_message(self.mls.provider(), &self.mls.signer(), &serde_json::to_vec(&obj)?)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                .tls_serialize_detached()?;
+            let reply = self.hub_deposit("application", json!({"mls": dsip_core::b64::encode(&msg)})).await?;
+            let what = if kind == "read" { obj["through"].clone() } else { obj["targets"].clone() };
+            match reply["type"].as_str() {
+                Some("accepted") => println!("SENT-RECEIPT {kind} {what}"),
+                _ => println!("ERR receipt refused: {}", reply["reason"]),
+            }
+        }
+        Ok(())
+    }
+
+    /// Seal and deposit one activity (M§11.1): signed by the device key, AES-256-GCM under the epoch's
+    /// exporter key, AAD `group_id ‖ epoch`, 10 s lifetime, no `accepted` expected.
+    async fn send_activity(&mut self, activity: &str, state: &str) -> Result<()> {
+        let conversation = self.conversation.clone().context("no conversation")?;
+        let group = self.group.as_ref().context("no group")?;
+        let obj = json!({"object": "activity", "conversation": conversation, "sender": self.identity,
+            "activity": activity, "state": state});
+        let signed = sign(&obj, &self.keys.device, &self.keys.device.kid());
+        let compact = format!("{}.{}.{}", signed.protected, signed.payload, signed.signature);
+        let key = dsip_mls::activity_key(group, self.mls.provider()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let nonce: [u8; 12] = rand::random();
+        let use_ = dsip_messaging::mls_wire::SealUse::Activity { group: group.group_id().as_slice(), epoch: group.epoch().as_u64() };
+        let sealed = dsip_messaging::mls_wire::seal(&key, &nonce, compact.as_bytes(), use_);
+        let hub = self.hub.clone().context("no hub")?;
+        let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], &hub.0, now_s(), &self.group_b64()?,
+            "ephemeral", json!({"sealed": dsip_core::b64::encode(&sealed)}));
+        self.send(&env).await?;
+        println!("SENT-ACTIVITY {activity} {state}");
+        Ok(())
+    }
+
+    /// Open a pushed activity: the epoch's exporter key, then the device signature, then the leaf it belongs to.
+    fn activity_in(&mut self, item: &Value) -> Result<()> {
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let Some(group) = self.group.as_ref() else { return Ok(()) };
+        if item["group"].as_str().and_then(dsip_core::b64::decode).as_deref() != Some(group.group_id().as_slice()) {
+            return Ok(());
+        }
+        let sealed = item["sealed"].as_str().and_then(dsip_core::b64::decode).unwrap_or_default();
+        let key = dsip_mls::activity_key(group, self.mls.provider()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let use_ = dsip_messaging::mls_wire::SealUse::Activity { group: group.group_id().as_slice(), epoch: group.epoch().as_u64() };
+        let Ok(plain) = dsip_messaging::mls_wire::open(&key, &sealed, use_) else {
+            println!("DROP activity: not sealed for this epoch");
+            return Ok(());
+        };
+        let compact = String::from_utf8(plain).unwrap_or_default();
+        let mut parts = compact.split('.');
+        let env = Envelope {
+            protected: parts.next().unwrap_or("").to_string(),
+            payload: parts.next().unwrap_or("").to_string(),
+            signature: parts.next().unwrap_or("").to_string(),
+        };
+        let Ok(ver) = dsip_core::envelope::verify_raw(&env, &ctx, false) else {
+            println!("DROP activity: bad signature");
+            return Ok(());
+        };
+        // M§11.1: the signature attributes it; the signing device must be a leaf of the group.
+        let leaf = group
+            .members()
+            .filter_map(|m| member_identity(group, m.index, &ctx).ok())
+            .find(|w| w.device == ver.signer_did)
+            .map(|w| w.identity);
+        let octx = json!({"conversation": self.conversation, "conversation_kind": self.kind, "leaf_identity": leaf});
+        let obj = ver.payload;
+        if check_object(&obj, &octx)["verdict"] != "accept" {
+            println!("DROP activity from {}: not a member's device", ver.signer_did);
+            return Ok(());
+        }
+        self.tick();
+        self.receipts.step(&json!({"activity_in": {"sender": obj["sender"], "activity": obj["activity"], "state": obj["state"],
+            "expires_at": item["expires_at"]}}));
+        println!("ACTIVITY {} {} {}", obj["sender"].as_str().unwrap_or(""), obj["activity"].as_str().unwrap_or(""),
+            obj["state"].as_str().unwrap_or(""));
+        Ok(())
+    }
+
     async fn send_text(&mut self, text: &str) -> Result<()> {
         let conversation = self.conversation.clone().context("no conversation")?;
         let now = now_s();
@@ -540,6 +692,11 @@ impl Client {
             .map_err(|e| anyhow::anyhow!("{e:?}"))?
             .tls_serialize_detached()?;
         let reply = self.hub_deposit("application", json!({"mls": dsip_core::b64::encode(&msg)})).await?;
+        if reply["type"] == "accepted" {
+            // Our own content is part of the conversation the receipt rules reason about (M§10.2, M§10.3).
+            self.tick();
+            self.receipts.step(&json!({"sync": {"items": [{"seq": reply["seq"], "object": obj}]}}));
+        }
         match reply["type"].as_str() {
             Some("accepted") => println!("OK sent seq={}", reply["seq"]),
             _ => println!("ERR send refused: {}", reply["reason"]),
@@ -563,6 +720,13 @@ impl Client {
             "items" => {
                 for item in p["items"].as_array().into_iter().flatten() {
                     self.item(item).await?;
+                }
+                // M§10.2: receipts are decided once per batch (a live push is a batch of one).
+                if !self.batch.is_empty() {
+                    let items = std::mem::take(&mut self.batch);
+                    self.tick();
+                    let emissions = self.receipts.step(&json!({"sync": {"items": items}}));
+                    self.outbox.extend(emissions);
                 }
                 if p["next"].is_string() {
                     self.sync(false).await?;
@@ -598,6 +762,10 @@ impl Client {
     async fn item(&mut self, item: &Value) -> Result<()> {
         let cursor = item["cursor"].as_str().unwrap_or("").to_string();
         let class = item["class"].as_str().unwrap_or("").to_string();
+        if class == "ephemeral" {
+            // Never stored, no cursor: nothing to commit (M§11.2).
+            return self.activity_in(item);
+        }
         if self.resume.is_duplicate(item) {
             // M§8.5: already durably processed; collapse silently, but acknowledge it.
             self.resume.commit(item, true);
@@ -662,8 +830,18 @@ impl Client {
                     json!({"subject": self.identity, "groups": [{"group": group, "state": "joined"}]}));
                 self.send(&env).await?;
             }
-            Outcome::Text { sender, text } => println!("RECV {sender}: {text}"),
+            Outcome::Text { sender, object } => {
+                println!("RECV {sender}: {}", object["text"].as_str().unwrap_or(""));
+                self.batch.push(json!({"seq": item["seq"], "object": object}));
+            }
+            Outcome::Receipt { sender, object } => {
+                let what = if object["kind"] == "read" { object["through"].clone() } else { object["targets"].clone() };
+                println!("RECEIPT {sender} {} {what}", object["kind"].as_str().unwrap_or(""));
+                self.batch.push(json!({"seq": item["seq"], "object": object}));
+            }
             Outcome::Media { sender, object } => {
+                self.last_media = object["id"].as_str().map(String::from);
+                self.batch.push(json!({"seq": item["seq"], "object": object.clone()}));
                 // The item is committed; a failed fetch leaves the content visible and the blob re-fetchable.
                 match self.fetch_media(&object).await {
                     Ok((path, sha)) => println!(
@@ -760,10 +938,15 @@ fn process(
             if verdict["verdict"] != "accept" {
                 return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
             }
-            if obj.get("blob").is_some() {
-                return Ok(Outcome::Media { sender, object: obj });
+            if verdict["effective"]["render"] == "ignore" {
+                return Ok(Outcome::Nothing); // M§8.1: unknown objects and receipt kinds are ignored
             }
-            Ok(Outcome::Text { sender, text: obj["text"].as_str().unwrap_or("").to_string() })
+            match obj["object"].as_str() {
+                Some("receipt") => Ok(Outcome::Receipt { sender, object: obj }),
+                Some("content") if obj.get("blob").is_some() => Ok(Outcome::Media { sender, object: obj }),
+                Some("content") => Ok(Outcome::Text { sender, object: obj }),
+                _ => Ok(Outcome::Nothing),
+            }
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
             let added: Vec<String> = staged
@@ -858,6 +1041,13 @@ async fn main() -> Result<()> {
         crash_next: false,
         state: args.state.clone(),
         http: http_client(args.ca.as_deref())?,
+        receipts: dsip_messaging::client::Client::new(&json!({"now": now_s(), "me": args.identity, "member_identities": 2,
+            "policy": {"delivered": !args.no_delivered, "read": args.disclose.iter().any(|d| d == "read"),
+                       "played": args.disclose.iter().any(|d| d == "played"),
+                       "activity": args.disclose.iter().any(|d| d == "activity")}})),
+        batch: vec![],
+        outbox: vec![],
+        last_media: None,
     };
     if let Some(c) = &conv {
         client.set_conversation(c);
@@ -865,6 +1055,7 @@ async fn main() -> Result<()> {
     client.connect().await?;
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         let recv = async {
             match client.conn.as_mut() {
@@ -917,6 +1108,48 @@ async fn main() -> Result<()> {
                         Ok(())
                     }
                     "online" => client.connect().await,
+                    "read" => {
+                        // M§10.3: the local user has read everything up to the latest content.
+                        let through = client.receipts.snapshot()["timeline"].as_array().and_then(|t| t.last().cloned());
+                        match through {
+                            Some(t) => {
+                                client.tick();
+                                let e = client.receipts.step(&json!({"read": {"through": t}}));
+                                println!("OK read through={t} ({} to send)", e.len());
+                                client.outbox.extend(e);
+                                Ok(())
+                            }
+                            None => Err(anyhow::anyhow!("nothing to read")),
+                        }
+                    }
+                    "play" => {
+                        // M§10.4: the local user played a media item (default: the latest received).
+                        let id = if rest.trim().is_empty() { client.last_media.clone() } else { Some(rest.trim().to_string()) };
+                        match id {
+                            Some(id) => {
+                                let e = client.receipts.step(&json!({"play": {"id": id}}));
+                                println!("OK played {id} ({} to send)", e.len());
+                                client.outbox.extend(e);
+                                Ok(())
+                            }
+                            None => Err(anyhow::anyhow!("nothing to play")),
+                        }
+                    }
+                    "typing" | "uploading" | "recording-audio" | "recording-video" => {
+                        let state = if rest.trim() == "stop" { "stopped" } else { "active" };
+                        client.tick();
+                        let e = client.receipts.step(&json!({"activity": {"activity": cmd, "state": state}}));
+                        if e.is_empty() {
+                            println!("OK {cmd} {state} (not sent: refresh bound or not disclosed)");
+                        }
+                        client.outbox.extend(e);
+                        Ok(())
+                    }
+                    "status" => {
+                        client.tick();
+                        println!("STATUS {}", client.receipts.snapshot());
+                        Ok(())
+                    }
                     "crash-next" => {
                         client.crash_next = true;
                         println!("OK crash-next");
@@ -931,12 +1164,25 @@ async fn main() -> Result<()> {
                 if let Err(e) = result {
                     println!("ERR {e}");
                 }
+                if let Err(e) = client.flush_outbox().await {
+                    println!("ERR {e}");
+                }
+                std::io::stdout().flush()?;
+            }
+            _ = ticker.tick() => {
+                client.tick();
+                if let Err(e) = client.flush_outbox().await {
+                    println!("ERR {e}");
+                }
                 std::io::stdout().flush()?;
             }
             frame = recv => {
                 match frame {
                     Ok(Some(text)) => {
                         if let Err(e) = client.inbound(&text).await {
+                            println!("ERR {e}");
+                        }
+                        if let Err(e) = client.flush_outbox().await {
                             println!("ERR {e}");
                         }
                         std::io::stdout().flush()?;

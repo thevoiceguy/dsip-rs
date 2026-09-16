@@ -269,7 +269,11 @@ impl Mailbox {
         };
         let class = s(&e["class"]);
         if class == "ephemeral" {
-            // M§11.2: pushed to bound devices, never stored, never acknowledged
+            // M§11.2: pushed to bound devices, never stored, never acknowledged; dropped at the
+            // originating deposit's expires_at (spec-gap 49)
+            if e["expires_at"].as_i64().is_some_and(|t| t < self.now) {
+                return vec![];
+            }
             return self.bound.iter().map(|d| json!({"push": {"to": d, "class": "ephemeral"}})).collect();
         }
         if reg.state == "pending" && reg.items >= self.pending_max {
