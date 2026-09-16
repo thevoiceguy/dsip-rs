@@ -71,10 +71,44 @@ pub fn verify_delegation_for(deleg: &Envelope, subject: &str, device: &str, capa
     if !has_cap {
         return Verdict::reject(RejectCode::DelegationCapability);
     }
-    match (p.get("issued_at").and_then(Value::as_i64), p.get("expires_at").and_then(Value::as_i64)) {
-        (Some(ia), Some(ea)) if ia <= ctx.now && ctx.now < ea => Verdict::accept(),
-        _ => Verdict::reject(RejectCode::DelegationExpired),
+    let issued_at = match (p.get("issued_at").and_then(Value::as_i64), p.get("expires_at").and_then(Value::as_i64)) {
+        (Some(ia), Some(ea)) if ia <= ctx.now && ctx.now < ea => ia,
+        _ => return Verdict::reject(RejectCode::DelegationExpired),
+    };
+    if revocations_for(subject, ctx).iter().any(|r| revokes(r, subject, device, issued_at, ctx)) {
+        return Verdict::reject(RejectCode::DelegationRevoked);
     }
+    Verdict::accept()
+}
+
+/// Every revocation a verifier can see for `subject`: those it holds and those the subject's DID document publishes.
+///
+/// Spec: v0.8 draft (spec-gap 57); §8.1 — the document is authoritative. Impl: a validly signed revocation only
+/// removes authority, so a held one counts as well.
+pub fn revocations_for(subject: &str, ctx: &Context) -> Vec<Envelope> {
+    let mut out = ctx.revocations.clone();
+    if let Some(doc) = ctx.resolver.resolve(subject) {
+        out.extend(doc.delegation_revocations.iter().filter_map(|c| {
+            let mut parts = c.split('.');
+            Some(Envelope { protected: parts.next()?.to_string(), payload: parts.next()?.to_string(), signature: parts.next()?.to_string() })
+        }));
+    }
+    out
+}
+
+/// Whether a `delegation-revocation` revokes `device`'s delegation for `subject` issued at `delegation_issued_at`.
+///
+/// Spec: v0.8 draft (spec-gap 57) — signed directly by a key of the subject, `from` = `subject`, covering delegations
+/// issued at or before `revoked_at`. The record is a credential: no delivery window applies.
+pub fn revokes(rev: &Envelope, subject: &str, device: &str, delegation_issued_at: i64, ctx: &Context) -> bool {
+    let Ok(ver) = verify_raw(rev, ctx, false) else { return false };
+    let p = &ver.payload;
+    p["type"] == "delegation-revocation"
+        && p["subject"] == subject
+        && p["from"] == subject
+        && ver.signer_did == subject
+        && p["device"] == device
+        && p["revoked_at"].as_i64().is_some_and(|t| delegation_issued_at <= t)
 }
 
 /// Is `device` authorized to act for `subject`? Direct when equal; otherwise via a presented delegation.

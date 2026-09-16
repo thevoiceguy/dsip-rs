@@ -142,6 +142,9 @@ pub struct DidDocument {
     /// Key agreement methods, embedded (M§6.9 reads an X25519 key here); references are not followed.
     #[serde(rename = "keyAgreement", default, skip_serializing_if = "Vec::is_empty")]
     pub key_agreement: Vec<Value>,
+    /// Compact `delegation-revocation` records the subject publishes (v0.8 draft, spec-gap 57): authoritative (§8.1).
+    #[serde(rename = "dsipDelegationRevocations", default, skip_serializing_if = "Vec::is_empty")]
+    pub delegation_revocations: Vec<String>,
 }
 
 impl DidDocument {
@@ -204,6 +207,7 @@ impl DidDocument {
                 })
                 .unwrap_or_default(),
             key_agreement: vec![],
+            delegation_revocations: vec![],
         }
     }
 }

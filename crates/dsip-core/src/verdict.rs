@@ -27,6 +27,8 @@ pub enum RejectCode {
     DelegationInvalid,
     DelegationExpired,
     DelegationCapability,
+    /// A revocation covers the delegation (v0.8 draft, spec-gap 57).
+    DelegationRevoked,
     ExpiryOrder,
     ReplayWindow,
     IntroductionValidity,

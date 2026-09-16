@@ -25,7 +25,10 @@
 //! to the recipient's key agreement key (M§6.9), as a deposit to the recipient's mailbox; the recipient sees it as a
 //! request — never as a message — and `accept-request` returns a `dsip.message` grant the same way, which the
 //! requester holds and presents when it creates the conversation. Grants carry the signing device's delegation.
-//! The identity's key agreement key is derived from its identity key (spec-gap 55).
+//! The identity's key agreement key is derived from its identity key (spec-gap 55). `revoke-device` (spec-gap 57)
+//! signs a `delegation-revocation` with the identity key, publishes it in the identity's DID document and sends it
+//! to the mailbox, which ends the device's binding; `remove-leaf` lets any member remove a leaf whose delegation no
+//! longer verifies (M§7.3, M§12.4).
 //! `offline` only drops the connection; `crash-next` exits after processing the next new item and before
 //! committing it.
 
@@ -697,6 +700,16 @@ impl Client {
         Ok(c.group.members().filter(|m| member_identity(&c.group, m.index, &ctx).is_ok_and(|w| pred(&w))).map(|m| m.index).collect())
     }
 
+    /// The leaves whose credential names `device`, whether or not their delegation still verifies.
+    fn device_leaves(&self, group: &str, device: &str) -> Result<Vec<LeafNodeIndex>> {
+        let c = self.conv(group)?;
+        Ok(c.group
+            .members()
+            .filter(|m| BasicCredential::try_from(m.credential.clone()).is_ok_and(|b| b.identity() == device.as_bytes()))
+            .map(|m| m.index)
+            .collect())
+    }
+
     /// Remove every leaf of `identity` from the active conversation (M§7.3).
     async fn remove(&mut self, identity: &str) -> Result<()> {
         let group = self.active()?;
@@ -732,12 +745,59 @@ impl Client {
         Ok(())
     }
 
+    /// Revoke a device's delegation (spec-gap 57): a `delegation-revocation` signed by the identity key, published in
+    /// the identity's DID document (authoritative, §8.1) and sent to its mailbox, which closes the device's binding.
+    async fn revoke_device(&mut self, device: &str) -> Result<()> {
+        let now = now_s();
+        let p = json!({"dsip": wire::version_block(), "type": "delegation-revocation", "id": wire::new_id(now), "from": self.identity,
+            "subject": self.identity, "device": device, "revoked_at": now, "reason": "lost", "issued_at": now, "expires_at": now + 300});
+        let rev = sign(&p, &self.keys.controller, &format!("{}#key-1", self.identity));
+        // Publish: the identity's document is one of the files this device resolves from.
+        let doc_file = self.resolver_files.iter().find(|f| {
+            std::fs::read_to_string(f).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|d| d["id"] == json!(self.identity))
+        });
+        let doc_file = doc_file.cloned().context("this identity's DID document is not among --resolver-file")?;
+        let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&doc_file)?)?;
+        let list = doc.as_object_mut().context("document")?.entry("dsipDelegationRevocations").or_insert(json!([]));
+        list.as_array_mut().context("revocations")?.push(json!(compact(&rev)));
+        std::fs::write(&doc_file, serde_json::to_string_pretty(&doc)?)?;
+        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
+            json!({"subject": self.identity, "revoked_delegations": [compact(&rev)]}));
+        let id = wire::payload_of(&env).and_then(|q| q["id"].as_str().map(String::from)).context("id")?;
+        self.send(&env).await?;
+        let reply = self.await_reply(&id).await?;
+        anyhow::ensure!(reply["type"] == "accepted", "mailbox refused the revocation: {}", reply["reason"]);
+        println!("OK revoked {device} published={} mailbox=accepted", doc_file.display());
+        Ok(())
+    }
+
+    /// M§7.3, M§12.4: remove another member's leaf whose delegation no longer verifies (any member MAY). Refused
+    /// locally while it still verifies: then only its own identity may remove it.
+    async fn remove_leaf(&mut self, device: &str) -> Result<()> {
+        let group = self.active()?;
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let c = self.conv(&group)?;
+        let leaf = c
+            .group
+            .members()
+            .find(|m| BasicCredential::try_from(m.credential.clone()).is_ok_and(|b| b.identity() == device.as_bytes()))
+            .context("no leaf for that device")?;
+        if member_identity(&c.group, leaf.index, &ctx).is_ok() {
+            bail!("the leaf's delegation still verifies: only its own identity may remove it (M§7.3)");
+        }
+        let c = self.convs.get_mut(&group).context("group")?;
+        let (commit, _, _) = c.group.remove_members(self.mls.provider(), &self.mls.signer(), &[leaf.index]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        self.commit(&group, commit, None, vec![], &format!("removed lapsed leaf {device}")).await
+    }
+
     /// M§12.4: remove a device of this identity from every group, then rotate the archive key.
     async fn remove_device(&mut self, device: &str) -> Result<()> {
         let personal = self.personal.clone().context("no personal group")?;
         let groups: Vec<String> = self.convs.keys().cloned().collect();
         for group in groups {
-            let leaves = self.leaves_where(&group, |w| w.device == device)?;
+            // By credential, not by authentication: a revoked device's leaf no longer authenticates (spec-gap 57).
+            let leaves = self.device_leaves(&group, device)?;
             if leaves.is_empty() {
                 continue;
             }
@@ -1383,10 +1443,21 @@ fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &st
                 .map(|w| format!("{}#{}", w.identity, w.device))
                 .collect();
             let removed_leaves: Vec<LeafNodeIndex> = staged.remove_proposals().map(|r| r.remove_proposal().removed()).collect();
+            // A removed leaf may no longer authenticate (a revoked delegation, spec-gap 57): render it by its credential.
             let removed: Vec<String> = removed_leaves
                 .iter()
-                .filter_map(|i| member_identity(group, *i, ctx).ok())
-                .map(|w| format!("{}#{}", w.identity, w.device))
+                .map(|i| match member_identity(group, *i, ctx) {
+                    Ok(w) => format!("{}#{}", w.identity, w.device),
+                    Err(_) => {
+                        let device = group
+                            .public_group()
+                            .leaf(*i)
+                            .and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
+                            .map(|b| String::from_utf8_lossy(b.identity()).into_owned())
+                            .unwrap_or_default();
+                        format!("unverified#{device}")
+                    }
+                })
                 .collect();
             let remaining: Vec<String> = group
                 .members()
@@ -1552,7 +1623,10 @@ async fn main() -> Result<()> {
                         }
                         std::io::stdout().flush()?;
                     }
-                    Ok(None) => client.conn = None,
+                    Ok(None) => {
+                        println!("DISCONNECTED by the mailbox");
+                        client.conn = None;
+                    }
                     Err(e) => {
                         println!("ERR connection {e}");
                         client.conn = None;
@@ -1618,6 +1692,8 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "personal" => client.create_personal().await,
         "add-device" => client.add_device(rest.trim()).await,
         "remove-device" => client.remove_device(rest.trim()).await,
+        "revoke-device" => client.revoke_device(rest.trim()).await,
+        "remove-leaf" => client.remove_leaf(rest.trim()).await,
         "remove" => client.remove(rest.trim()).await,
         "send" => client.send_text(rest).await,
         "voice" => client.send_audio(rest.trim(), "voice-message", None, None).await,
