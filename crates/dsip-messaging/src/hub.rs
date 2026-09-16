@@ -24,6 +24,7 @@ pub struct Hub {
     digests: HashMap<String, i64>,
     seq_class: HashMap<i64, String>,
     pending: BTreeMap<String, Vec<i64>>,
+    group_info: bool,
 }
 
 fn s(v: &Value) -> String {
@@ -47,6 +48,7 @@ impl Hub {
             digests: HashMap::new(),
             seq_class: HashMap::new(),
             pending: BTreeMap::new(),
+            group_info: false,
         }
     }
 
@@ -69,8 +71,19 @@ impl Hub {
     fn deposit(&mut self, d: &Value) -> Vec<Value> {
         let class = s(&d["class"]);
         let ident = s(&d["identity"]);
-        if !matches!(class.as_str(), "handshake" | "application" | "ephemeral") {
+        if !matches!(class.as_str(), "handshake" | "application" | "ephemeral" | "group-info") {
             return Self::error(d, "mailbox.unsupported-class");
+        }
+        if class == "group-info" {
+            // M§6.5 rule 6 / M§6.8: the hub keeps the latest GroupInfo so a returning device can
+            // external-join, and forwards it to the members' mailboxes. Never sequenced.
+            if !self.roster.contains_key(&ident) {
+                return Self::error(d, "policy.blocked");
+            }
+            self.group_info = true;
+            let mut out = vec![json!({"accepted": {"to": d["device"], "in_reply_to": d["id"]}})];
+            out.extend(self.roster.keys().map(|i| json!({"fanout": {"to": i, "class": "group-info"}})));
+            return out;
         }
         if class == "ephemeral" {
             // M§11.2: never sequenced or stored; dropped once expired
@@ -206,6 +219,7 @@ impl Hub {
             self.roster.iter().map(|(i, d)| (i.clone(), json!(d.iter().collect::<Vec<_>>()))).collect();
         let pending: serde_json::Map<String, Value> =
             self.pending.iter().filter(|(_, q)| !q.is_empty()).map(|(i, q)| (i.clone(), json!(q))).collect();
-        json!({"epoch": self.epoch, "next_seq": self.next_seq, "roster": roster, "pending": pending})
+        json!({"epoch": self.epoch, "next_seq": self.next_seq, "roster": roster, "pending": pending,
+               "group_info": self.group_info})
     }
 }

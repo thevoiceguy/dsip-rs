@@ -1,0 +1,109 @@
+//! Building the profile's envelopes.
+//!
+//! Spec: M§5 (every profile message is a DSIP-JOSE envelope whose `dsip` block names
+//! `messaging/1.0`, with the device or service key as signer and a lifetime inside M§5.1's bound),
+//! §10.2 (signature over the payload bytes), §13.2 (`hello`).
+
+use serde_json::{json, Value};
+
+use dsip_core::envelope::{sign, Envelope};
+use dsip_core::keys::KeyPair;
+use dsip_core::ulid::Ulid;
+
+/// Profile identifier (M§1).
+pub const PROFILE: &str = "messaging/1.0";
+/// Lifetime of a profile envelope, seconds (M§5.1: ≤ 60).
+pub const TTL_S: i64 = 30;
+/// Lifetime of an `ephemeral` deposit, seconds (M§11.2: ≤ 10).
+pub const EPHEMERAL_TTL_S: i64 = 10;
+
+/// The `dsip` version block of a profile message.
+pub fn version_block() -> Value {
+    json!({"core": "1.0", "min_core": "1.0", "profiles": [PROFILE], "extensions": [], "critical": []})
+}
+
+/// A fresh ULID for `now` (seconds).
+pub fn new_id(now: i64) -> String {
+    Ulid::generate_at(now.max(0) as u64 * 1000).as_str().to_string()
+}
+
+/// Build and sign a profile payload: `{dsip, type, id, from, to, …fields, issued_at, expires_at}`.
+pub fn message(key: &KeyPair, msg_type: &str, to: &str, now: i64, ttl: i64, fields: Value) -> Envelope {
+    let mut p = json!({"dsip": version_block(), "type": msg_type, "id": new_id(now), "from": key.did(), "to": to});
+    for (k, v) in fields.as_object().into_iter().flatten() {
+        p[k.as_str()] = v.clone();
+    }
+    p["issued_at"] = json!(now);
+    p["expires_at"] = json!(now + ttl);
+    sign(&p, key, &key.kid())
+}
+
+/// The decoded payload of an envelope.
+pub fn payload_of(env: &Envelope) -> Option<Value> {
+    serde_json::from_slice(&dsip_core::b64::decode(&env.payload)?).ok()
+}
+
+/// A signed `accepted` (M§5.3): the service's claim that it took responsibility.
+pub fn accepted(key: &KeyPair, to: &str, now: i64, in_reply_to: &str, extra: Value) -> Envelope {
+    let mut fields = json!({"in_reply_to": in_reply_to});
+    for (k, v) in extra.as_object().into_iter().flatten() {
+        fields[k.as_str()] = v.clone();
+    }
+    message(key, "accepted", to, now, TTL_S, fields)
+}
+
+/// A signed `error` carrying a reason token (M§16).
+pub fn error(key: &KeyPair, to: &str, now: i64, in_reply_to: Option<&str>, reason: &str, detail: Option<&str>) -> Envelope {
+    let mut fields = json!({"reason": reason});
+    if let Some(id) = in_reply_to {
+        fields["in_reply_to"] = json!(id);
+    }
+    if let Some(d) = detail {
+        fields["detail"] = json!(d);
+    }
+    message(key, "error", to, now, TTL_S, fields)
+}
+
+/// The service's `hello` answering a client's (§13.2, M§4.3).
+pub fn service_hello(key: &KeyPair, to_hello_id: &str, now: i64, capabilities: Value) -> Envelope {
+    let p = json!({
+        "dsip": {"core": "1.0", "min_core": "1.0", "profiles": [], "extensions": [], "critical": []},
+        "type": "hello", "id": new_id(now), "from": key.did(), "in_reply_to": to_hello_id,
+        "capabilities": capabilities, "issued_at": now, "expires_at": now + TTL_S});
+    sign(&p, key, &key.kid())
+}
+
+/// The `capabilities.mailbox` object a mailbox advertises (M§4.3).
+pub fn mailbox_capabilities(hub: bool) -> Value {
+    json!({
+        "max_envelope_bytes": dsip_core::WS_MAX_ENVELOPE_BYTES,
+        "store_and_forward": true,
+        "mailbox": {
+            "profiles": [PROFILE],
+            "modes": ["sync", "queue"],
+            "hub": hub,
+            "ciphersuites": [1],
+            "max_mls_bytes": dsip_messaging::checks::MAX_MLS_BYTES,
+            "mls_retention_s": 2_592_000,
+        }
+    })
+}
+
+/// A `deposit` (M§5.2).
+pub fn deposit(key: &KeyPair, to: &str, now: i64, group: &str, class: &str, fields: Value) -> Envelope {
+    let mut f = json!({"group": group, "class": class});
+    for (k, v) in fields.as_object().into_iter().flatten() {
+        f[k.as_str()] = v.clone();
+    }
+    let ttl = if class == "ephemeral" { EPHEMERAL_TTL_S } else { TTL_S };
+    message(key, "deposit", to, now, ttl, f)
+}
+
+/// An `items` response or live push (M§5.4).
+pub fn items(key: &KeyPair, to: &str, now: i64, in_reply_to: Option<&str>, items: Vec<Value>, next: Value) -> Envelope {
+    let mut fields = json!({"items": items, "next": next});
+    if let Some(id) = in_reply_to {
+        fields["in_reply_to"] = json!(id);
+    }
+    message(key, "items", to, now, TTL_S, fields)
+}

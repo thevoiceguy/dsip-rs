@@ -290,6 +290,19 @@ impl HubView {
         self.group.group_context().epoch().as_u64()
     }
 
+    /// The group roster as the hub state machine's `context.roster`: identity → device DIDs.
+    ///
+    /// Spec: M§6.5 — the hub derives member identities from leaf credentials (M§6.2).
+    pub fn roster(&self, ctx: &Context) -> Result<Value, MlsError> {
+        let mut roster: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        for m in self.group.members() {
+            let leaf = self.group.leaf(m.index).ok_or_else(|| MlsError("missing leaf".into()))?;
+            let who = authenticate_leaf_node(leaf, ctx).map_err(|c| MlsError(format!("leaf {}: {c}", m.index.u32())))?;
+            roster.entry(who.identity).or_default().push(who.device);
+        }
+        Ok(json!(roster))
+    }
+
     /// Validate a commit and describe it as the hub state machine's `deposit.commit` (M§6.5, M§7.3):
     /// `{adds: [{identity, device}], removes: [{identity, device, delegation_valid}], valid, external}`.
     /// A commit that fails MLS validation or leaf authentication is `valid: false`; a valid one is merged.
