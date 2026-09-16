@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::checks::MAILBOX_MODES;
@@ -33,28 +34,34 @@ pub const MESSAGE_GRANT_SCOPES: &[&str] = &["dsip.message", "dsip.invite"];
 /// Spec: M§14.2.
 pub const ORIGIN_SKEW_S: i64 = 300;
 
+#[derive(Serialize, Deserialize)]
 struct Group {
     hub: String,
     state: String,
     since: i64,
     items: i64,
+    #[serde(default)]
+    high_seq: i64,
 }
 
+#[derive(Serialize, Deserialize)]
 struct Item {
     cursor: String,
     n: i64,
     class: String,
     group: String,
     expires_at: Option<i64>,
+    seq: Option<i64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct KeyPackages {
     one_time: i64,
     last_resort: bool,
 }
 
 /// Mailbox state for one served owner.
+#[derive(Serialize, Deserialize)]
 pub struct Mailbox {
     now: i64,
     owner: String,
@@ -70,12 +77,31 @@ pub struct Mailbox {
     items: Vec<Item>,
     counter: i64,
     acks: HashMap<String, i64>,
+    #[serde(skip)]
     bound: BTreeSet<String>,
+    #[serde(with = "archived_index")]
     archived: HashMap<(String, i64), String>,
     intro_limit: usize,
     intro_window: i64,
     inbox_cap: usize,
     intro_log: HashMap<String, Vec<i64>>,
+}
+
+/// The archive index as a list of `[group, seq, cursor]`: JSON object keys cannot be tuples.
+mod archived_index {
+    use std::collections::HashMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(m: &HashMap<(String, i64), String>, ser: S) -> Result<S::Ok, S::Error> {
+        let mut v: Vec<(&String, i64, &String)> = m.iter().map(|((g, s), c)| (g, *s, c)).collect();
+        v.sort();
+        v.serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<HashMap<(String, i64), String>, D::Error> {
+        Ok(Vec::<(String, i64, String)>::deserialize(de)?.into_iter().map(|(g, s, c)| ((g, s), c)).collect())
+    }
 }
 
 fn s(v: &Value) -> String {
@@ -112,7 +138,7 @@ impl Mailbox {
             .as_object()
             .map(|m| {
                 m.iter()
-                    .map(|(g, r)| (g.clone(), Group { hub: s(&r["hub"]), state: s(&r["state"]), since: now, items: 0 }))
+                    .map(|(g, r)| (g.clone(), Group { hub: s(&r["hub"]), state: s(&r["state"]), since: now, items: 0, high_seq: 0 }))
                     .collect()
             })
             .unwrap_or_default();
@@ -154,6 +180,25 @@ impl Mailbox {
         }
     }
 
+    /// Everything a mailbox keeps across a restart: items, cursor counter, acknowledgements, registrations (with their
+    /// pending age and bound), KeyPackages, revoked grants, the archive index and the first-contact rate window.
+    ///
+    /// Spec: M§4.4, M§5.4, M§5.5, M§5.7, M§6.6, M§12.2, §19.4. Impl (spec-gap 59): live bindings are not state; a
+    /// restarted mailbox pushes nothing until a device syncs live again.
+    pub fn full_state(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    /// A mailbox restored from [`Mailbox::full_state`], with no live bindings; `None` if the value is not one.
+    pub fn from_full_state(v: &Value) -> Option<Mailbox> {
+        serde_json::from_value(v.clone()).ok()
+    }
+
+    /// The owner's registered devices.
+    pub fn devices(&self) -> &[String] {
+        &self.devices
+    }
+
     /// Set the owner's registered devices (M§4.4: those that have completed a verified `hello`
     /// within the retention window). A host calls this as devices bind; vectors set it in `context`.
     pub fn register_devices(&mut self, devices: &[String]) {
@@ -181,6 +226,13 @@ impl Mailbox {
             "archive" => self.archive(e),
             "kp_upload" => self.kp_upload(e),
             "kp_fetch" => self.kp_fetch(e),
+            "restart" => {
+                // spec-gap 59: everything durable survives; live bindings are connections and do not
+                if let Some(m) = Mailbox::from_full_state(&self.full_state()) {
+                    *self = m;
+                }
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -205,7 +257,7 @@ impl Mailbox {
         }
         self.counter += 1;
         let c = cursor(self.counter);
-        self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into(), expires_at: None });
+        self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into(), expires_at: None, seq: None });
         let pushes =
             self.bound.iter().filter(|d| Some(d.as_str()) != depositor).map(|d| json!({"push": {"to": d, "cursor": c}})).collect();
         (c, pushes)
@@ -285,7 +337,7 @@ impl Mailbox {
         }
         let group = s(&e["group"]);
         let now = self.now;
-        self.groups.entry(group.clone()).or_insert_with(|| Group { hub: s(&e["hub"]), state: "pending".into(), since: now, items: 0 });
+        self.groups.entry(group.clone()).or_insert_with(|| Group { hub: s(&e["hub"]), state: "pending".into(), since: now, items: 0, high_seq: 0 });
         let (c, pushes) = self.store("welcome", &group, None);
         let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
         out.extend(pushes);
@@ -322,13 +374,29 @@ impl Mailbox {
             }
             return self.bound.iter().map(|d| json!({"push": {"to": d, "class": "ephemeral"}})).collect();
         }
+        let seq = e["seq"].as_i64();
+        if let Some(seq) = seq.filter(|n| *n <= reg.high_seq) {
+            // spec-gap 59: a hub retries an unacknowledged fan-out (M§6.5 rule 5) and delivers in seq order, so a seq at
+            // or below the group's highest stored is a redelivery: acknowledged as a duplicate, not stored or pushed again
+            let mut acc = json!({"to": e["from"], "in_reply_to": e["id"], "duplicate": true});
+            if let Some(it) = self.items.iter().find(|it| it.group == group && it.seq == Some(seq)) {
+                acc["cursor"] = json!(it.cursor);
+            }
+            return vec![json!({"accepted": acc})];
+        }
         if reg.state == "pending" && reg.items >= self.pending_max {
             return Self::error(&e["from"], &e["id"], "mailbox.quota-exceeded");
         }
         if let Some(r) = self.groups.get_mut(&group) {
             r.items += 1;
+            if let Some(seq) = seq {
+                r.high_seq = seq;
+            }
         }
         let (c, pushes) = self.store(&class, &group, None);
+        if let Some(it) = self.items.last_mut() {
+            it.seq = seq;
+        }
         let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
         out.extend(pushes);
         out
@@ -384,7 +452,7 @@ impl Mailbox {
             } else if let Some(r) = self.groups.get_mut(&group) {
                 r.state = "joined".into();
             } else if let Some(hub) = g["hub"].as_str() {
-                self.groups.insert(group, Group { hub: hub.into(), state: "joined".into(), since: self.now, items: 0 });
+                self.groups.insert(group, Group { hub: hub.into(), state: "joined".into(), since: self.now, items: 0, high_seq: 0 });
             }
         }
         self.revoked.extend(e["revoked_grants"].as_array().into_iter().flatten().map(s));

@@ -13,6 +13,7 @@ dsip-core.workspace = true
 dsip-messaging.workspace = true
 dsip-mls = { workspace = true, features = ["sqlite"] }
 dsip-transport.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
