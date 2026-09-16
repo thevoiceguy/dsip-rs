@@ -304,6 +304,12 @@ impl HubView {
         Ok(HubView { group, provider })
     }
 
+    /// The group's `dsip_conversation` value, as JSON (M§6.3): its kind and its hub.
+    pub fn conversation(&self) -> Option<Value> {
+        let ext = self.group.group_context().extensions().unknown(EXT_DSIP_CONVERSATION)?;
+        serde_json::from_slice(&ext.0).ok()
+    }
+
     /// The current epoch.
     pub fn epoch(&self) -> u64 {
         self.group.group_context().epoch().as_u64()

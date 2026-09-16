@@ -4,10 +4,12 @@
 //! M§5.4 (cursors, pagination, live push), M§5.5 (single-use KeyPackages, last resort, per-device
 //! bound), M§5.7 (configuration and grant revocation), M§6.6 (pending registration, bound, TTL,
 //! hub match), M§11.2 (ephemeral never stored), M§12.2 (archive first-wins, refused in `queue`),
-//! M§14.2 (first-contact authorization), M§15.5 (unknown recipients).
+//! M§14.2 (first-contact authorization, `origin` on hub-forwarded welcomes), M§15.5 (unknown recipients),
+//! M§5.2 (forwarding an owner device's deposit to its group's hub).
 //!
 //! Impl: cursors are `c:` plus 16 lowercase hex digits of a per-mailbox counter; a grant is
-//! presented already verified (signature checks are the envelope pipeline's job).
+//! presented already verified (signature checks are the envelope pipeline's job), and so is an `origin`
+//! (its identity, group and `issued_at`); forwarding targets and `origin` refusals are spec-gaps 45 and 46.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -24,6 +26,11 @@ pub const KEY_PACKAGES_PER_DEVICE: i64 = 100;
 ///
 /// Spec: M§14.2 condition 2.
 pub const MESSAGE_GRANT_SCOPES: &[&str] = &["dsip.message", "dsip.invite"];
+
+/// Maximum distance between a hub-forwarded welcome's `origin` and the hub deposit, seconds.
+///
+/// Spec: M§14.2.
+pub const ORIGIN_SKEW_S: i64 = 300;
 
 struct Group {
     hub: String,
@@ -152,6 +159,7 @@ impl Mailbox {
         match name.as_str() {
             "advance" => self.advance(e.as_i64().unwrap_or(0)),
             "welcome" => self.welcome(e),
+            "forward" => self.forward(e),
             "hub_deposit" => self.hub_deposit(e),
             "sync" => self.sync(e),
             "unbind" => {
@@ -213,7 +221,16 @@ impl Mailbox {
         if !self.serves.contains(&recipient) {
             return Self::error(&e["from"], &e["id"], "transport.unknown-recipient");
         }
-        let adder = s(&e["adder_identity"]);
+        let mut adder = s(&e["adder_identity"]);
+        if e["via_hub"].as_bool().unwrap_or(false) {
+            // M§14.2 (spec-gap 46): only `origin` proves who added the owner; the hub connection does not
+            let o = &e["origin"];
+            let fresh = |t: &Value| (t.as_i64().unwrap_or(i64::MIN / 2) - e["issued_at"].as_i64().unwrap_or(0)).abs() <= ORIGIN_SKEW_S;
+            if !o.is_object() || o["group"] != e["group"] || !fresh(&o["issued_at"]) {
+                return Self::error(&e["from"], &e["id"], "policy.blocked");
+            }
+            adder = s(&o["identity"]);
+        }
         let successor = e.get("successor_of").and_then(Value::as_str).is_some_and(|g| self.groups.contains_key(g));
         let ok = self.admit == "open" || adder == self.owner || self.grant_ok(&e["grant"], &adder, &recipient) || successor;
         if !ok {
@@ -226,6 +243,18 @@ impl Mailbox {
         let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
         out.extend(pushes);
         out
+    }
+
+    /// Spec: M§5.2, M§6.6. Impl (spec-gap 45): forward only an owner device's deposit, and only to the
+    /// hub registered for its group; nothing is stored.
+    fn forward(&mut self, e: &Value) -> Vec<Value> {
+        if s(&e["identity"]) != self.owner {
+            return Self::error(&e["device"], &e["id"], "policy.blocked");
+        }
+        match self.groups.get(&s(&e["group"])) {
+            Some(r) if e["to"].as_str() == Some(r.hub.as_str()) => vec![json!({"forward": {"to": e["to"], "id": e["id"]}})],
+            _ => Self::error(&e["device"], &e["id"], "mailbox.unknown-group"),
+        }
     }
 
     fn hub_deposit(&mut self, e: &Value) -> Vec<Value> {

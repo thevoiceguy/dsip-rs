@@ -68,7 +68,7 @@ echo "live" >&4
 
 echo "=== Alice creates the conversation and sends"
 echo "kp 2" >&3; wait_for "$DIR/a.log" "OK uploaded" 10
-echo "create $BOB $DIR/grant.txt" >&3; wait_for "$DIR/a.log" "^OK conversation" 30
+echo "create direct $BOB $DIR/grant.txt" >&3; wait_for "$DIR/a.log" "^OK conversation" 30
 wait_for "$DIR/b.log" "^JOINED" 30
 echo "send Dinner at 7?" >&3
 wait_for "$DIR/b.log" "^RECV .*Dinner at 7" 30

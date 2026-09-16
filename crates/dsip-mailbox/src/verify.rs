@@ -59,6 +59,20 @@ impl Inbound {
     }
 }
 
+/// The identity a device's header delegation proves, for a message that did not arrive on that device's
+/// own binding: a deposit forwarded by a mailbox, or an `origin` (M§5.1, M§14.2). The delegation must be
+/// for this device and carry `dsip.messaging` (M§6.2).
+pub fn delegated_identity(verified: &Verified, ctx: &Context) -> Option<String> {
+    verified.header.delegations.iter().find_map(|d| {
+        let subject = dsip_core::b64::decode(&d.payload)
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|p| p["subject"].as_str().map(String::from))?;
+        dsip_core::delegation::verify_delegation_for(d, &subject, &verified.signer_did, "dsip.messaging", ctx)
+            .ok()
+            .then_some(subject)
+    })
+}
+
 /// Verify one frame: envelope stages 1–11, then the profile message rules (M§5).
 ///
 /// `hello` is passed through to the caller's binding logic; every other type must be a profile
