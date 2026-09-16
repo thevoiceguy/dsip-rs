@@ -34,6 +34,7 @@ pub const SCHEMAS: &[(&str, &str)] = &[
     schema!("call-event"),
     schema!("archive-record"),
     schema!("dsip-conversation"),
+    schema!("mailbox-service"),
 ];
 
 fn compiled() -> &'static HashMap<&'static str, Validator> {
