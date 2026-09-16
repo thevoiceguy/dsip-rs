@@ -20,6 +20,62 @@ use dsip_core::ulid::Ulid;
 
 use crate::checks::{accept, reject, ULID_TOLERANCE_S};
 
+/// The profile a usable mailbox entry must advertise.
+///
+/// Spec: M§4.2.
+pub const MESSAGING_PROFILE: &str = "messaging/1.0";
+
+/// Choose a mailbox from what an identity advertises.
+///
+/// Spec: M§4.2, §8.1 — DID document entries are authoritative and hints serve only identities with
+/// no document entry; an entry is usable when it satisfies the service schema and advertises
+/// `messaging/1.0`; order is by `priority` (absent = 0), stable within a priority; the selection is
+/// the first usable entry that accepts a connection, and devices sync every usable one.
+pub fn select_mailbox(inp: &Value) -> Value {
+    let list = |k: &str| -> Vec<Value> { inp[k].as_array().cloned().unwrap_or_default() };
+    let (doc, hints) = (list("document_entries"), list("hint_entries"));
+    let source = if !doc.is_empty() {
+        json!("did-document")
+    } else if !hints.is_empty() {
+        json!("hint")
+    } else {
+        Value::Null
+    };
+    let entries = if doc.is_empty() { hints } else { doc }; // §8.1 rule 6: no falling back past a document
+    let (mut usable, mut discarded): (Vec<Value>, Vec<Value>) = (vec![], vec![]);
+    for e in entries {
+        let advertises = e["profiles"].as_array().is_some_and(|p| p.iter().any(|x| x == MESSAGING_PROFILE));
+        if crate::schemas::schema_ok("mailbox-service", &e) && advertises {
+            usable.push(e);
+        } else {
+            discarded.push(e["uri"].clone());
+        }
+    }
+    usable.sort_by_key(|e| e["priority"].as_i64().unwrap_or(0)); // stable
+    let order: Vec<Value> = usable.iter().map(|e| e["mailbox"].clone()).collect();
+    let reachable = inp["reachable"].as_array();
+    let selected = order
+        .iter()
+        .find(|m| reachable.is_none_or(|r| r.contains(m)))
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({"source": source, "selected": selected, "order": order, "sync_targets": order, "discarded": discarded})
+}
+
+/// Whether an established conversation's mailbox may move to `candidate`.
+///
+/// Spec: M§4.2, M§15.4 — never on a hint alone.
+pub fn mailbox_switch(inp: &Value) -> Value {
+    let (established, candidate) = (&inp["established"], &inp["candidate"]);
+    if candidate["mailbox"] == established["mailbox"] {
+        json!({"switch": false, "reason": "unchanged"})
+    } else if candidate["source"] != "did-document" {
+        json!({"switch": false, "reason": "hint-sourced"})
+    } else {
+        json!({"switch": true, "reason": "did-document"})
+    }
+}
+
 /// Rejection reasons after which a caller may offer voicemail.
 ///
 /// Spec: M§13.2.

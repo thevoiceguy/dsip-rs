@@ -46,6 +46,13 @@ pub fn names(deleg: &Envelope) -> Option<(String, String)> {
 /// first check ("device list update" is implied by rotation; vector
 /// `envelope/rotated-did-web-old-key-delegation-rejected`).
 pub fn verify_delegation(deleg: &Envelope, subject: &str, device: &str, ctx: &Context) -> Verdict {
+    verify_delegation_for(deleg, subject, device, SIGNALING_CAPABILITY, ctx)
+}
+
+/// [`verify_delegation`] requiring an arbitrary capability instead of `dsip.signaling`.
+///
+/// Spec: §7.4; Messaging Profile M§6.2 — an MLS leaf requires `dsip.messaging` (spec-gap 39).
+pub fn verify_delegation_for(deleg: &Envelope, subject: &str, device: &str, capability: &str, ctx: &Context) -> Verdict {
     let ver = match verify_raw(deleg, ctx, false) {
         Ok(v) => v,
         Err(v) => return Verdict::reject(RejectCode::DelegationInvalid).detail(format!("{:?}", v.code)),
@@ -60,7 +67,7 @@ pub fn verify_delegation(deleg: &Envelope, subject: &str, device: &str, ctx: &Co
     let has_cap = p
         .get("capabilities")
         .and_then(Value::as_array)
-        .is_some_and(|c| c.iter().any(|x| x == SIGNALING_CAPABILITY));
+        .is_some_and(|c| c.iter().any(|x| x == capability));
     if !has_cap {
         return Verdict::reject(RejectCode::DelegationCapability);
     }

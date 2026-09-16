@@ -9,7 +9,8 @@
 //! M§6.6, M§12.2, M§14.2 (mailbox modes, sync and push, KeyPackage directory, group registration,
 //! archive first-wins, first-contact authorization — [`mailbox`]), M§6.5 (client seq gaps), M§7.2/M§7.5
 //! (conversation convergence), M§10 and M§11.2 (receipts, watermarks, activity) and M§13.2
-//! (voicemail offer — [`client`]).
+//! (voicemail offer — [`client`]), M§6.2/M§6.3/M§8.4/M§11.1/M§12.2 (the MLS layer: extension
+//! encoding, the leaf authentication service, AES-GCM formats — [`mls_wire`]).
 //!
 //! Impl: every rule here is pinned by `impl/vectors/messaging/`; the Python reference is
 //! `impl/tools/dsipvec/messaging.py`. The profile is a draft written before implementation, so
@@ -22,6 +23,7 @@ pub mod checks;
 pub mod client;
 pub mod hub;
 pub mod mailbox;
+pub mod mls_wire;
 pub mod schemas;
 
 use serde_json::{json, Value};
@@ -31,6 +33,9 @@ use serde_json::{json, Value};
 /// Spec: none (infrastructure) — dispatches on `input.check`.
 pub fn run_vector(v: &Value) -> Value {
     let inp = &v["input"];
+    if let Some(out) = mls_wire::run_check(inp["check"].as_str().unwrap_or(""), v) {
+        return out;
+    }
     match inp["check"].as_str().unwrap_or("") {
         "payload" => {
             let name = inp["schema"].as_str().unwrap_or("");
@@ -43,6 +48,8 @@ pub fn run_vector(v: &Value) -> Value {
         "message" => checks::check_message(&inp["payload"]),
         "object" => checks::check_object(&inp["object"], &v["context"]),
         "conversation-ext" => checks::check_conversation_ext(&inp["extension"]),
+        "mailbox-select" => client::select_mailbox(inp),
+        "mailbox-switch" => client::mailbox_switch(inp),
         "voicemail-offer" => client::voicemail_offer(inp),
         "direct-select" => client::select_direct(inp["candidates"].as_array().map(Vec::as_slice).unwrap_or(&[])),
         "successor-check" => client::check_successor(inp),
