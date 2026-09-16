@@ -745,19 +745,22 @@ impl History {
 /// retried once, then surfaced.
 ///
 /// Impl (spec-gap 58): `mailbox.stale-epoch` is handled like a conflict; re-proposal is bounded at `max_attempts`
-/// proposals in all (3); any other refusal is discarded and surfaced without retry.
+/// proposals in all (3); any other refusal is discarded and surfaced without retry. Spec: M§7.4 — Impl (spec-gap 60):
+/// `mailbox.unknown-group` is retried like a conflict when the sync shows the group moved to another hub, and surfaced
+/// otherwise.
 #[derive(Debug, Clone)]
 pub struct CommitRetry {
     max_attempts: i64,
     attempt: i64,
     state: &'static str,
     unknown_retry_used: bool,
+    last_reason: Option<String>,
 }
 
 impl CommitRetry {
     /// A retry machine from a vector `context` (`max_attempts`, default 3).
     pub fn new(ctx: &Value) -> CommitRetry {
-        CommitRetry { max_attempts: ctx["max_attempts"].as_i64().unwrap_or(3), attempt: 1, state: "pending", unknown_retry_used: false }
+        CommitRetry { max_attempts: ctx["max_attempts"].as_i64().unwrap_or(3), attempt: 1, state: "pending", unknown_retry_used: false, last_reason: None }
     }
 
     fn surface(&mut self, reason: &str) -> Vec<Value> {
@@ -767,11 +770,12 @@ impl CommitRetry {
 
     /// The hub answered: `reason` is `None` for `accepted`.
     pub fn answer(&mut self, reason: Option<&str>) -> Vec<Value> {
+        self.last_reason = reason.map(String::from);
         let Some(reason) = reason else {
             self.state = "merged";
             return vec![json!({"merge": {}})];
         };
-        if matches!(reason, "mailbox.commit-conflict" | "mailbox.stale-epoch") {
+        if matches!(reason, "mailbox.commit-conflict" | "mailbox.stale-epoch" | "mailbox.unknown-group") {
             if self.attempt >= self.max_attempts {
                 return self.surface(reason);
             }
@@ -784,8 +788,13 @@ impl CommitRetry {
         vec![json!({"discard": {}}), json!({"sync": {}})]
     }
 
-    /// The device has synced past the winning commit; `still_needed` says whether the operation remains to be done.
-    pub fn synced(&mut self, still_needed: bool) -> Vec<Value> {
+    /// The device has synced past the winning commit; `still_needed` says whether the operation remains to be done, and
+    /// `hub_moved` whether the sync showed the group moved to another hub (M§7.4).
+    pub fn synced(&mut self, still_needed: bool, hub_moved: bool) -> Vec<Value> {
+        if self.last_reason.as_deref() == Some("mailbox.unknown-group") && !hub_moved {
+            self.state = "surfaced"; // spec-gap 60: no move, so unknown-group is final
+            return vec![json!({"surface": "mailbox.unknown-group"})];
+        }
         if !still_needed {
             self.state = "done";
             return vec![json!({"done": "no-longer-needed"})];
@@ -800,7 +809,7 @@ impl CommitRetry {
         if let Some(a) = ev.get("answer") {
             return self.answer(a["reason"].as_str());
         }
-        self.synced(ev["synced"]["still_needed"].as_bool().unwrap_or(true))
+        self.synced(ev["synced"]["still_needed"].as_bool().unwrap_or(true), ev["synced"]["hub_moved"].as_bool().unwrap_or(false))
     }
 
     /// Snapshot compared by the vectors.

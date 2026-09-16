@@ -1016,6 +1016,19 @@ fn dispatch(
                 e["revoked_devices"] = json!(revoked_devices);
             }
             let emissions = st.mailbox.step(&json!({"config": e}));
+            if emissions.iter().any(|x| x.get("accepted").is_some()) {
+                // M§7.4 (spec-gap 60): a group moved to another hub is forwarded to that hub's endpoint from now on
+                for g in p["groups"].as_array().into_iter().flatten() {
+                    if let (Some(group), Some(did)) = (g["group"].as_str(), g["hub"].as_str()) {
+                        if let Some(uri) = g["hub_uri"].as_str() {
+                            st.hub_refs.insert(group.to_string(), json!({"did": did, "uri": uri}));
+                        }
+                        if g.get("handover_seq").is_some() {
+                            tracing::info!("group {group} moved to hub {did} after seq {}", g["handover_seq"]);
+                        }
+                    }
+                }
+            }
             for c in emissions.iter().filter_map(|x| x.get("close")) {
                 let d = c["device"].as_str().unwrap_or("");
                 if let Some(tx) = st.bound.remove(d) {
@@ -1049,18 +1062,26 @@ fn hub_deposit(
     let bytes = dsip_core::b64::decode(mls).unwrap_or_default();
     let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
 
+    let mut refreshed = None;
     if class == "group-info" {
         // Bootstrap or refresh the public view (M§6.5 rule 6).
         match HubView::from_group_info(&bytes) {
+            Ok(view) if st.hubs.contains_key(&group) => refreshed = Some(view), // applied once the hub accepts it
             Ok(view) => {
                 let conv = view.conversation().unwrap_or(Value::Null);
-                if !st.hubs.contains_key(&group) {
-                    let roster = view.roster(&ctx).unwrap_or(json!({}));
-                    let kind = conv["kind"].as_str().unwrap_or("direct");
-                    let hub = Hub::new(&json!({"now": now, "kind": kind, "epoch": view.epoch(), "roster": roster}));
-                    st.hubs.insert(group.clone(), hub);
-                    tracing::info!("hubbing {kind} group {group} from epoch {}", view.epoch());
+                if conv["hub"]["did"] != json!(st.key.did()) {
+                    // Impl (spec-gap 60): a hub hosts only a group whose dsip_conversation names it
+                    tracing::info!("group-info for {group} names hub {} — not hosting it", conv["hub"]["did"]);
+                    let env = wire::error(&st.key, device, now, Some(&id), "mailbox.unknown-group", Some("the group names another hub"));
+                    return vec![Out::Device(device.to_string(), env)];
                 }
+                let roster = view.roster(&ctx).unwrap_or(json!({}));
+                let kind = conv["kind"].as_str().unwrap_or("direct");
+                // M§7.4 (spec-gap 60): a group moved here continues the numbering its previous hub reached
+                let next_seq = p["handover_seq"].as_i64().map_or(1, |h| h + 1);
+                let hub = Hub::new(&json!({"now": now, "kind": kind, "epoch": view.epoch(), "roster": roster, "next_seq": next_seq}));
+                st.hubs.insert(group.clone(), hub);
+                tracing::info!("hubbing {kind} group {group} from epoch {} at seq {next_seq}", view.epoch());
                 st.conversations.insert(group.clone(), conv);
                 st.views.insert(group.clone(), view);
             }
@@ -1090,6 +1111,15 @@ fn hub_deposit(
     }
     let hub = st.hubs.get_mut(&group).expect("hub");
     let emissions = hub.step(&json!({"deposit": deposit}));
+    if let Some(view) = refreshed.filter(|_| emissions.iter().any(|e| e.get("accepted").is_some())) {
+        st.conversations.insert(group.clone(), view.conversation().unwrap_or(Value::Null));
+        st.views.insert(group.clone(), view);
+    }
+    if let Some(c) = deposit.get("commit").filter(|c| c["moves_to"].is_string()) {
+        if emissions.iter().any(|e| e.get("accepted").is_some()) {
+            tracing::info!("group {group} moves to hub {}: ordered here, refused from now on", c["moves_to"]);
+        }
+    }
     for e in &emissions {
         if let Some(err) = e.get("error") {
             tracing::info!("hub refused {class} from {identity}: {}", err["reason"]);

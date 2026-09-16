@@ -223,3 +223,70 @@ fn extension_bytes_match_openmls() {
     assert_eq!(mls_wire::decode_extension(&non_minimal), Err("mls-length-non-minimal"));
     assert!(Extension::tls_deserialize(&mut &non_minimal[..]).is_err());
 }
+
+#[test]
+fn hub_move_on_real_mls() {
+    // M§7.4 (spec-gap 60): a GroupContextExtensions commit moves the group; the old hub orders it and stops, the new hub
+    // bootstraps from the GroupInfo and continues the numbering; a commit rewriting the conversation is not ordered.
+    let resolver = StaticResolver::default();
+    let ctx = Context::new(NOW, &resolver);
+    let caps = ["dsip.signaling", "dsip.messaging"];
+    let (alice, alice_dev) = device("alice", "alice-phone", &caps);
+    let (bob, bob_dev) = device("bob", "bob-phone", &caps);
+    let gid = ulid(20).into_bytes();
+    let conv = json!({"conversation": ulid(21), "kind": "group", "hub": {"did": HUB, "uri": "wss://mbx.alice.example/dsip"}, "successor_of": null});
+    let mut ag = alice_dev.create_group(&gid, &serde_json::to_vec(&conv).unwrap()).unwrap();
+    let gi = ag.export_group_info(alice_dev.provider().crypto(), &alice_dev.signer(), true).unwrap();
+    let mut old_view = HubView::from_group_info(&bytes(&gi)).unwrap();
+    let (kp, _) = authenticate_key_package(&bob_dev.key_package().unwrap(), alice_dev.provider(), &ctx).unwrap();
+    let (commit, welcome, _) = ag.add_members(alice_dev.provider(), &alice_dev.signer(), &[kp]).unwrap();
+    old_view.observe_commit(&bytes(&commit), &ctx).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let mut bg = bob_dev.join(&bytes(&welcome)).unwrap();
+    let mut old_hub = Hub::new(&json!({"now": NOW, "kind": "group", "epoch": 1, "next_seq": 2,
+        "roster": {alice.clone(): [alice_dev.did()], bob.clone(): [bob_dev.did()]}}));
+
+    // A commit changing the conversation's kind is refused by the public view before the hub machine sees it.
+    let mut bad = conv.clone();
+    bad["kind"] = json!("direct");
+    let mut ext = ag.extensions().clone();
+    ext.add_or_replace(Extension::Unknown(mls_wire::EXT_DSIP_CONVERSATION, UnknownExtension(serde_json::to_vec(&bad).unwrap()))).unwrap();
+    let (rewrite, _, _) = ag.update_group_context_extensions(alice_dev.provider(), ext, &alice_dev.signer()).unwrap();
+    let mut probe = HubView::load(&old_view.save()).unwrap();
+    assert_eq!(probe.observe_commit(&bytes(&rewrite), &ctx).unwrap()["valid"], false);
+    ag.clear_pending_commit(alice_dev.provider().storage()).unwrap();
+
+    // Bob moves the group to his mailbox.
+    let new_hub_ref = json!({"did": "did:web:mbx.bob.example", "uri": "wss://mbx.bob.example/dsip"});
+    let mv = bytes(&bob_dev.move_hub_commit(&mut bg, &new_hub_ref).unwrap());
+    let observed = old_view.observe_commit(&mv, &ctx).unwrap();
+    assert_eq!(observed["moves_to"], "did:web:mbx.bob.example");
+    let (_, e, _) = message_header(&mv).unwrap();
+    let emitted = old_hub.step(&json!({"deposit": {"id": ulid(22), "device": bob_dev.did(), "identity": bob, "class": "handshake",
+        "epoch": e, "digest": digest(&mv), "commit": observed}}));
+    let handover = emitted[0]["accepted"]["seq"].as_i64().unwrap();
+    assert_eq!(handover, 2);
+    bg.merge_pending_commit(bob_dev.provider()).unwrap();
+
+    // Alice processes the move and learns the new hub from the staged commit.
+    let pm = MlsMessageIn::tls_deserialize(&mut &mv[..]).unwrap().try_into_protocol_message().unwrap();
+    let before = dsip_mls::conversation_extension(&ag);
+    let ProcessedMessageContent::StagedCommitMessage(staged) = ag.process_message(alice_dev.provider(), pm).unwrap().into_content() else {
+        panic!("not a commit")
+    };
+    let update = dsip_mls::conversation_update(before.as_deref(), &staged).expect("the conversation changed");
+    assert_eq!(update["effective"]["hub"], new_hub_ref);
+    ag.merge_staged_commit(alice_dev.provider(), *staged).unwrap();
+
+    // The old hub refuses what comes after; the new hub bootstraps from Bob's GroupInfo and continues from handover + 1.
+    let msg = bytes(&ag.create_message(alice_dev.provider(), &alice_dev.signer(), b"{}").unwrap());
+    let (_, e, _) = message_header(&msg).unwrap();
+    let dep = json!({"deposit": {"id": ulid(23), "device": alice_dev.did(), "identity": alice, "class": "application", "epoch": e, "digest": digest(&msg)}});
+    assert_eq!(old_hub.step(&dep)[0]["error"]["reason"], "mailbox.unknown-group");
+    let gi = bg.export_group_info(bob_dev.provider().crypto(), &bob_dev.signer(), true).unwrap();
+    let new_view = HubView::from_group_info(&bytes(&gi)).unwrap();
+    assert_eq!(new_view.conversation().unwrap()["hub"], new_hub_ref);
+    let mut new_hub = Hub::new(&json!({"now": NOW, "kind": "group", "epoch": new_view.epoch(), "next_seq": handover + 1,
+        "roster": new_view.roster(&ctx).unwrap()}));
+    assert_eq!(new_hub.step(&dep)[0]["accepted"]["seq"], 3);
+}
