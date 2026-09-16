@@ -11,9 +11,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Hub state for one group.
+#[derive(Serialize, Deserialize)]
 pub struct Hub {
     now: i64,
     kind: String,
@@ -52,7 +54,7 @@ impl Hub {
         }
     }
 
-    /// Apply one event (`deposit`, `ack`, `advance`) and return what the hub emits.
+    /// Apply one event (`deposit`, `ack`, `advance`, `restart`) and return what the hub emits.
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         if let Some(n) = ev.get("advance").and_then(Value::as_i64) {
             self.now += n;
@@ -61,7 +63,36 @@ impl Hub {
         if let Some(a) = ev.get("ack") {
             return self.ack(&s(&a["identity"]), a["seq"].as_i64().unwrap_or(0));
         }
+        if ev.get("restart").is_some() {
+            if let Some(h) = Hub::from_full_state(&self.full_state()) {
+                *self = h;
+            }
+            return self.resend_heads();
+        }
         self.deposit(&ev["deposit"])
+    }
+
+    /// Everything a hub keeps across a restart: epoch, roster, sequence counter, digests, fan-out queues.
+    ///
+    /// Spec: M§6.5, M§9.3. Impl (spec-gap 59): all hub state is durable; a restart loses nothing.
+    pub fn full_state(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    /// A hub restored from [`Hub::full_state`]; `None` if the value is not one.
+    pub fn from_full_state(v: &Value) -> Option<Hub> {
+        serde_json::from_value(v.clone()).ok()
+    }
+
+    /// The head of every unacknowledged fan-out queue, to be sent again.
+    ///
+    /// Spec: M§6.5 rule 5 (retry before later items). Impl (spec-gap 59): a restarted hub, or one whose retry timer
+    /// fires, re-sends each queue's head; the member mailbox acknowledges a redelivery as a duplicate.
+    pub fn resend_heads(&self) -> Vec<Value> {
+        self.pending
+            .iter()
+            .filter_map(|(i, q)| q.first().map(|seq| json!({"fanout": {"to": i, "seq": seq, "class": self.seq_class[seq]}})))
+            .collect()
     }
 
     fn error(d: &Value, reason: &str) -> Vec<Value> {
@@ -215,6 +246,11 @@ impl Hub {
             Some(next) => vec![json!({"fanout": {"to": ident, "seq": next, "class": self.seq_class[next]}})],
             None => vec![],
         }
+    }
+
+    /// Every seq still queued for some member mailbox: the payloads a host must keep for retries.
+    pub fn queued_seqs(&self) -> BTreeSet<i64> {
+        self.pending.values().flatten().copied().collect()
     }
 
     /// Snapshot compared by the vectors: epoch, next seq, roster, non-empty pending queues.

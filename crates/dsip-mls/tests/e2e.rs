@@ -184,6 +184,14 @@ fn messaging_end_to_end_on_real_mls() {
     let archived = mls_wire::seal(&[5u8; 32], &[6u8; 12], &record, SealUse::Archive { group: &gid, seq: 4 });
     assert_eq!(mls_wire::open(&[5u8; 32], &archived, SealUse::Archive { group: &gid, seq: 4 }).unwrap(), record);
 
+    // --- spec-gap 59: the hub restarts; its public view and its ordering state come back from what it saved
+    let saved = hub_view.save();
+    drop(hub_view);
+    let mut hub_view = HubView::load(&saved).expect("reload the public view");
+    assert_eq!(hub_view.epoch(), 1);
+    assert_eq!(hub_view.roster(&ctx).unwrap(), json!({alice.clone(): [alice_dev.did()], bob.clone(): [bob_dev.did()]}));
+    let mut hub = Hub::from_full_state(&hub.full_state()).expect("reload the hub");
+
     // --- M§6.5 rule 2 on real commits: Bob's update wins epoch 1; Alice's concurrent commit is refused
     let bob_update = bytes(bg.self_update(bob_dev.provider(), &bob_dev.signer(), LeafNodeParameters::default()).unwrap().commit());
     let alice_update = bytes(ag.self_update(alice_dev.provider(), &alice_dev.signer(), LeafNodeParameters::default()).unwrap().commit());

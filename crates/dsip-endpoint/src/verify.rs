@@ -34,6 +34,21 @@ impl SeenIds {
         self.ids.insert(id.to_string(), track_until.max(now + REPLAY_WINDOW_S));
     }
 
+    /// Every tracked id with the time it may be forgotten, for a service that keeps them across a restart.
+    ///
+    /// Impl (spec-gap 59): a restarted service that forgot its seen ids would accept a replay of a frame from
+    /// before the restart that is still inside the window.
+    pub fn entries(&self) -> Vec<(String, i64)> {
+        let mut v: Vec<(String, i64)> = self.ids.iter().map(|(k, t)| (k.clone(), *t)).collect();
+        v.sort();
+        v
+    }
+
+    /// Ids restored from [`SeenIds::entries`].
+    pub fn from_entries(entries: Vec<(String, i64)>) -> SeenIds {
+        SeenIds { ids: entries.into_iter().collect() }
+    }
+
     /// The set view used by the verification context.
     pub fn set(&self) -> std::collections::HashSet<String> {
         self.ids.keys().cloned().collect()

@@ -1,15 +1,38 @@
 //! The bytes behind the cursors.
 //!
 //! Spec: M§5.4 — `items` carries what was stored; the state machine owns cursors, retention and
-//! ordering, so this is only the payload side of the same records. Impl: in memory, as the
-//! reference relay's frame store is.
+//! ordering, so this is only the payload side of the same records. Impl (spec-gap 59): held in memory and
+//! saved with the rest of the service state after every change ([`write_atomically`]).
 
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Replace `path` with `bytes` so that a crash leaves either the old file or the new one: write a sibling
+/// temporary file, sync it, rename it over the target, and sync the directory.
+///
+/// Spec: none (infrastructure).
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// One stored item, as `items` will carry it (M§5.4).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     /// Deposit class.
     pub class: String,
@@ -101,7 +124,7 @@ impl Item {
 }
 
 /// Cursor → item, plus the KeyPackage bytes the directory serves (M§5.5).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Store {
     items: HashMap<String, Item>,
     key_packages: HashMap<String, Vec<String>>,

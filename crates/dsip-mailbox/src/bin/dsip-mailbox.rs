@@ -12,6 +12,12 @@
 //! acting identity of a forwarded deposit from the delegation in its header, since the connection it
 //! arrived on belongs to a mailbox. Welcomes a hub fans out carry the adder's deposit as `origin`,
 //! which the receiving mailbox verifies (M§14.2, spec-gap 46).
+//!
+//! Impl (spec-gap 59): everything but live connections is saved to `<state>/mailbox-state.json` after each change
+//! and reloaded at startup — the machines' full state, the hub's public MLS views, stored payloads and KeyPackages,
+//! fan-out payloads still queued, hub references, revocations and the seen-id window. A restarted hub re-sends the
+//! head of every unacknowledged fan-out queue at once, and after that any head left unacknowledged is re-sent with
+//! backoff; a member mailbox acknowledges a redelivery as a duplicate.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -29,7 +35,7 @@ use dsip_core::envelope::{self, Context, Envelope};
 use dsip_core::keys::KeyPair;
 use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
-use dsip_mailbox::store::{Item, Store};
+use dsip_mailbox::store::{write_atomically, Item, Store};
 use dsip_mailbox::verify::{delegated_identity, verify_frame};
 use dsip_mailbox::{http, wire, HELLO_TIMEOUT_S};
 use dsip_messaging::client::select_mailbox;
@@ -75,6 +81,14 @@ struct Args {
     max_blob_bytes: i64,
 }
 
+/// The saved service state, in the state directory.
+const STATE_FILE: &str = "mailbox-state.json";
+/// Seconds between checks for unacknowledged fan-out.
+const RETRY_TICK_S: u64 = 2;
+/// First and largest delay before re-sending a fan-out head that stays unacknowledged, seconds.
+const RETRY_FIRST_S: i64 = 4;
+const RETRY_MAX_S: i64 = 60;
+
 /// What a handled message produces.
 enum Out {
     /// To a bound device of the owner, if connected.
@@ -109,6 +123,10 @@ struct Service {
     /// `https://…/blobs` as advertised (M§4.3).
     blob_endpoint: String,
     max_blob_bytes: i64,
+    /// Where [`STATE_FILE`] lives.
+    state_dir: PathBuf,
+    /// Unacknowledged fan-out heads by (group, member identity): (seq, next retry at, current delay).
+    retry: HashMap<(String, String), (i64, i64, i64)>,
 }
 
 /// What goes out on a connection to a peer service.
@@ -132,6 +150,107 @@ fn ctx_of<'a>(resolver: &'a StaticResolver, seen: &SeenIds, supported: &Supporte
 const CLOSE_SENTINEL: &str = "\u{0}close";
 
 impl Service {
+    /// Save everything that must survive a restart (spec-gap 59). A failed write is logged, not fatal: the
+    /// in-memory state is still correct and the next change writes again.
+    fn persist(&mut self) {
+        let now = now_s();
+        self.seen.sweep(now);
+        let queued: HashMap<&String, std::collections::BTreeSet<i64>> = self.hubs.iter().map(|(g, h)| (g, h.queued_seqs())).collect();
+        // A fan-out payload is kept while its seq is queued for some mailbox; group-info and ephemeral (-1) are the latest.
+        self.fanout.retain(|(g, seq), _| *seq < 0 || queued.get(g).is_some_and(|q| q.contains(seq)));
+        let compact = |e: &Envelope| format!("{}.{}.{}", e.protected, e.payload, e.signature);
+        let state = json!({
+            "format": 1,
+            "service": self.key.did(),
+            "owner": self.owner,
+            "mailbox": self.mailbox.full_state(),
+            "hubs": self.hubs.iter().map(|(g, h)| (g.clone(), h.full_state())).collect::<serde_json::Map<_, _>>(),
+            "views": self.views.iter().map(|(g, v)| (g.clone(), serde_json::from_slice(&v.save()).unwrap_or(Value::Null)))
+                .collect::<serde_json::Map<_, _>>(),
+            "store": serde_json::to_value(&self.store).unwrap_or(Value::Null),
+            "fanout": self.fanout.iter().map(|((g, seq), it)| json!([g, seq, it])).collect::<Vec<_>>(),
+            "conversations": self.conversations,
+            "hub_refs": self.hub_refs,
+            "revocations": self.revocations.iter().map(compact).collect::<Vec<_>>(),
+            "seen": self.seen.entries(),
+        });
+        let bytes = serde_json::to_vec(&state).unwrap_or_default();
+        if let Err(e) = write_atomically(&self.state_dir.join(STATE_FILE), &bytes) {
+            tracing::warn!("saving state failed: {e}");
+        }
+    }
+
+    /// Reload what [`Service::persist`] saved. Returns false when there is nothing to reload.
+    fn restore(&mut self) -> Result<bool> {
+        let path = self.state_dir.join(STATE_FILE);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let v: Value = serde_json::from_slice(&std::fs::read(&path)?).context("reading saved state")?;
+        anyhow::ensure!(v["format"] == 1, "unknown state format {}", v["format"]);
+        anyhow::ensure!(v["owner"] == json!(self.owner), "saved state is for {}, not {}", v["owner"], self.owner);
+        self.mailbox = Mailbox::from_full_state(&v["mailbox"]).context("saved mailbox")?;
+        for (g, h) in v["hubs"].as_object().into_iter().flatten() {
+            self.hubs.insert(g.clone(), Hub::from_full_state(h).context("saved hub")?);
+        }
+        for (g, view) in v["views"].as_object().into_iter().flatten() {
+            let view = HubView::load(&serde_json::to_vec(view)?).map_err(|e| anyhow::anyhow!("saved view of {g}: {e}"))?;
+            self.views.insert(g.clone(), view);
+        }
+        self.store = serde_json::from_value(v["store"].clone()).context("saved store")?;
+        for f in v["fanout"].as_array().into_iter().flatten() {
+            let item: Item = serde_json::from_value(f[2].clone()).context("saved fan-out")?;
+            self.fanout.insert((f[0].as_str().unwrap_or("").to_string(), f[1].as_i64().unwrap_or(-1)), item);
+        }
+        let map = |x: &Value| x.as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+        self.conversations = map(&v["conversations"]);
+        self.hub_refs = map(&v["hub_refs"]);
+        self.revocations = v["revocations"].as_array().into_iter().flatten().filter_map(Value::as_str)
+            .filter_map(|c| {
+                let mut parts = c.split('.');
+                Some(Envelope { protected: parts.next()?.into(), payload: parts.next()?.into(), signature: parts.next()?.into() })
+            })
+            .collect();
+        self.seen = SeenIds::from_entries(serde_json::from_value(v["seen"].clone()).unwrap_or_default());
+        Ok(true)
+    }
+
+    /// Re-send fan-out heads nobody has acknowledged (M§6.5 rule 5, spec-gap 59): all of them at once after a restart,
+    /// then each head that stays unacknowledged, with doubling delay. Our own owner's queue is filled in-process and
+    /// never waits.
+    fn retry_fanout(&mut self, service: &Arc<Mutex<Service>>, restarted: bool) {
+        let now = now_s();
+        let heads: Vec<(String, Value)> =
+            self.hubs.iter().flat_map(|(g, h)| h.resend_heads().into_iter().map(move |e| (g.clone(), e))).collect();
+        let mut live = std::collections::HashSet::new();
+        for (group, e) in heads {
+            let (to, seq) = (e["fanout"]["to"].as_str().unwrap_or("").to_string(), e["fanout"]["seq"].as_i64().unwrap_or(-1));
+            if to == self.owner {
+                continue;
+            }
+            let key = (group.clone(), to.clone());
+            live.insert(key.clone());
+            let due = match self.retry.get(&key) {
+                _ if restarted => Some(RETRY_FIRST_S),
+                Some((s, at, delay)) if *s == seq => (now >= *at).then_some((delay * 2).min(RETRY_MAX_S)),
+                _ => {
+                    self.retry.insert(key.clone(), (seq, now + RETRY_FIRST_S, RETRY_FIRST_S)); // just sent: wait before retrying
+                    None
+                }
+            };
+            let Some(delay) = due else { continue };
+            self.retry.insert(key, (seq, now + delay, delay));
+            tracing::info!("re-sending fan-out seq {seq} in {group} to {to}");
+            let resolver = self.resolver();
+            for out in self.hub_out(&group, vec![e], now) {
+                if let Out::Identity(id, env) = out {
+                    federate(service, self, &id, env, &resolver);
+                }
+            }
+        }
+        self.retry.retain(|k, _| live.contains(k));
+    }
+
     fn resolver(&self) -> StaticResolver {
         let mut r = StaticResolver::default();
         for f in &self.resolver_files {
@@ -429,10 +548,31 @@ async fn main() -> Result<()> {
         blob_dir: args.state.join("blobs"),
         blob_endpoint: format!("https://{}/blobs", args.listen),
         max_blob_bytes: args.max_blob_bytes,
+        state_dir: args.state.clone(),
+        retry: HashMap::new(),
     }));
     std::fs::create_dir_all(args.state.join("blobs"))?;
-
+    // Bound before the state is reloaded: a connection waits in the backlog until the accept loop starts.
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("binding {}", args.listen))?;
+    {
+        let mut st = service.lock().await;
+        if st.restore()? {
+            tracing::info!("restored state: {} items, {} hubbed groups, {} registered devices",
+                st.mailbox.snapshot()["items"].as_array().map_or(0, Vec::len), st.hubs.len(), st.mailbox.devices().len());
+        }
+    }
+    let retry_service = service.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(RETRY_TICK_S));
+        let mut restarted = true; // the first tick runs at once: re-send whatever was queued before we stopped
+        loop {
+            tick.tick().await;
+            let mut st = retry_service.lock().await;
+            st.retry_fanout(&retry_service, restarted);
+            restarted = false;
+        }
+    });
+
     loop {
         let (tcp, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
@@ -610,10 +750,12 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
         let mut st = service.lock().await;
         if identity == st.owner {
             st.bound.insert(device.clone(), tx.clone());
-            let devices: Vec<String> = st.bound.keys().cloned().collect();
-            // The owner's registered devices are the ones that have bound (M§4.4).
+            // The owner's registered devices are the ones that have bound (M§4.4), including before a restart.
+            let mut devices: Vec<String> = st.mailbox.devices().to_vec();
+            devices.push(device.clone());
             st.mailbox.register_devices(&devices);
         }
+        st.persist();
     }
 
     loop {
@@ -683,6 +825,7 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
             Out::Identity(identity, env) => federate(service, &mut st, &identity, env, &resolver),
         }
     }
+    st.persist();
     replies
 }
 
@@ -1102,6 +1245,9 @@ async fn peer_task(
                             continue; // group-info and ephemeral are not sequenced
                         }
                         let mut st = service.lock().await;
+                        if p["duplicate"] == json!(true) {
+                            tracing::info!("{mailbox_did} already had seq {seq} in {group}");
+                        }
                         if let Some(hub) = st.hubs.get_mut(&group) {
                             let more = hub.step(&json!({"ack": {"identity": identity, "seq": seq}}));
                             // The ack may release the next queued item for that mailbox.
@@ -1113,6 +1259,7 @@ async fn peer_task(
                                 }
                             }
                         }
+                        st.persist();
                     }
                 }
                 None => break,

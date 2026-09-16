@@ -285,13 +285,14 @@ pub fn digest(bytes: &[u8]) -> String {
 /// commit (framing signature by a member leaf, credentials per M§6.2) before sequencing it.
 pub struct HubView {
     group: PublicGroup,
-    provider: OpenMlsRustCrypto,
+    crypto: openmls_rust_crypto::RustCrypto,
+    storage: openmls_rust_crypto::MemoryStorage,
 }
 
 impl HubView {
     /// Start tracking a group from a GroupInfo that carries the ratchet tree extension.
     pub fn from_group_info(group_info: &[u8]) -> Result<HubView, MlsError> {
-        let provider = OpenMlsRustCrypto::default();
+        let (crypto, storage) = (openmls_rust_crypto::RustCrypto::default(), openmls_rust_crypto::MemoryStorage::default());
         let msg = MlsMessageIn::tls_deserialize(&mut &group_info[..]).map_err(err("group info bytes"))?;
         let MlsMessageBodyIn::GroupInfo(gi) = msg.extract() else { return Err(MlsError("not a group info".into())) };
         let tree = gi
@@ -299,9 +300,37 @@ impl HubView {
             .ratchet_tree()
             .map(|t| t.ratchet_tree().clone())
             .ok_or_else(|| MlsError("group info without ratchet tree".into()))?;
-        let (group, _) = PublicGroup::from_external(provider.crypto(), provider.storage(), tree, gi, ProposalStore::new())
-            .map_err(err("public group"))?;
-        Ok(HubView { group, provider })
+        let (group, _) = PublicGroup::from_external(&crypto, &storage, tree, gi, ProposalStore::new()).map_err(err("public group"))?;
+        Ok(HubView { group, crypto, storage })
+    }
+
+    /// The view's MLS storage as bytes, to be written wherever the hub keeps its state.
+    ///
+    /// Impl (spec-gap 59): the public group lives in an in-memory OpenMLS store whose every record is copied out; a
+    /// restarted hub reloads it with [`HubView::load`] and validates the next commit against the same tree and epoch.
+    pub fn save(&self) -> Vec<u8> {
+        let values = self.storage.values.read().map(|v| v.clone()).unwrap_or_default();
+        let mut records: Vec<(String, String)> = values.iter().map(|(k, v)| (hex::encode(k), hex::encode(v))).collect();
+        records.sort();
+        serde_json::to_vec(&json!({"group_id": hex::encode(self.group.group_id().as_slice()), "records": records}))
+            .unwrap_or_default()
+    }
+
+    /// A view restored from [`HubView::save`].
+    pub fn load(bytes: &[u8]) -> Result<HubView, MlsError> {
+        let v: Value = serde_json::from_slice(bytes).map_err(err("hub view bytes"))?;
+        let unhex = |x: &Value| hex::decode(x.as_str().unwrap_or("")).map_err(err("hub view hex"));
+        let mut values = std::collections::HashMap::new();
+        for rec in v["records"].as_array().into_iter().flatten() {
+            values.insert(unhex(&rec[0])?, unhex(&rec[1])?);
+        }
+        let storage = openmls_rust_crypto::MemoryStorage::default();
+        *storage.values.write().map_err(|_| MlsError("hub view storage lock".into()))? = values;
+        let group_id = GroupId::from_slice(&unhex(&v["group_id"])?);
+        let group = PublicGroup::load(&storage, &group_id)
+            .map_err(err("load public group"))?
+            .ok_or_else(|| MlsError("no public group in the saved view".into()))?;
+        Ok(HubView { group, crypto: openmls_rust_crypto::RustCrypto::default(), storage })
     }
 
     /// The group's `dsip_conversation` value, as JSON (M§6.3): its kind and its hub.
@@ -334,7 +363,7 @@ impl HubView {
     pub fn observe_commit(&mut self, bytes: &[u8], ctx: &Context) -> Result<Value, MlsError> {
         let msg = MlsMessageIn::tls_deserialize(&mut &bytes[..]).map_err(err("commit bytes"))?;
         let pm = msg.try_into_protocol_message().map_err(err("protocol message"))?;
-        let processed = match self.group.process_message(self.provider.crypto(), pm) {
+        let processed = match self.group.process_message(&self.crypto, pm) {
             Ok(p) => p,
             Err(_) => return Ok(json!({"adds": [], "removes": [], "valid": false})),
         };
@@ -359,7 +388,7 @@ impl HubView {
                 Err(_) => removes.push(json!({"identity": "", "device": String::from_utf8_lossy(&identity), "delegation_valid": false})),
             }
         }
-        self.group.merge_commit(self.provider.storage(), *staged).map_err(err("merge commit"))?;
+        self.group.merge_commit(&self.storage, *staged).map_err(err("merge commit"))?;
         Ok(json!({"adds": adds, "removes": removes, "valid": true, "external": external}))
     }
 }
