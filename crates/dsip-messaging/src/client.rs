@@ -737,3 +737,74 @@ impl History {
                "held": self.held.iter().map(|h| h["cursor"].clone()).collect::<Vec<_>>(), "current_akid": self.current_akid()})
     }
 }
+
+/// What a committing device does with the hub's answer to its commit.
+///
+/// Spec: M§6.5 — a member applies its commit only with the hub's `accepted`; on `mailbox.commit-conflict` it syncs,
+/// processes the winning commit and re-proposes if still needed; §15.3 — an unknown `mailbox` condition is re-synced,
+/// retried once, then surfaced.
+///
+/// Impl (spec-gap 58): `mailbox.stale-epoch` is handled like a conflict; re-proposal is bounded at `max_attempts`
+/// proposals in all (3); any other refusal is discarded and surfaced without retry.
+#[derive(Debug, Clone)]
+pub struct CommitRetry {
+    max_attempts: i64,
+    attempt: i64,
+    state: &'static str,
+    unknown_retry_used: bool,
+}
+
+impl CommitRetry {
+    /// A retry machine from a vector `context` (`max_attempts`, default 3).
+    pub fn new(ctx: &Value) -> CommitRetry {
+        CommitRetry { max_attempts: ctx["max_attempts"].as_i64().unwrap_or(3), attempt: 1, state: "pending", unknown_retry_used: false }
+    }
+
+    fn surface(&mut self, reason: &str) -> Vec<Value> {
+        self.state = "surfaced";
+        vec![json!({"discard": {}}), json!({"surface": reason})]
+    }
+
+    /// The hub answered: `reason` is `None` for `accepted`.
+    pub fn answer(&mut self, reason: Option<&str>) -> Vec<Value> {
+        let Some(reason) = reason else {
+            self.state = "merged";
+            return vec![json!({"merge": {}})];
+        };
+        if matches!(reason, "mailbox.commit-conflict" | "mailbox.stale-epoch") {
+            if self.attempt >= self.max_attempts {
+                return self.surface(reason);
+            }
+        } else if reason.split('.').next() == Some("mailbox") && !REASONS.iter().any(|(t, _)| *t == reason) && !self.unknown_retry_used {
+            self.unknown_retry_used = true; // §15.3 mailbox fallback: re-sync, retry once, then surface
+        } else {
+            return self.surface(reason);
+        }
+        self.state = "syncing";
+        vec![json!({"discard": {}}), json!({"sync": {}})]
+    }
+
+    /// The device has synced past the winning commit; `still_needed` says whether the operation remains to be done.
+    pub fn synced(&mut self, still_needed: bool) -> Vec<Value> {
+        if !still_needed {
+            self.state = "done";
+            return vec![json!({"done": "no-longer-needed"})];
+        }
+        self.attempt += 1;
+        self.state = "pending";
+        vec![json!({"repropose": {"attempt": self.attempt}})]
+    }
+
+    /// Apply one trace event (`answer`, `synced`).
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        if let Some(a) = ev.get("answer") {
+            return self.answer(a["reason"].as_str());
+        }
+        self.synced(ev["synced"]["still_needed"].as_bool().unwrap_or(true))
+    }
+
+    /// Snapshot compared by the vectors.
+    pub fn snapshot(&self) -> Value {
+        json!({"attempt": self.attempt, "state": self.state})
+    }
+}
