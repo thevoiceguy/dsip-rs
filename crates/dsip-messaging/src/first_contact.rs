@@ -19,7 +19,6 @@ use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::checks::{accept_effective, reject};
-use crate::schemas::schema_ok;
 
 /// The only sealing algorithm of 1.0.
 ///
@@ -142,7 +141,8 @@ pub fn sealed_aad(p: &Value) -> Vec<u8> {
 ///
 /// Spec: M§14.1.
 pub fn check_introduction(p: &Value) -> Value {
-    if !schema_ok("introduction", p) {
+    // The core v0.8 introduction schema carries `sealed` (§19.4).
+    if dsip_schema::validate::validate_against("introduction", p).is_err() {
         return reject("schema-invalid", None);
     }
     if p.get("purpose").is_some() && p.get("sealed").is_some() {

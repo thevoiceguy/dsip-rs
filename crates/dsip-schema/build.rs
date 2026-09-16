@@ -11,7 +11,7 @@ use std::process::Command;
 
 fn schema_dir() -> PathBuf {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    manifest.join("../../../v0.7/dsip-schemas-v0.7-draft/dsip-schemas")
+    manifest.join("../../../v0.8/dsip-schemas-v0.8-draft/dsip-schemas")
 }
 
 fn main() {
@@ -24,6 +24,8 @@ fn main() {
     }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("regen");
+    // A schema removed from the generator must not survive in the scratch output of an earlier build.
+    let _ = std::fs::remove_dir_all(&out);
     let status = Command::new("python3").arg(dir.join("generate_schemas.py")).arg(&out).status();
     match status {
         Ok(s) if s.success() => compare(&schemas, &out),
@@ -45,7 +47,7 @@ fn compare(committed: &Path, regenerated: &Path) {
     if !drift.is_empty() {
         panic!(
             "schema drift: committed schemas differ from generate_schemas.py output for {:?}. \
-             Regenerate with `python3 v0.7/dsip-schemas-v0.7-draft/dsip-schemas/generate_schemas.py schemas`.",
+             Regenerate with `python3 v0.8/dsip-schemas-v0.8-draft/dsip-schemas/generate_schemas.py schemas`.",
             drift
         );
     }

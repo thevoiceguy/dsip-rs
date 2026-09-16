@@ -22,6 +22,8 @@ fn main() {
         println!("cargo:rerun-if-changed={}", entry.expect("entry").path().display());
     }
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("regen");
+    // A schema removed from the generator must not survive in the scratch output of an earlier build.
+    let _ = std::fs::remove_dir_all(&out);
     let status = Command::new("python3").arg(dir.join("generate_schemas.py")).arg(&out).status();
     match status {
         Ok(s) if s.success() => compare(&schemas, &out),

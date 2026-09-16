@@ -10,6 +10,7 @@ build = "build.rs"
 
 [dependencies]
 dsip-core.workspace = true
+dsip-schema.workspace = true
 serde_json.workspace = true
 jsonschema.workspace = true
 aes-gcm.workspace = true
