@@ -23,12 +23,12 @@ use crate::embedded::SCHEMAS;
 pub const SCHEMA_NAMES: &[&str] = &[
     "invite", "progress", "answer", "reject", "cancel", "update", "info", "bye", "error", "hello", "introduction",
     "grant", "publish", "subscribe", "notify", "unpublish", "provenance", "key-rotation", "reachability-hint",
-    "webrtc-info-data", "envelope", "message",
+    "webrtc-info-data", "dtmf-info-data", "envelope", "message",
 ];
 
 /// `info.data` schemas by `about` (§12.12): validated for the bindings this implementation
 /// speaks; an unimplemented `about` leaves `data` unchecked (ignored, never rejected).
-pub const BINDING_DATA_SCHEMAS: &[(&str, &str)] = &[("transport:webrtc", "webrtc-info-data")];
+pub const BINDING_DATA_SCHEMAS: &[(&str, &str)] = &[("transport:webrtc", "webrtc-info-data"), ("media:dtmf", "dtmf-info-data")];
 
 fn compiled() -> &'static HashMap<&'static str, Validator> {
     static CELL: OnceLock<HashMap<&'static str, Validator>> = OnceLock::new();

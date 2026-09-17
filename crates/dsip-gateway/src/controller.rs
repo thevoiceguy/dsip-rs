@@ -86,6 +86,23 @@ impl GatewayCall {
                     let direction = m.get("direction").and_then(Value::as_str).unwrap_or("sendrecv");
                     out.push(json!({"sip": {"request": "re-INVITE", "direction": direction}}));
                 }
+                ("info", _) => {
+                    // G§9 (spec-gap 70): DTMF crosses as `info` about media:dtmf, and only while the call is up;
+                    // any other `about` belongs to the DSIP leg's own binding and is not carried to the PSTN
+                    let about = m.get("about").and_then(Value::as_str).unwrap_or("");
+                    if about != "media:dtmf" {
+                        out.push(json!({"ignore": format!("dsip info {about}")}));
+                    } else if !self.answered || self.dsip == "ended" {
+                        out.push(json!({"ignore": "dsip dtmf outside the established call"}));
+                    } else {
+                        let d = &m["data"];
+                        let mut sip = json!({"request": "INFO", "dtmf": d["digits"]});
+                        if let Some(ms) = d.get("duration_ms") {
+                            sip["duration_ms"] = ms.clone();
+                        }
+                        out.push(json!({ "sip": sip }));
+                    }
+                }
                 ("bye", _) => {
                     self.dsip = "ended";
                     if matches!(self.sip, "calling" | "early" | "confirmed") {
@@ -175,6 +192,21 @@ impl GatewayCall {
                             self.dsip = "ended";
                             out.push(json!({"dsip": {"local": "hangup", "reason": r["reason"]}}));
                             out.push(json!({"media": "release"}));
+                        }
+                    }
+                    (Some("INFO"), _) => {
+                        // G§9: SIP INFO dtmf-relay becomes an `info` about media:dtmf on the DSIP leg (spec-gap 70)
+                        out.push(json!({"sip": {"response": 200}}));
+                        if let Some(digits) = s.get("dtmf") {
+                            if self.answered && self.dsip != "ended" {
+                                let mut data = json!({"digits": digits});
+                                if let Some(ms) = s.get("duration_ms") {
+                                    data["duration_ms"] = ms.clone();
+                                }
+                                out.push(json!({"dsip": {"local": "info", "about": "media:dtmf", "data": data}}));
+                            } else {
+                                out.push(json!({"ignore": "sip dtmf outside the established call"}));
+                            }
                         }
                     }
                     (Some("REFER"), _) => out.push(json!({"sip": {"response": 603}})),
