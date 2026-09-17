@@ -290,3 +290,26 @@ fn hub_move_on_real_mls() {
         "roster": new_view.roster(&ctx).unwrap()}));
     assert_eq!(new_hub.step(&dep)[0]["accepted"]["seq"], 3);
 }
+
+#[test]
+fn previous_epoch_application_still_decrypts() {
+    // M§6.5 rule 3: the hub accepts an application message for the previous epoch, so a member that has already merged
+    // the next commit must still read it (a receipt racing a rekey).
+    let resolver = StaticResolver::default();
+    let ctx = Context::new(NOW, &resolver);
+    let caps = ["dsip.signaling", "dsip.messaging"];
+    let (_, alice_dev) = device("alice", "alice-phone", &caps);
+    let (_, bob_dev) = device("bob", "bob-phone", &caps);
+    let conv = json!({"conversation": ulid(30), "kind": "direct", "hub": {"did": HUB}, "successor_of": null});
+    let mut ag = alice_dev.create_group(&ulid(31).into_bytes(), &serde_json::to_vec(&conv).unwrap()).unwrap();
+    let (kp, _) = authenticate_key_package(&bob_dev.key_package().unwrap(), alice_dev.provider(), &ctx).unwrap();
+    let (_, welcome, _) = ag.add_members(alice_dev.provider(), &alice_dev.signer(), &[kp]).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let mut bg = bob_dev.join(&bytes(&welcome)).unwrap();
+    let late = bytes(&bg.create_message(bob_dev.provider(), &bob_dev.signer(), b"{\"late\":1}").unwrap());
+    ag.self_update(alice_dev.provider(), &alice_dev.signer(), LeafNodeParameters::default()).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let pm = MlsMessageIn::tls_deserialize(&mut &late[..]).unwrap().try_into_protocol_message().unwrap();
+    let processed = ag.process_message(alice_dev.provider(), pm).expect("previous-epoch message decrypts");
+    assert!(matches!(processed.into_content(), ProcessedMessageContent::ApplicationMessage(_)));
+}

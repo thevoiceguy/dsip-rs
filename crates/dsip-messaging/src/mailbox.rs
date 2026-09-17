@@ -532,7 +532,9 @@ impl Mailbox {
             return Self::error(&e["from"], &e["id"], "transport.unknown-recipient");
         }
         let who = s(&e["from_identity"]);
-        if !(self.admit == "open" || who == target || self.grant_ok(&e["grant"], &who, &target)) {
+        // M§7.5 (spec-gap 61): a registered predecessor authorizes a successor creator's fetch, as it does the welcome
+        let successor = e["successor_of"].as_str().is_some_and(|g| self.groups.contains_key(g));
+        if !(self.admit == "open" || who == target || successor || self.grant_ok(&e["grant"], &who, &target)) {
             return Self::error(&e["from"], &e["id"], "policy.first-contact-required");
         }
         let mut served = serde_json::Map::new();
