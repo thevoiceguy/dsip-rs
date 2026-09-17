@@ -5,8 +5,9 @@
 # deposit's manifest names it. Bob's mailbox (sync mode) fetches it on receipt, verifies the hash and size, keeps a
 # copy, and names its own copy in the items it serves. Alice's mailbox then crashes: Bob's device comes back and plays
 # the message from his own mailbox. With Alice's mailbox back, a replicated copy that has been damaged fails the
-# device's hash check and the device falls back to the original; and a message larger than Bob's mailbox accepts is
-# not replicated at all. Needs ffmpeg (libopus). Self-verifying.
+# device's hash check and the device falls back to the original; a fetch that finds nothing to serve is tried again
+# until it succeeds; and a message larger than Bob's mailbox accepts is not replicated at all. Needs ffmpeg (libopus).
+# Self-verifying.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -40,6 +41,7 @@ crash() { kill -9 "$1"; wait "$1" 2>/dev/null || true; }
 echo "=== two voice messages (Ogg Opus)"
 ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=440:duration=2" -c:a libopus -b:a 24k "$DIR/short.ogg"
 ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=550:duration=2" -c:a libopus -b:a 24k "$DIR/second.ogg"
+ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=660:duration=2" -c:a libopus -b:a 24k "$DIR/third.ogg"
 ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=330:duration=6" -c:a libopus -b:a 48k "$DIR/long.ogg"
 SHORT_SHA=$(sha256sum "$DIR/short.ogg" | cut -d' ' -f1); LONG_SHA=$(sha256sum "$DIR/long.ogg" | cut -d' ' -f1)
 LONG_SIZE=$(stat -c %s "$DIR/long.ogg")
@@ -89,14 +91,27 @@ wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 2 30
 wait_for "$DIR/b.log" "^BLOB-SOURCE-REJECTED https://127.0.0.1:9572/blobs/$COPY: " 10
 grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9571/blobs/$COPY" || { echo "FAIL: the damaged copy was not rejected in favour of the original"; exit 1; }
 
-echo "=== Bob's mailbox now takes blobs only up to 4 KiB, so the next one is not replicated"
-echo "offline" >&4; wait_nth "$DIR/b.log" "^OK offline" 3 10; crash "$MBX_B"
-start_b --max-blob-bytes 4096; wait_nth "$DIR/mbx-b.log" "restored state" 1 20
-sleep 2
-echo "voice $DIR/long.ogg" >&3; wait_nth "$DIR/a.log" "^OK sent" 3 30
-wait_for "$DIR/mbx-b.log" "not replicating https://127.0.0.1:9571/blobs/[0-9a-f]+: \"too-large\"" 60
+echo "=== a fetch that finds nothing to serve is tried again until the blob is there (spec-gap 67)"
+crash "$MBX_B"
+echo "voice $DIR/third.ogg" >&3; wait_nth "$DIR/a.log" "^OK sent" 3 30
+THIRD=$(grep "^OK sent audio" "$DIR/a.log" | tail -1 | sed -E 's/.*blob=([0-9a-f]+).*/\1/')
+mv "$DIR/mbx-a/blobs/$THIRD" "$DIR/third.blob"          # the origin has nothing to serve for it, for now
+start_b; wait_nth "$DIR/mbx-b.log" "restored state" 1 20
+wait_for "$DIR/mbx-b.log" "not replicating https://127.0.0.1:9571/blobs/$THIRD: \"unavailable\" \(attempt 1, again in [0-9]+s\)" 40
+mv "$DIR/third.blob" "$DIR/mbx-a/blobs/$THIRD"          # …and now it has
+wait_for "$DIR/mbx-b.log" "replicated blob $THIRD " 60
 echo "live" >&4
 wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 3 60
+grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9572/blobs/$THIRD" || { echo "FAIL: the retried copy was not used"; exit 1; }
+
+echo "=== Bob's mailbox now takes blobs only up to 4 KiB, so the next one is not replicated"
+echo "offline" >&4; wait_nth "$DIR/b.log" "^OK offline" 3 20; crash "$MBX_B"
+start_b --max-blob-bytes 4096; wait_nth "$DIR/mbx-b.log" "restored state" 1 20
+sleep 2
+echo "voice $DIR/long.ogg" >&3; wait_nth "$DIR/a.log" "^OK sent" 4 30
+wait_for "$DIR/mbx-b.log" "not replicating https://127.0.0.1:9571/blobs/[0-9a-f]+: \"too-large\"" 60
+echo "live" >&4
+wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 4 60
 grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9571/blobs/" || { echo "FAIL: the second message did not come from the original"; exit 1; }
 [ "$(grep '^RECV-AUDIO' "$DIR/b.log" | tail -1 | sed -E 's/.* sha256=([0-9a-f]+) .*/\1/')" = "$LONG_SHA" ] || { echo "FAIL: second audio differs"; exit 1; }
 sleep 1
@@ -107,4 +122,5 @@ echo "=== Bob played:"; grep "^RECV-AUDIO" "$DIR/b.log" | sed -E 's/ file=[^ ]+/
 echo "=== Bob's mailbox:"; grep -E "replicated blob|not replicating" "$DIR/mbx-b.log" | sed 's/.*dsip_mailbox[^ ]* /  /'
 echo
 echo "PASS: a member mailbox replicated a verified blob and served its own copy while the origin was down; a damaged copy"
-echo "      failed the device's check and the original served it; a blob over the limit ($LONG_SIZE bytes) stayed at the origin."
+echo "      failed the device's check and the original served it; a fetch with nothing to serve was retried until it"
+echo "      succeeded; a blob over the limit ($LONG_SIZE bytes) stayed at the origin."

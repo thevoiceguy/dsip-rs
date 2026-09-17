@@ -588,6 +588,11 @@ impl Mailbox {
     }
 }
 
+/// Attempts a member mailbox makes at replicating one blob before leaving it at its origin.
+///
+/// Spec: M§8.4 rule 6 (SHOULD replicate). Impl (spec-gap 67).
+pub const BLOB_REPLICATION_ATTEMPTS: i64 = 5;
+
 /// Whether a member mailbox replicates a manifest blob (no `fetched`), and whether it keeps what it fetched.
 ///
 /// Spec: M§8.4 rule 6 — a member mailbox of a `sync`-mode owner SHOULD replicate every manifest blob on receipt,
@@ -612,10 +617,13 @@ pub fn blob_replicate(inp: &Value) -> Value {
         return json!({"action": "fetch"});
     };
     if f["status"] != 200 {
-        return json!({"action": "discard", "reason": "unavailable"});
+        // spec-gap 67: the origin was unreachable or had nothing to serve — worth trying again, boundedly
+        let attempts = inp["max_attempts"].as_i64().unwrap_or(BLOB_REPLICATION_ATTEMPTS);
+        return json!({"action": "discard", "reason": "unavailable", "retry": inp["attempt"].as_i64().unwrap_or(1) < attempts});
     }
     if f["sha256"] != e["sha256"] || f["size"] != e["size"] {
-        return json!({"action": "discard", "reason": "mismatch"});
+        // the origin served something else: retrying fetches the same wrong bytes
+        return json!({"action": "discard", "reason": "mismatch", "retry": false});
     }
     json!({"action": "store"})
 }

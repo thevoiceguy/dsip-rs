@@ -134,6 +134,8 @@ struct Service {
     retry: HashMap<(String, String, String), (i64, i64, i64)>,
     /// Manifest blobs of newly stored items, waiting to be replicated (M§8.4 rule 6, spec-gap 65).
     replicate: Vec<Value>,
+    /// Blobs whose replication is still to be tried again: `(entry, attempts so far, next attempt at)` (spec-gap 67).
+    replicate_later: Vec<(Value, i64, i64)>,
     /// Welcome deposits in flight, by deposit id: `(group, added identity, the commit's seq)` (spec-gap 66). A welcome
     /// carries no `seq` on the wire (M§5.2), so its acknowledgement is matched here to release the hub's queue.
     welcomes_sent: HashMap<String, (String, String, i64)>,
@@ -183,6 +185,7 @@ impl Service {
             "hub_refs": self.hub_refs,
             "revocations": self.revocations.iter().map(compact).collect::<Vec<_>>(),
             "welcomes_sent": self.welcomes_sent.iter().map(|(id, (g, i, s))| json!([id, g, i, s])).collect::<Vec<_>>(),
+            "replicate_later": self.replicate_later.iter().map(|(e, n, at)| json!([e, n, at])).collect::<Vec<_>>(),
             "seen": self.seen.entries(),
         });
         let bytes = serde_json::to_vec(&state).unwrap_or_default();
@@ -222,6 +225,9 @@ impl Service {
                 Some(Envelope { protected: parts.next()?.into(), payload: parts.next()?.into(), signature: parts.next()?.into() })
             })
             .collect();
+        for r in v["replicate_later"].as_array().into_iter().flatten() {
+            self.replicate_later.push((r[0].clone(), r[1].as_i64().unwrap_or(1), r[2].as_i64().unwrap_or(0)));
+        }
         for w in v["welcomes_sent"].as_array().into_iter().flatten() {
             self.welcomes_sent.insert(s_of(&w[0]), (s_of(&w[1]), s_of(&w[2]), w[3].as_i64().unwrap_or(0)));
         }
@@ -592,6 +598,7 @@ async fn main() -> Result<()> {
         state_dir: args.state.clone(),
         retry: HashMap::new(),
         replicate: vec![],
+        replicate_later: vec![],
         welcomes_sent: HashMap::new(),
     }));
     std::fs::create_dir_all(args.state.join("blobs"))?;
@@ -612,6 +619,14 @@ async fn main() -> Result<()> {
             tick.tick().await;
             let mut st = retry_service.lock().await;
             st.retry_fanout(&retry_service, restarted);
+            let now = now_s();
+            let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut st.replicate_later).into_iter().partition(|(_, _, at)| *at <= now);
+            st.replicate_later = waiting;
+            drop(st);
+            for (entry, attempt, _) in due {
+                let service = retry_service.clone();
+                tokio::spawn(async move { replicate_blob(service, entry, attempt).await });
+            }
             restarted = false;
         }
     });
@@ -754,7 +769,7 @@ fn https_client(ca: Option<&std::path::Path>) -> Result<reqwest::Client> {
 }
 
 /// Replicate one manifest blob into this mailbox, as the pinned decision says (M§8.4 rule 6, spec-gap 65).
-async fn replicate_blob(service: Arc<Mutex<Service>>, entry: Value) {
+async fn replicate_blob(service: Arc<Mutex<Service>>, entry: Value, attempt: i64) {
     let (decision, http, path) = {
         let st = service.lock().await;
         let sha = entry["sha256"].as_str().unwrap_or("").to_string();
@@ -762,7 +777,7 @@ async fn replicate_blob(service: Arc<Mutex<Service>>, entry: Value) {
         let path = st.blob_dir.join(&sha);
         let stored = if valid && path.exists() { vec![sha] } else { vec![] };
         let d = dsip_messaging::mailbox::blob_replicate(&json!({"mode": st.mailbox.mode(), "max_blob_bytes": st.max_blob_bytes,
-            "stored": stored, "entry": entry}));
+            "stored": stored, "entry": entry, "attempt": attempt}));
         if !valid {
             return;
         }
@@ -794,13 +809,21 @@ async fn replicate_blob(service: Arc<Mutex<Service>>, entry: Value) {
         Some(body) => json!({"status": 200, "sha256": hex_sha256(body), "size": body.len()}),
         None => json!({"status": 0}),
     };
-    let d = dsip_messaging::mailbox::blob_replicate(&json!({"entry": entry, "fetched": f}));
+    let d = dsip_messaging::mailbox::blob_replicate(&json!({"entry": entry, "fetched": f, "attempt": attempt}));
     match (d["action"].as_str(), fetched) {
         (Some("store"), Some(body)) => {
             let tmp = path.with_extension("part");
             if std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
                 tracing::info!("replicated blob {} ({} bytes) from {uri}", entry["sha256"].as_str().unwrap_or(""), body.len());
             }
+        }
+        _ if d["retry"] == json!(true) => {
+            // spec-gap 67: the origin had nothing to serve just now; try again, with the fan-out backoff
+            let delay = (RETRY_FIRST_S * (1 << (attempt - 1).min(4))).min(RETRY_MAX_S);
+            let mut st = service.lock().await;
+            st.replicate_later.push((entry.clone(), attempt + 1, now_s() + delay));
+            st.persist();
+            tracing::info!("not replicating {uri}: {} (attempt {attempt}, again in {delay}s)", d["reason"]);
         }
         _ => tracing::info!("not replicating {uri}: {}", d["reason"]),
     }
@@ -934,7 +957,7 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
     }
     for entry in std::mem::take(&mut st.replicate) {
         let service = service.clone();
-        tokio::spawn(async move { replicate_blob(service, entry).await });
+        tokio::spawn(async move { replicate_blob(service, entry, 1).await });
     }
     st.persist();
     replies
