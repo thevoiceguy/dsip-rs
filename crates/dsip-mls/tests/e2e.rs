@@ -313,3 +313,78 @@ fn previous_epoch_application_still_decrypts() {
     let processed = ag.process_message(alice_dev.provider(), pm).expect("previous-epoch message decrypts");
     assert!(matches!(processed.into_content(), ProcessedMessageContent::ApplicationMessage(_)));
 }
+
+#[test]
+fn external_join_on_real_mls() {
+    // M§6.8 (spec-gap 62): a new device of a member identity, and a device that lost its group state, join by external
+    // commit from the latest GroupInfo; the hub's public view names the joiner; a stranger is refused.
+    let resolver = StaticResolver::default();
+    let ctx = Context::new(NOW, &resolver);
+    let caps = ["dsip.signaling", "dsip.messaging"];
+    let (alice, alice_dev) = device("alice", "alice-phone", &caps);
+    let (bob, bob_phone) = device("bob", "bob-phone", &caps);
+    let (_, bob_tablet) = device("bob", "bob-tablet", &caps);
+    let (carol, carol_dev) = device("carol", "carol-phone", &caps);
+    let conv = json!({"conversation": ulid(40), "kind": "direct", "hub": {"did": HUB}, "successor_of": null});
+    let mut ag = alice_dev.create_group(&ulid(41).into_bytes(), &serde_json::to_vec(&conv).unwrap()).unwrap();
+    let gi = ag.export_group_info(alice_dev.provider().crypto(), &alice_dev.signer(), true).unwrap();
+    let mut view = HubView::from_group_info(&bytes(&gi)).unwrap();
+    let (kp, _) = authenticate_key_package(&bob_phone.key_package().unwrap(), alice_dev.provider(), &ctx).unwrap();
+    let (commit, _welcome, _) = ag.add_members(alice_dev.provider(), &alice_dev.signer(), &[kp]).unwrap();
+    view.observe_commit(&bytes(&commit), &ctx).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let mut hub = Hub::new(&json!({"now": NOW, "kind": "direct", "epoch": 1, "next_seq": 2,
+        "roster": {alice.clone(): [alice_dev.did()], bob.clone(): [bob_phone.did()]}}));
+    let deposit = |hub: &mut Hub, id: u8, dev: &str, identity: &str, bytes: &[u8], commit: Value| {
+        let (_, e, _) = message_header(bytes).unwrap();
+        hub.step(&json!({"deposit": {"id": ulid(id), "device": dev, "identity": identity, "class": "handshake", "epoch": e,
+            "digest": digest(bytes), "commit": commit}}))
+    };
+
+    // Bob's tablet: no welcome, no sibling online — it joins from the GroupInfo.
+    let gi = bytes(&ag.export_group_info(alice_dev.provider().crypto(), &alice_dev.signer(), true).unwrap());
+    let (mut tg, ext) = bob_tablet.external_join(&gi).unwrap();
+    let ext = bytes(&ext);
+    let observed = view.observe_commit(&ext, &ctx).unwrap();
+    assert_eq!(observed["external"], true);
+    assert_eq!(observed["adds"], json!([{"identity": bob, "device": bob_tablet.did()}]));
+    assert_eq!(observed["removes"], json!([]));
+    assert!(deposit(&mut hub, 42, &bob_tablet.did(), &bob, &ext, observed)[0].get("accepted").is_some());
+    // Alice processes it and can read the tablet.
+    let pm = MlsMessageIn::tls_deserialize(&mut &ext[..]).unwrap().try_into_protocol_message().unwrap();
+    let processed = ag.process_message(alice_dev.provider(), pm).unwrap();
+    assert!(matches!(processed.sender(), Sender::NewMemberCommit));
+    let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else { panic!("commit") };
+    let described = dsip_mls::external_commit(&ag, &staged, &ctx).unwrap();
+    assert_eq!(described["joiner"], json!({"identity": bob, "device": bob_tablet.did()}));
+    ag.merge_staged_commit(alice_dev.provider(), *staged).unwrap();
+    let hello = bytes(&tg.create_message(bob_tablet.provider(), &bob_tablet.signer(), b"{}").unwrap());
+    let pm = MlsMessageIn::tls_deserialize(&mut &hello[..]).unwrap().try_into_protocol_message().unwrap();
+    assert!(ag.process_message(alice_dev.provider(), pm).is_ok());
+
+    // Bob's phone lost its state: the same device key, a fresh store. Its external commit removes its old leaf.
+    let (_, phone_again) = device("bob", "bob-phone", &caps);
+    let gi = bytes(&ag.export_group_info(alice_dev.provider().crypto(), &alice_dev.signer(), true).unwrap());
+    let (_pg, ext) = phone_again.external_join(&gi).unwrap();
+    let ext = bytes(&ext);
+    let observed = view.observe_commit(&ext, &ctx).unwrap();
+    assert_eq!(observed["adds"], json!([{"identity": bob, "device": bob_phone.did()}]));
+    assert_eq!(observed["removes"], json!([{"identity": bob, "device": bob_phone.did()}]));
+    assert!(deposit(&mut hub, 43, &bob_phone.did(), &bob, &ext, observed)[0].get("accepted").is_some());
+    let pm = MlsMessageIn::tls_deserialize(&mut &ext[..]).unwrap().try_into_protocol_message().unwrap();
+    let ProcessedMessageContent::StagedCommitMessage(staged) = ag.process_message(alice_dev.provider(), pm).unwrap().into_content() else {
+        panic!("commit")
+    };
+    assert_eq!(dsip_mls::external_commit(&ag, &staged, &ctx).unwrap()["removes"], json!([{"identity": bob, "device": bob_phone.did()}]));
+    ag.merge_staged_commit(alice_dev.provider(), *staged).unwrap();
+
+    // Carol was never in the group: the view describes the join, the hub refuses it.
+    let gi = bytes(&ag.export_group_info(alice_dev.provider().crypto(), &alice_dev.signer(), true).unwrap());
+    let (_cg, ext) = carol_dev.external_join(&gi).unwrap();
+    let ext = bytes(&ext);
+    let mut probe = HubView::load(&view.save()).unwrap();
+    let observed = probe.observe_commit(&ext, &ctx).unwrap();
+    assert_eq!(observed["adds"], json!([{"identity": carol, "device": carol_dev.did()}]));
+    assert_eq!(deposit(&mut hub, 44, &carol_dev.did(), &carol, &ext, observed)[0]["error"]["reason"], "policy.blocked");
+}
+

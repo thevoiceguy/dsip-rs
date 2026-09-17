@@ -298,6 +298,28 @@ pub fn check_conversation_update(before: &Value, after: &Value) -> Value {
     accept_effective(json!({"moves_to": if moved { after["hub"]["did"].clone() } else { Value::Null }, "hub": after["hub"]}))
 }
 
+/// What an external commit may do, checked alike by the hub and every member.
+///
+/// Spec: M§6.8 — a device joins by external commit only into a group its identity is already in, or its own personal
+/// group, removing that identity's stale leaves it replaces. Impl (spec-gap 62): the joiner is the identity and device
+/// of the commit's own leaf; the commit adds exactly that device and removes only leaves of the joiner's identity.
+pub fn check_external_join(inp: &Value) -> Value {
+    let j = &inp["joiner"];
+    let adds: Vec<(&Value, &Value)> = inp["adds"].as_array().into_iter().flatten().map(|a| (&a["identity"], &a["device"])).collect();
+    if adds != [(&j["identity"], &j["device"])] {
+        return reject("external-join-adds", None);
+    }
+    let member = inp["roster"].as_array().into_iter().flatten().any(|i| *i == j["identity"]);
+    let own_personal = inp["kind"] == "personal" && inp["owner"] == j["identity"];
+    if !(member || own_personal) {
+        return reject("external-join-not-member", None);
+    }
+    if inp["removes"].as_array().into_iter().flatten().any(|r| r["identity"] != j["identity"]) {
+        return reject("external-join-removes-other", None);
+    }
+    accept()
+}
+
 /// Schema plus kind fallback for the `dsip_conversation` GroupContext extension.
 ///
 /// Spec: M§6.3 — an unknown conversation kind is handled as `group`.

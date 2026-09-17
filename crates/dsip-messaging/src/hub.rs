@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::checks::check_external_join;
+
 /// Hub state for one group.
 #[derive(Serialize, Deserialize)]
 pub struct Hub {
@@ -147,9 +149,11 @@ impl Hub {
         let commit = d.get("commit");
         let external = commit.is_some_and(|c| c["external"].as_bool().unwrap_or(false));
         if external {
-            // M§6.8
-            let own_personal = self.kind == "personal" && self.owner.as_deref() == Some(ident.as_str());
-            if !(self.roster.contains_key(&ident) || own_personal) {
+            // M§6.8 (spec-gap 62): the same check every member makes
+            let c = commit.cloned().unwrap_or(Value::Null);
+            let v = check_external_join(&json!({"kind": self.kind, "owner": self.owner, "roster": self.roster.keys().collect::<Vec<_>>(),
+                "joiner": {"identity": ident, "device": d["device"]}, "adds": c["adds"], "removes": c["removes"]}));
+            if v["verdict"] != "accept" {
                 return Self::error(d, "policy.blocked");
             }
         } else if !self.roster.contains_key(&ident) {
