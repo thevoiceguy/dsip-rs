@@ -52,7 +52,7 @@ use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, CommitRetry, History, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, member_identity, message_header, Device, MlsError};
+use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
 use dsip_transport::{now_s, tls};
@@ -984,6 +984,70 @@ impl Client {
         Ok(())
     }
 
+    /// Groups this identity's mailbox holds a GroupInfo for that this device is not in (M§6.8).
+    fn available(&self) -> Result<()> {
+        for (key, v) in self.mls.provider().list_state("group_info:").map_err(Self::state_err)? {
+            let gid = key.trim_start_matches("group_info:").to_string();
+            if self.convs.contains_key(&gid) {
+                continue;
+            }
+            let conv = dsip_mls::group_info_conversation(&unb64(&v)).unwrap_or(Value::Null);
+            println!("AVAILABLE group={gid} conversation={} kind={}", conv["conversation"].as_str().unwrap_or("?"), conv["kind"].as_str().unwrap_or("?"));
+        }
+        Ok(())
+    }
+
+    /// Join a group by external commit from the latest GroupInfo in this identity's mailbox: a new device with no
+    /// sibling online, or a device that lost its group state (M§6.8, spec-gap 62). Refusals are handled as the pinned
+    /// [`CommitRetry`] decides; a stale GroupInfo is replaced by syncing.
+    async fn rejoin(&mut self, gid: &str) -> Result<()> {
+        let mut retry = CommitRetry::new(&json!({}));
+        loop {
+            let gi = self.mls.provider().get_state(&format!("group_info:{gid}")).map_err(Self::state_err)?
+                .context("no GroupInfo for that group in this mailbox; sync first")?;
+            // Whatever this device held for the group is superseded by the join (MLS resync removes its old leaf).
+            self.convs.remove(gid);
+            let (group, commit) = self.mls.external_join(&unb64(&gi)).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let conv: Value = conversation_extension(&group).and_then(|b| serde_json::from_slice(&b).ok()).context("no dsip_conversation")?;
+            let epoch = group.epoch().as_u64();
+            self.add_conv(group, &conv);
+            let reply = self.hub_deposit(gid, "handshake", json!({"mls": b64(&commit.tls_serialize_detached()?)})).await?;
+            let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
+            let mut must_sync = false;
+            for action in retry.answer(reason.as_deref()) {
+                if action.get("merge").is_some() {
+                    // the external commit is already applied locally (OpenMLS stores it merged)
+                    self.history.step(&json!({"joined": {"group": gid, "epoch": epoch}}));
+                    self.save_groups()?;
+                    self.mls.provider().put_state(&format!("joined:{gid}"), &json!(epoch)).map_err(Self::state_err)?;
+                    println!("OK rejoined {} kind={} epoch={epoch} seq={}", conv["conversation"].as_str().unwrap_or(""), conv["kind"].as_str().unwrap_or(""), reply["seq"]);
+                    return self.publish_group_info(gid).await;
+                }
+                if action.get("discard").is_some() {
+                    if let Some(mut c) = self.convs.remove(gid) {
+                        c.group.delete(self.mls.provider().storage()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    }
+                    self.save_groups()?;
+                }
+                if let Some(r) = action.get("surface") {
+                    bail!("rejoin refused by the hub: {}", r.as_str().unwrap_or(""));
+                }
+                if action.get("sync").is_some() {
+                    must_sync = true;
+                }
+            }
+            if must_sync {
+                println!("CONFLICT rejoin: {} at epoch {epoch}; syncing for a newer GroupInfo", reason.as_deref().unwrap_or(""));
+                self.sync_all().await?;
+            }
+            for action in retry.synced(true, false) {
+                if let Some(r) = action.get("surface") {
+                    bail!("rejoin refused by the hub: {}", r.as_str().unwrap_or(""));
+                }
+            }
+        }
+    }
+
     async fn add(&mut self, group: &str, peer: &str, grant: Option<String>, kp: Option<KeyPackage>) -> Result<()> {
         let kp = match kp {
             Some(k) => k,
@@ -1482,6 +1546,18 @@ impl Client {
             self.resume.commit(item, false);
             return self.save_resume();
         }
+        if class == "group-info" {
+            // M§6.8: the latest GroupInfo per group is what this device can join by external commit from
+            let gid = item["group"].as_str().unwrap_or("").to_string();
+            self.resume.commit(item, false);
+            let p = self.mls.provider();
+            p.atomically(|| {
+                p.put_state(&format!("group_info:{gid}"), &item["mls"])?;
+                p.put_state("resume", &self.resume.snapshot())
+            })
+            .map_err(Self::state_err)?;
+            return Ok(());
+        }
         if !matches!(class.as_str(), "welcome" | "handshake" | "application") {
             self.resume.commit(item, false);
             return self.save_resume();
@@ -1513,13 +1589,13 @@ impl Client {
         let before = self.resume.clone();
         let crash = std::mem::take(&mut self.crash_next);
         let mut slot = if class == "welcome" { None } else { self.convs.remove(&gid) };
-        let (mls, resume) = (&self.mls, &mut self.resume);
+        let (mls, resume, me) = (&self.mls, &mut self.resume, self.identity.as_str());
         let result = mls.provider().atomically(|| {
             let target = slot.as_mut().map(|c| {
                 let Conv { group, conversation, kind, .. } = c;
                 (group, conversation.as_str(), kind.as_str())
             });
-            let outcome = process(mls, target, &class, &bytes, &ctx)?;
+            let outcome = process(mls, target, &class, &bytes, &ctx, me)?;
             if crash {
                 // Processed, MLS state written inside the transaction, never committed.
                 println!("CRASH {class} {cursor} processed, not committed");
@@ -1713,7 +1789,7 @@ fn ogg_opus_duration_ms(bytes: &[u8]) -> Option<i64> {
 
 /// The MLS side of one item, with no I/O, so it can run inside the item's transaction. `group` is the target group
 /// with its conversation id and kind; a welcome needs none.
-fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &str)>, class: &str, bytes: &[u8], ctx: &Context) -> Result<Outcome, MlsError> {
+fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &str)>, class: &str, bytes: &[u8], ctx: &Context, me: &str) -> Result<Outcome, MlsError> {
     if class == "welcome" {
         let joined = match mls.join(bytes) {
             Ok(g) => g,
@@ -1733,7 +1809,8 @@ fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &st
         Sender::Member(idx) => member_identity(group, *idx, ctx).ok(),
         _ => None,
     };
-    let (sender, sender_device) = who.map(|w| (w.identity, w.device)).unwrap_or_default();
+    let external = matches!(processed.sender(), Sender::NewMemberCommit);
+    let (mut sender, sender_device) = who.map(|w| (w.identity, w.device)).unwrap_or_default();
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app) => {
             let obj: Value = serde_json::from_slice(&app.into_bytes()).map_err(mls_err("content json"))?;
@@ -1748,10 +1825,31 @@ fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &st
             Ok(Outcome::Object { sender, sender_device, object: obj })
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
-            let added: Vec<String> = staged
+            let mut joined_externally = vec![];
+            if external {
+                // M§6.8 (spec-gap 62): every member checks an external join as the hub did, before applying it
+                let described = match external_commit(group, &staged, ctx) {
+                    Ok(d) => d,
+                    Err(e) => return Ok(Outcome::Dropped(format!("external commit: {e}"))),
+                };
+                let mut roster: Vec<String> = group.members().filter_map(|m| member_identity(group, m.index, ctx).ok()).map(|w| w.identity).collect();
+                roster.sort();
+                roster.dedup();
+                let mut inp = described.clone();
+                inp["kind"] = json!(kind);
+                inp["owner"] = json!(if kind == "personal" { me } else { "" });
+                inp["roster"] = json!(roster);
+                let v = dsip_messaging::checks::check_external_join(&inp);
+                if v["verdict"] != "accept" {
+                    return Ok(Outcome::Dropped(format!("external join refused: {}", v["code"])));
+                }
+                sender = described["joiner"]["identity"].as_str().unwrap_or("").to_string();
+                joined_externally.push(format!("{}#{}", sender, described["joiner"]["device"].as_str().unwrap_or("")));
+            }
+            let added: Vec<String> = joined_externally.into_iter().chain(staged
                 .add_proposals()
                 .filter_map(|a| dsip_mls::authenticate_leaf_node(a.add_proposal().key_package().leaf_node(), ctx).ok())
-                .map(|w| format!("{}#{}", w.identity, w.device))
+                .map(|w| format!("{}#{}", w.identity, w.device)))
                 .collect();
             let removed_leaves: Vec<LeafNodeIndex> = staged.remove_proposals().map(|r| r.remove_proposal().removed()).collect();
             // A removed leaf may no longer authenticate (a revoked delegation, spec-gap 57): render it by its credential.
@@ -2017,6 +2115,8 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "remove-leaf" => client.remove_leaf(rest.trim()).await,
         "remove" => client.remove(rest.trim()).await,
         "successor" => client.create_successor().await,
+        "available" => client.available(),
+        "rejoin" => client.rejoin(rest.trim()).await,
         "move-hub" => {
             // M§7.4: move the active group to another hub, by default this identity's own mailbox
             let group = client.active()?;

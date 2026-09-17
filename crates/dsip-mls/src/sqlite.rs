@@ -84,6 +84,21 @@ impl SqliteProvider {
             .map_err(err("put state"))
     }
 
+    /// Every application state entry whose key starts with `prefix`, in key order.
+    pub fn list_state(&self, prefix: &str) -> Result<Vec<(String, Value)>, MlsError> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM dsip_device_state WHERE key >= ?1 ORDER BY key").map_err(err("list state"))?;
+        let rows = stmt.query_map([prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(err("list state"))?;
+        let mut out = vec![];
+        for row in rows {
+            let (k, v) = row.map_err(err("list state"))?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            out.push((k, serde_json::from_str(&v).map_err(err("state json"))?));
+        }
+        Ok(out)
+    }
+
     /// The application state value under `key`, if stored.
     pub fn get_state(&self, key: &str) -> Result<Option<Value>, MlsError> {
         let text: Option<String> = self

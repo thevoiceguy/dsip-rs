@@ -1085,7 +1085,13 @@ fn hub_deposit(
                 let kind = conv["kind"].as_str().unwrap_or("direct");
                 // M§7.4 (spec-gap 60): a group moved here continues the numbering its previous hub reached
                 let next_seq = p["handover_seq"].as_i64().map_or(1, |h| h + 1);
-                let hub = Hub::new(&json!({"now": now, "kind": kind, "epoch": view.epoch(), "roster": roster, "next_seq": next_seq}));
+                let mut ctx_hub = json!({"now": now, "kind": kind, "epoch": view.epoch(), "roster": roster, "next_seq": next_seq});
+                if kind == "personal" {
+                    // Impl (spec-gap 62): a personal group is hubbed at its owner's mailbox (M§7.1), so the owner — who may
+                    // re-join it by external commit with no leaf left (M§6.8) — is the identity this mailbox serves
+                    ctx_hub["owner"] = json!(st.owner);
+                }
+                let hub = Hub::new(&ctx_hub);
                 st.hubs.insert(group.clone(), hub);
                 tracing::info!("hubbing {kind} group {group} from epoch {} at seq {next_seq}", view.epoch());
                 st.conversations.insert(group.clone(), conv);

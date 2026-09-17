@@ -204,6 +204,34 @@ impl<P: OpenMlsProvider> Device<P> {
         Ok(commit)
     }
 
+    /// Join a group by external commit from a TLS-serialized GroupInfo carrying the ratchet tree. A leaf of this same
+    /// device key already in the group is removed by the commit (MLS resync). The group is stored with the commit
+    /// applied: if the hub refuses the commit, [`MlsGroup::delete`] it.
+    ///
+    /// Spec: M§6.8, M§6.4 (the external commit is a PublicMessage the hub validates).
+    pub fn external_join(&self, group_info: &[u8]) -> Result<(MlsGroup, MlsMessageOut), MlsError> {
+        let msg = MlsMessageIn::tls_deserialize(&mut &group_info[..]).map_err(err("group info bytes"))?;
+        let MlsMessageBodyIn::GroupInfo(gi) = msg.extract() else { return Err(MlsError("not a group info".into())) };
+        let config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .max_past_epochs(PAST_EPOCHS)
+            .use_ratchet_tree_extension(true)
+            .build();
+        let leaf = LeafNodeParameters::builder().with_capabilities(capabilities()).with_extensions(self.leaf_extensions()?).build();
+        let (group, bundle) = MlsGroup::external_commit_builder()
+            .with_config(config)
+            .build_group(&self.provider, gi, self.credential_with_key())
+            .map_err(err("external commit"))?
+            .leaf_node_parameters(leaf)
+            .load_psks(self.provider.storage())
+            .map_err(err("external commit psks"))?
+            .build(self.provider.rand(), self.provider.crypto(), &self.signer(), |_| true)
+            .map_err(err("external commit build"))?
+            .finalize(&self.provider)
+            .map_err(err("external commit finalize"))?;
+        Ok((group, bundle.into_commit()))
+    }
+
     /// Join a group from a TLS-serialized Welcome message.
     ///
     /// Spec: M§6.6, M§6.7. The caller authenticates every member afterwards ([`authenticate_members`]).
@@ -276,6 +304,46 @@ pub fn member_identity(group: &MlsGroup, index: LeafNodeIndex, ctx: &Context) ->
 /// Spec: M§6.3.
 pub fn conversation_extension(group: &MlsGroup) -> Option<Vec<u8>> {
     group.extensions().unknown(EXT_DSIP_CONVERSATION).map(|u| u.0.clone())
+}
+
+/// The `dsip_conversation` value a TLS-serialized GroupInfo carries, without joining.
+///
+/// Spec: M§6.3, M§6.8.
+pub fn group_info_conversation(group_info: &[u8]) -> Option<Value> {
+    let msg = MlsMessageIn::tls_deserialize(&mut &group_info[..]).ok()?;
+    let MlsMessageBodyIn::GroupInfo(gi) = msg.extract() else { return None };
+    let ext = gi.group_context().extensions().unknown(EXT_DSIP_CONVERSATION)?;
+    serde_json::from_slice(&ext.0).ok()
+}
+
+/// Describe an external commit the way [`dsip_messaging::checks::check_external_join`] takes it: `{joiner: {identity,
+/// device}, adds: [joiner], removes: [{identity, device}]}`, read before the commit is merged. A removed leaf that no
+/// longer authenticates is named by its credential with an empty identity — unless it is the joiner's own device.
+///
+/// Spec: M§6.8 — every member verifies an external join as the hub does.
+pub fn external_commit(group: &MlsGroup, staged: &StagedCommit, ctx: &Context) -> Result<Value, MlsError> {
+    let leaf = staged.update_path_leaf_node().ok_or_else(|| MlsError("external commit without a path".into()))?;
+    let who = authenticate_leaf_node(leaf, ctx).map_err(|c| MlsError(format!("external joiner: {c}")))?;
+    let joiner = json!({"identity": who.identity, "device": who.device});
+    let removes: Vec<Value> = staged
+        .remove_proposals()
+        .map(|r| {
+            let index = r.remove_proposal().removed();
+            match member_identity(group, index, ctx) {
+                Ok(w) => json!({"identity": w.identity, "device": w.device}),
+                Err(_) => {
+                    let device = group.public_group().leaf(index)
+                        .and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
+                        .map(|b| String::from_utf8_lossy(b.identity()).into_owned())
+                        .unwrap_or_default();
+                    // the joiner's own stale leaf (MLS resync) is the joiner's identity (spec-gap 62)
+                    let identity = if device == joiner["device"] { joiner["identity"].clone() } else { json!("") };
+                    json!({"identity": identity, "device": device})
+                }
+            }
+        })
+        .collect();
+    Ok(json!({"joiner": joiner, "adds": [joiner], "removes": removes}))
 }
 
 /// What a staged commit does to `dsip_conversation`, given the value before it: `None` when it leaves it unchanged,
@@ -417,6 +485,14 @@ impl HubView {
             moves_to = update["effective"]["moves_to"].as_str().map(String::from);
         }
         let mut adds = vec![];
+        if external {
+            // M§6.8: an external joiner is the commit's own path leaf, not an Add proposal
+            let joiner = staged.update_path_leaf_node().ok_or_else(|| MlsError("external commit without a path".into()))?;
+            match authenticate_leaf_node(joiner, ctx) {
+                Ok(who) => adds.push(json!({"identity": who.identity, "device": who.device})),
+                Err(_) => return Ok(json!({"adds": [], "removes": [], "valid": false})),
+            }
+        }
         for add in staged.add_proposals() {
             match authenticate_leaf_node(add.add_proposal().key_package().leaf_node(), ctx) {
                 Ok(who) => adds.push(json!({"identity": who.identity, "device": who.device})),
@@ -430,7 +506,12 @@ impl HubView {
             let identity = BasicCredential::try_from(leaf.credential().clone()).map(|b| b.identity().to_vec()).unwrap_or_default();
             match authenticate_leaf_node(leaf, ctx) {
                 Ok(who) => removes.push(json!({"identity": who.identity, "device": who.device})),
-                Err(_) => removes.push(json!({"identity": "", "device": String::from_utf8_lossy(&identity), "delegation_valid": false})),
+                Err(_) => {
+                    let device = String::from_utf8_lossy(&identity).into_owned();
+                    // An external joiner replacing its own stale leaf (MLS resync) is that leaf's identity (spec-gap 62)
+                    let own = adds.first().filter(|j| external && j["device"] == json!(device)).map(|j| j["identity"].clone());
+                    removes.push(json!({"identity": own.unwrap_or(json!("")), "device": device, "delegation_valid": false}))
+                }
             }
         }
         self.group.merge_commit(&self.storage, *staged).map_err(err("merge commit"))?;
