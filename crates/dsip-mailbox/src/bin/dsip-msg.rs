@@ -1383,7 +1383,19 @@ impl Client {
             let what = if kind == "read" { obj["through"].clone() } else { obj["targets"].clone() };
             let via = if target == group { "" } else { " (personal group)" };
             match reply["type"].as_str() {
-                Some("accepted") => println!("SENT-RECEIPT {kind} {what}{via}"),
+                Some("accepted") => {
+                    println!("SENT-RECEIPT {kind} {what}{via}");
+                    if kind == "read" {
+                        // spec-gap 68: our own watermark is history too — a device added later reads it from archive
+                        let seq = reply["seq"].as_i64().unwrap_or(0);
+                        let emissions = self.history.step(&json!({"sent": {"group": target, "seq": seq, "id": object_key(&obj),
+                            "object": "receipt"}}));
+                        if emissions.iter().any(|e| e.get("archive").is_some()) {
+                            let (me, device) = (self.identity.clone(), self.keys.device.did());
+                            self.archive_object(&target, &obj, &me, &device, seq);
+                        }
+                    }
+                }
                 _ => println!("ERR receipt refused: {}", reply["reason"]),
             }
         }
