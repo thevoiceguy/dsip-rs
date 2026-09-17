@@ -64,6 +64,12 @@ fn err<E: std::fmt::Debug>(what: &str) -> impl FnOnce(E) -> MlsError + '_ {
     move |e| MlsError(format!("{what}: {e:?}"))
 }
 
+/// Past epochs whose application secrets a member keeps.
+///
+/// Spec: M§6.5 rule 3 — a hub accepts application messages for the current or the previous epoch, so a member that
+/// has already processed a commit must still decrypt one sent just before it.
+pub const PAST_EPOCHS: usize = 1;
+
 /// A DSIP device key used directly as the MLS leaf signer.
 ///
 /// Spec: M§6.2 — the leaf `signature_key` MUST be the device's Ed25519 key; MLS's labelled signatures
@@ -173,6 +179,7 @@ impl<P: OpenMlsProvider> Device<P> {
             .with_group_id(GroupId::from_slice(group_id))
             .ciphersuite(CIPHERSUITE)
             .with_wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .max_past_epochs(PAST_EPOCHS)
             .use_ratchet_tree_extension(true)
             .with_capabilities(capabilities())
             .with_leaf_node_extensions(self.leaf_extensions()?)
@@ -205,6 +212,7 @@ impl<P: OpenMlsProvider> Device<P> {
         let MlsMessageBodyIn::Welcome(w) = msg.extract() else { return Err(MlsError("not a welcome".into())) };
         let config = MlsGroupJoinConfig::builder()
             .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .max_past_epochs(PAST_EPOCHS)
             .use_ratchet_tree_extension(true)
             .build();
         StagedWelcome::new_from_welcome(&self.provider, &config, w, None)

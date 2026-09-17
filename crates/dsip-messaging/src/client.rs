@@ -181,6 +181,103 @@ pub fn select_successor(candidates: &[Value]) -> Value {
     json!({"winner": kept.into_iter().min().map(|(_, g)| g), "discarded": discarded})
 }
 
+/// A device converging on one successor per dead group.
+///
+/// Spec: M§7.5 — a successor is accepted only from a predecessor member re-adding predecessor members, otherwise it is a
+/// new conversation under first contact; concurrent successors converge on the lowest `group_id`.
+///
+/// Impl (spec-gap 61): per predecessor the device keeps its valid successors as candidates and stays in only the
+/// lowest — declining a higher one, leaving one it had kept (or created) when a lower one appears; a successor for a
+/// group the device never knew is first contact; asked to create a successor when one exists, it uses that one.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SuccessorTracker {
+    groups: BTreeMap<String, BTreeSet<String>>,
+    candidates: BTreeMap<String, BTreeSet<String>>,
+    winner: BTreeMap<String, String>,
+}
+
+impl SuccessorTracker {
+    /// A tracker from a vector `context`: `groups` (group → roster by identity).
+    pub fn new(ctx: &Value) -> SuccessorTracker {
+        let groups = ctx["groups"]
+            .as_object()
+            .map(|m| m.iter().map(|(g, r)| (g.clone(), r.as_array().into_iter().flatten().map(s).collect())).collect())
+            .unwrap_or_default();
+        SuccessorTracker { groups, ..Default::default() }
+    }
+
+    /// Record (or refresh) a group this device is a member of, with its roster by identity.
+    pub fn member_of(&mut self, group: &str, roster: &[String]) {
+        self.groups.insert(group.to_string(), roster.iter().cloned().collect());
+    }
+
+    /// The successor this device converged on for `predecessor`, if any.
+    pub fn successor(&self, predecessor: &str) -> Option<&str> {
+        self.winner.get(predecessor).map(String::as_str)
+    }
+
+    /// Apply one event (`create`, `created`, `welcome`) and return what the device does.
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        let Some((name, e)) = ev.as_object().and_then(|m| m.iter().next()) else { return vec![] };
+        match name.as_str() {
+            "create" => {
+                let pred = s(&e["predecessor"]);
+                if let Some(w) = self.winner.get(&pred) {
+                    return vec![json!({"use": w})];
+                }
+                match self.groups.get(&pred) {
+                    Some(r) => vec![json!({"create": {"successor_of": pred, "roster": r}})],
+                    None => vec![json!({"refuse": "not-a-member"})],
+                }
+            }
+            "created" => {
+                let pred = s(&e["successor_of"]);
+                let roster = self.groups.get(&pred).cloned().unwrap_or_default();
+                self.candidate(&s(&e["group"]), &pred, roster, true)
+            }
+            "welcome" => {
+                let pred = s(&e["successor_of"]);
+                let group = s(&e["group"]);
+                let Some(pred_roster) = self.groups.get(&pred) else { return vec![json!({"first_contact": group})] };
+                let check = check_successor(&json!({"predecessor_roster": pred_roster, "creator": e["creator"], "roster": e["roster"]}));
+                if check["verdict"] != "accept" {
+                    return vec![json!({"first_contact": group})];
+                }
+                let roster = e["roster"].as_array().into_iter().flatten().map(s).collect();
+                self.candidate(&group, &pred, roster, false)
+            }
+            _ => vec![],
+        }
+    }
+
+    fn candidate(&mut self, group: &str, pred: &str, roster: BTreeSet<String>, mine: bool) -> Vec<Value> {
+        let cands = self.candidates.entry(pred.to_string()).or_default();
+        cands.insert(group.to_string());
+        let list: Vec<Value> = cands.iter().map(|c| json!(c)).collect();
+        let best = select_successor(&list)["winner"].as_str().map(String::from);
+        if best.as_deref() != Some(group) {
+            return vec![json!({if mine { "leave" } else { "decline" }: group})];
+        }
+        let prev = self.winner.insert(pred.to_string(), group.to_string());
+        self.groups.insert(group.to_string(), roster); // a successor can itself be succeeded
+        let mut out = if mine { vec![] } else { vec![json!({"join": group})] };
+        if let Some(p) = prev.filter(|p| p != group) {
+            out.push(json!({"leave": p}));
+        }
+        out
+    }
+
+    /// Snapshot compared by the vectors: per predecessor with candidates, the successor and the candidates.
+    pub fn snapshot(&self) -> Value {
+        let m: serde_json::Map<String, Value> = self
+            .candidates
+            .iter()
+            .map(|(p, c)| (p.clone(), json!({"successor": self.winner.get(p), "candidates": c})))
+            .collect();
+        Value::Object(m)
+    }
+}
+
 struct Content {
     sender: String,
     seq: i64,

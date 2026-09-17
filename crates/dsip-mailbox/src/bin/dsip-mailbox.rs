@@ -362,6 +362,9 @@ impl Service {
                     let Some(welcome) = item.welcome else { continue };
                     let mut fields = json!({"recipient": to, "mls": welcome,
                         "hub": self.conversations.get(group).map(|c| c["hub"].clone()).unwrap_or(Value::Null)});
+                    if let Some(pred) = self.conversations.get(group).and_then(|c| c["successor_of"].as_str()) {
+                        fields["successor_of"] = json!(pred); // M§7.5: admitted by the member mailbox without a grant
+                    }
                     if let Some(g) = item.grants {
                         fields["grants"] = g;
                     }
@@ -977,8 +980,11 @@ fn dispatch(
         "key-package-fetch" => {
             let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
             let grant = p["grant"].as_str().and_then(|g| grant_payload(g, &ctx)).unwrap_or(Value::Null);
-            let event = json!({"kp_fetch": {"id": id, "from": device, "from_identity": identity,
+            let mut event = json!({"kp_fetch": {"id": id, "from": device, "from_identity": identity,
                 "target": p["target"], "grant": grant}});
+            if let Some(g) = p.get("successor_of") {
+                event["kp_fetch"]["successor_of"] = g.clone(); // M§7.5, spec-gap 61
+            }
             let emissions = st.mailbox.step(&event);
             st.mailbox_out(emissions, now)
         }

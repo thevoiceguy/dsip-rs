@@ -49,7 +49,7 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, CommitRetry, History, Resume};
+use dsip_messaging::client::{select_mailbox, CommitRetry, History, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, member_identity, message_header, Device, MlsError};
@@ -260,6 +260,8 @@ struct Client {
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
     own: HashSet<String>,
     resume: Resume,
+    /// Successor groups per dead group (M§7.5, spec-gap 61).
+    successors: SuccessorTracker,
     grants: HashMap<String, String>,
     /// Grants other identities issued to this one, by granter (M§14.1): presented when creating a conversation.
     grants_held: BTreeMap<String, String>,
@@ -486,9 +488,18 @@ impl Client {
     /// that device's. The identity's own mailbox is asked over the bound connection, so no second binding
     /// displaces it.
     async fn fetch_key_package(&mut self, target: &str, grant: Option<&str>, device: Option<&str>) -> Result<KeyPackage> {
+        self.fetch_key_package_for(target, grant, device, None).await
+    }
+
+    /// As [`Client::fetch_key_package`]; `successor_of` names the dead group a successor is being created for, which
+    /// authorizes the fetch at a mailbox that has it registered (M§7.5, spec-gap 61).
+    async fn fetch_key_package_for(&mut self, target: &str, grant: Option<&str>, device: Option<&str>, successor_of: Option<&str>) -> Result<KeyPackage> {
         let mut fields = json!({"target": target});
         if let Some(g) = grant {
             fields["grant"] = json!(g);
+        }
+        if let Some(g) = successor_of {
+            fields["successor_of"] = json!(g);
         }
         let payload = if target == self.identity {
             let env = wire::message(&self.keys.device, "key-package-fetch", &self.mailbox.0, now_s(), wire::TTL_S, fields);
@@ -817,10 +828,15 @@ impl Client {
 
     /// Create a group hubbed at this identity's own mailbox (M§6.5 rule 6, M§6.6).
     async fn new_group(&mut self, kind: &str) -> Result<String> {
+        let conversation = wire::new_id(now_s());
+        self.new_group_for(&conversation, kind, None).await
+    }
+
+    /// A group for `conversation`, hubbed at this identity's mailbox; `successor_of` for a successor group (M§7.5).
+    async fn new_group_for(&mut self, conversation: &str, kind: &str, successor_of: Option<&str>) -> Result<String> {
         let now = now_s();
-        let conversation = wire::new_id(now);
         let group_id = wire::new_id(now).into_bytes();
-        let conv = json!({"conversation": conversation, "kind": kind, "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}, "successor_of": null});
+        let conv = json!({"conversation": conversation, "kind": kind, "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}, "successor_of": successor_of});
         let group = self.mls.create_group(&group_id, &serde_json::to_vec(&conv)?).map_err(|e| anyhow::anyhow!("{e}"))?;
         let gid = self.add_conv(group, &conv);
         self.save_groups()?;
@@ -868,6 +884,106 @@ impl Client {
     }
 
     /// Add `peer` to a conversation: the hub fans the welcome out with our deposit as `origin` (M§7.3, M§14.2).
+    /// Refresh the tracker's rosters (by identity) from the groups this device is in (M§7.5: "last known roster").
+    fn track_rosters(&mut self) {
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        for (gid, c) in &self.convs {
+            if let Ok(members) = authenticate_members(&c.group, &ctx) {
+                let mut ids: Vec<String> = members.into_iter().map(|m| m.identity).collect();
+                ids.sort();
+                ids.dedup();
+                self.successors.member_of(gid, &ids);
+            }
+        }
+    }
+
+    fn save_successors(&self) -> Result<()> {
+        let v = serde_json::to_value(&self.successors)?;
+        self.mls.provider().put_state("successors", &v).map_err(Self::state_err)
+    }
+
+    /// Stop taking part in a group: forget it here and unregister it at the mailbox (M§5.7, M§7.5).
+    async fn leave_group(&mut self, gid: &str, why: &str) -> Result<()> {
+        let Some(c) = self.convs.remove(gid) else { return Ok(()) };
+        println!("LEFT group={gid} conversation={} ({why})", c.conversation);
+        if self.active.as_deref() == Some(gid) {
+            self.active = self.convs.iter().find(|(_, c)| c.kind != "personal").map(|(g, _)| g.clone());
+        }
+        self.save_groups()?;
+        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
+            json!({"subject": self.identity, "groups": [{"group": gid, "state": "left"}]}));
+        self.send(&env).await
+    }
+
+    /// Act on what the successor tracker decided (spec-gap 61).
+    async fn apply_successor(&mut self, emissions: Vec<Value>, of: &str) -> Result<()> {
+        self.save_successors()?;
+        for e in emissions {
+            if let Some(g) = e["join"].as_str() {
+                println!("SUCCESSOR joined group={g} of={of}");
+                self.active = Some(g.to_string());
+                self.save_groups()?;
+            } else if let Some(g) = e["leave"].as_str().or(e["decline"].as_str()) {
+                self.leave_group(g, &format!("successor of {of} converged elsewhere")).await?;
+            } else if let Some(g) = e["first_contact"].as_str() {
+                // M§7.5: not a valid successor; its mailbox admitted it only as one, so it is not kept
+                self.leave_group(g, "not a valid successor: first contact required").await?;
+            }
+        }
+        // The conversation continues in the successor converged on, never in the dead group or a left one.
+        if let Some(w) = self.successors.successor(of).filter(|w| self.convs.contains_key(*w)).map(String::from) {
+            if self.active.as_deref() != Some(w.as_str()) {
+                self.active = Some(w);
+                self.save_groups()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a successor for the active group, whose hub is gone: same conversation, this mailbox as hub, the last
+    /// known roster re-added (M§7.5). If a successor already exists, use it instead.
+    async fn create_successor(&mut self) -> Result<()> {
+        let pred = self.active()?;
+        self.track_rosters();
+        let decision = self.successors.step(&json!({"create": {"predecessor": pred}}));
+        let Some(d) = decision.first() else { bail!("successor tracker said nothing") };
+        if let Some(g) = d["use"].as_str() {
+            println!("SUCCESSOR exists group={g} of={pred}");
+            self.active = Some(g.to_string());
+            return self.save_groups();
+        }
+        let Some(create) = d.get("create") else { bail!("successor refused: {}", d["refuse"]) };
+        let (conversation, kind) = {
+            let c = self.conv(&pred)?;
+            (c.conversation.clone(), c.kind.clone())
+        };
+        let gid = self.new_group_for(&conversation, &kind, Some(&pred)).await?;
+        println!("SUCCESSOR created group={gid} of={pred}");
+        let emissions = self.successors.step(&json!({"created": {"group": gid, "successor_of": pred}}));
+        self.apply_successor(emissions, &pred).await?;
+        let others: Vec<String> = create["roster"].as_array().into_iter().flatten().filter_map(Value::as_str)
+            .filter(|i| *i != self.identity).map(String::from).collect();
+        for peer in others {
+            if !self.convs.contains_key(&gid) {
+                return Ok(()); // a lower successor arrived meanwhile and this one was left
+            }
+            match self.fetch_key_package_for(&peer, None, None, Some(&pred)).await {
+                Ok(kp) => {
+                    let op = CommitOp::Add { kp: Box::new(kp), grants: vec![], identity: peer.clone(), device: None };
+                    if let Err(e) = self.commit_op(&gid, op, &format!("added {peer}")).await {
+                        if !self.convs.contains_key(&gid) {
+                            return Ok(()); // converged on another successor while adding
+                        }
+                        println!("ERR successor add {peer}: {e}");
+                    }
+                }
+                Err(e) => println!("ERR successor add {peer}: {e}"),
+            }
+        }
+        Ok(())
+    }
+
     async fn add(&mut self, group: &str, peer: &str, grant: Option<String>, kp: Option<KeyPackage>) -> Result<()> {
         let kp = match kp {
             Some(k) => k,
@@ -1446,6 +1562,22 @@ impl Client {
                 let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
                     json!({"subject": self.identity, "groups": [{"group": group, "state": "joined"}]}));
                 self.send(&env).await?;
+                if let Some(pred) = conv["successor_of"].as_str() {
+                    // M§7.5: check the successor against the predecessor as this device last knew it, then converge
+                    let r = resolver(&self.resolver_files);
+                    let ctx = self.ctx(&r);
+                    let creator = self.conv(&group).ok()
+                        .and_then(|c| member_identity(&c.group, LeafNodeIndex::new(0), &ctx).ok())
+                        .map(|w| w.identity).unwrap_or_default();
+                    let mut roster = members.clone();
+                    roster.sort();
+                    roster.dedup();
+                    self.track_rosters();
+                    let emissions =
+                        self.successors.step(&json!({"welcome": {"group": group, "successor_of": pred, "creator": creator, "roster": roster}}));
+                    let pred = pred.to_string();
+                    self.apply_successor(emissions, &pred).await?;
+                }
             }
             Outcome::Object { sender, sender_device, object } => self.object_in(&gid, item, &sender, &sender_device, object).await?,
             Outcome::Dropped(why) => println!("DROP {why}"),
@@ -1717,6 +1849,7 @@ async fn main() -> Result<()> {
         lines: HashMap::new(),
         own: HashSet::new(),
         resume,
+        successors: get("successors")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         grants: HashMap::new(),
         grants_held: BTreeMap::new(),
         requests: BTreeMap::new(),
@@ -1883,6 +2016,7 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "revoke-device" => client.revoke_device(rest.trim()).await,
         "remove-leaf" => client.remove_leaf(rest.trim()).await,
         "remove" => client.remove(rest.trim()).await,
+        "successor" => client.create_successor().await,
         "move-hub" => {
             // M§7.4: move the active group to another hub, by default this identity's own mailbox
             let group = client.active()?;

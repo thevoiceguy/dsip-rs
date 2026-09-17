@@ -74,6 +74,10 @@ pub fn run_vector(v: &Value) -> Value {
             let mut r = client::Resume::new(&v["context"]);
             trace(inp, |ev| (r.step(ev), r.snapshot()))
         }
+        "successor-trace" => {
+            let mut t = client::SuccessorTracker::new(&v["context"]);
+            trace(inp, |ev| (t.step(ev), t.snapshot()))
+        }
         "commit-retry-trace" => {
             let mut c = client::CommitRetry::new(&v["context"]);
             trace(inp, |ev| (c.step(ev), c.snapshot()))
