@@ -149,6 +149,54 @@ pub fn select_direct(candidates: &[Value]) -> Value {
     json!({"winner": kept.into_iter().min(), "discarded": discarded})
 }
 
+/// Whether a callee device sends a `call-event` for a leg that ended, and with which outcome.
+///
+/// Spec: M§13.3 — a callee device that alerted and was not answered sends one; never for `session.answered-elsewhere`.
+/// Impl (spec-gap 63): a leg this device rejected with `user.declined` is `declined`; any other alerted, unanswered leg
+/// is `missed`; a leg that never alerted sends nothing.
+pub fn call_event_decision(inp: &Value) -> Value {
+    if !inp["alerted"].as_bool().unwrap_or(false) || inp["answered_here"].as_bool().unwrap_or(false) {
+        return json!({"send": false});
+    }
+    let reason = inp["reason"].as_str().unwrap_or("");
+    if reason == "session.answered-elsewhere" {
+        return json!({"send": false});
+    }
+    if inp["ended_by"] == "local" && reason == "user.declined" {
+        return json!({"send": true, "outcome": "declined"});
+    }
+    json!({"send": true, "outcome": "missed"})
+}
+
+/// One timeline per peer identity: its conversation's content (seq order) and the personal group's call events for it.
+///
+/// Spec: M§13.3 (interleave by peer identity), M§8.5 (time never reorders history). Impl (spec-gap 63): call events
+/// collapse by `session`, first by seq kept; a call goes before the first content item whose `at` is later than its own.
+pub fn peer_timeline(inp: &Value) -> Value {
+    let mut seen = BTreeSet::new();
+    let (mut calls, mut collapsed) = (vec![], vec![]);
+    for c in inp["calls"].as_array().into_iter().flatten() {
+        let session = s(&c["session"]);
+        if !seen.insert(session.clone()) {
+            collapsed.push(session);
+            continue;
+        }
+        calls.push((c["at"].as_i64().unwrap_or(0), session));
+    }
+    calls.sort_by_key(|(at, _)| *at); // stable: equal times keep seq order
+    let (mut out, mut k) = (vec![], 0);
+    for item in inp["content"].as_array().into_iter().flatten() {
+        let at = item["at"].as_i64().unwrap_or(0);
+        while k < calls.len() && calls[k].0 < at {
+            out.push(format!("call:{}", calls[k].1));
+            k += 1;
+        }
+        out.push(format!("content:{}", s(&item["id"])));
+    }
+    out.extend(calls[k..].iter().map(|(_, sess)| format!("call:{sess}")));
+    json!({"timeline": out, "collapsed": collapsed})
+}
+
 /// Accept a successor group only from a predecessor member re-adding predecessor members.
 ///
 /// Spec: M§7.5 — otherwise the group is a new conversation subject to first contact.
@@ -338,6 +386,7 @@ impl Client {
         let Some((name, e)) = ev.as_object().and_then(|m| m.iter().next()) else { return vec![] };
         match name.as_str() {
             "sync" => self.sync(e),
+            "restore" => self.restore(e),
             "read" => self.read(e),
             "play" => self.play(e),
             "activity" => self.activity(e),
@@ -349,6 +398,7 @@ impl Client {
 
     fn sync(&mut self, e: &Value) -> Vec<Value> {
         let mut fresh = vec![];
+        let mut out = vec![];
         for it in e["items"].as_array().into_iter().flatten() {
             let o = &it["object"];
             match o["object"].as_str() {
@@ -362,11 +412,15 @@ impl Client {
                     self.timeline.push(id.clone());
                     fresh.push(id);
                 }
-                Some("receipt") => self.receipt(o),
+                Some("receipt") => {
+                    if self.receipt(o) {
+                        // M§12.2 (spec-gap 64): a receipt that changes rendering is archived like content
+                        out.push(json!({"archive": {"seq": it["seq"]}}));
+                    }
+                }
                 _ => {}
             }
         }
-        let mut out = vec![];
         if self.policy("delivered") && self.members <= DELIVERED_MAX_GROUP {
             // M§10.2: decided after the whole batch, so a sibling's receipt in it suppresses ours
             let targets: Vec<String> = fresh
@@ -385,8 +439,32 @@ impl Client {
         out
     }
 
-    fn receipt(&mut self, o: &Value) {
+    /// Content and receipts opened from archive: rendering state only, nothing sent or archived (spec-gap 64).
+    fn restore(&mut self, e: &Value) -> Vec<Value> {
+        for it in e["items"].as_array().into_iter().flatten() {
+            let o = &it["object"];
+            match o["object"].as_str() {
+                Some("content") => {
+                    let id = s(&o["id"]);
+                    if !self.content.contains_key(&id) {
+                        let seq = it["seq"].as_i64().unwrap_or(0);
+                        self.content.insert(id.clone(), Content { sender: s(&o["sender"]), seq, kind: s(&o["kind"]) });
+                        self.timeline.push(id);
+                    }
+                }
+                Some("receipt") => {
+                    self.receipt(o);
+                }
+                _ => {}
+            }
+        }
+        vec![]
+    }
+
+    /// Apply a receipt; `true` when it changed what is rendered.
+    fn receipt(&mut self, o: &Value) -> bool {
         let who = s(&o["sender"]);
+        let mut changed = false;
         match o["kind"].as_str() {
             Some(kind @ ("delivered" | "played")) => {
                 for t in o["targets"].as_array().into_iter().flatten().map(s) {
@@ -395,7 +473,11 @@ impl Client {
                         continue;
                     }
                     let book = if kind == "delivered" { &mut self.delivered } else { &mut self.played };
-                    book.entry(t).or_default().entry(who.clone()).or_insert_with(|| o["sent_at"].clone());
+                    let entry = book.entry(t).or_default();
+                    if !entry.contains_key(&who) {
+                        entry.insert(who.clone(), o["sent_at"].clone()); // first by seq wins
+                        changed = true;
+                    }
                 }
             }
             Some("read") => {
@@ -405,11 +487,13 @@ impl Client {
                         // M§10.3: monotone
                         self.read_seq.insert(who.clone(), c.seq);
                         self.read_through.insert(who, through);
+                        changed = true;
                     }
                 }
             }
             _ => {}
         }
+        changed
     }
 
     fn read_send(&mut self) -> Vec<Value> {
@@ -744,6 +828,7 @@ pub struct History {
     joined: BTreeMap<String, i64>,
     held: Vec<Value>,
     shown: BTreeMap<String, (String, i64)>,
+    applied: std::collections::BTreeSet<String>,
 }
 
 impl History {
@@ -754,6 +839,7 @@ impl History {
             joined: ctx["joined"].as_object().into_iter().flatten().map(|(g, e)| (g.clone(), e.as_i64().unwrap_or(0))).collect(),
             held: vec![],
             shown: BTreeMap::new(),
+            applied: Default::default(),
         }
     }
 
@@ -781,6 +867,19 @@ impl History {
         json!({"show": id})
     }
 
+    /// An archive record under a held key: content is shown; a receipt (spec-gap 64) or call event (spec-gap 63) is
+    /// applied to the receipt state or call log and is not a timeline entry.
+    fn open(&mut self, e: &Value) -> Value {
+        if e["object"] == "receipt" || e["object"] == "call-event" {
+            let id = s(&e["id"]);
+            if !self.applied.insert(id.clone()) {
+                return json!({"duplicate": id});
+            }
+            return json!({"apply": e["cursor"]});
+        }
+        self.show(e)
+    }
+
     fn show_from_mls(&mut self, e: &Value) -> Vec<Value> {
         let shown = self.show(e);
         let fresh = shown.get("show").is_some();
@@ -804,14 +903,14 @@ impl History {
                 self.keys.insert(akid.clone(), e["created_at"].as_i64().unwrap_or(0));
                 let (release, keep): (Vec<Value>, Vec<Value>) = std::mem::take(&mut self.held).into_iter().partition(|h| h["akid"] == json!(akid));
                 self.held = keep;
-                release.iter().map(|h| self.show(h)).collect()
+                release.iter().map(|h| self.open(h)).collect()
             }
             "archive" => {
                 if !self.keys.contains_key(e["akid"].as_str().unwrap_or("")) {
                     self.held.push(e.clone());
                     return vec![json!({"hold": e["cursor"]})];
                 }
-                vec![self.show(e)]
+                vec![self.open(e)]
             }
             "mls" => {
                 let group = s(&e["group"]);
