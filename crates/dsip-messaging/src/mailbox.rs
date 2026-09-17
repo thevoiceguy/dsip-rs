@@ -197,6 +197,11 @@ impl Mailbox {
         serde_json::from_value(v.clone()).ok()
     }
 
+    /// The owner's mailbox mode (M§4.4): `sync` or `queue`.
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+
     /// The owner's registered devices.
     pub fn devices(&self) -> &[String] {
         &self.devices
@@ -567,6 +572,59 @@ impl Mailbox {
             .collect();
         json!({"items": self.items.iter().map(|it| it.cursor.as_str()).collect::<Vec<_>>(), "groups": groups, "key_packages": kps})
     }
+}
+
+/// Whether a member mailbox replicates a manifest blob (no `fetched`), and whether it keeps what it fetched.
+///
+/// Spec: M§8.4 rule 6 — a member mailbox of a `sync`-mode owner SHOULD replicate every manifest blob on receipt,
+/// verifying `sha256`. Impl (spec-gap 65): skipped when not `sync`, already stored, over `max_blob_bytes`, or not
+/// https; a fetched body is stored only for a 200 matching the manifest's `sha256` and `size`.
+pub fn blob_replicate(inp: &Value) -> Value {
+    let e = &inp["entry"];
+    let Some(f) = inp.get("fetched") else {
+        let skip = |reason: &str| json!({"action": "skip", "reason": reason});
+        if inp["mode"] != "sync" {
+            return skip("mode");
+        }
+        if inp["stored"].as_array().into_iter().flatten().any(|h| *h == e["sha256"]) {
+            return skip("stored");
+        }
+        if e["size"].as_i64().unwrap_or(i64::MAX) > inp["max_blob_bytes"].as_i64().unwrap_or(0) {
+            return skip("too-large");
+        }
+        if !e["uri"].as_str().unwrap_or("").starts_with("https://") {
+            return skip("not-https");
+        }
+        return json!({"action": "fetch"});
+    };
+    if f["status"] != 200 {
+        return json!({"action": "discard", "reason": "unavailable"});
+    }
+    if f["sha256"] != e["sha256"] || f["size"] != e["size"] {
+        return json!({"action": "discard", "reason": "mismatch"});
+    }
+    json!({"action": "store"})
+}
+
+/// The `blobs` manifest a mailbox puts in `items`: `uri` at its own blob endpoint for every blob it holds.
+///
+/// Spec: M§8.4 rule 6 ("rewrite `uri` in `items`"). Impl (spec-gap 65): only held blobs are rewritten.
+pub fn items_blobs(inp: &Value) -> Value {
+    let endpoint = inp["blob_endpoint"].as_str().unwrap_or("").trim_end_matches('/');
+    let stored: Vec<&Value> = inp["stored"].as_array().into_iter().flatten().collect();
+    let blobs: Vec<Value> = inp["manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let mut e = e.clone();
+            if stored.contains(&&e["sha256"]) {
+                e["uri"] = json!(format!("{endpoint}/{}", e["sha256"].as_str().unwrap_or("")));
+            }
+            e
+        })
+        .collect();
+    json!({"blobs": blobs})
 }
 
 /// What a mailbox answers to `PUT {blob_endpoint}/{sha256}`: `{status, reason}` or `{status, accepted}`.

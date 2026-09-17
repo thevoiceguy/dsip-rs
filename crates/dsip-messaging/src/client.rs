@@ -149,6 +149,26 @@ pub fn select_direct(candidates: &[Value]) -> Value {
     json!({"winner": kept.into_iter().min(), "discarded": discarded})
 }
 
+/// Where a device fetches a content blob from, in order: its own mailbox's copy (a manifest entry for the same
+/// `sha256` and `size` at another `uri`), then the content object's `uri`.
+///
+/// Spec: M§8.4 rules 6–7 — devices fetch from their own mailbox, falling back to the original `uri`, and verify
+/// `sha256` and `size` either way. Impl (spec-gap 65): the unencrypted manifest only reorders sources for the blob the
+/// encrypted content names.
+pub fn blob_sources(inp: &Value) -> Value {
+    let b = &inp["blob"];
+    let mut sources: Vec<Value> = inp["manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["sha256"] == b["sha256"] && e["size"] == b["size"] && e["uri"] != b["uri"])
+        .map(|e| e["uri"].clone())
+        .take(1)
+        .collect();
+    sources.push(b["uri"].clone());
+    json!({"sources": sources})
+}
+
 /// Whether a callee device sends a `call-event` for a leg that ended, and with which outcome.
 ///
 /// Spec: M§13.3 — a callee device that alerted and was not answered sends one; never for `session.answered-elsewhere`.

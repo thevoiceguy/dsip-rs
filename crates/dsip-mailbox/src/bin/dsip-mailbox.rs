@@ -127,6 +127,8 @@ struct Service {
     state_dir: PathBuf,
     /// Unacknowledged fan-out heads by (group, member identity): (seq, next retry at, current delay).
     retry: HashMap<(String, String), (i64, i64, i64)>,
+    /// Manifest blobs of newly stored items, waiting to be replicated (M§8.4 rule 6, spec-gap 65).
+    replicate: Vec<Value>,
 }
 
 /// What goes out on a connection to a peer service.
@@ -265,6 +267,20 @@ impl Service {
         r
     }
 
+    /// An item as `items` carries it, with blobs this mailbox holds named at its own blob endpoint (M§8.4 rule 6).
+    fn item_value(&self, it: &Item, cursor: &str) -> Value {
+        let mut v = it.to_value(cursor);
+        if let Some(manifest) = v.get("blobs").cloned() {
+            let stored: Vec<Value> = manifest.as_array().into_iter().flatten()
+                .filter_map(|e| e["sha256"].as_str())
+                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) && self.blob_dir.join(h).exists())
+                .map(|h| json!(h)).collect();
+            v["blobs"] = dsip_messaging::mailbox::items_blobs(&json!({"blob_endpoint": self.blob_endpoint, "stored": stored,
+                "manifest": manifest}))["blobs"].clone();
+        }
+        v
+    }
+
     /// Mailbox emissions → envelopes (M§5.3, M§5.4, M§5.5).
     fn mailbox_out(&mut self, emissions: Vec<Value>, now: i64) -> Vec<Out> {
         let mut out = vec![];
@@ -297,7 +313,7 @@ impl Service {
                         .into_iter()
                         .flatten()
                         .filter_map(|c| c.as_str())
-                        .filter_map(|c| self.store.get(c).map(|it| it.to_value(c)))
+                        .filter_map(|c| self.store.get(c).map(|it| self.item_value(it, c)))
                         .collect();
                     let env = wire::items(&self.key, &to, now, body["in_reply_to"].as_str(), list, body["next"].clone());
                     out.push(Out::Device(to, env));
@@ -305,7 +321,7 @@ impl Service {
                 "push" => {
                     if let Some(c) = body["cursor"].as_str() {
                         if let Some(it) = self.store.get(c) {
-                            let env = wire::items(&self.key, &to, now, None, vec![it.to_value(c)], Value::Null);
+                            let env = wire::items(&self.key, &to, now, None, vec![self.item_value(it, c)], Value::Null);
                             out.push(Out::Device(to, env));
                         }
                     }
@@ -453,6 +469,10 @@ impl Service {
         for e in emissions {
             if let Some(c) = e.get("accepted").and_then(|a| a.get("cursor")).and_then(Value::as_str) {
                 if e["accepted"]["duplicate"] != json!(true) {
+                    if item.class == "application" {
+                        // M§8.4 rule 6: the blobs this item references are replicated after it is stored
+                        self.replicate.extend(item.blobs.as_ref().and_then(Value::as_array).into_iter().flatten().cloned());
+                    }
                     self.store.put(c, item.clone());
                 }
                 return;
@@ -553,6 +573,7 @@ async fn main() -> Result<()> {
         max_blob_bytes: args.max_blob_bytes,
         state_dir: args.state.clone(),
         retry: HashMap::new(),
+        replicate: vec![],
     }));
     std::fs::create_dir_all(args.state.join("blobs"))?;
     // Bound before the state is reloaded: a connection waits in the backlog until the accept loop starts.
@@ -702,6 +723,70 @@ async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>)
     }
 }
 
+/// HTTPS trusting the service's `--ca`, read when used (it may be written after startup, as for peer connections).
+fn https_client(ca: Option<&std::path::Path>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder().use_rustls_tls().https_only(true);
+    if let Some(ca) = ca {
+        for cert in reqwest::Certificate::from_pem_bundle(&std::fs::read(ca)?)? {
+            b = b.add_root_certificate(cert);
+        }
+    }
+    Ok(b.build()?)
+}
+
+/// Replicate one manifest blob into this mailbox, as the pinned decision says (M§8.4 rule 6, spec-gap 65).
+async fn replicate_blob(service: Arc<Mutex<Service>>, entry: Value) {
+    let (decision, http, path) = {
+        let st = service.lock().await;
+        let sha = entry["sha256"].as_str().unwrap_or("").to_string();
+        let valid = sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let path = st.blob_dir.join(&sha);
+        let stored = if valid && path.exists() { vec![sha] } else { vec![] };
+        let d = dsip_messaging::mailbox::blob_replicate(&json!({"mode": st.mailbox.mode(), "max_blob_bytes": st.max_blob_bytes,
+            "stored": stored, "entry": entry}));
+        if !valid {
+            return;
+        }
+        (d, https_client(st.ca.as_deref()), path)
+    };
+    let Ok(http) = http else { return };
+    let uri = entry["uri"].as_str().unwrap_or("").to_string();
+    if decision["action"] != "fetch" {
+        if decision["reason"] != "stored" {
+            tracing::info!("not replicating {uri}: {}", decision["reason"]);
+        }
+        return;
+    }
+    let fetched = match http.get(&uri).send().await {
+        Ok(resp) if resp.status().as_u16() == 200 => match resp.bytes().await {
+            Ok(body) => Some(body.to_vec()),
+            Err(_) => None,
+        },
+        Ok(resp) => {
+            tracing::info!("replicating {uri}: {}", resp.status());
+            None
+        }
+        Err(e) => {
+            tracing::info!("replicating {uri}: {e}");
+            None
+        }
+    };
+    let f = match &fetched {
+        Some(body) => json!({"status": 200, "sha256": hex_sha256(body), "size": body.len()}),
+        None => json!({"status": 0}),
+    };
+    let d = dsip_messaging::mailbox::blob_replicate(&json!({"entry": entry, "fetched": f}));
+    match (d["action"].as_str(), fetched) {
+        (Some("store"), Some(body)) => {
+            let tmp = path.with_extension("part");
+            if std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
+                tracing::info!("replicated blob {} ({} bytes) from {uri}", entry["sha256"].as_str().unwrap_or(""), body.len());
+            }
+        }
+        _ => tracing::info!("not replicating {uri}: {}", d["reason"]),
+    }
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::Digest as _;
     sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
@@ -827,6 +912,10 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
             }
             Out::Identity(identity, env) => federate(service, &mut st, &identity, env, &resolver),
         }
+    }
+    for entry in std::mem::take(&mut st.replicate) {
+        let service = service.clone();
+        tokio::spawn(async move { replicate_blob(service, entry).await });
     }
     st.persist();
     replies
