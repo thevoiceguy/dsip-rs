@@ -939,7 +939,21 @@ impl History {
                 }
                 self.show_from_mls(e)
             }
-            "sent" => self.show_from_mls(e),
+            "sent" => {
+                if e["object"] == "receipt" || e["object"] == "call-event" {
+                    // spec-gap 68: the read watermark a device sends is archived, so a device added later knows where
+                    // its user had read (M§10.3, M§10.5); like any archived receipt it is state, not a timeline entry
+                    let id = s(&e["id"]);
+                    if !self.applied.insert(id.clone()) {
+                        return vec![json!({"duplicate": id})];
+                    }
+                    return match self.current_akid() {
+                        Some(akid) => vec![json!({"archive": {"group": e["group"], "seq": e["seq"], "akid": akid}})],
+                        None => vec![],
+                    };
+                }
+                self.show_from_mls(e)
+            }
             _ => vec![],
         }
     }

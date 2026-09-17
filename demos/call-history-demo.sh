@@ -3,7 +3,7 @@
 # (M§13.3, M§12.2; spec-gaps 63, 64).
 #
 # Alice discloses read receipts. Bob's phone shows her delivered and read receipts on his message and archives them
-# (they changed what it renders). Alice's call rings Bob's phone and goes unanswered: the phone reports a missed call
+# (they changed what it renders), and archives the read watermark it sends for itself. Alice's call rings Bob's phone and goes unanswered: the phone reports a missed call
 # to Bob's personal group, archived too. Bob adds a laptop: from archive it restores the conversation, Alice's
 # receipts (without sending receipts of its own for old history) and the missed call. With both devices ringing,
 # a call answered on the laptop leaves no event on either; one both miss is reported by both and shown once; one
@@ -61,6 +61,7 @@ echo "=== Alice's receipts on Bob's message change what the phone renders, so it
 echo "send Are we still on for 7?" >&4; wait_for "$DIR/a.log" "^RECV $BOB: Are we still on for 7\?" 30
 wait_for "$DIR/bp.log" "^RECEIPT $ALICE delivered" 30
 echo "read" >&3; wait_for "$DIR/bp.log" "^RECEIPT $ALICE read" 30
+echo "read" >&4; wait_for "$DIR/bp.log" "^SENT-RECEIPT read .*\(personal group\)" 20
 sleep 2
 [ "$(grep -c '^ARCHIVED seq=' "$DIR/bp.log")" -ge 3 ] || { echo "FAIL: the phone did not archive the receipts"; exit 1; }
 
@@ -84,13 +85,23 @@ echo "live" >&5
 wait_for "$DIR/bl.log" "^HISTORY seq=[0-9]+ $BOB: Are we still on for 7\?" 30
 wait_for "$DIR/bl.log" "^HISTORY-RECEIPT seq=[0-9]+ $ALICE delivered" 30
 wait_for "$DIR/bl.log" "^HISTORY-RECEIPT seq=[0-9]+ $ALICE read" 30
+wait_for "$DIR/bl.log" "^HISTORY-RECEIPT seq=[0-9]+ $BOB read" 30
 wait_for "$DIR/bl.log" "^HISTORY-CALL missed $ALICE session=$S1" 30
 wait_for "$DIR/bl.log" "^HISTORY seq=[0-9]+ $ALICE: Call me back" 30
 wait_for "$DIR/bl.log" "^JOINED .* kind=direct" 30
 sleep 2
 echo "status" >&5; wait_for "$DIR/bl.log" "^STATUS " 10
-grep "^STATUS " "$DIR/bl.log" | tail -1 | grep -q "\"read_through\":{\"$ALICE\"" || { echo "FAIL: the laptop did not restore Alice's read receipt"; exit 1; }
+STATUS=$(grep "^STATUS " "$DIR/bl.log" | tail -1)
+echo "$STATUS" | grep -q "\"read_through\":{.*\"$ALICE\"" || { echo "FAIL: the laptop did not restore Alice's read receipt"; exit 1; }
+echo "$STATUS" | grep -q "\"read_through\":{.*\"$BOB\"" || { echo "FAIL: the laptop did not restore its own user's read position (spec-gap 68)"; exit 1; }
 if grep -q "^SENT-RECEIPT delivered" "$DIR/bl.log"; then echo "FAIL: the laptop sent receipts for restored history"; exit 1; fi
+
+for x in bl bp; do
+  # a receipt is state, not a conversation entry — on the device that sent it as much as on the one that restored it
+  echo "history" >&"$([ $x = bl ] && echo 5 || echo 4)"; wait_for "$DIR/$x.log" "^OK history" 10
+  LINES=$(grep -c "^TIMELINE " "$DIR/$x.log" || true)
+  [ "$LINES" = 2 ] || { echo "FAIL: $x has $LINES timeline entries, expected the 2 messages"; exit 1; }
+done
 
 echo "=== both devices ring: answered on the laptop → no event anywhere"
 S2=$(sid)
@@ -127,5 +138,5 @@ for f in bp bl; do
   [ "$n" = 1 ] || { echo "FAIL: $f recorded the shared missed call $n times"; exit 1; }
 done
 echo
-echo "PASS: missed and declined calls reached every device once (answered-elsewhere left none); receipts and call history"
-echo "      were archived and restored onto a device added later, which sent nothing for old history."
+echo "PASS: missed and declined calls reached every device once (answered-elsewhere left none); receipts, the user's own"
+echo "      read position and call history were archived and restored onto a later device, which sent nothing for history."
