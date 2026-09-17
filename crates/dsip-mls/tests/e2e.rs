@@ -117,7 +117,8 @@ fn messaging_end_to_end_on_real_mls() {
     let emitted = hub.step(&json!({"deposit": {"id": ulid(4), "device": alice_dev.did(), "identity": alice, "class": "handshake",
         "epoch": hdr_epoch, "digest": digest(&commit), "commit": observed}}));
     assert_eq!(emitted[0]["accepted"]["seq"], 1);
-    assert!(emitted.contains(&json!({"fanout": {"to": bob, "class": "welcome"}})), "{emitted:?}");
+    // spec-gap 66: the welcome is queued for Bob at the commit's seq and retried like any fan-out
+    assert!(emitted.contains(&json!({"fanout": {"to": bob, "seq": 1, "class": "welcome"}})), "{emitted:?}");
     assert_eq!(hub_view.epoch(), 1);
     ag.merge_pending_commit(alice_dev.provider()).unwrap();
 

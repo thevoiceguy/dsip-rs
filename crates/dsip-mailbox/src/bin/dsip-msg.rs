@@ -273,6 +273,8 @@ struct Client {
     /// Successor groups per dead group (M§7.5, spec-gap 61).
     successors: SuccessorTracker,
     grants: HashMap<String, String>,
+    /// KeyPackages fetched ahead of an add, by identity (M§5.5: single use, held until committed).
+    prefetched: HashMap<String, KeyPackage>,
     /// Grants other identities issued to this one, by granter (M§14.1): presented when creating a conversation.
     grants_held: BTreeMap<String, String>,
     /// Introductions received and not yet answered, by id (M§14.1: requests, never messages).
@@ -1059,7 +1061,7 @@ impl Client {
     }
 
     async fn add(&mut self, group: &str, peer: &str, grant: Option<String>, kp: Option<KeyPackage>) -> Result<()> {
-        let kp = match kp {
+        let kp = match kp.or_else(|| self.prefetched.remove(peer)) {
             Some(k) => k,
             None => self.fetch_key_package(peer, grant.as_deref(), None).await?,
         };
@@ -2129,6 +2131,7 @@ async fn main() -> Result<()> {
         resume,
         successors: get("successors")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         grants: HashMap::new(),
+        prefetched: HashMap::new(),
         grants_held: BTreeMap::new(),
         requests: BTreeMap::new(),
         crash_next: false,
@@ -2296,6 +2299,19 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "remove" => client.remove(rest.trim()).await,
         "successor" => client.create_successor().await,
         "available" => client.available(),
+        "prefetch" => {
+            // M§5.5: fetch a peer's KeyPackage now and hold it (it is single use) for a later add
+            let w: Vec<&str> = rest.split_whitespace().collect();
+            let peer = w.first().context("usage: prefetch <peer> [grant file]")?.to_string();
+            let grant = match w.get(1) {
+                Some(f) => Some(std::fs::read_to_string(f)?.trim().to_string()),
+                None => client.grants_held.get(&peer).cloned(),
+            };
+            let kp = client.fetch_key_package(&peer, grant.as_deref(), None).await?;
+            client.prefetched.insert(peer.clone(), kp);
+            println!("OK prefetched a key package for {peer}");
+            Ok(())
+        }
         "call-ended" => {
             // call-ended <session> <peer> <alerted 0|1> <answered here 0|1> <local|remote> <reason>
             let w: Vec<&str> = rest.split_whitespace().collect();

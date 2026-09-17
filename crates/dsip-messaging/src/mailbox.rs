@@ -55,6 +55,9 @@ struct Item {
     group: String,
     expires_at: Option<i64>,
     seq: Option<i64>,
+    /// Digest of a welcome's MLS bytes, which tells a redelivery from a new invitation (spec-gap 66).
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -265,7 +268,8 @@ impl Mailbox {
         }
         self.counter += 1;
         let c = cursor(self.counter);
-        self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into(), expires_at: None, seq: None });
+        self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into(), expires_at: None, seq: None,
+            digest: None });
         let pushes =
             self.bound.iter().filter(|d| Some(d.as_str()) != depositor).map(|d| json!({"push": {"to": d, "cursor": c}})).collect();
         (c, pushes)
@@ -345,8 +349,18 @@ impl Mailbox {
         }
         let group = s(&e["group"]);
         let now = self.now;
+        if let Some(digest) = e["digest"].as_str() {
+            // spec-gap 66: the hub retries a welcome it saw no acknowledgement for. A redelivery is the same MLS bytes
+            // (M§9.3), not merely another welcome for the group: adding a sibling device sends a new one (M§6.7).
+            if let Some(it) = self.items.iter().find(|it| it.class == "welcome" && it.digest.as_deref() == Some(digest)) {
+                return vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": it.cursor, "duplicate": true}})];
+            }
+        }
         self.groups.entry(group.clone()).or_insert_with(|| Group { hub: s(&e["hub"]), state: "pending".into(), since: now, items: 0, high_seq: 0, previous: None });
         let (c, pushes) = self.store("welcome", &group, None);
+        if let Some(it) = self.items.last_mut() {
+            it.digest = e["digest"].as_str().map(String::from);
+        }
         let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
         out.extend(pushes);
         out

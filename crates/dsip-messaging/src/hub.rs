@@ -32,6 +32,9 @@ pub struct Hub {
     group_info: bool,
     #[serde(default)]
     moved_to: Option<String>,
+    /// Unacknowledged welcomes per added identity, by the seq of the commit that added it (spec-gap 66).
+    #[serde(default)]
+    welcomes: BTreeMap<String, Vec<i64>>,
 }
 
 fn s(v: &Value) -> String {
@@ -57,6 +60,7 @@ impl Hub {
             pending: BTreeMap::new(),
             group_info: false,
             moved_to: None,
+            welcomes: BTreeMap::new(),
         }
     }
 
@@ -67,7 +71,7 @@ impl Hub {
             return vec![];
         }
         if let Some(a) = ev.get("ack") {
-            return self.ack(&s(&a["identity"]), a["seq"].as_i64().unwrap_or(0));
+            return self.ack(&s(&a["identity"]), a["seq"].as_i64().unwrap_or(0), a["class"].as_str().unwrap_or(""));
         }
         if ev.get("restart").is_some() {
             if let Some(h) = Hub::from_full_state(&self.full_state()) {
@@ -95,10 +99,16 @@ impl Hub {
     /// Spec: M§6.5 rule 5 (retry before later items). Impl (spec-gap 59): a restarted hub, or one whose retry timer
     /// fires, re-sends each queue's head; the member mailbox acknowledges a redelivery as a duplicate.
     pub fn resend_heads(&self) -> Vec<Value> {
-        self.pending
+        let items = self
+            .pending
             .iter()
-            .filter_map(|(i, q)| q.first().map(|seq| json!({"fanout": {"to": i, "seq": seq, "class": self.seq_class[seq]}})))
-            .collect()
+            .filter(|(i, _)| !self.welcomes.get(*i).is_some_and(|w| !w.is_empty()))
+            .filter_map(|(i, q)| q.first().map(|seq| json!({"fanout": {"to": i, "seq": seq, "class": self.seq_class[seq]}})));
+        let welcomes = self
+            .welcomes
+            .iter()
+            .filter_map(|(i, q)| q.first().map(|seq| json!({"fanout": {"to": i, "seq": seq, "class": "welcome"}})));
+        items.chain(welcomes).collect()
     }
 
     fn error(d: &Value, reason: &str) -> Vec<Value> {
@@ -228,7 +238,16 @@ impl Hub {
                 .filter(|a| !before.get(&s(&a["identity"])).is_some_and(|devs| devs.contains(&s(&a["device"]))))
                 .map(|a| s(&a["identity"]))
                 .collect();
-            out.extend(gained.iter().map(|i| json!({"fanout": {"to": i, "class": "welcome"}})));
+            let seq = self.digests[&s(&d["digest"])];
+            for i in gained {
+                // spec-gap 66: a welcome is queued and retried like any fan-out, in its own queue — a member adding its
+                // own device needs both the commit (for its other devices) and the welcome (for the new one)
+                let q = self.welcomes.entry(i.clone()).or_default();
+                q.push(seq);
+                if q.len() == 1 {
+                    out.push(json!({"fanout": {"to": i, "seq": seq, "class": "welcome"}}));
+                }
+            }
         }
         out
     }
@@ -242,30 +261,42 @@ impl Hub {
         let mut out = vec![json!({"accepted": {"to": d["device"], "in_reply_to": d["id"], "seq": seq}})];
         for i in targets {
             // M§6.5 rule 5: per-mailbox seq order; an unacknowledged item blocks later ones
+            let held = self.welcomes.get(i).is_some_and(|w| !w.is_empty());
             let q = self.pending.entry(i.clone()).or_default();
             q.push(seq);
-            if q.len() == 1 {
+            // spec-gap 66: nothing reaches a mailbox before the welcome it has not acknowledged — until then it has no
+            // registration for the group and would refuse the item (M§6.6)
+            if q.len() == 1 && !held {
                 out.push(json!({"fanout": {"to": i, "seq": seq, "class": class}}));
             }
         }
         out
     }
 
-    fn ack(&mut self, ident: &str, seq: i64) -> Vec<Value> {
-        let Some(q) = self.pending.get_mut(ident) else { return vec![] };
+    fn ack(&mut self, ident: &str, seq: i64, class: &str) -> Vec<Value> {
+        let welcome = class == "welcome";
+        let queue = if welcome { &mut self.welcomes } else { &mut self.pending };
+        let Some(q) = queue.get_mut(ident) else { return vec![] };
         if q.first() != Some(&seq) {
             return vec![];
         }
         q.remove(0);
-        match q.first() {
-            Some(next) => vec![json!({"fanout": {"to": ident, "seq": next, "class": self.seq_class[next]}})],
-            None => vec![],
+        if let Some(next) = q.first() {
+            let class = if welcome { "welcome".to_string() } else { self.seq_class[next].clone() };
+            return vec![json!({"fanout": {"to": ident, "seq": next, "class": class}})];
         }
+        if welcome {
+            // the group is registered now: whatever waited behind the welcome goes
+            if let Some(next) = self.pending.get(ident).and_then(|q| q.first()) {
+                return vec![json!({"fanout": {"to": ident, "seq": next, "class": self.seq_class[next]}})];
+            }
+        }
+        vec![]
     }
 
-    /// Every seq still queued for some member mailbox: the payloads a host must keep for retries.
+    /// Every seq still queued for some member mailbox, welcomes included: the payloads a host must keep for retries.
     pub fn queued_seqs(&self) -> BTreeSet<i64> {
-        self.pending.values().flatten().copied().collect()
+        self.pending.values().chain(self.welcomes.values()).flatten().copied().collect()
     }
 
     /// Snapshot compared by the vectors: epoch, next seq, roster, non-empty pending queues.
@@ -274,7 +305,9 @@ impl Hub {
             self.roster.iter().map(|(i, d)| (i.clone(), json!(d.iter().collect::<Vec<_>>()))).collect();
         let pending: serde_json::Map<String, Value> =
             self.pending.iter().filter(|(_, q)| !q.is_empty()).map(|(i, q)| (i.clone(), json!(q))).collect();
+        let welcomes: serde_json::Map<String, Value> =
+            self.welcomes.iter().filter(|(_, q)| !q.is_empty()).map(|(i, q)| (i.clone(), json!(q))).collect();
         json!({"epoch": self.epoch, "next_seq": self.next_seq, "roster": roster, "pending": pending,
-               "group_info": self.group_info, "moved_to": self.moved_to})
+               "group_info": self.group_info, "moved_to": self.moved_to, "welcomes": welcomes})
     }
 }
