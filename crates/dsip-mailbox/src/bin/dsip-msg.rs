@@ -1245,20 +1245,51 @@ impl Client {
     }
 
     /// Fetch, verify and decrypt a content object's blob into `--state`/media (M§8.4 rule 7).
-    async fn fetch_media(&self, object: &Value) -> Result<(PathBuf, String)> {
+    ///
+    /// Sources come from the pinned [`blob_sources`](dsip_messaging::client::blob_sources): this identity's mailbox's
+    /// copy first when the item's manifest names one, then the content's own `uri` (M§8.4 rule 6, spec-gap 65).
+    async fn fetch_media(&self, object: &Value, manifest: &Value) -> Result<(PathBuf, String, String)> {
         let b = &object["blob"];
-        let uri = b["uri"].as_str().context("blob without uri")?;
         let key: [u8; 32] = unb64(&b["key"]).try_into().ok().context("blob key")?;
-        let resp = self.http.get(uri).send().await?;
-        anyhow::ensure!(resp.status().is_success(), "GET {uri}: {}", resp.status());
-        let stored = resp.bytes().await?;
-        let plain = dsip_messaging::mls_wire::open_blob(&key, &stored, b["size"].as_u64().unwrap_or(0) as usize, b["sha256"].as_str().unwrap_or(""))
-            .map_err(|c| anyhow::anyhow!("{c}"))?;
-        let dir = self.state.join("media");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.ogg", object["id"].as_str().unwrap_or("blob")));
-        std::fs::write(&path, &plain)?;
-        Ok((path, digest(&plain)))
+        let sources = dsip_messaging::client::blob_sources(&json!({"blob": b, "manifest": manifest}));
+        let mut errors = vec![];
+        for uri in sources["sources"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            let stored = match self.http.get(uri).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        println!("BLOB-SOURCE-REJECTED {uri}: {e}");
+                        errors.push(format!("{uri}: {e}"));
+                        continue;
+                    }
+                },
+                Ok(resp) => {
+                    println!("BLOB-SOURCE-REJECTED {uri}: {}", resp.status());
+                    errors.push(format!("{uri}: {}", resp.status()));
+                    continue;
+                }
+                Err(e) => {
+                    println!("BLOB-SOURCE-REJECTED {uri}: {e}");
+                    errors.push(format!("{uri}: {e}"));
+                    continue;
+                }
+            };
+            // M§8.4 rule 7: whichever source, the hash and size must match before decrypting
+            match dsip_messaging::mls_wire::open_blob(&key, &stored, b["size"].as_u64().unwrap_or(0) as usize, b["sha256"].as_str().unwrap_or("")) {
+                Ok(plain) => {
+                    let dir = self.state.join("media");
+                    std::fs::create_dir_all(&dir)?;
+                    let path = dir.join(format!("{}.ogg", object["id"].as_str().unwrap_or("blob")));
+                    std::fs::write(&path, &plain)?;
+                    return Ok((path, digest(&plain), uri.to_string()));
+                }
+                Err(c) => {
+                    println!("BLOB-SOURCE-REJECTED {uri}: {c}");
+                    errors.push(format!("{uri}: {c}"));
+                }
+            }
+        }
+        bail!("no source served the blob: {}", errors.join("; "))
     }
 
     /// Our own content, accepted by the hub: known to the receipt rules (M§10.2) and archived (M§12.2, spec-gap 51).
@@ -1886,9 +1917,9 @@ impl Client {
                         c.last_media = object["id"].as_str().map(String::from);
                     }
                     // The item is committed; a failed fetch leaves the content visible and the blob re-fetchable.
-                    match self.fetch_media(&object).await {
-                        Ok((path, sha)) => println!(
-                            "RECV-AUDIO {sender} purpose={} duration_ms={} session={} file={} sha256={sha}",
+                    match self.fetch_media(&object, &item["blobs"]).await {
+                        Ok((path, sha, from)) => println!(
+                            "RECV-AUDIO {sender} purpose={} duration_ms={} session={} file={} sha256={sha} from={from}",
                             object["purpose"].as_str().unwrap_or("message"), object["duration_ms"],
                             object["session"].as_str().unwrap_or("-"), path.display()
                         ),
