@@ -49,7 +49,7 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, CommitRetry, History, Resume, SuccessorTracker};
+use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
@@ -87,6 +87,9 @@ struct Args {
     /// Mailbox `wss://` URI, for `--write-doc`.
     #[arg(long)]
     mailbox_uri: Option<String>,
+    /// Seconds a seq gap may stay unfilled before this device re-joins by external commit (M§6.5; spec-gap 69).
+    #[arg(long, default_value_t = dsip_messaging::client::GAP_TIMEOUT_S)]
+    gap_timeout: i64,
     /// Behavior disclosed to other identities (M§10.5): any of `read`, `played`, `activity`. `delivered` is on
     /// unless `--no-delivered`.
     #[arg(long, value_delimiter = ',')]
@@ -267,6 +270,11 @@ struct Client {
     restored: Vec<Value>,
     /// Call history by session, from the personal group (M§13.3; spec-gap 63).
     calls: BTreeMap<String, Value>,
+    /// Seq gaps per group (M§6.5): what is held, and when the hold began (spec-gap 69).
+    gaps: BTreeMap<String, GapTracker>,
+    /// Items held behind a gap, by group, kept durably until the gap fills or this device re-joins.
+    held_items: BTreeMap<String, Vec<Value>>,
+    gap_timeout: i64,
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
     own: HashSet<String>,
     resume: Resume,
@@ -601,8 +609,12 @@ impl Client {
         self.send(&env).await?;
         let reply = self.await_reply(&id).await?;
         if let Some(seq) = reply["seq"].as_i64() {
-            // The hub's `accepted` seq marks this device's own copy as processed (spec-gap 47).
+            // The hub's `accepted` seq marks this device's own copy as processed (spec-gap 47), for the gap
+            // tracker as much as for the resume state — otherwise its own items look like a gap (spec-gap 69).
             self.resume.sent(group, seq);
+            if matches!(class, "handshake" | "application") {
+                self.gap_of_from(group, seq).step(&json!({"item": {"seq": seq, "class": class}}));
+            }
             self.save_resume()?;
         }
         Ok(reply)
@@ -1321,6 +1333,57 @@ impl Client {
         }
     }
 
+    /// This group's gap tracker, starting from the seq position this device has committed, or — for a device that has
+    /// just joined and processed nothing — from the item at hand: what came before its welcome is not its gap
+    /// (M§6.5, M§12.3 step 5; spec-gap 69).
+    fn gap_of_from(&mut self, group: &str, first_seq: i64) -> &mut GapTracker {
+        let committed = self.resume.snapshot()["groups"][group]["contiguous"].as_i64().unwrap_or(0);
+        let contiguous = if committed == 0 { (first_seq - 1).max(0) } else { committed };
+        let (now, timeout) = (now_s(), self.gap_timeout);
+        self.gaps
+            .entry(group.to_string())
+            .or_insert_with(|| GapTracker::new(&json!({"now": now, "contiguous": contiguous, "gap_timeout": timeout})))
+    }
+
+    /// The tracker as it stands (it exists once the group has had a sequenced item).
+    fn gap_of(&mut self, group: &str) -> &mut GapTracker {
+        self.gap_of_from(group, 1)
+    }
+
+    /// Advance the gap trackers to wall time and re-join any group whose gap has not filled in time (M§6.5, M§6.8).
+    async fn check_gaps(&mut self) -> Result<()> {
+        let now = now_s();
+        let mut rejoin = vec![];
+        for (gid, g) in self.gaps.iter_mut() {
+            let delta = now - g.now();
+            if delta <= 0 {
+                continue;
+            }
+            for e in g.step(&json!({"advance": delta})) {
+                if let Some(held) = e.get("rejoin") {
+                    rejoin.push((gid.clone(), held["held"].clone(), g.snapshot()["contiguous"].as_i64().unwrap_or(0)));
+                }
+            }
+        }
+        for (gid, held, through) in rejoin {
+            println!("GAP-TIMEOUT group={gid} held={held}: re-joining by external commit");
+            self.held_items.remove(&gid);
+            self.resume.rejoined(&gid, through);
+            let held_json = serde_json::to_value(&self.held_items)?;
+            let p = self.mls.provider();
+            p.atomically(|| {
+                p.put_state("held_items", &held_json)?;
+                p.put_state("resume", &self.resume.snapshot())
+            })
+            .map_err(Self::state_err)?;
+            self.gaps.remove(&gid);
+            if let Err(e) = self.rejoin(&gid).await {
+                println!("ERR re-joining {gid}: {e}");
+            }
+        }
+        Ok(())
+    }
+
     /// Advance each conversation's receipt machine to wall time; report indicators that expired (M§10.3, M§11.2).
     fn tick(&mut self) {
         let now = now_s();
@@ -1761,6 +1824,36 @@ impl Client {
                 return Ok(());
             }
         }
+        // M§6.5 (spec-gap 69): a handshake beyond a seq gap, and anything after a held item, waits for the gap to fill
+        let mut released = vec![];
+        if matches!(class.as_str(), "handshake" | "application") && item["held_release"] != json!(true) && self.convs.contains_key(&gid) {
+            let seq = item["seq"].as_i64().unwrap_or(0);
+            let decisions = self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": class}}));
+            if decisions.iter().any(|d| d["hold"] == json!(seq)) {
+                let mut held = item.clone();
+                held["held_release"] = json!(true);
+                self.held_items.entry(gid.clone()).or_default().push(held);
+                self.resume.commit(item, true); // acknowledged: this device holds it durably, unprocessed
+                let held_json = serde_json::to_value(&self.held_items)?;
+                let p = self.mls.provider();
+                p.atomically(|| {
+                    p.put_state("held_items", &held_json)?;
+                    p.put_state("resume", &self.resume.snapshot())
+                })
+                .map_err(Self::state_err)?;
+                println!("HOLD {class} seq={seq} (waiting for the gap to fill)");
+                return Ok(());
+            }
+            for d in &decisions {
+                if let Some(s) = d["process"].as_i64().filter(|s| *s != seq) {
+                    if let Some(items) = self.held_items.get_mut(&gid) {
+                        if let Some(i) = items.iter().position(|h| h["seq"] == json!(s)) {
+                            released.push(items.remove(i));
+                        }
+                    }
+                }
+            }
+        }
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
         let before = self.resume.clone();
@@ -1862,6 +1955,11 @@ impl Client {
                 }
             }
             Outcome::Nothing => {}
+        }
+        for held in released {
+            // the gap filled: what was waiting behind it is processed now, in seq order
+            println!("RELEASED {} seq={}", held["class"].as_str().unwrap_or(""), held["seq"]);
+            Box::pin(self.item(&held)).await?;
         }
         Ok(())
     }
@@ -2139,6 +2237,9 @@ async fn main() -> Result<()> {
         sent_at: HashMap::new(),
         restored: vec![],
         calls: get("calls")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
+        gaps: BTreeMap::new(),
+        held_items: get("held_items")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
+        gap_timeout: args.gap_timeout,
         own: HashSet::new(),
         resume,
         successors: get("successors")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
@@ -2221,6 +2322,10 @@ async fn main() -> Result<()> {
             }
             _ = ticker.tick() => {
                 client.tick();
+                // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)
+                if let Err(e) = client.check_gaps().await {
+                    println!("ERR {e}");
+                }
                 if let Err(e) = client.flush_outbox().await {
                     println!("ERR {e}");
                 }

@@ -619,6 +619,7 @@ impl Client {
 /// a gap not filled within [`GAP_TIMEOUT_S`] of the first held item triggers a re-join (M§6.8).
 pub struct GapTracker {
     now: i64,
+    timeout: i64,
     contiguous: i64,
     seen: BTreeSet<i64>,
     held: Vec<i64>,
@@ -626,10 +627,12 @@ pub struct GapTracker {
 }
 
 impl GapTracker {
-    /// A tracker from a vector `context`: `now`, `contiguous`.
+    /// A tracker from a vector `context`: `now`, `contiguous`, `gap_timeout` (default [`GAP_TIMEOUT_S`]).
     pub fn new(ctx: &Value) -> GapTracker {
         GapTracker {
             now: ctx["now"].as_i64().unwrap_or(0),
+            // M§6.5 RECOMMENDED 300 s; a device may hold for less (spec-gap 69)
+            timeout: ctx["gap_timeout"].as_i64().unwrap_or(GAP_TIMEOUT_S),
             contiguous: ctx["contiguous"].as_i64().unwrap_or(0),
             seen: BTreeSet::new(),
             held: vec![],
@@ -641,7 +644,7 @@ impl GapTracker {
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         if let Some(n) = ev.get("advance").and_then(Value::as_i64) {
             self.now += n;
-            if !self.held.is_empty() && self.gap_since.is_some_and(|t| self.now - t >= GAP_TIMEOUT_S) {
+            if !self.held.is_empty() && self.gap_since.is_some_and(|t| self.now - t >= self.timeout) {
                 let out = vec![json!({"rejoin": {"held": self.held}})];
                 self.contiguous = self.held.iter().chain(self.seen.iter()).copied().max().unwrap_or(self.contiguous);
                 self.seen.clear();
@@ -677,6 +680,11 @@ impl GapTracker {
             self.gap_since = None;
         }
         out
+    }
+
+    /// The time this tracker has been advanced to.
+    pub fn now(&self) -> i64 {
+        self.now
     }
 
     /// Snapshot compared by the vectors.
@@ -776,6 +784,17 @@ impl Resume {
         }
     }
 
+    /// Re-joined by external commit: every seq up to the highest seen is passed.
+    ///
+    /// Spec: M§6.5, M§6.8 — the items behind the gap are gone, or for epochs this device can no longer reach, so a
+    /// later redelivery is a duplicate (spec-gap 69).
+    pub fn rejoined(&mut self, group: &str, seq: i64) {
+        let (contiguous, seen) = self.groups.entry(group.to_string()).or_default();
+        *contiguous = seen.iter().copied().chain([seq, *contiguous]).max().unwrap_or(seq);
+        seen.clear();
+        self.joined.insert(group.to_string());
+    }
+
     /// Forget the cursor after `mailbox.cursor-invalid`; seq positions and joined groups are kept.
     pub fn cursor_invalid(&mut self) {
         self.cursor = None;
@@ -789,7 +808,7 @@ impl Resume {
         }
     }
 
-    /// Apply one trace event (`items` with optional `crash_at`, `sent`, `sync`, `restart`, `cursor_invalid`).
+    /// Apply one trace event (`items` with optional `crash_at`, `sent`, `rejoined`, `sync`, `restart`, `cursor_invalid`).
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         if let Some(e) = ev.get("items") {
             let mut out = vec![];
@@ -813,6 +832,10 @@ impl Resume {
         }
         if let Some(e) = ev.get("sent") {
             self.sent(e["group"].as_str().unwrap_or(""), e["seq"].as_i64().unwrap_or(0));
+            return vec![];
+        }
+        if let Some(e) = ev.get("rejoined") {
+            self.rejoined(e["group"].as_str().unwrap_or(""), e["seq"].as_i64().unwrap_or(0));
             return vec![];
         }
         if ev.get("restart").is_some() {
