@@ -212,6 +212,10 @@ fn unb64(v: &Value) -> Vec<u8> {
 
 /// M§8.5: the deduplication key of an object.
 fn object_key(o: &Value) -> String {
+    if o["object"] == "call-event" {
+        // M§13.3 (spec-gap 63): one call-event per session, whichever device reported it
+        return format!("call|{}", o["session"].as_str().unwrap_or(""));
+    }
     format!("{}|{}|{}", o["conversation"].as_str().unwrap_or(""), o["sender"].as_str().unwrap_or(""), o["id"].as_str().unwrap_or(""))
 }
 
@@ -257,6 +261,12 @@ struct Client {
     history: History,
     /// Display text of shown history, by object key.
     lines: HashMap<String, String>,
+    /// `sent_at` of shown content, by object key (M§13.3 peer timelines).
+    sent_at: HashMap<String, i64>,
+    /// Content and receipts opened from archive, waiting to be applied to their conversation (spec-gap 64).
+    restored: Vec<Value>,
+    /// Call history by session, from the personal group (M§13.3; spec-gap 63).
+    calls: BTreeMap<String, Value>,
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
     own: HashSet<String>,
     resume: Resume,
@@ -1453,12 +1463,18 @@ impl Client {
                         by_group.entry(g).or_default().push(it);
                     }
                     for (g, items) in by_group {
-                        if let Some(c) = self.convs.get_mut(&g) {
-                            let emissions = c.receipts.step(&json!({"sync": {"items": items}}));
-                            self.outbox.extend(emissions.into_iter().map(|e| (g.clone(), e)));
+                        let Some(c) = self.convs.get_mut(&g) else { continue };
+                        let emissions = c.receipts.step(&json!({"sync": {"items": items}}));
+                        for e in emissions {
+                            match e["archive"]["seq"].as_i64() {
+                                // M§12.2 (spec-gap 64): the receipt changed rendering, so it is archived
+                                Some(seq) => self.archive_receipts(&items, seq),
+                                None => self.outbox.push((g.clone(), e)),
+                            }
                         }
                     }
                 }
+                self.apply_restored();
                 if p["next"].is_string() {
                     self.sync(false).await?;
                 }
@@ -1502,6 +1518,105 @@ impl Client {
         self.save_resume()
     }
 
+    /// Archive one object at `(group, seq)` under the current key (M§12.2); used for call events (spec-gap 63).
+    fn archive_object(&mut self, group: &str, obj: &Value, sender: &str, sender_device: &str, seq: i64) {
+        let (Some(akid), Some(conversation)) = (self.history.current_akid(), self.convs.get(group).map(|c| c.conversation.clone())) else { return };
+        let record = json!({"object": "archive-record", "conversation": conversation, "group": group, "seq": seq,
+            "sender": sender, "sender_device": sender_device, "received_at": now_s(), "payload": obj});
+        self.outbox.push((group.to_string(), json!({"archive": {"akid": akid, "record": record}})));
+    }
+
+    /// Archive the receipts at `seq` in a receipt batch, filed under the group each arrived in (M§12.2, spec-gap 64).
+    fn archive_receipts(&mut self, items: &[Value], seq: i64) {
+        let Some(akid) = self.history.current_akid() else { return };
+        for it in items.iter().filter(|it| it["seq"] == json!(seq) && it["object"]["object"] == "receipt") {
+            let src = it["src"].as_str().unwrap_or("").to_string();
+            let Some(conversation) = self.convs.get(&src).map(|c| c.conversation.clone()) else { continue };
+            let record = json!({"object": "archive-record", "conversation": conversation, "group": src, "seq": seq,
+                "sender": it["object"]["sender"], "sender_device": it["sender_device"], "received_at": now_s(), "payload": it["object"]});
+            self.outbox.push((src, json!({"archive": {"akid": akid, "record": record}})));
+        }
+    }
+
+    /// Apply restored content and receipts to the conversation they belong to, once this device is in it; the rest wait
+    /// (a restored record can be opened before the welcome to its conversation arrives).
+    fn apply_restored(&mut self) {
+        let mut by_group: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        let mut waiting = vec![];
+        for r in std::mem::take(&mut self.restored) {
+            let conversation = r["object"]["conversation"].clone();
+            let target = self.convs.iter().filter(|(_, c)| json!(c.conversation) == conversation)
+                .min_by_key(|(_, c)| c.kind == "personal").map(|(g, _)| g.clone());
+            match target {
+                Some(g) => by_group.entry(g).or_default().push(r),
+                None => waiting.push(r),
+            }
+        }
+        self.restored = waiting;
+        for (g, items) in by_group {
+            let Some(c) = self.convs.get_mut(&g) else { continue };
+            // Whatever the pinned machine decides for restored history is carried out, as for live items (it decides nothing).
+            for e in c.receipts.step(&json!({"restore": {"items": items}})) {
+                match e["archive"]["seq"].as_i64() {
+                    Some(seq) => self.archive_receipts(&items, seq),
+                    None => self.outbox.push((g.clone(), e)),
+                }
+            }
+        }
+    }
+
+    /// A callee leg ended: send the personal group a `call-event` if the pinned decision says so (M§13.3, spec-gap 63).
+    async fn call_ended(&mut self, session: &str, peer: &str, alerted: bool, answered_here: bool, ended_by: &str, reason: &str) -> Result<()> {
+        let d = dsip_messaging::client::call_event_decision(&json!({"alerted": alerted, "answered_here": answered_here,
+            "ended_by": ended_by, "reason": reason}));
+        if d["send"] != json!(true) {
+            println!("NO-CALL-EVENT session={session} reason={reason}");
+            return Ok(());
+        }
+        let personal = self.personal.clone().context("no personal group")?;
+        let obj = json!({"object": "call-event", "session": session, "peer": peer, "direction": "inbound", "outcome": d["outcome"], "at": now_s()});
+        let reply = self.send_object(&personal, &obj, json!({})).await?;
+        anyhow::ensure!(reply["type"] == "accepted", "call-event refused: {}", reply["reason"]);
+        if self.calls.contains_key(session) {
+            println!("SENT-CALL-EVENT {} session={session} (already recorded)", d["outcome"].as_str().unwrap_or(""));
+        } else {
+            println!("SENT-CALL-EVENT {} session={session}", d["outcome"].as_str().unwrap_or(""));
+            self.calls.insert(session.to_string(), obj.clone());
+            self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls)?).map_err(Self::state_err)?;
+            let (me, device) = (self.identity.clone(), self.keys.device.did());
+            self.archive_object(&personal, &obj, &me, &device, reply["seq"].as_i64().unwrap_or(0));
+            self.flush_outbox().await?;
+        }
+        Ok(())
+    }
+
+    /// Print one peer's timeline: the direct conversation's content and the personal group's call events for that peer
+    /// (M§13.3, spec-gap 63).
+    fn timeline(&self, peer: &str) -> Result<()> {
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let conversations: Vec<String> = self.convs.values()
+            .filter(|c| c.kind == "direct" && authenticate_members(&c.group, &ctx).is_ok_and(|m| m.iter().any(|w| w.identity == peer)))
+            .map(|c| c.conversation.clone()).collect();
+        let content: Vec<Value> = self.history.snapshot()["timeline"].as_array().into_iter().flatten().filter_map(Value::as_str)
+            .filter(|k| conversations.iter().any(|c| k.starts_with(&format!("{c}|"))))
+            .map(|k| json!({"id": k, "at": self.sent_at.get(k).copied().unwrap_or(0)})).collect();
+        let calls: Vec<Value> = self.calls.values().filter(|c| c["peer"] == json!(peer))
+            .map(|c| json!({"session": c["session"], "at": c["at"], "outcome": c["outcome"]})).collect();
+        let t = dsip_messaging::client::peer_timeline(&json!({"content": content, "calls": calls}));
+        let entries = t["timeline"].as_array().cloned().unwrap_or_default();
+        println!("PEER-TIMELINE {peer} {}", entries.len());
+        for e in entries {
+            let e = e.as_str().unwrap_or("");
+            if let Some(k) = e.strip_prefix("content:") {
+                println!("  MSG {}", self.lines.get(k).cloned().unwrap_or_default());
+            } else if let Some(sess) = e.strip_prefix("call:") {
+                println!("  CALL {} session={sess}", self.calls.get(sess).and_then(|c| c["outcome"].as_str()).unwrap_or(""));
+            }
+        }
+        Ok(())
+    }
+
     fn open_archive(&mut self, item: &Value) {
         let akid = item["akid"].as_str().unwrap_or("");
         let Some((key, _)) = self.archive_keys.get(akid).copied() else { return };
@@ -1515,11 +1630,28 @@ impl Client {
         let Ok(record) = serde_json::from_slice::<Value>(&plain) else { return };
         let obj = &record["payload"];
         let key_id = object_key(obj);
-        let e = self.history.step(&json!({"archive": {"cursor": item["cursor"], "akid": akid, "group": group, "seq": seq, "id": key_id}}));
+        let e = self.history.step(&json!({"archive": {"cursor": item["cursor"], "akid": akid, "group": group, "seq": seq, "id": key_id,
+            "object": obj["object"]}}));
         if e.iter().any(|x| x.get("show").is_some()) {
             let line = format!("{}: {}", record["sender"].as_str().unwrap_or(""), display(obj));
             println!("HISTORY seq={seq} {line}");
-            self.lines.insert(key_id, line);
+            self.lines.insert(key_id.clone(), line);
+            self.sent_at.insert(key_id, obj["sent_at"].as_i64().unwrap_or(0));
+            self.restored.push(json!({"seq": seq, "object": obj}));
+        }
+        if e.iter().any(|x| x.get("apply").is_some()) && obj["object"] == "call-event" {
+            let session = obj["session"].as_str().unwrap_or("").to_string();
+            if !self.calls.contains_key(&session) {
+                println!("HISTORY-CALL {} {} session={session}", obj["outcome"].as_str().unwrap_or(""), obj["peer"].as_str().unwrap_or(""));
+                self.calls.insert(session, obj.clone());
+                let _ = self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls).unwrap_or_default());
+            }
+            return;
+        }
+        if e.iter().any(|x| x.get("apply").is_some()) {
+            let what = if obj["kind"] == "read" { obj["through"].clone() } else { obj["targets"].clone() };
+            println!("HISTORY-RECEIPT seq={seq} {} {} {what}", record["sender"].as_str().unwrap_or(""), obj["kind"].as_str().unwrap_or(""));
+            self.restored.push(json!({"seq": seq, "object": obj}));
         }
     }
 
@@ -1711,6 +1843,19 @@ impl Client {
                 }
                 self.save_archive()?;
             }
+            Some("call-event") => {
+                // M§13.3 (spec-gap 63): every alerted device may report the call; one entry per session
+                let session = object["session"].as_str().unwrap_or("").to_string();
+                if self.calls.contains_key(&session) {
+                    println!("DUP-CALL session={session} from {sender_device}");
+                } else {
+                    println!("CALL {} {} {} session={session}", object["outcome"].as_str().unwrap_or(""),
+                        object["direction"].as_str().unwrap_or(""), object["peer"].as_str().unwrap_or(""));
+                    self.calls.insert(session, object.clone());
+                    self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls)?).map_err(Self::state_err)?;
+                    self.archive_object(gid, &object, sender, sender_device, seq);
+                }
+            }
             Some("receipt") => {
                 let what = if object["kind"] == "read" { object["through"].clone() } else { object["targets"].clone() };
                 let personal = self.personal.as_deref() == Some(gid);
@@ -1722,7 +1867,7 @@ impl Client {
                     Some(gid.to_string())
                 };
                 if let Some(t) = target {
-                    self.batch.push((t, json!({"seq": seq, "object": object})));
+                    self.batch.push((t, json!({"seq": seq, "object": object, "src": gid, "sender_device": sender_device})));
                 }
             }
             Some("content") => {
@@ -1732,7 +1877,8 @@ impl Client {
                     println!("DUP-HISTORY seq={seq}");
                     return Ok(());
                 }
-                self.lines.insert(key, format!("{sender}: {}", display(&object)));
+                self.lines.insert(key.clone(), format!("{sender}: {}", display(&object)));
+                self.sent_at.insert(key, object["sent_at"].as_i64().unwrap_or(0));
                 self.archive_requests(gid, &emissions, &object, sender, sender_device, seq);
                 self.batch.push((gid.to_string(), json!({"seq": seq, "object": object.clone()})));
                 if object.get("blob").is_some() {
@@ -1945,6 +2091,9 @@ async fn main() -> Result<()> {
         held: BTreeMap::new(),
         history: History::default(),
         lines: HashMap::new(),
+        sent_at: HashMap::new(),
+        restored: vec![],
+        calls: get("calls")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         own: HashSet::new(),
         resume,
         successors: get("successors")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
@@ -2116,6 +2265,17 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "remove" => client.remove(rest.trim()).await,
         "successor" => client.create_successor().await,
         "available" => client.available(),
+        "call-ended" => {
+            // call-ended <session> <peer> <alerted 0|1> <answered here 0|1> <local|remote> <reason>
+            let w: Vec<&str> = rest.split_whitespace().collect();
+            match w.as_slice() {
+                [session, peer, alerted, answered, by, reason] => {
+                    client.call_ended(session, peer, *alerted == "1", *answered == "1", by, reason).await
+                }
+                _ => Err(anyhow::anyhow!("usage: call-ended <session> <peer> <alerted 0|1> <answered 0|1> <local|remote> <reason>")),
+            }
+        }
+        "timeline" => client.timeline(rest.trim()),
         "rejoin" => client.rejoin(rest.trim()).await,
         "move-hub" => {
             // M§7.4: move the active group to another hub, by default this identity's own mailbox

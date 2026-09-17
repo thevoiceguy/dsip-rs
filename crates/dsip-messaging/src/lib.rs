@@ -60,6 +60,8 @@ pub fn run_vector(v: &Value) -> Value {
         "blob-put" => mailbox::blob_put(inp),
         "blob-get" => mailbox::blob_get(inp),
         "voicemail-offer" => client::voicemail_offer(inp),
+        "call-event" => client::call_event_decision(inp),
+        "peer-timeline" => client::peer_timeline(inp),
         "direct-select" => client::select_direct(inp["candidates"].as_array().map(Vec::as_slice).unwrap_or(&[])),
         "successor-check" => client::check_successor(inp),
         "successor-select" => client::select_successor(inp["candidates"].as_array().map(Vec::as_slice).unwrap_or(&[])),
