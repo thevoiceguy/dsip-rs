@@ -81,6 +81,10 @@ struct Args {
     max_blob_bytes: i64,
 }
 
+fn s_of(v: &Value) -> String {
+    v.as_str().unwrap_or("").to_string()
+}
+
 /// The saved service state, in the state directory.
 const STATE_FILE: &str = "mailbox-state.json";
 /// Seconds between checks for unacknowledged fan-out.
@@ -125,10 +129,14 @@ struct Service {
     max_blob_bytes: i64,
     /// Where [`STATE_FILE`] lives.
     state_dir: PathBuf,
-    /// Unacknowledged fan-out heads by (group, member identity): (seq, next retry at, current delay).
-    retry: HashMap<(String, String), (i64, i64, i64)>,
+    /// Unacknowledged fan-out heads by (group, member identity, class): (seq, next retry at, current delay). A welcome
+    /// has its own queue (spec-gap 66), so it is tracked apart from the identity's sequenced items.
+    retry: HashMap<(String, String, String), (i64, i64, i64)>,
     /// Manifest blobs of newly stored items, waiting to be replicated (M§8.4 rule 6, spec-gap 65).
     replicate: Vec<Value>,
+    /// Welcome deposits in flight, by deposit id: `(group, added identity, the commit's seq)` (spec-gap 66). A welcome
+    /// carries no `seq` on the wire (M§5.2), so its acknowledgement is matched here to release the hub's queue.
+    welcomes_sent: HashMap<String, (String, String, i64)>,
 }
 
 /// What goes out on a connection to a peer service.
@@ -174,6 +182,7 @@ impl Service {
             "conversations": self.conversations,
             "hub_refs": self.hub_refs,
             "revocations": self.revocations.iter().map(compact).collect::<Vec<_>>(),
+            "welcomes_sent": self.welcomes_sent.iter().map(|(id, (g, i, s))| json!([id, g, i, s])).collect::<Vec<_>>(),
             "seen": self.seen.entries(),
         });
         let bytes = serde_json::to_vec(&state).unwrap_or_default();
@@ -213,6 +222,9 @@ impl Service {
                 Some(Envelope { protected: parts.next()?.into(), payload: parts.next()?.into(), signature: parts.next()?.into() })
             })
             .collect();
+        for w in v["welcomes_sent"].as_array().into_iter().flatten() {
+            self.welcomes_sent.insert(s_of(&w[0]), (s_of(&w[1]), s_of(&w[2]), w[3].as_i64().unwrap_or(0)));
+        }
         self.seen = SeenIds::from_entries(serde_json::from_value(v["seen"].clone()).unwrap_or_default());
         Ok(true)
     }
@@ -227,10 +239,11 @@ impl Service {
         let mut live = std::collections::HashSet::new();
         for (group, e) in heads {
             let (to, seq) = (e["fanout"]["to"].as_str().unwrap_or("").to_string(), e["fanout"]["seq"].as_i64().unwrap_or(-1));
+            let class = e["fanout"]["class"].as_str().unwrap_or("").to_string();
             if to == self.owner {
-                continue;
+                continue; // our own owner's queues are filled and acknowledged in-process
             }
-            let key = (group.clone(), to.clone());
+            let key = (group.clone(), to.clone(), class.clone());
             live.insert(key.clone());
             let due = match self.retry.get(&key) {
                 _ if restarted => Some(RETRY_FIRST_S),
@@ -242,7 +255,7 @@ impl Service {
             };
             let Some(delay) = due else { continue };
             self.retry.insert(key, (seq, now + delay, delay));
-            tracing::info!("re-sending fan-out seq {seq} in {group} to {to}");
+            tracing::info!("re-sending {} seq {seq} in {group} to {to}", if class == "welcome" { "welcome" } else { "fan-out" });
             let resolver = self.resolver();
             for out in self.hub_out(&group, vec![e], now) {
                 if let Out::Identity(id, env) = out {
@@ -374,7 +387,8 @@ impl Service {
                 "fanout" if body["class"] == "welcome" => {
                     // M§6.5 rule 5, M§14.2: the welcome the commit carried, with the grants and the
                     // committer's own deposit as `origin`, so the new member's mailbox can verify the adder.
-                    let Some(item) = batch_seq.and_then(|s| self.fanout.get(&(group.to_string(), s)).cloned()) else { continue };
+                    let seq = body["seq"].as_i64().or(batch_seq);
+                    let Some(item) = seq.and_then(|s| self.fanout.get(&(group.to_string(), s)).cloned()) else { continue };
                     let Some(welcome) = item.welcome else { continue };
                     let mut fields = json!({"recipient": to, "mls": welcome,
                         "hub": self.conversations.get(group).map(|c| c["hub"].clone()).unwrap_or(Value::Null)});
@@ -387,7 +401,11 @@ impl Service {
                     if let Some(o) = item.origin {
                         fields["origin"] = json!(o);
                     }
-                    out.push(Out::Identity(to, wire::deposit(&self.key, "", now, group, "welcome", fields)));
+                    let env = wire::deposit(&self.key, "", now, group, "welcome", fields);
+                    if let (Some(id), Some(seq)) = (wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)), seq) {
+                        self.welcomes_sent.insert(id, (group.to_string(), to.clone(), seq));
+                    }
+                    out.push(Out::Identity(to, env));
                 }
                 "forward" if body["class"] == "ephemeral" => {
                     // M§11.2: never stored, no seq, no accepted; the envelope never outlives the originating
@@ -574,6 +592,7 @@ async fn main() -> Result<()> {
         state_dir: args.state.clone(),
         retry: HashMap::new(),
         replicate: vec![],
+        welcomes_sent: HashMap::new(),
     }));
     std::fs::create_dir_all(args.state.join("blobs"))?;
     // Bound before the state is reloaded: a connection waits in the backlog until the accept loop starts.
@@ -982,9 +1001,11 @@ fn dispatch(
                 let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
                 let grant = p["grants"].as_array().into_iter().flatten().filter_map(Value::as_str)
                     .find_map(|g| grant_payload(g, &ctx)).unwrap_or(Value::Null);
+                // spec-gap 66: the welcome's own bytes tell a retried delivery from a new invitation
+                let w_digest = p["mls"].as_str().and_then(dsip_core::b64::decode).map(|b| digest(&b));
                 let mut w = json!({"id": id, "from": device, "adder_identity": identity,
                     "recipient": st.owner, "group": group, "hub": p["hub"]["did"], "grant": grant,
-                    "successor_of": p["successor_of"]});
+                    "successor_of": p["successor_of"], "digest": w_digest});
                 // A service-signed welcome (no delegation) came from a hub: only `origin` names the adder (M§14.2).
                 if device == hello_device && bound_identity == device {
                     w["via_hub"] = json!(true);
@@ -1240,6 +1261,12 @@ fn hub_deposit(
             Out::Identity(to, env) if to == st.owner => {
                 let dep = wire::payload_of(&env).unwrap_or(json!({}));
                 result.extend(st.local_deposit(&dep, now));
+                if dep["class"] == "welcome" {
+                    // spec-gap 66: the welcome for our own owner never leaves the process, so its queue is released here
+                    if let (Some(h), Some(s)) = (st.hubs.get_mut(&group), seq) {
+                        h.step(&json!({"ack": {"identity": st.owner, "seq": s, "class": "welcome"}}));
+                    }
+                }
                 if let Some(h) = st.hubs.get_mut(&group) {
                     if let Some(s) = dep["seq"].as_i64() {
                         // A local ack may release the owner's next queued item; deliver it the same way.
@@ -1369,6 +1396,24 @@ async fn peer_task(
                         tracing::info!("{mailbox_did} refused our deposit: {} {}", p["reason"], p["detail"]);
                     }
                     if p["type"] == "accepted" {
+                        // spec-gap 66: a welcome carries no seq, so its acknowledgement is matched by deposit id
+                        if let Some(id) = p["in_reply_to"].as_str() {
+                            let mut st = service.lock().await;
+                            if let Some((group, identity, seq)) = st.welcomes_sent.remove(id) {
+                                if let Some(hub) = st.hubs.get_mut(&group) {
+                                    let more = hub.step(&json!({"ack": {"identity": identity, "seq": seq, "class": "welcome"}}));
+                                    let outs = st.hub_out(&group, more, now_s());
+                                    for out in outs {
+                                        if let Out::Identity(to, env) = out {
+                                            let resolver = st.resolver();
+                                            federate(&service, &mut st, &to, env, &resolver);
+                                        }
+                                    }
+                                }
+                                st.persist();
+                                continue;
+                            }
+                        }
                         let Some((group, identity, seq)) = p["in_reply_to"].as_str().and_then(|id| inflight.remove(id)) else {
                             continue;
                         };
