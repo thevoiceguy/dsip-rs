@@ -1345,10 +1345,6 @@ impl Client {
             .or_insert_with(|| GapTracker::new(&json!({"now": now, "contiguous": contiguous, "gap_timeout": timeout})))
     }
 
-    /// The tracker as it stands (it exists once the group has had a sequenced item).
-    fn gap_of(&mut self, group: &str) -> &mut GapTracker {
-        self.gap_of_from(group, 1)
-    }
 
     /// Advance the gap trackers to wall time and re-join any group whose gap has not filled in time (M§6.5, M§6.8).
     async fn check_gaps(&mut self) -> Result<()> {

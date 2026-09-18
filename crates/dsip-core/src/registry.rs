@@ -139,8 +139,8 @@ pub fn effective_integrity(v: Option<&str>) -> &'static str {
 
 /// Registered `about` namespaces for `info`.
 ///
-/// Spec: §12.12 (`dsip-info-about`; initial values are the media transport identifiers).
-pub const INFO_ABOUT: &[&str] = &["transport:webrtc"];
+/// Spec: §12.12 (`dsip-info-about`); `media:dtmf` carries DTMF digits (spec-gap 70).
+pub const INFO_ABOUT: &[&str] = &["transport:webrtc", "media:dtmf"];
 
 /// How a reason token resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
