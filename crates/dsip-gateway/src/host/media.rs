@@ -2,7 +2,8 @@
 //! RTP socket (SIP side, G.711 8 kHz), transcoded frame by frame.
 //!
 //! Spec: §14.1 (media flows only once both sides are up), §17.1 (Opus), §17.2 (encryption floor
-//! on the DSIP side; the SIP side's plain RTP is the §6.3 downgrade this gateway names). Impl:
+//! on the DSIP side; the SIP side's plain RTP is the §6.3 downgrade this gateway names), G§9
+//! (DTMF as RFC 4733 telephone-event when the SIP leg negotiated it). Impl:
 //! Opus decode → 48 kHz PCM → naive 6:1 decimate → G.711 encode, and the reverse with 1:6
 //! sample-hold; round one favours simplicity over resampler quality.
 
@@ -21,6 +22,48 @@ use tracing::{debug, trace};
 
 /// PCM sample-rate hop between Opus (48 kHz) and G.711 (8 kHz).
 const DECIMATE: usize = 6;
+
+/// One RTP packet interval at 8 kHz, in timestamp units (20 ms).
+const FRAME_SAMPLES: u16 = 160;
+
+/// A DTMF digit received as RFC 4733 telephone-event on the SIP leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtmfEvent {
+    /// The digit (`0`–`9`, `*`, `#`, `A`–`D`).
+    pub digits: String,
+    /// The event's total duration, ms.
+    pub duration_ms: u64,
+}
+
+/// RFC 4733 event code of a DTMF digit, `None` for anything else.
+pub fn dtmf_event_code(digit: char) -> Option<u8> {
+    match digit.to_ascii_uppercase() {
+        d @ '0'..='9' => Some(d as u8 - b'0'),
+        '*' => Some(10),
+        '#' => Some(11),
+        d @ 'A'..='D' => Some(12 + (d as u8 - b'A')),
+        _ => None,
+    }
+}
+
+/// The digit of an RFC 4733 DTMF event code, `None` for codes above 15.
+pub fn dtmf_digit_of(code: u8) -> Option<char> {
+    match code {
+        0..=9 => Some((b'0' + code) as char),
+        10 => Some('*'),
+        11 => Some('#'),
+        12..=15 => Some((b'A' + code - 12) as char),
+        _ => None,
+    }
+}
+
+/// Decode an RFC 4733 telephone-event payload: `(event, end, duration in timestamp units)`.
+pub fn telephone_event_of(payload: &[u8]) -> Option<(u8, bool, u16)> {
+    if payload.len() < 4 {
+        return None;
+    }
+    Some((payload[0], payload[1] & 0x80 != 0, u16::from_be_bytes([payload[2], payload[3]])))
+}
 
 /// The SIP-side RTP endpoint (plain RTP, symmetric-latching to where packets come from).
 pub struct RtpLeg {
@@ -65,17 +108,50 @@ impl RtpLeg {
         self.socket.send_to(&pkt.to_bytes(), to).await?;
         Ok(())
     }
+
+    /// Send one DTMF digit as an RFC 4733 event of `duration_ms` with payload type `pt`: a marked start
+    /// packet, an update every 20 ms, then the end packet three times, all on the event's timestamp.
+    ///
+    /// Spec: G§9. Impl (spec-gap 70): volume 10 dBm0; audio packets keep flowing on their own clock.
+    pub async fn send_event(&self, digit: char, duration_ms: u64, pt: u8) -> Result<()> {
+        let Some(code) = dtmf_event_code(digit) else { return Ok(()) };
+        let Some(to) = *self.remote.lock().await else { return Ok(()) };
+        let total = (duration_ms * 8).min(u16::MAX as u64) as u16; // 8 kHz timestamp units
+        let ts = self.ts.load(Ordering::Relaxed);
+        let mut elapsed = FRAME_SAMPLES.min(total);
+        let mut first = true;
+        loop {
+            let end = elapsed >= total;
+            let payload = Bytes::from(vec![code, if end { 0x80 | 10 } else { 10 }, (elapsed >> 8) as u8, elapsed as u8]);
+            for _ in 0..if end { 3 } else { 1 } {
+                let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+                let pkt = RtpPacket::build(pt, seq, ts, self.ssrc, payload.clone(), first);
+                first = false;
+                self.socket.send_to(&pkt.to_bytes(), to).await?;
+            }
+            if end {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            elapsed = elapsed.saturating_add(FRAME_SAMPLES).min(total);
+        }
+        Ok(())
+    }
 }
 
 /// Start the two transcoding pumps for a connected call. Returns when either side closes.
 ///
 /// - DSIP→SIP: forge `PeerEvent::Rtp` (Opus) → decode → decimate → G.711 → RTP to the trunk.
 /// - SIP→DSIP: RTP from the trunk → G.711 decode → upsample → Opus encode → `AudioSender`.
+/// `event_pt` is the payload type the trunk uses for RFC 4733 telephone-event, if negotiated: such packets are
+/// not audio; a completed event (its end packet, once) is reported on `dtmf_out` (G§9).
 pub async fn bridge(
     mut dsip_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>, // decoded Opus payloads from the DSIP leg
     dsip_tx: AudioSender,
     rtp: Arc<RtpLeg>,
     pcma: bool,
+    event_pt: Option<u8>,
+    dtmf_out: Option<tokio::sync::mpsc::UnboundedSender<DtmfEvent>>,
 ) -> Result<()> {
     // SIP → DSIP: read RTP, learn the remote, decode G.711, upsample, Opus-encode, send.
     let rtp_in = rtp.clone();
@@ -86,10 +162,23 @@ pub async fn bridge(
             Err(e) => { debug!("opus enc: {e}"); return; }
         };
         let mut out = vec![0u8; 4000];
+        let mut reported_event_ts: Option<u32> = None;
         loop {
             let Ok((n, from)) = rtp_in.socket.recv_from(&mut buf).await else { break };
             rtp_in.set_remote(from).await;
             let Ok(pkt) = RtpPacket::parse(Bytes::copy_from_slice(&buf[..n])) else { continue };
+            if event_pt.is_some_and(|pt| pkt.header.payload_type() == pt) {
+                // RFC 4733: report the event once, on its (retransmitted) end packet, keyed by its timestamp
+                if let Some((code, true, dur)) = telephone_event_of(&pkt.payload) {
+                    if reported_event_ts != Some(pkt.header.timestamp) {
+                        reported_event_ts = Some(pkt.header.timestamp);
+                        if let (Some(d), Some(tx)) = (dtmf_digit_of(code), &dtmf_out) {
+                            let _ = tx.send(DtmfEvent { digits: d.to_string(), duration_ms: dur as u64 / 8 });
+                        }
+                    }
+                }
+                continue;
+            }
             let mut pcm48 = Vec::with_capacity(pkt.payload.len() * DECIMATE);
             for &b in pkt.payload.iter() {
                 let s = if pcma { g711::decode_alaw(b) } else { g711::decode_ulaw(b) };

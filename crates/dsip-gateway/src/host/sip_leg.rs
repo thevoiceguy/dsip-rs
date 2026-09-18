@@ -29,7 +29,14 @@ pub struct RemoteRtp {
     pub payload_types: Vec<u8>,
     /// `sendrecv` | `sendonly` | `recvonly` | `inactive`.
     pub direction: String,
+    /// The payload type the peer announced for RFC 4733 `telephone-event/8000`, if any (G§9).
+    pub telephone_event: Option<u8>,
 }
+
+/// The payload type this gateway announces for RFC 4733 `telephone-event/8000`.
+///
+/// Spec: G§9 (a gateway MAY carry DTMF as RTP events when the SIP leg negotiated `telephone-event`).
+pub const TELEPHONE_EVENT_PT: u8 = 101;
 
 /// Parse `c=` and `m=audio` out of a trunk's SDP.
 pub fn parse_remote_rtp(sdp: &str) -> Option<RemoteRtp> {
@@ -37,6 +44,7 @@ pub fn parse_remote_rtp(sdp: &str) -> Option<RemoteRtp> {
     let mut port = None;
     let mut pts = vec![];
     let mut direction = "sendrecv".to_string();
+    let mut telephone_event = None;
     for line in sdp.lines().map(|l| l.trim_end_matches('\r')) {
         if let Some(c) = line.strip_prefix("c=IN IP4 ") {
             ip = Some(c.trim().to_string());
@@ -47,18 +55,28 @@ pub fn parse_remote_rtp(sdp: &str) -> Option<RemoteRtp> {
         } else if let Some(d) = line.strip_prefix("a=") {
             if ["sendrecv", "sendonly", "recvonly", "inactive"].contains(&d) {
                 direction = d.to_string();
+            } else if let Some(r) = d.strip_prefix("rtpmap:") {
+                // a=rtpmap:<pt> telephone-event/8000 (RFC 4733)
+                let mut it = r.split_whitespace();
+                if let (Some(pt), Some(codec)) = (it.next(), it.next()) {
+                    if codec.to_ascii_lowercase().starts_with("telephone-event/") {
+                        telephone_event = pt.parse().ok();
+                    }
+                }
             }
         }
     }
     let addr = format!("{}:{}", ip?, port?).parse().ok()?;
-    Some(RemoteRtp { addr, payload_types: pts, direction })
+    Some(RemoteRtp { addr, payload_types: pts, direction, telephone_event })
 }
 
-/// Our SDP toward the trunk: G.711 µ-law/A-law, plain RTP (round one).
+/// Our SDP toward the trunk: G.711 µ-law/A-law plus RFC 4733 telephone-event, plain RTP (round one).
 pub fn local_sdp(ip: &str, port: u16, direction: &str) -> String {
+    let te = TELEPHONE_EVENT_PT;
     format!(
         "v=0\r\no=dsip-gateway 1 1 IN IP4 {ip}\r\ns=DSIP gateway\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
-         m=audio {port} RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na={direction}\r\n"
+         m=audio {port} RTP/AVP 0 8 {te}\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n\
+         a=rtpmap:{te} telephone-event/8000\r\na=fmtp:{te} 0-15\r\na={direction}\r\n"
     )
 }
 

@@ -209,6 +209,18 @@ impl GatewayCall {
                             }
                         }
                     }
+                    (None, _) if s["event"] == "dtmf" => {
+                        // G§9: a digit that arrived as RFC 4733 telephone-event has nothing to answer on the SIP leg
+                        if self.answered && self.dsip != "ended" {
+                            let mut data = json!({"digits": s["dtmf"]});
+                            if let Some(ms) = s.get("duration_ms") {
+                                data["duration_ms"] = ms.clone();
+                            }
+                            out.push(json!({"dsip": {"local": "info", "about": "media:dtmf", "data": data}}));
+                        } else {
+                            out.push(json!({"ignore": "sip dtmf outside the established call"}));
+                        }
+                    }
                     (Some("REFER"), _) => out.push(json!({"sip": {"response": 603}})),
                     (Some("re-INVITE"), _) => {
                         let direction = s.get("direction").and_then(Value::as_str).unwrap_or("sendrecv");

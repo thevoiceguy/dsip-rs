@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::controller::GatewayCall;
 use super::dsip_leg::DsipMedia;
-use super::media::RtpLeg;
+use super::media::{DtmfEvent, RtpLeg};
 use super::sip_leg::{RemoteRtp, SipEvent, SipLeg};
 
 /// A live call: its controller, DSIP session id, SIP Call-ID, and media handles.
@@ -102,9 +102,8 @@ async fn apply_sip(call: &mut Call, s: &Value, legs: &Legs<'_>) -> Result<()> {
                     let reason = o.get("reason_header").and_then(|r| r.get("text")).and_then(Value::as_str).unwrap_or("user.hangup");
                     legs.sip.bye(cid, q, reason).await?;
                 } else if req == "INFO" {
-                    // G§9 (spec-gap 70): DTMF from the DSIP leg goes on the wire as INFO dtmf-relay
                     let digits = o.get("dtmf").and_then(Value::as_str).unwrap_or("");
-                    legs.sip.info_dtmf(cid, digits, o.get("duration_ms").and_then(Value::as_u64)).await?;
+                    send_dtmf(legs.sip, call.rtp.as_ref(), call.remote_rtp.as_ref(), cid, digits, o.get("duration_ms").and_then(Value::as_u64)).await?;
                 }
             }
         }
@@ -113,6 +112,44 @@ async fn apply_sip(call: &mut Call, s: &Value, legs: &Legs<'_>) -> Result<()> {
     Ok(())
 }
 
+
+/// Put DTMF from the DSIP leg on the SIP side: RFC 4733 events when the trunk negotiated `telephone-event`
+/// and the RTP leg is up, otherwise INFO dtmf-relay.
+///
+/// Spec: G§9 allows either carriage. Impl (spec-gap 70): RTP events are preferred when negotiated — they
+/// are what trunks interoperate on; INFO dtmf-relay is the fallback for a trunk that offered no
+/// `telephone-event`.
+pub async fn send_dtmf(
+    sip: &Arc<SipLeg>,
+    rtp: Option<&Arc<RtpLeg>>,
+    remote: Option<&RemoteRtp>,
+    sip_call_id: &str,
+    digits: &str,
+    duration_ms: Option<u64>,
+) -> Result<()> {
+    match (rtp, remote.and_then(|r| r.telephone_event)) {
+        (Some(rtp), Some(pt)) => {
+            let ms = duration_ms.unwrap_or(super::sip_leg::DTMF_DEFAULT_DURATION_MS);
+            for d in digits.chars() {
+                rtp.send_event(d, ms, pt).await?;
+            }
+            Ok(())
+        }
+        _ => sip.info_dtmf(sip_call_id, digits, duration_ms).await,
+    }
+}
+
+/// A DTMF event the media bridge decoded from the trunk's RTP (G§9): the controller sees it as a SIP-side
+/// event with nothing to answer.
+pub async fn on_rtp_dtmf(calls: &Arc<Mutex<Calls>>, sip: &Arc<SipLeg>, key: &str, ev: DtmfEvent) -> Result<()> {
+    let mut guard = calls.lock().await;
+    let event = json!({"sip": {"event": "dtmf", "dtmf": ev.digits, "duration_ms": ev.duration_ms}});
+    let emits = guard.0.get_mut(key).map(|c| c.step(&event)).unwrap_or_default();
+    if let Some(call) = guard.0.get_mut(key) {
+        apply(call, emits, &Legs { sip }).await?;
+    }
+    Ok(())
+}
 
 impl Call {
     /// A fresh outbound (DSIP→PSTN) call.
