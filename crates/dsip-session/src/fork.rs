@@ -299,7 +299,7 @@ impl Relay {
                     .map(|a| a.session.clone())
                     .collect();
                 for sid in live {
-                    let fresh = self.invites.get(&sid).map(|inv| inv.expires_at.unwrap_or(self.now + 1) > self.now).unwrap_or(false);
+                    let fresh = self.invites.get(&sid).map(|inv| inv.expires_at.unwrap_or(self.now + 1) >= self.now).unwrap_or(false); // `expired` is expires_at < now (§12.9)
                     if fresh {
                         self.attempts.get_mut(&sid).expect("live").legs.insert(device.clone(), LegState::Delivered);
                         self.out.push(Emission::Deliver { leg: device.clone(), msg_type: "invite".into(), reason: None, id: Some(sid) });
@@ -384,21 +384,32 @@ impl Relay {
         }
         let att = self.attempts.get_mut(&sid).expect("checked");
         if m.msg_type == "cancel" && m.from == att.initiator {
-            // §12.7 rule 3: per-leg cancel to every leg that has not terminated
-            let live: Vec<String> = att.legs.iter().filter(|(_, s)| !s.terminated()).map(|(l, _)| l.clone()).collect();
+            // §12.7 rule 3: per-leg cancel to every leg that has not terminated — or, addressed to a device, to
+            // that leg alone (§12.11: "a specific device DID (targeted cancel of one leg)")
+            let only = m.to.clone().filter(|to| att.legs.contains_key(to));
+            if only.is_none() && m.to.as_ref().is_some_and(|to| *to != att.identity) {
+                // addressed to a device that is no leg of this attempt: not the attempt's business
+                return self.route_plain(m);
+            }
+            let live: Vec<String> = att
+                .legs
+                .iter()
+                .filter(|(l, s)| !s.terminated() && only.as_ref().is_none_or(|o| o == *l))
+                .map(|(l, _)| l.clone())
+                .collect();
             for leg in live {
                 att.legs.insert(leg.clone(), LegState::Cancelled);
                 self.out.push(Emission::Deliver { leg, msg_type: "cancel".into(), reason: m.reason.clone(), id: None });
             }
-            if att.outcome.is_none() {
+            if att.outcome.is_none() && att.legs.values().all(|s| s.terminated()) {
                 att.outcome = Some("cancelled");
             }
             return;
         }
         let leg = m.from.clone();
         let Some(&state) = att.legs.get(&leg) else {
-            self.out.push(Emission::Drop("unknown-leg"));
-            return;
+            // spec-gap 82: not a leg of this attempt — routed like any envelope, never dropped
+            return self.route_plain(m);
         };
         if state.terminated() && !(m.msg_type == "answer" && state == LegState::Answered) {
             self.out.push(Emission::Drop("leg-terminated"));
@@ -439,7 +450,15 @@ impl Relay {
         } else if self.known(&to) {
             self.enqueue(m);
         } else {
-            self.out.push(Emission::Drop("unknown-attempt"));
+            // spec-gap 82: §13.2 — a relay MUST NOT silently drop an envelope on a live connection. Traffic for a
+            // session it holds no attempt for is routed like any envelope; with no route, the sender is told so.
+            self.out.push(Emission::Send(crate::event::SendMsg {
+                msg_type: "error".into(),
+                to: m.from.clone(),
+                reason: Some("transport.unknown-recipient".into()),
+                in_reply_to: Some(m.id.clone()),
+                ..Default::default()
+            }));
         }
     }
 
