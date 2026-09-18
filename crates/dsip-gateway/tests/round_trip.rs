@@ -4,8 +4,8 @@
 //! receiving transcoded RTP.
 //!
 //! No relay, no external processes: real SIP on the wire, real forge DTLS-SRTP on the DSIP side,
-//! the real `GatewayCall` controller mediating, real transcoding. DTMF crosses both ways as SIP INFO
-//! dtmf-relay ⇄ DSIP `info` about `media:dtmf` (G§9, spec-gap 70).
+//! the real `GatewayCall` controller mediating, real transcoding. DTMF crosses both ways (G§9, spec-gap 70):
+//! as SIP INFO dtmf-relay when the trunk offered no `telephone-event`, as RFC 4733 RTP events when it did.
 #![cfg(feature = "host")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,8 +15,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use dsip_gateway::controller::GatewayCall;
 use dsip_gateway::host::dsip_leg::DsipMedia;
-use dsip_gateway::host::media::{bridge, RtpLeg};
-use dsip_gateway::host::sip_leg::{local_sdp, SipEvent, SipLeg};
+use dsip_gateway::host::call::send_dtmf;
+use dsip_gateway::host::media::{bridge, telephone_event_of, DtmfEvent, RtpLeg};
+use dsip_gateway::host::sip_leg::{local_sdp, RemoteRtp, SipEvent, SipLeg, TELEPHONE_EVENT_PT};
 use forge_webrtc::{IceCandidate, PeerConnection, PeerEvent};
 use serde_json::json;
 use tokio::net::UdpSocket;
@@ -32,10 +33,14 @@ struct SipPeer {
     info_status: Arc<AtomicU64>,
     /// The INVITE we answered and where it came from, for in-dialog requests of our own.
     invite: Arc<Mutex<Option<(String, std::net::SocketAddr)>>>,
+    /// RFC 4733 event packets received: (event, end, duration, marker).
+    events_in: Arc<Mutex<Vec<(u8, bool, u16, bool)>>>,
+    /// Whether our SDP answer offers telephone-event (payload type 101).
+    telephone_event: bool,
 }
 
 impl SipPeer {
-    async fn spawn() -> (Arc<SipPeer>, u16) {
+    async fn spawn(telephone_event: bool) -> (Arc<SipPeer>, u16) {
         let peer = Arc::new(SipPeer {
             sip: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             rtp: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
@@ -43,12 +48,21 @@ impl SipPeer {
             info_in: Arc::new(Mutex::new(vec![])),
             info_status: Arc::new(AtomicU64::new(0)),
             invite: Arc::new(Mutex::new(None)),
+            events_in: Arc::new(Mutex::new(vec![])),
+            telephone_event,
         });
         let port = peer.sip.local_addr().unwrap().port();
-        let (rtp, rtp_in) = (peer.rtp.clone(), peer.rtp_in.clone());
+        let (rtp, rtp_in, events_in) = (peer.rtp.clone(), peer.rtp_in.clone(), peer.events_in.clone());
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             while let Ok((n, from)) = rtp.recv_from(&mut buf).await {
+                if n >= 12 && buf[1] & 0x7f == TELEPHONE_EVENT_PT {
+                    // an RFC 4733 event: record it, never echo it (a trunk plays it, it does not send it back)
+                    if let Some((code, end, dur)) = telephone_event_of(&buf[12..n]) {
+                        events_in.lock().unwrap().push((code, end, dur, buf[1] & 0x80 != 0));
+                    }
+                    continue;
+                }
                 rtp_in.fetch_add(1, Ordering::Relaxed);
                 let _ = rtp.send_to(&buf[..n], from).await; // echo (a real trunk sources its own)
             }
@@ -64,7 +78,9 @@ impl SipPeer {
                     let h = copy_headers(&msg);
                     let _ = p.sip.send_to(status(&h, 100, "Trying").as_bytes(), from).await;
                     let rp = p.rtp.local_addr().unwrap().port();
-                    let sdp = format!("v=0\r\no=peer 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {rp} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n");
+                    let te = if p.telephone_event { format!(" {TELEPHONE_EVENT_PT}") } else { String::new() };
+                    let te_attr = if p.telephone_event { format!("a=rtpmap:{TELEPHONE_EVENT_PT} telephone-event/8000\r\na=fmtp:{TELEPHONE_EVENT_PT} 0-15\r\n") } else { String::new() };
+                    let sdp = format!("v=0\r\no=peer 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {rp} RTP/AVP 0{te}\r\na=rtpmap:0 PCMU/8000\r\n{te_attr}a=sendrecv\r\n");
                     let ok = format!("{}Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}", ok_headers(&h), sdp.len(), sdp);
                     let _ = p.sip.send_to(ok.as_bytes(), from).await;
                 } else if first.starts_with("BYE") || first.starts_with("CANCEL") {
@@ -124,11 +140,25 @@ fn pump(
     });
 }
 
-#[tokio::test]
-async fn dsip_caller_reaches_sip_peer_with_transcoded_audio() {
+/// A connected DSIP→PSTN call with audio proven across the bridge, ready for DTMF.
+struct Live {
+    peer: Arc<SipPeer>,
+    peer_port: u16,
+    sip: Arc<SipLeg>,
+    sip_rx: mpsc::Receiver<SipEvent>,
+    rtp: Arc<RtpLeg>,
+    remote: RemoteRtp,
+    caller: PeerConnection,
+    gw: DsipMedia,
+    call_id: String,
+    ctrl: GatewayCall,
+    dtmf_rx: mpsc::UnboundedReceiver<DtmfEvent>,
+}
+
+async fn live_call(telephone_event: bool) -> Live {
     let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
 
-    let (peer, peer_port) = SipPeer::spawn().await;
+    let (peer, peer_port) = SipPeer::spawn(telephone_event).await;
     let (sip, mut sip_rx) = SipLeg::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1", "gateway").await.unwrap();
     let rtp = RtpLeg::bind("127.0.0.1", 0, 0x1234).await.unwrap();
 
@@ -173,14 +203,18 @@ async fn dsip_caller_reaches_sip_peer_with_transcoded_audio() {
         }
         assert!(tokio::time::Instant::now() < d2, "no 200 from the SIP peer");
     }
-    rtp.set_remote(remote.unwrap().addr).await;
+    let remote = remote.unwrap();
+    assert_eq!(remote.telephone_event, telephone_event.then_some(TELEPHONE_EVENT_PT), "SDP parse of telephone-event");
+    rtp.set_remote(remote.addr).await;
     let emits = ctrl.step(&json!({"sip": {"status": 200, "sdp": true}}));
     assert!(emits.iter().any(|e| e["dsip"]["local"] == "accept" && e["dsip"]["answered_by"] == "gateway"), "{emits:?}");
     assert!(emits.iter().any(|e| e["media"] == "bridge"));
 
     // Bridge: gateway inbound Opus → G.711 → peer; peer echo → Opus → caller.
     let sender = gw.sender().unwrap();
-    tokio::spawn(async move { let _ = bridge(rtp_in_rx, sender, rtp, false).await; });
+    let (dtmf_tx, dtmf_rx) = mpsc::unbounded_channel();
+    let bridge_rtp = rtp.clone();
+    tokio::spawn(async move { let _ = bridge(rtp_in_rx, sender, bridge_rtp, false, remote_te(telephone_event), Some(dtmf_tx)).await; });
 
     // Caller sources a 440 Hz Opus tone for ~0.8 s.
     let caller_send = caller.sender().unwrap();
@@ -198,11 +232,32 @@ async fn dsip_caller_reaches_sip_peer_with_transcoded_audio() {
     let at_peer = peer.rtp_in.load(Ordering::Relaxed);
     assert!(at_peer >= 10, "SIP peer should have received transcoded G.711 RTP through the gateway, got {at_peer}");
 
+    Live { peer, peer_port, sip, sip_rx, rtp, remote, caller, gw, call_id, ctrl, dtmf_rx }
+}
+
+fn remote_te(negotiated: bool) -> Option<u8> {
+    negotiated.then_some(TELEPHONE_EVENT_PT)
+}
+
+async fn hang_up(mut live: Live) {
+    // BYE both ways.
+    assert!(live.ctrl.step(&json!({"dsip": {"type": "bye", "reason": "user.hangup"}})).iter().any(|e| e["sip"]["request"] == "BYE"));
+    live.sip.bye(&live.call_id, Some(16), "user.hangup").await.unwrap();
+    live.caller.close();
+    live.gw.close();
+}
+
+#[tokio::test]
+async fn dsip_caller_reaches_sip_peer_with_transcoded_audio_and_dtmf_as_info() {
+    let mut live = live_call(false).await;
+    let Live { peer, peer_port, sip, sip_rx, rtp, remote, call_id, ctrl, .. } = &mut live;
+    let _ = rtp;
+
     // DTMF, DSIP → PSTN: the controller maps the signed `info` to INFO; the leg puts one dtmf-relay per digit on
     // the wire, CSeq increasing (G§9, spec-gap 70).
     let emits = ctrl.step(&json!({"dsip": {"type": "info", "about": "media:dtmf", "data": {"digits": "12#"}}}));
     assert_eq!(emits, vec![json!({"sip": {"request": "INFO", "dtmf": "12#"}})]);
-    sip.info_dtmf(&call_id, "12#", None).await.unwrap();
+    send_dtmf(sip, Some(rtp), Some(remote), call_id, "12#", None).await.unwrap();
     let d3 = tokio::time::Instant::now() + Duration::from_secs(5);
     while peer.info_in.lock().unwrap().len() < 3 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -220,14 +275,14 @@ async fn dsip_caller_reaches_sip_peer_with_transcoded_audio() {
     let (invite_msg, gw_addr) = peer.invite.lock().unwrap().clone().unwrap();
     let info = format!(
         "INFO sip:gateway@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK-peer-info\r\nFrom: {};tag=peer\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: 1 INFO\r\nMax-Forwards: 70\r\nContent-Type: application/dtmf-relay\r\nContent-Length: 24\r\n\r\nSignal=5\r\nDuration=160\r\n",
-        peer_port, hval(&invite_msg, "To"), hval(&invite_msg, "From"), hval(&invite_msg, "Call-ID")
+        *peer_port, hval(&invite_msg, "To"), hval(&invite_msg, "From"), hval(&invite_msg, "Call-ID")
     );
     peer.sip.send_to(info.as_bytes(), gw_addr).await.unwrap();
     let mut got = None;
     let d4 = tokio::time::Instant::now() + Duration::from_secs(5);
     while got.is_none() {
         if let Ok(Some(SipEvent::Info { call_id: cid, digits, duration_ms })) = tokio::time::timeout(Duration::from_millis(500), sip_rx.recv()).await {
-            assert_eq!(cid, call_id);
+            assert_eq!(&cid, call_id);
             got = Some((digits, duration_ms));
         }
         assert!(tokio::time::Instant::now() < d4, "the leg should have reported the peer's INFO");
@@ -238,10 +293,51 @@ async fn dsip_caller_reaches_sip_peer_with_transcoded_audio() {
     assert!(emits.iter().any(|e| e["dsip"]["local"] == "info" && e["dsip"]["about"] == "media:dtmf" && e["dsip"]["data"]["digits"] == "5"), "{emits:?}");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(peer.info_status.load(Ordering::SeqCst), 200, "the leg answers dtmf-relay INFO with 200");
+    assert!(peer.events_in.lock().unwrap().is_empty(), "no telephone-event negotiated: nothing rides RTP");
 
-    // BYE both ways.
-    assert!(ctrl.step(&json!({"dsip": {"type": "bye", "reason": "user.hangup"}})).iter().any(|e| e["sip"]["request"] == "BYE"));
-    sip.bye(&call_id, Some(16), "user.hangup").await.unwrap();
-    caller.close();
-    gw.close();
+    hang_up(live).await;
+}
+
+#[tokio::test]
+async fn dtmf_as_rfc4733_events_when_the_trunk_negotiated_telephone_event() {
+    let mut live = live_call(true).await;
+    let Live { peer, sip, rtp, remote, call_id, ctrl, dtmf_rx, .. } = &mut live;
+
+    // DSIP → PSTN: the same controller emission, carried as RTP events because the trunk offered telephone-event
+    // (G§9): per digit a marked start packet, updates, and the end packet three times, at the full duration.
+    let emits = ctrl.step(&json!({"dsip": {"type": "info", "about": "media:dtmf", "data": {"digits": "12#", "duration_ms": 100}}}));
+    assert_eq!(emits, vec![json!({"sip": {"request": "INFO", "dtmf": "12#", "duration_ms": 100}})]);
+    send_dtmf(sip, Some(rtp), Some(remote), call_id, "12#", Some(100)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = peer.events_in.lock().unwrap().clone();
+    let ended: Vec<(u8, u16)> = events.iter().filter(|(_, end, _, _)| *end).map(|(c, _, d, _)| (*c, *d)).collect();
+    assert_eq!(ended, [(1, 800); 3].iter().chain([(2, 800); 3].iter()).chain([(11, 800); 3].iter()).copied().collect::<Vec<_>>(), "{events:?}");
+    assert_eq!(events.iter().filter(|(_, _, _, marker)| *marker).count(), 3, "one marked start per digit: {events:?}");
+    assert!(events.iter().any(|(c, end, d, _)| *c == 1 && !*end && *d < 800), "updates before the end: {events:?}");
+    assert!(peer.info_in.lock().unwrap().is_empty(), "telephone-event negotiated: no INFO on the wire");
+
+    // PSTN → DSIP: the trunk sends an RFC 4733 event for '5' (start, updates, end ×3); the bridge reports it once,
+    // and the controller maps it to a DSIP info about media:dtmf with nothing to answer on the SIP leg.
+    let gw_rtp = std::net::SocketAddr::from(([127, 0, 0, 1], rtp.port()));
+    let ts = 123_456u32;
+    let mut seq = 500u16;
+    let mut send = |code: u8, end: bool, dur: u16, marker: bool| {
+        let payload = Bytes::from(vec![code, if end { 0x8a } else { 0x0a }, (dur >> 8) as u8, dur as u8]);
+        let pkt = forge_rtp::rtp::RtpPacket::build(TELEPHONE_EVENT_PT, seq, ts, 0xabcd, payload, marker);
+        seq = seq.wrapping_add(1);
+        pkt.to_bytes()
+    };
+    let mut packets = vec![send(5, false, 160, true), send(5, false, 320, false), send(5, false, 480, false)];
+    packets.extend([send(5, true, 1280, false), send(5, true, 1280, false), send(5, true, 1280, false)]);
+    for p in packets {
+        peer.rtp.send_to(&p, gw_rtp).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let ev = tokio::time::timeout(Duration::from_secs(5), dtmf_rx.recv()).await.expect("the bridge reports the event").unwrap();
+    assert_eq!(ev, DtmfEvent { digits: "5".into(), duration_ms: 160 });
+    assert!(tokio::time::timeout(Duration::from_millis(300), dtmf_rx.recv()).await.is_err(), "the end packet's retransmissions report nothing more");
+    let emits = ctrl.step(&json!({"sip": {"event": "dtmf", "dtmf": ev.digits, "duration_ms": ev.duration_ms}}));
+    assert_eq!(emits, vec![json!({"dsip": {"local": "info", "about": "media:dtmf", "data": {"digits": "5", "duration_ms": 160}}})]);
+
+    hang_up(live).await;
 }
