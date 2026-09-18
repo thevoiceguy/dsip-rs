@@ -34,6 +34,29 @@ pub const MESSAGE_GRANT_SCOPES: &[&str] = &["dsip.message", "dsip.invite"];
 /// Spec: M§14.2.
 pub const ORIGIN_SKEW_S: i64 = 300;
 
+/// How long a mailbox holds a moved group's new hub off while the old hub's items through `handover_seq` are
+/// still missing, seconds, from the `mailbox-config` that named the new hub.
+///
+/// Spec: M§7.4 (RECOMMENDED 300 s). Impl (spec-gap 71): a mailbox's own choice, `handover_wait` in a vector context.
+pub const HANDOVER_WAIT_S: i64 = 300;
+
+/// The hub a group moved from (M§7.4, spec-gap 60) and how far its delivery got (spec-gap 71).
+#[derive(Serialize, Deserialize, Clone)]
+struct Previous {
+    hub: String,
+    /// `handover_seq`: the seq the old hub gave the moving commit.
+    through: i64,
+    /// When the owner's device named the new hub; the wait for the old hub's last items starts here.
+    #[serde(default)]
+    since: i64,
+    /// The group's highest stored seq when the wait expired and the new hub was admitted regardless.
+    #[serde(default)]
+    released: Option<i64>,
+    /// Seqs the old hub delivered after the wait expired, stored out of order.
+    #[serde(default)]
+    late: Vec<i64>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Group {
     hub: String,
@@ -44,7 +67,7 @@ struct Group {
     high_seq: i64,
     /// The hub the group moved from and the seq of the commit that moved it (M§7.4, spec-gap 60).
     #[serde(default)]
-    previous: Option<(String, i64)>,
+    previous: Option<Previous>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -77,6 +100,8 @@ pub struct Mailbox {
     admit: String,
     pending_ttl: i64,
     pending_max: i64,
+    #[serde(default = "default_handover_wait")]
+    handover_wait: i64,
     groups: BTreeMap<String, Group>,
     kp: BTreeMap<String, KeyPackages>,
     revoked: BTreeSet<String>,
@@ -91,6 +116,10 @@ pub struct Mailbox {
     intro_window: i64,
     inbox_cap: usize,
     intro_log: HashMap<String, Vec<i64>>,
+}
+
+fn default_handover_wait() -> i64 {
+    HANDOVER_WAIT_S
 }
 
 /// The archive index as a list of `[group, seq, cursor]`: JSON object keys cannot be tuples.
@@ -171,6 +200,7 @@ impl Mailbox {
             admit: ctx["admit"].as_str().unwrap_or("grant").to_string(),
             pending_ttl: ctx["pending_group_ttl"].as_i64().unwrap_or(604_800),
             pending_max: ctx["pending_group_max_items"].as_i64().unwrap_or(500),
+            handover_wait: ctx["handover_wait"].as_i64().unwrap_or(HANDOVER_WAIT_S),
             groups,
             kp,
             revoked: BTreeSet::new(),
@@ -203,6 +233,11 @@ impl Mailbox {
     /// The owner's mailbox mode (M§4.4): `sync` or `queue`.
     pub fn mode(&self) -> &str {
         &self.mode
+    }
+
+    /// The mailbox's clock, seconds; a host advances it with `advance` events.
+    pub fn now(&self) -> i64 {
+        self.now
     }
 
     /// The owner's registered devices.
@@ -384,40 +419,58 @@ impl Mailbox {
         }
         let group = s(&e["group"]);
         let from = s(&e["from"]);
-        let Some(reg) = self.groups.get(&group) else {
+        let now = self.now;
+        let wait = self.handover_wait;
+        let Some(reg) = self.groups.get_mut(&group) else {
             return Self::error(&e["from"], &e["id"], "mailbox.unknown-group"); // M§6.6
         };
         let seq_in = e["seq"].as_i64();
-        match &reg.previous {
-            Some((prev, through)) if *prev == from && reg.hub != from => {
+        // An item of the previous hub arriving after the wait for it expired (spec-gap 71): stored out of order.
+        let mut late = false;
+        let mut out = vec![];
+        match &mut reg.previous {
+            Some(prev) if prev.hub == from && reg.hub != from => {
                 // spec-gap 60: the previous hub still delivers what it ordered, through the commit that moved the group
-                if seq_in.is_none_or(|n| n > *through) {
+                let Some(n) = seq_in.filter(|n| *n <= prev.through) else {
                     return Self::error(&e["from"], &e["id"], "mailbox.unknown-group");
-                }
+                };
+                // spec-gap 71: after the wait, what it still delivers at or below handover_seq is stored (the owner's
+                // devices fill their gap with it); what was stored before is a redelivery as usual
+                late = prev.released.is_some_and(|r| n > r) && !prev.late.contains(&n);
             }
             _ if reg.hub != from => return Self::error(&e["from"], &e["id"], "mailbox.unknown-group"), // M§6.6
-            Some((_, through)) => {
-                if reg.high_seq < *through {
-                    // spec-gap 60: not before the previous hub's items through the move are stored (the new hub retries)
-                    return Self::error(&e["from"], &e["id"], "mailbox.unknown-group");
+            Some(prev) => {
+                if reg.high_seq < prev.through && prev.released.is_none() {
+                    if now - prev.since < wait {
+                        // spec-gap 60: not before the previous hub's items through the move are stored (the new hub retries)
+                        return Self::error(&e["from"], &e["id"], "mailbox.unknown-group");
+                    }
+                    // spec-gap 71: the previous hub did not finish within handover_wait of the owner naming the new one;
+                    // the new hub is admitted and the missing seqs are left to the owner's devices (M§6.5 gap handling)
+                    prev.released = Some(reg.high_seq);
+                    prev.late = vec![];
+                    let missing: Vec<i64> = (reg.high_seq + 1..=prev.through).collect();
+                    out.push(json!({"handover_expired": {"group": group, "hub": prev.hub, "missing": missing}}));
                 }
-                if seq_in.is_some_and(|n| n <= *through) {
+                if seq_in.is_some_and(|n| n <= prev.through) {
                     return Self::error(&e["from"], &e["id"], "policy.blocked"); // spec-gap 60: numbering continues
                 }
             }
             None => {}
         }
+        let reg = &self.groups[&group];
         let class = s(&e["class"]);
         if class == "ephemeral" {
             // M§11.2: pushed to bound devices, never stored, never acknowledged; dropped at the
             // originating deposit's expires_at (spec-gap 49)
             if e["expires_at"].as_i64().is_some_and(|t| t < self.now) {
-                return vec![];
+                return out;
             }
-            return self.bound.iter().map(|d| json!({"push": {"to": d, "class": "ephemeral"}})).collect();
+            out.extend(self.bound.iter().map(|d| json!({"push": {"to": d, "class": "ephemeral"}})));
+            return out;
         }
         let seq = e["seq"].as_i64();
-        if let Some(seq) = seq.filter(|n| *n <= reg.high_seq) {
+        if let Some(seq) = seq.filter(|n| *n <= reg.high_seq && !late) {
             // spec-gap 59: a hub retries an unacknowledged fan-out (M§6.5 rule 5) and delivers in seq order, so a seq at
             // or below the group's highest stored is a redelivery: acknowledged as a duplicate, not stored or pushed again
             let mut acc = json!({"to": e["from"], "in_reply_to": e["id"], "duplicate": true});
@@ -431,15 +484,17 @@ impl Mailbox {
         }
         if let Some(r) = self.groups.get_mut(&group) {
             r.items += 1;
-            if let Some(seq) = seq {
-                r.high_seq = seq;
+            match (seq, late, &mut r.previous) {
+                (Some(n), true, Some(prev)) => prev.late.push(n),
+                (Some(n), _, _) => r.high_seq = n,
+                _ => {}
             }
         }
         let (c, pushes) = self.store(&class, &group, None);
         if let Some(it) = self.items.last_mut() {
             it.seq = seq;
         }
-        let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
+        out.push(json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}}));
         out.extend(pushes);
         out
     }
@@ -497,7 +552,9 @@ impl Mailbox {
                     // M§7.4 (spec-gap 60): an owner device that processed the commit moving the group names the new hub
                     // and that commit's seq; the old hub's items through it are still admitted
                     let through = g["handover_seq"].as_i64().unwrap_or(r.high_seq);
-                    r.previous = Some((std::mem::replace(&mut r.hub, hub.to_string()), through));
+                    let hub = std::mem::replace(&mut r.hub, hub.to_string());
+                    // spec-gap 71: the wait for the old hub's last items starts here
+                    r.previous = Some(Previous { hub, through, since: self.now, released: None, late: vec![] });
                 }
             } else if let Some(hub) = g["hub"].as_str() {
                 self.groups.insert(group, Group { hub: hub.into(), state: "joined".into(), since: self.now, items: 0, high_seq: 0, previous: None });
