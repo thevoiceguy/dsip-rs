@@ -104,7 +104,23 @@ pub enum SipEvent {
         /// SIP Call-ID.
         call_id: String,
     },
+    /// An in-dialog INFO carrying `application/dtmf-relay` (answered 200 already).
+    ///
+    /// Spec: G§9 (spec-gap 70). One INFO carries one digit on the wire; the event carries that digit.
+    Info {
+        /// SIP Call-ID.
+        call_id: String,
+        /// The digit (`0`–`9`, `*`, `#`, `A`–`D`).
+        digits: String,
+        /// `Duration=` from the body, ms, if present.
+        duration_ms: Option<u64>,
+    },
 }
+
+/// Tone length used on the wire when the DSIP `info` carries no `duration_ms`.
+///
+/// Spec: G§9 leaves it to the gateway. Impl (spec-gap 70): 160 ms, the common dtmf-relay default.
+pub const DTMF_DEFAULT_DURATION_MS: u64 = 160;
 
 struct SipCall {
     invite: Request,
@@ -216,6 +232,28 @@ impl SipLeg {
         self.send_req(&req, c.remote_addr).await
     }
 
+    /// DTMF digits as in-dialog INFO requests, one `application/dtmf-relay` body per digit, in order.
+    ///
+    /// Spec: G§9 (spec-gap 70): a DSIP `info` about `media:dtmf` becomes SIP INFO on the established call.
+    /// Impl: the UAC builder bumps CSeq on a clone of the dialog, so the stored dialog is advanced here too,
+    /// keeping every in-dialog request's CSeq increasing.
+    pub async fn info_dtmf(&self, call_id: &str, digits: &str, duration_ms: Option<u64>) -> Result<()> {
+        let ms = duration_ms.unwrap_or(DTMF_DEFAULT_DURATION_MS);
+        for d in digits.chars() {
+            let (req, addr) = {
+                let mut calls = self.calls.lock().await;
+                let c = calls.get_mut(call_id).ok_or_else(|| anyhow!("unknown call"))?;
+                let dialog = c.dialog.as_mut().ok_or_else(|| anyhow!("no dialog yet for INFO"))?;
+                let body = format!("Signal={d}\r\nDuration={ms}\r\n");
+                let req = self.uac.create_info(dialog, "application/dtmf-relay", &body).map_err(|e| anyhow!("info: {e}"))?;
+                dialog.next_local_cseq();
+                (req, c.remote_addr)
+            };
+            self.send_req(&req, addr).await?;
+        }
+        Ok(())
+    }
+
     /// Provisional response to an inbound INVITE.
     pub async fn ringing(&self, call_id: &str) -> Result<()> {
         let calls = self.calls.lock().await;
@@ -282,6 +320,27 @@ impl SipLeg {
                     let ok = UserAgentServer::accept_options(&req);
                     self.send_resp(&ok, from).await?;
                 }
+                m if *m == Method::Info => {
+                    // G§9 (spec-gap 70): dtmf-relay on a known call is answered 200 and reported; any other
+                    // INFO payload is not carried (415), and INFO outside a call we know is 481 (RFC 6086 §4.2.2)
+                    let known = self.calls.lock().await.contains_key(&call_id);
+                    let ctype = header(&req, "Content-Type").unwrap_or_default().to_ascii_lowercase();
+                    if !known {
+                        self.send_resp(&UserAgentServer::create_response(&req, 481, "Call/Transaction Does Not Exist"), from).await?;
+                    } else if ctype.starts_with("application/dtmf-relay") {
+                        let body = String::from_utf8_lossy(req.body()).to_string();
+                        match dtmf_relay_of(&body) {
+                            Some((digits, duration_ms)) => {
+                                let ok = self.uas.create_ok(&req, None).map_err(|e| anyhow!("ok: {e}"))?;
+                                self.send_resp(&ok, from).await?;
+                                let _ = self.events.send(SipEvent::Info { call_id, digits, duration_ms }).await;
+                            }
+                            None => self.send_resp(&UserAgentServer::create_response(&req, 400, "Bad Request"), from).await?,
+                        }
+                    } else {
+                        self.send_resp(&UserAgentServer::create_response(&req, 415, "Unsupported Media Type"), from).await?;
+                    }
+                }
                 _ => {
                     let resp = UserAgentServer::create_response(&req, 501, "Not Implemented");
                     self.send_resp(&resp, from).await?;
@@ -292,7 +351,10 @@ impl SipLeg {
             let status = resp.code();
             let cseq = resp.headers().get("CSeq").map(String::from).unwrap_or_default();
             if !cseq.ends_with("INVITE") {
-                return Ok(()); // BYE/CANCEL responses need no action in round one
+                if cseq.ends_with("INFO") && status >= 300 {
+                    debug!("INFO on {call_id} answered {status}"); // G§9: a refused digit is not retried
+                }
+                return Ok(()); // BYE/CANCEL/INFO responses need no further action in round one
             }
             let mut calls = self.calls.lock().await;
             let Some(c) = calls.get_mut(&call_id) else { return Ok(()) };
@@ -325,6 +387,25 @@ fn user_of(uri: Option<&str>) -> String {
     let s = s.split('>').next().unwrap_or(s);
     let s = s.split(':').nth(1).unwrap_or(s);
     s.split('@').next().unwrap_or(s).split(';').next().unwrap_or("").to_string()
+}
+
+/// `Signal=` and `Duration=` of an `application/dtmf-relay` body; `None` without a valid signal.
+///
+/// Spec: G§9 (spec-gap 70): digits are `0`–`9`, `*`, `#`, `A`–`D`.
+pub fn dtmf_relay_of(body: &str) -> Option<(String, Option<u64>)> {
+    let mut signal = None;
+    let mut duration = None;
+    for line in body.lines() {
+        let (k, v) = line.split_once('=')?;
+        match k.trim().to_ascii_lowercase().as_str() {
+            "signal" => signal = Some(v.trim().to_ascii_uppercase()),
+            "duration" => duration = v.trim().parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    let s = signal?;
+    let ok = s.len() == 1 && s.chars().all(|c| c.is_ascii_digit() || matches!(c, '*' | '#' | 'A'..='D'));
+    ok.then_some((s, duration))
 }
 
 fn q850_of(reason: Option<&str>) -> Option<u32> {

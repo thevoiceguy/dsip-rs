@@ -30,6 +30,9 @@ pub struct Call {
     /// The controller has signalled both legs are up.
     pub media_ready: bool,
     dial_target: Option<String>,
+    /// The last SIP request the leg reported; the leg answers BYE, CANCEL and INFO itself, so the
+    /// controller's `response` emission for those is not sent again (a `response` otherwise answers the INVITE).
+    last_sip_request: Option<String>,
 }
 
 /// The gateway's live-call table, one per direction-initiating event.
@@ -79,7 +82,9 @@ async fn apply_sip(call: &mut Call, s: &Value, legs: &Legs<'_>) -> Result<()> {
         Value::String(k) if k == "INVITE" => {}
         Value::Object(o) => {
             if let Some(code) = o.get("response").and_then(Value::as_u64) {
-                if code == 100 { /* trying already sent by the leg */ }
+                if call.last_sip_request.as_deref().is_some_and(|r| matches!(r, "BYE" | "CANCEL" | "INFO")) {
+                    // answered by the leg on receipt; nothing to send
+                } else if code == 100 { /* trying already sent by the leg */ }
                 else if code == 180 { legs.sip.ringing(cid).await?; }
                 else if (200..300).contains(&code) {
                     let rtp = call.rtp.as_ref().expect("rtp");
@@ -96,6 +101,10 @@ async fn apply_sip(call: &mut Call, s: &Value, legs: &Legs<'_>) -> Result<()> {
                     let q = o.get("q850").and_then(Value::as_u64).map(|c| c as u32);
                     let reason = o.get("reason_header").and_then(|r| r.get("text")).and_then(Value::as_str).unwrap_or("user.hangup");
                     legs.sip.bye(cid, q, reason).await?;
+                } else if req == "INFO" {
+                    // G§9 (spec-gap 70): DTMF from the DSIP leg goes on the wire as INFO dtmf-relay
+                    let digits = o.get("dtmf").and_then(Value::as_str).unwrap_or("");
+                    legs.sip.info_dtmf(cid, digits, o.get("duration_ms").and_then(Value::as_u64)).await?;
                 }
             }
         }
@@ -117,6 +126,7 @@ impl Call {
             remote_rtp: None,
             media_ready: false,
             dial_target: Some(dial_target),
+            last_sip_request: None,
         }
     }
 
@@ -131,6 +141,7 @@ impl Call {
             remote_rtp: remote,
             media_ready: false,
             dial_target: None,
+            last_sip_request: None,
         }
     }
 
@@ -174,8 +185,18 @@ pub async fn on_sip_event(calls: &Arc<Mutex<Calls>>, sip: &Arc<SipLeg>, ev: SipE
         SipEvent::Bye { call_id, q850 } => (find_by_sip(&guard, call_id), json!({"sip": {"request": "BYE", "q850": q850}})),
         SipEvent::Cancel { call_id } => (find_by_sip(&guard, call_id), json!({"sip": {"request": "CANCEL"}})),
         SipEvent::Ack { call_id } => (find_by_sip(&guard, call_id), json!({"sip": {"request": "ACK"}})),
+        SipEvent::Info { call_id, digits, duration_ms } => {
+            let mut s = json!({"request": "INFO", "dtmf": digits});
+            if let Some(ms) = duration_ms {
+                s["duration_ms"] = json!(ms);
+            }
+            (find_by_sip(&guard, call_id), json!({"sip": s}))
+        }
     };
     let Some(key) = key else { return Ok(()) };
+    if let Some(c) = guard.0.get_mut(&key) {
+        c.last_sip_request = event["sip"]["request"].as_str().map(String::from);
+    }
     let emits = guard.0.get_mut(&key).map(|c| c.step(&event)).unwrap_or_default();
     if let Some(call) = guard.0.get_mut(&key) {
         apply(call, emits, &Legs { sip }).await?;
