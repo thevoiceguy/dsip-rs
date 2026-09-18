@@ -4,11 +4,12 @@
 //! receiving transcoded RTP.
 //!
 //! No relay, no external processes: real SIP on the wire, real forge DTLS-SRTP on the DSIP side,
-//! the real `GatewayCall` controller mediating, real transcoding.
+//! the real `GatewayCall` controller mediating, real transcoding. DTMF crosses both ways as SIP INFO
+//! dtmf-relay ⇄ DSIP `info` about `media:dtmf` (G§9, spec-gap 70).
 #![cfg(feature = "host")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,6 +26,12 @@ struct SipPeer {
     sip: Arc<UdpSocket>,
     rtp: Arc<UdpSocket>,
     rtp_in: Arc<AtomicU64>,
+    /// INFO requests received: (CSeq header, body).
+    info_in: Arc<Mutex<Vec<(String, String)>>>,
+    /// Status of the last response to an INFO we sent.
+    info_status: Arc<AtomicU64>,
+    /// The INVITE we answered and where it came from, for in-dialog requests of our own.
+    invite: Arc<Mutex<Option<(String, std::net::SocketAddr)>>>,
 }
 
 impl SipPeer {
@@ -33,6 +40,9 @@ impl SipPeer {
             sip: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             rtp: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             rtp_in: Arc::new(AtomicU64::new(0)),
+            info_in: Arc::new(Mutex::new(vec![])),
+            info_status: Arc::new(AtomicU64::new(0)),
+            invite: Arc::new(Mutex::new(None)),
         });
         let port = peer.sip.local_addr().unwrap().port();
         let (rtp, rtp_in) = (peer.rtp.clone(), peer.rtp_in.clone());
@@ -50,6 +60,7 @@ impl SipPeer {
                 let msg = String::from_utf8_lossy(&buf[..n]).to_string();
                 let first = msg.lines().next().unwrap_or("");
                 if first.starts_with("INVITE") {
+                    *p.invite.lock().unwrap() = Some((msg.clone(), from));
                     let h = copy_headers(&msg);
                     let _ = p.sip.send_to(status(&h, 100, "Trying").as_bytes(), from).await;
                     let rp = p.rtp.local_addr().unwrap().port();
@@ -58,6 +69,13 @@ impl SipPeer {
                     let _ = p.sip.send_to(ok.as_bytes(), from).await;
                 } else if first.starts_with("BYE") || first.starts_with("CANCEL") {
                     let _ = p.sip.send_to(status(&copy_headers(&msg), 200, "OK").as_bytes(), from).await;
+                } else if first.starts_with("INFO") {
+                    let body = msg.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default();
+                    p.info_in.lock().unwrap().push((hval(&msg, "CSeq"), body));
+                    let _ = p.sip.send_to(status(&copy_headers(&msg), 200, "OK").as_bytes(), from).await;
+                } else if first.starts_with("SIP/2.0") && hval(&msg, "CSeq").ends_with("INFO") {
+                    let code: u64 = first.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+                    p.info_status.store(code, Ordering::SeqCst);
                 }
             }
         });
@@ -179,6 +197,47 @@ async fn dsip_caller_reaches_sip_peer_with_transcoded_audio() {
 
     let at_peer = peer.rtp_in.load(Ordering::Relaxed);
     assert!(at_peer >= 10, "SIP peer should have received transcoded G.711 RTP through the gateway, got {at_peer}");
+
+    // DTMF, DSIP → PSTN: the controller maps the signed `info` to INFO; the leg puts one dtmf-relay per digit on
+    // the wire, CSeq increasing (G§9, spec-gap 70).
+    let emits = ctrl.step(&json!({"dsip": {"type": "info", "about": "media:dtmf", "data": {"digits": "12#"}}}));
+    assert_eq!(emits, vec![json!({"sip": {"request": "INFO", "dtmf": "12#"}})]);
+    sip.info_dtmf(&call_id, "12#", None).await.unwrap();
+    let d3 = tokio::time::Instant::now() + Duration::from_secs(5);
+    while peer.info_in.lock().unwrap().len() < 3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(tokio::time::Instant::now() < d3, "SIP peer should have received three INFOs, got {:?}", peer.info_in.lock().unwrap());
+    }
+    let infos = peer.info_in.lock().unwrap().clone();
+    let signals: Vec<String> = infos.iter().map(|(_, b)| dsip_gateway::host::sip_leg::dtmf_relay_of(b).unwrap().0).collect();
+    assert_eq!(signals, ["1", "2", "#"]);
+    assert!(infos.iter().all(|(_, b)| b.contains("Duration=160")), "{infos:?}");
+    let cseqs: Vec<u32> = infos.iter().map(|(c, _)| c.split_whitespace().next().unwrap().parse().unwrap()).collect();
+    assert!(cseqs.windows(2).all(|w| w[1] > w[0]), "INFO CSeqs must increase: {cseqs:?}");
+
+    // DTMF, PSTN → DSIP: the peer sends INFO dtmf-relay in the dialog; the leg answers 200 and reports it; the
+    // controller maps it to a DSIP `info` about media:dtmf.
+    let (invite_msg, gw_addr) = peer.invite.lock().unwrap().clone().unwrap();
+    let info = format!(
+        "INFO sip:gateway@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK-peer-info\r\nFrom: {};tag=peer\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: 1 INFO\r\nMax-Forwards: 70\r\nContent-Type: application/dtmf-relay\r\nContent-Length: 24\r\n\r\nSignal=5\r\nDuration=160\r\n",
+        peer_port, hval(&invite_msg, "To"), hval(&invite_msg, "From"), hval(&invite_msg, "Call-ID")
+    );
+    peer.sip.send_to(info.as_bytes(), gw_addr).await.unwrap();
+    let mut got = None;
+    let d4 = tokio::time::Instant::now() + Duration::from_secs(5);
+    while got.is_none() {
+        if let Ok(Some(SipEvent::Info { call_id: cid, digits, duration_ms })) = tokio::time::timeout(Duration::from_millis(500), sip_rx.recv()).await {
+            assert_eq!(cid, call_id);
+            got = Some((digits, duration_ms));
+        }
+        assert!(tokio::time::Instant::now() < d4, "the leg should have reported the peer's INFO");
+    }
+    let (digits, duration_ms) = got.unwrap();
+    assert_eq!((digits.as_str(), duration_ms), ("5", Some(160)));
+    let emits = ctrl.step(&json!({"sip": {"request": "INFO", "dtmf": digits, "duration_ms": 160}}));
+    assert!(emits.iter().any(|e| e["dsip"]["local"] == "info" && e["dsip"]["about"] == "media:dtmf" && e["dsip"]["data"]["digits"] == "5"), "{emits:?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(peer.info_status.load(Ordering::SeqCst), 200, "the leg answers dtmf-relay INFO with 200");
 
     // BYE both ways.
     assert!(ctrl.step(&json!({"dsip": {"type": "bye", "reason": "user.hangup"}})).iter().any(|e| e["sip"]["request"] == "BYE"));
