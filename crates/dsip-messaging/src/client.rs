@@ -103,6 +103,166 @@ pub const ACTIVITY_REFRESH_S: i64 = 5;
 /// Spec: M§6.5 (`gap_timeout`, RECOMMENDED 300 s).
 pub const GAP_TIMEOUT_S: i64 = 300;
 
+/// How long a group's hub may be unreachable before the device creates the successor group (M§7.5), seconds.
+///
+/// Spec: M§9.4 (RECOMMENDED 24 h). Impl (spec-gap 72): the device's own choice, `hub_timeout` in a vector context.
+pub const HUB_TIMEOUT_S: i64 = 86400;
+/// First and largest delay before a pending deposit is re-deposited to an unreachable hub, seconds.
+///
+/// Spec: §13.2 (initial 1 s, factor 2, max 60 s; the ceiling — a host adds full jitter). Impl (spec-gap 72).
+pub const HUB_RETRY_INITIAL_S: i64 = 1;
+/// See [`HUB_RETRY_INITIAL_S`].
+pub const HUB_RETRY_MAX_S: i64 = 60;
+
+/// A device's outbox for one group while its hub cannot be reached.
+///
+/// Spec: M§9.4 — the client keeps content pending, retries with the §13.2 backoff, never deposits into members'
+/// mailboxes directly, and a hub unreachable past a threshold is the successor-group trigger (M§7.5); M§9.3 — a
+/// retry re-deposits the same bytes. Impl (spec-gap 72): the hub is down from the first `mailbox.hub-unreachable`
+/// (or no answer at all) until an `accepted`; the head is retried first and an `accepted` flushes the rest in order;
+/// after `hub_timeout` the pending items are handed to the successor to re-encrypt and the dead group's outbox is
+/// abandoned. Any other refusal is not an outage: the item leaves the outbox for its own handling.
+#[derive(Debug, Clone)]
+pub struct HubOutage {
+    now: i64,
+    hub_timeout: i64,
+    pending: Vec<String>,
+    down_since: Option<i64>,
+    attempt: i64,
+    retry_at: Option<i64>,
+    state: &'static str,
+}
+
+impl HubOutage {
+    /// An outbox from a vector `context`: `now`, `hub_timeout` (default [`HUB_TIMEOUT_S`]). A host restoring its
+    /// outbox passes `pending` (item ids, in order) and `down_since`; the first retry is then due at once.
+    pub fn new(ctx: &Value) -> HubOutage {
+        let now = ctx["now"].as_i64().unwrap_or(0);
+        let pending: Vec<String> = ctx["pending"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+        let down_since = ctx["down_since"].as_i64();
+        HubOutage {
+            now,
+            hub_timeout: ctx["hub_timeout"].as_i64().unwrap_or(HUB_TIMEOUT_S),
+            pending,
+            down_since,
+            attempt: 0,
+            retry_at: down_since.map(|_| now),
+            state: if down_since.is_some() { "down" } else { "up" },
+        }
+    }
+
+    /// Whether the hub is currently unreachable.
+    pub fn is_down(&self) -> bool {
+        self.state == "down"
+    }
+
+    /// The outbox's clock, seconds.
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+
+    /// When the current outage began, if the hub is down.
+    pub fn down_since(&self) -> Option<i64> {
+        self.down_since
+    }
+
+    /// Pending item ids, oldest first.
+    pub fn pending(&self) -> &[String] {
+        &self.pending
+    }
+
+    /// A new deposit for the group: forwarded now, or queued while the hub is down.
+    pub fn deposit(&mut self, id: &str) -> Vec<Value> {
+        if self.state == "abandoned" {
+            return vec![json!({"refuse": "group-abandoned"})];
+        }
+        self.pending.push(id.to_string());
+        if self.state == "up" { vec![json!({"forward": id})] } else { vec![json!({"queued": id})] }
+    }
+
+    fn unreachable(&mut self, id: &str) -> Vec<Value> {
+        if !self.pending.iter().any(|p| p == id) {
+            return vec![];
+        }
+        if self.down_since.is_none() {
+            self.down_since = Some(self.now);
+            self.state = "down";
+        }
+        self.attempt += 1;
+        let delay = (HUB_RETRY_INITIAL_S << (self.attempt - 1).min(30)).min(HUB_RETRY_MAX_S);
+        self.retry_at = Some(self.now + delay);
+        vec![json!({"retry_in": delay})]
+    }
+
+    /// The deposit got no answer at all: an outage like a refusal.
+    pub fn no_answer(&mut self, id: &str) -> Vec<Value> {
+        self.unreachable(id)
+    }
+
+    /// The hub's (or the mailbox's) answer to a pending deposit; `reason` is `None` for `accepted`.
+    pub fn answer(&mut self, id: &str, reason: Option<&str>) -> Vec<Value> {
+        if reason == Some("mailbox.hub-unreachable") {
+            return self.unreachable(id);
+        }
+        let Some(pos) = self.pending.iter().position(|p| p == id) else { return vec![] };
+        self.pending.remove(pos);
+        if let Some(r) = reason {
+            return vec![json!({"refused": {"id": id, "reason": r}})];
+        }
+        let mut out = vec![json!({"sent": id})];
+        if self.state == "down" {
+            self.state = "up";
+            self.down_since = None;
+            self.attempt = 0;
+            self.retry_at = None;
+            out.extend(self.pending.iter().map(|p| json!({"forward": p}))); // the hub is back: flush in order
+        }
+        out
+    }
+
+    /// Time passes: a retry when due, the successor trigger at the threshold.
+    pub fn advance(&mut self, n: i64) -> Vec<Value> {
+        self.now += n;
+        if self.state != "down" {
+            return vec![];
+        }
+        if self.now - self.down_since.unwrap_or(self.now) >= self.hub_timeout {
+            // M§9.4: the successor-group trigger of M§7.5; the pending items are re-encrypted for the successor
+            let pending = std::mem::take(&mut self.pending);
+            self.state = "abandoned";
+            self.retry_at = None;
+            return vec![json!({"successor": {"pending": pending}})];
+        }
+        if let (Some(head), Some(at)) = (self.pending.first(), self.retry_at) {
+            if self.now >= at {
+                self.retry_at = None; // the answer schedules the next attempt
+                return vec![json!({"forward": head})];
+            }
+        }
+        vec![]
+    }
+
+    /// Apply one trace event (`deposit`, `answer`, `no_answer`, `advance`).
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        if let Some(d) = ev.get("deposit") {
+            return self.deposit(d["id"].as_str().unwrap_or(""));
+        }
+        if let Some(a) = ev.get("answer") {
+            return self.answer(a["id"].as_str().unwrap_or(""), a["reason"].as_str());
+        }
+        if let Some(a) = ev.get("no_answer") {
+            return self.no_answer(a["id"].as_str().unwrap_or(""));
+        }
+        self.advance(ev["advance"].as_i64().unwrap_or(0))
+    }
+
+    /// Snapshot compared by the vectors.
+    pub fn snapshot(&self) -> Value {
+        json!({"state": self.state, "pending": self.pending, "attempt": self.attempt,
+               "down_for": self.down_since.map(|d| self.now - d)})
+    }
+}
+
 fn s(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()
 }

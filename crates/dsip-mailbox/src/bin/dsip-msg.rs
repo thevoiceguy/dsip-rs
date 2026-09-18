@@ -49,7 +49,7 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, Resume, SuccessorTracker};
+use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
@@ -90,6 +90,10 @@ struct Args {
     /// Seconds a seq gap may stay unfilled before this device re-joins by external commit (M§6.5; spec-gap 69).
     #[arg(long, default_value_t = dsip_messaging::client::GAP_TIMEOUT_S)]
     gap_timeout: i64,
+    /// How long a group's hub may be unreachable before this device creates the successor group (M§9.4, M§7.5;
+    /// RECOMMENDED 24 h).
+    #[arg(long, default_value_t = dsip_messaging::client::HUB_TIMEOUT_S)]
+    hub_timeout: i64,
     /// Behavior disclosed to other identities (M§10.5): any of `read`, `played`, `activity`. `delivered` is on
     /// unless `--no-delivered`.
     #[arg(long, value_delimiter = ',')]
@@ -275,6 +279,11 @@ struct Client {
     /// Items held behind a gap, by group, kept durably until the gap fills or this device re-joins.
     held_items: BTreeMap<String, Vec<Value>>,
     gap_timeout: i64,
+    /// The outbox per group while its hub cannot be reached (M§9.4; spec-gap 72).
+    outages: BTreeMap<String, HubOutage>,
+    /// Pending items per group, oldest first: `{id, mls, obj, extra}`, kept durably until accepted (M§9.2).
+    pending: BTreeMap<String, Vec<Value>>,
+    hub_timeout: i64,
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
     own: HashSet<String>,
     resume: Resume,
@@ -643,6 +652,7 @@ impl Client {
     /// the new hub (M§7.4, spec-gap 60).
     async fn send_object(&mut self, group: &str, obj: &Value, extra: Value) -> Result<Value> {
         let mut retry = CommitRetry::new(&json!({}));
+        let item_id = wire::new_id(now_s());
         loop {
             let hub_before = self.conv(group)?.hub.0.clone();
             let c = self.convs.get_mut(group).context("not a member of that group")?;
@@ -651,11 +661,27 @@ impl Client {
                 .create_message(self.mls.provider(), &self.mls.signer(), &serde_json::to_vec(obj)?)
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?
                 .tls_serialize_detached()?;
-            let mut fields = json!({"mls": b64(&msg)});
-            for (k, v) in extra.as_object().into_iter().flatten() {
-                fields[k.as_str()] = v.clone();
+            // M§9.2: the item is pending until the hub's accepted; its bytes are what every retry re-deposits (M§9.3)
+            let item = json!({"id": item_id, "mls": b64(&msg), "obj": obj, "extra": extra});
+            self.pending.entry(group.to_string()).or_default().push(item.clone());
+            let decision = self.outage_mut(group).deposit(&item_id);
+            if decision.iter().any(|e| e.get("queued").is_some()) {
+                // M§9.4: the hub is down; the item waits behind the pending ones and goes out with them
+                println!("PENDING {item_id} queued");
+                self.save_pending()?;
+                return Ok(json!({"type": "pending", "id": item_id}));
             }
-            let reply = self.hub_deposit(group, "application", fields).await?;
+            if decision.iter().any(|e| e.get("refuse").is_some()) {
+                self.pending.entry(group.to_string()).or_default().retain(|i| i["id"] != item_id);
+                bail!("group abandoned after its hub outage; the conversation continues in its successor");
+            }
+            let (more, reply) = self.deposit_item(group, &item).await?;
+            let Some(reply) = reply else {
+                self.run_outage(group, more).await?; // kept pending; the ticker retries with the §13.2 backoff
+                return Ok(json!({"type": "pending", "id": item_id}));
+            };
+            self.pending.entry(group.to_string()).or_default().retain(|i| i["id"] != item_id);
+            self.run_outage(group, more).await?; // an accepted answer may end an outage and flush the queue
             let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
             let actions = retry.answer(reason.as_deref());
             if !actions.iter().any(|a| a.get("sync").is_some()) {
@@ -668,6 +694,110 @@ impl Client {
                 return Ok(reply);
             }
         }
+    }
+
+    fn outage_mut(&mut self, group: &str) -> &mut HubOutage {
+        let timeout = self.hub_timeout;
+        self.outages.entry(group.to_string()).or_insert_with(|| HubOutage::new(&json!({"now": now_s(), "hub_timeout": timeout})))
+    }
+
+    /// Persist the outbox (M§9.2 pending items) with each outage's start, so a restart resumes the retries and the
+    /// threshold (spec-gap 72).
+    fn save_pending(&mut self) -> Result<()> {
+        let mut v = serde_json::Map::new();
+        for (g, items) in &self.pending {
+            if !items.is_empty() {
+                v.insert(g.clone(), json!({"items": items, "down_since": self.outages.get(g).and_then(|o| o.down_since())}));
+            }
+        }
+        self.mls.provider().put_state("pending", &Value::Object(v)).map_err(Self::state_err)
+    }
+
+    /// Deposit one pending item — its own MLS bytes (M§9.3) — and tell the outbox what came back: the outbox's
+    /// emissions and, unless the item stays pending, the answer. No answer at all counts as the hub unreachable.
+    async fn deposit_item(&mut self, group: &str, item: &Value) -> Result<(Vec<Value>, Option<Value>)> {
+        let id = item["id"].as_str().unwrap_or("").to_string();
+        let mut fields = json!({"mls": item["mls"]});
+        for (k, v) in item["extra"].as_object().into_iter().flatten() {
+            fields[k.as_str()] = v.clone();
+        }
+        match self.hub_deposit(group, "application", fields).await {
+            Ok(reply) => {
+                let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
+                let emissions = self.outage_mut(group).answer(&id, reason.as_deref());
+                let still_pending = reason.as_deref() == Some("mailbox.hub-unreachable");
+                Ok((emissions, (!still_pending).then_some(reply)))
+            }
+            Err(e) if e.to_string().contains("no answer") => Ok((self.outage_mut(group).no_answer(&id), None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Act on the outbox's emissions (M§9.4): re-deposit the head when due, flush the rest once the hub answers, and
+    /// create the successor group when the outage has lasted `hub_timeout`.
+    async fn run_outage(&mut self, group: &str, emissions: Vec<Value>) -> Result<()> {
+        let mut queue: std::collections::VecDeque<Value> = emissions.into();
+        while let Some(e) = queue.pop_front() {
+            if let Some(id) = e["forward"].as_str().map(String::from) {
+                let Some(item) = self.pending.get(group).and_then(|v| v.iter().find(|i| i["id"] == id).cloned()) else { continue };
+                let (more, reply) = self.deposit_item(group, &item).await?;
+                if let Some(r) = reply {
+                    self.pending.entry(group.to_string()).or_default().retain(|i| i["id"] != id);
+                    if r["type"] == "accepted" {
+                        self.sent(group, &r, &item["obj"]);
+                        println!("SENT-AFTER-OUTAGE {id} seq={}", r["seq"]);
+                    } else {
+                        println!("ERR pending {id} refused: {}", r["reason"]);
+                    }
+                }
+                queue.extend(more);
+            } else if let Some(d) = e["retry_in"].as_i64() {
+                let head = self.outages.get(group).and_then(|o| o.pending().first().cloned()).unwrap_or_default();
+                println!("PENDING {head} retry_in={d}");
+            } else if let Some(s) = e.get("successor") {
+                let ids: Vec<String> = s["pending"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+                println!("OUTAGE-SUCCESSOR group={group} pending={}", ids.len());
+                self.trigger_successor(group).await?;
+            }
+        }
+        self.save_pending()
+    }
+
+    /// M§9.4: the hub of `dead` has been unreachable for `hub_timeout`, the successor-group trigger of M§7.5. The
+    /// pending items are re-encrypted for the successor (their bytes were for the dead group's epoch).
+    async fn trigger_successor(&mut self, dead: &str) -> Result<()> {
+        let items = self.pending.remove(dead).unwrap_or_default();
+        self.outages.remove(dead);
+        self.save_pending()?;
+        self.active = Some(dead.to_string());
+        self.create_successor().await?;
+        let Some(winner) = self.successors.snapshot()[dead]["successor"].as_str().map(String::from) else {
+            println!("ERR no successor for {dead}; {} item(s) dropped", items.len());
+            return Ok(());
+        };
+        for it in items {
+            // boxed: send_object → run_outage → here → send_object is the one recursion in the outbox
+            let reply = Box::pin(self.send_object(&winner, &it["obj"], it["extra"].clone())).await?;
+            self.sent(&winner, &reply, &it["obj"]);
+            println!("RESENT {} in={winner} seq={}", it["id"].as_str().unwrap_or(""), reply["seq"]);
+        }
+        Ok(())
+    }
+
+    /// The ticker's share of M§9.4: time passes for every outage.
+    async fn check_outages(&mut self) -> Result<()> {
+        let now = now_s();
+        let down: Vec<String> = self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, _)| g.clone()).collect();
+        for g in down {
+            let emissions = match self.outages.get_mut(&g) {
+                Some(o) if now > o.now() => o.advance(now - o.now()),
+                _ => continue,
+            };
+            if !emissions.is_empty() {
+                self.run_outage(&g, emissions).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Build a commit for `op` against the group's current epoch: `(commit, welcome)`.
@@ -1536,6 +1666,7 @@ impl Client {
         self.sent(&group, &reply, &obj);
         match reply["type"].as_str() {
             Some("accepted") => println!("OK sent seq={}", reply["seq"]),
+            Some("pending") => {} // M§9.4: kept in the outbox, announced as PENDING
             _ => println!("ERR send refused: {}", reply["reason"]),
         }
         Ok(())
@@ -2236,6 +2367,9 @@ async fn main() -> Result<()> {
         gaps: BTreeMap::new(),
         held_items: get("held_items")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         gap_timeout: args.gap_timeout,
+        outages: BTreeMap::new(),
+        pending: BTreeMap::new(),
+        hub_timeout: args.hub_timeout,
         own: HashSet::new(),
         resume,
         successors: get("successors")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
@@ -2253,6 +2387,21 @@ async fn main() -> Result<()> {
     };
 
     // Restart: everything below comes from the database, exactly as last committed.
+    // M§9.4 (spec-gap 72): pending items and the outage they wait out survive a restart; the first retry is due now.
+    if let Some(p) = client.mls.provider().get_state("pending").map_err(Client::state_err)? {
+        let now = now_s();
+        for (g, v) in p.as_object().into_iter().flatten() {
+            let items: Vec<Value> = v["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                continue;
+            }
+            let ids: Vec<&str> = items.iter().filter_map(|i| i["id"].as_str()).collect();
+            let down_since = v["down_since"].as_i64().unwrap_or(now);
+            client.outages.insert(g.clone(), HubOutage::new(&json!({"now": now, "hub_timeout": client.hub_timeout, "pending": ids, "down_since": down_since})));
+            println!("PENDING restored {} item(s) for {g}", items.len());
+            client.pending.insert(g.clone(), items);
+        }
+    }
     let mut groups: Vec<String> = get_state_list(&client, "groups")?;
     if let Some(g) = client.mls.provider().get_state("group").map_err(Client::state_err)?.and_then(|g| g.as_str().map(String::from)) {
         groups.push(g); // state written before devices held several groups
@@ -2320,6 +2469,10 @@ async fn main() -> Result<()> {
                 client.tick();
                 // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)
                 if let Err(e) = client.check_gaps().await {
+                    println!("ERR {e}");
+                }
+                // M§9.4 (spec-gap 72): pending items are retried with backoff; a long outage makes a successor
+                if let Err(e) = client.check_outages().await {
                     println!("ERR {e}");
                 }
                 if let Err(e) = client.flush_outbox().await {

@@ -88,6 +88,10 @@ pub fn run_vector(v: &Value) -> Value {
             let mut c = client::CommitRetry::new(&v["context"]);
             trace(inp, |ev| (c.step(ev), c.snapshot()))
         }
+        "hub-outage-trace" => {
+            let mut o = client::HubOutage::new(&v["context"]);
+            trace(inp, |ev| (o.step(ev), o.snapshot()))
+        }
         "history-trace" => {
             let mut h = client::History::new(&v["context"]);
             trace(inp, |ev| (h.step(ev), h.snapshot()))

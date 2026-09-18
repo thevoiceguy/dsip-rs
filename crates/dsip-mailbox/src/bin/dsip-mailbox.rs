@@ -1167,7 +1167,8 @@ fn dispatch(
                             return vec![];
                         }
                         _ => {
-                            let env = wire::error(&st.key, &device, now, Some(&id), "mailbox.unknown-group", Some("hub not reachable"));
+                            // M§9.4 (spec-gap 72): no endpoint for the hub is the same outage as a failed dial
+                            let env = wire::error(&st.key, &device, now, Some(&id), "mailbox.hub-unreachable", Some("no endpoint known for the hub"));
                             return vec![Out::Device(device, env)];
                         }
                     }
@@ -1426,7 +1427,9 @@ fn peer_send(service: &Arc<Mutex<Service>>, st: &mut Service, peer_did: &str, ur
     }
 }
 
-/// One outbound connection to a peer mailbox: send deposits, feed acceptances back to the hub.
+/// One outbound connection to a peer mailbox: send deposits, feed acceptances back to the hub. When it ends —
+/// a dial that failed, or a connection lost — every deposit a device forwarded through it and the hub never
+/// answered is answered `mailbox.hub-unreachable`, so the device keeps it pending (M§9.4, spec-gap 72).
 async fn peer_task(
     key: KeyPair,
     ca: Option<PathBuf>,
@@ -1435,12 +1438,46 @@ async fn peer_task(
     mut rx: mpsc::UnboundedReceiver<PeerMsg>,
     service: Arc<Mutex<Service>>,
 ) -> Result<()> {
+    // forwarded deposit id → the owner device waiting for the hub's answer (M§5.2)
+    let mut forwarded: HashMap<String, String> = HashMap::new();
+    let outcome = peer_run(&key, ca, uri, &mailbox_did, &mut rx, &mut forwarded, &service).await;
+    let mut lost: Vec<(String, String)> = forwarded.drain().collect();
+    while let Ok(msg) = rx.try_recv() {
+        if let PeerMsg::Forward(env, device) = msg {
+            if let Some(id) = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)) {
+                lost.push((id, device));
+            }
+        }
+    }
+    if !lost.is_empty() {
+        let st = service.lock().await;
+        let now = now_s();
+        for (id, device) in lost {
+            tracing::info!("hub {mailbox_did} unreachable: answering {device}'s deposit {id} mailbox.hub-unreachable");
+            if let Some(tx) = st.bound.get(&device) {
+                let env = wire::error(&st.key, &device, now, Some(&id), "mailbox.hub-unreachable", Some("the group's hub could not be reached"));
+                let _ = tx.send(env.frame());
+            }
+        }
+    }
+    outcome
+}
+
+async fn peer_run(
+    key: &KeyPair,
+    ca: Option<PathBuf>,
+    uri: String,
+    mailbox_did: &str,
+    rx: &mut mpsc::UnboundedReceiver<PeerMsg>,
+    forwarded: &mut HashMap<String, String>,
+    service: &Arc<Mutex<Service>>,
+) -> Result<()> {
     let tls = tls::client_config(ca.as_deref())?;
     let mut seen = SeenIds::default();
     let params = ConnectParams {
         url: uri,
         tls,
-        device: &key,
+        device: key,
         on_behalf_of: None,
         delegations: vec![],
         supported: Supported::all_known(),
@@ -1453,8 +1490,6 @@ async fn peer_task(
     // deposit id → (group, recipient identity, seq): an `accepted` names only what it answers, but the
     // hub's fan-out queue is per identity (M§6.5 rule 5), so the recipient has to be remembered here.
     let mut inflight: HashMap<String, (String, String, i64)> = HashMap::new();
-    // forwarded deposit id → the owner device waiting for the hub's answer (M§5.2)
-    let mut forwarded: HashMap<String, String> = HashMap::new();
     anyhow::ensure!(conn.relay.did == mailbox_did, "peer mailbox is {} not {mailbox_did}", conn.relay.did);
     tracing::info!("federating to {mailbox_did}");
     loop {
@@ -1505,7 +1540,7 @@ async fn peer_task(
                                     for out in outs {
                                         if let Out::Identity(to, env) = out {
                                             let resolver = st.resolver();
-                                            federate(&service, &mut st, &to, env, &resolver);
+                                            federate(service, &mut st, &to, env, &resolver);
                                         }
                                     }
                                 }
@@ -1530,7 +1565,7 @@ async fn peer_task(
                             for out in outs {
                                 if let Out::Identity(to, env) = out {
                                     let resolver = st.resolver();
-                                    federate(&service, &mut st, &to, env, &resolver);
+                                    federate(service, &mut st, &to, env, &resolver);
                                 }
                             }
                         }

@@ -261,6 +261,11 @@ impl Mailbox {
             "advance" => self.advance(e.as_i64().unwrap_or(0)),
             "welcome" => self.welcome(e),
             "forward" => self.forward(e),
+            "forward_failed" => {
+                // M§9.4 (spec-gap 72): a forwarded deposit the mailbox could not hand to the hub (connection refused
+                // or lost) is answered mailbox.hub-unreachable, so the device keeps it pending and retries
+                Self::error(&e["device"], &e["id"], "mailbox.hub-unreachable")
+            }
             "first_contact" => self.first_contact(e),
             "hub_deposit" => self.hub_deposit(e),
             "sync" => self.sync(e),
