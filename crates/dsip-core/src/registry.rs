@@ -64,6 +64,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("transport.routing-refused", &["error"]),
     ("transport.unknown-recipient", &["error"]),
     ("transport.rate-limited", &["error"]),
+    ("transport.no-response", &["error"]), // §12.7 rule 6 (spec-gap 76)
     ("gateway.unreachable", &["reject", "error"]),
     ("gateway.downgraded", &["error"]),
     ("gateway.mapped", &["reject", "bye", "error"]),

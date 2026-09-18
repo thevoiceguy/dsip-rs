@@ -226,9 +226,17 @@ impl State {
                 Emission::Queue { to, msg_type } => tracing::info!("queued {msg_type} for {to} (§13.3)"),
                 Emission::Dequeue { to, msg_type, why } => tracing::info!("dequeued {msg_type} for {to}: {why}"),
                 Emission::Send(m) if m.msg_type == "error" => {
-                    if let Some(s) = sender {
-                        let f = self.error_frame(s, m.reason.as_deref().unwrap_or("transport.routing-refused"), m.in_reply_to.as_deref(), None, None);
-                        self.deliver(s, &f);
+                    // The relay's own signed error. Usually it answers the sender of the frame in hand; the attempt
+                    // outcome `transport.no-response` (§12.7 rule 6, spec-gap 76) goes to the initiator and may come
+                    // from a timer, with no frame in hand at all.
+                    let to = if m.to.is_empty() { sender.map(String::from) } else { Some(m.to.clone()) };
+                    if let Some(to) = to {
+                        let reason = m.reason.as_deref().unwrap_or("transport.routing-refused");
+                        let f = self.error_frame(&to, reason, m.in_reply_to.as_deref(), m.session.as_deref(), None);
+                        if reason == "transport.no-response" {
+                            tracing::info!("attempt {sid} outcome: no leg responded");
+                        }
+                        self.deliver(&to, &f);
                     }
                 }
                 Emission::Drop(why) => tracing::info!("dropped on {sid}: {why}"),

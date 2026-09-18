@@ -116,6 +116,9 @@ pub struct Mailbox {
     intro_window: i64,
     inbox_cap: usize,
     intro_log: HashMap<String, Vec<i64>>,
+    /// Introductions the owner sent and has no answer for yet (`mailbox-config` `introductions_sent`, spec-gap 81).
+    #[serde(default)]
+    introductions_sent: Vec<String>,
 }
 
 fn default_handover_wait() -> i64 {
@@ -213,6 +216,7 @@ impl Mailbox {
             intro_window: ctx["intro_window"].as_i64().unwrap_or(3600),
             inbox_cap: ctx["inbox_cap"].as_u64().unwrap_or(16) as usize,
             intro_log: HashMap::new(),
+            introductions_sent: Vec::new(),
         }
     }
 
@@ -319,7 +323,16 @@ impl Mailbox {
     /// inbox; an unknown recipient or a full inbox is accepted without holding (indistinguishable from delivery); held
     /// until the envelope expires.
     fn first_contact(&mut self, e: &Value) -> Vec<Value> {
-        let keys = [format!("sender:{}", s(&e["sender_identity"])), format!("inbox:{}", s(&e["recipient"]))];
+        let mut keys = vec![format!("sender:{}", s(&e["sender_identity"])), format!("inbox:{}", s(&e["recipient"]))];
+        // M§14.1 (spec-gap 81): a grant answering an introduction the owner sent is the reply it asked for — not
+        // metered, and the entry is consumed: one introduction, one answer. Any other grant is an unsolicited write
+        // into the mailbox and takes the introduction budget below.
+        if s(&e["kind"]) == "grant" {
+            if let Some(i) = e["session"].as_str().and_then(|id| self.introductions_sent.iter().position(|x| x == id)) {
+                self.introductions_sent.remove(i);
+                keys.clear();
+            }
+        }
         let (now, window) = (self.now, self.intro_window);
         for k in &keys {
             let log = self.intro_log.entry(k.clone()).or_default();
@@ -566,6 +579,11 @@ impl Mailbox {
             }
         }
         self.revoked.extend(e["revoked_grants"].as_array().into_iter().flatten().map(s));
+        for id in e["introductions_sent"].as_array().into_iter().flatten().map(s) {
+            if !self.introductions_sent.contains(&id) {
+                self.introductions_sent.push(id);
+            }
+        }
         let mut out = vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"]}})];
         for d in e["revoked_devices"].as_array().into_iter().flatten().map(s) {
             // spec-gap 57: a revoked device loses its binding now, its registration and its KeyPackages

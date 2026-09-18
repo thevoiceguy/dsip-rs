@@ -46,7 +46,8 @@ pub fn evaluate_provenance(stmt: &Value, stmt_identity: &str, publication: &Valu
     if !known_variant {
         return json!({"verdict": "reject", "code": "provenance-variant-unknown"});
     }
-    let mut out = json!({"verdict": "accept", "processor": s("processor"), "operation": s("operation"), "integrity_mode": "derivative-bound"});
+    // spec-gap 77: a statement has no integrity mode of its own; the delivered stream's mode is the display's (§22.2)
+    let mut out = json!({"verdict": "accept", "processor": s("processor"), "operation": s("operation")});
     let pol = &publication["policy"];
     if s("operation") == Some("transcode") && matches!(pol["transcoding"].as_str(), Some("forbidden" | "denied")) {
         out["policy_violation"] = "transcoding".into();

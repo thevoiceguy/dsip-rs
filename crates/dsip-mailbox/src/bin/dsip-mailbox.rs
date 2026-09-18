@@ -618,7 +618,7 @@ fn grant_payload(compact: &str, ctx: &Context) -> Option<Value> {
 /// Verify the signed envelope a first-contact deposit carries, fresh at deposit time (§19.4 pipeline: signature,
 /// delegation binding, introduction validity, expiry, ULID), and the profile's introduction rules (M§14.1).
 /// Returns `(sender identity, recipient, expires_at)`.
-fn first_contact_envelope(kind: &str, compact: &str, ctx: &Context) -> Result<(String, String, i64), String> {
+fn first_contact_envelope(kind: &str, compact: &str, ctx: &Context) -> Result<(String, String, i64, Option<String>), String> {
     let mut parts = compact.split('.');
     let mut next = || parts.next().unwrap_or("").to_string();
     let env = Envelope { protected: next(), payload: next(), signature: next() };
@@ -633,7 +633,9 @@ fn first_contact_envelope(kind: &str, compact: &str, ctx: &Context) -> Result<(S
             return Err(v["code"].as_str().unwrap_or("introduction").to_string());
         }
     }
-    Ok((ver.identity.clone(), p["to"].as_str().unwrap_or("").to_string(), p["expires_at"].as_i64().unwrap_or(0)))
+    // a grant names the introduction it answers in `session` (§19.4): what makes it solicited (spec-gap 81)
+    let answers = (kind == "grant").then(|| p["session"].as_str().map(String::from)).flatten();
+    Ok((ver.identity.clone(), p["to"].as_str().unwrap_or("").to_string(), p["expires_at"].as_i64().unwrap_or(0), answers))
 }
 
 #[tokio::main]
@@ -1085,7 +1087,7 @@ fn dispatch(
             if matches!(class, "introduction" | "grant") {
                 // First contact (M§14.1, spec-gap 54): a signed introduction or grant for an identity, under §19.4's rules.
                 let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
-                let (sender, to, expires_at) = match first_contact_envelope(class, p["envelope"].as_str().unwrap_or(""), &ctx) {
+                let (sender, to, expires_at, answers) = match first_contact_envelope(class, p["envelope"].as_str().unwrap_or(""), &ctx) {
                     Ok(v) => v,
                     Err(why) => {
                         tracing::info!("{class} refused: {why}");
@@ -1096,8 +1098,11 @@ fn dispatch(
                     return vec![Out::Device(device.clone(), wire::error(&st.key, &device, now, Some(&id), "policy.blocked", Some("recipient is not the envelope's to")))];
                 }
                 item.expires_at = Some(expires_at);
-                let event = json!({"first_contact": {"id": id, "from": device, "sender_identity": sender, "recipient": to,
+                let mut event = json!({"first_contact": {"id": id, "from": device, "sender_identity": sender, "recipient": to,
                     "kind": class, "expires_at": expires_at}});
+                if let Some(session) = answers {
+                    event["first_contact"]["session"] = json!(session);
+                }
                 let emissions = st.mailbox.step(&event);
                 for e in &emissions {
                     match (e.get("accepted"), e.get("error")) {
@@ -1214,7 +1219,7 @@ fn dispatch(
         }
         "mailbox-config" => {
             let mut e = json!({"id": id, "device": device});
-            for k in ["mode", "admit", "groups", "revoked_grants"] {
+            for k in ["mode", "admit", "groups", "revoked_grants", "introductions_sent"] {
                 if let Some(v) = p.get(k) {
                     e[k] = v.clone();
                 }

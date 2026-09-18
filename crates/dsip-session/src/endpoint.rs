@@ -498,12 +498,13 @@ impl Endpoint {
                 return;
             }
             LocalEvent::RejectIntroduction { introduction, reason } => {
-                let Some((_, device)) = self.contacts.requests.remove(introduction) else {
+                let Some((identity, _)) = self.contacts.requests.remove(introduction) else {
                     self.emit(Emission::Refused("unknown-introduction"));
                     return;
                 };
-                // §19.4 outcome 2: reject addressed to the introduction id; a policy choice, not an obligation
-                self.send_simple("reject", &device, introduction, Some(reason.as_deref().unwrap_or("user.declined")));
+                // §19.4 outcome 2: reject naming the introduction id; a policy choice, not an obligation.
+                // spec-gap 74: like a grant, it is addressed to the introducing identity.
+                self.send_simple("reject", &identity, introduction, Some(reason.as_deref().unwrap_or("user.declined")));
                 return;
             }
             LocalEvent::Revoke { grant } => {
@@ -683,6 +684,18 @@ impl Endpoint {
         }
         if t == "error" {
             let r = m.reason.clone().unwrap_or_default();
+            // §12.7 rule 6 (spec-gap 76): the relay's own `transport.no-response` is the attempt outcome when
+            // every leg stayed silent; no cancel follows — the relay has closed every leg
+            let attempt = m.session.as_ref().filter(|sid| {
+                self.sessions.get(*sid).is_some_and(|s| {
+                    s.role == Role::Initiator && matches!(s.state, SessionState::Inviting | SessionState::Proceeding)
+                })
+            });
+            if let (true, Some(sid)) = (r == "transport.no-response", attempt) {
+                let sid = sid.clone();
+                self.end(&sid, Some("transport.no-response"), false);
+                return;
+            }
             self.ui_with("error", "reason", &r);
             return;
         }

@@ -432,6 +432,10 @@ impl Client {
         }
         let env = self.sign_delegated(&p);
         let id = p["id"].as_str().unwrap_or("").to_string();
+        // M§14.1 (spec-gap 81): tell our own mailbox first, so the grant that answers this is not rate-limited there
+        let sent = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
+            json!({"subject": self.identity, "introductions_sent": [id]}));
+        self.send(&sent).await?;
         let answer = self.deposit_first_contact("introduction", target, &env).await?;
         match answer["type"].as_str() {
             Some("accepted") => println!("OK introduction {id} to {target} accepted sealed={}", !plain),
