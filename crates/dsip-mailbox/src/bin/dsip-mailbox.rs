@@ -79,6 +79,13 @@ struct Args {
     /// Largest blob accepted on the blob endpoint, bytes (M§4.3 `max_blob_bytes`).
     #[arg(long, default_value_t = 16_777_216)]
     max_blob_bytes: i64,
+    /// How long a moved group's new hub is held off while the old hub's last items are missing, seconds
+    /// (M§7.4, RECOMMENDED 300; spec-gap 71).
+    #[arg(long, default_value_t = dsip_messaging::mailbox::HANDOVER_WAIT_S)]
+    handover_wait: i64,
+    /// Fault injection for demos: never deliver hub fan-out to this peer mailbox (a hub that dies before delivering).
+    #[arg(long)]
+    drop_fanout_to: Option<String>,
 }
 
 fn s_of(v: &Value) -> String {
@@ -139,6 +146,8 @@ struct Service {
     /// Welcome deposits in flight, by deposit id: `(group, added identity, the commit's seq)` (spec-gap 66). A welcome
     /// carries no `seq` on the wire (M§5.2), so its acknowledgement is matched here to release the hub's queue.
     welcomes_sent: HashMap<String, (String, String, i64)>,
+    /// Fault injection: peer mailbox DID whose fan-out is dropped (`--drop-fanout-to`).
+    drop_fanout_to: Option<String>,
 }
 
 /// What goes out on a connection to a peer service.
@@ -246,9 +255,6 @@ impl Service {
         for (group, e) in heads {
             let (to, seq) = (e["fanout"]["to"].as_str().unwrap_or("").to_string(), e["fanout"]["seq"].as_i64().unwrap_or(-1));
             let class = e["fanout"]["class"].as_str().unwrap_or("").to_string();
-            if to == self.owner {
-                continue; // our own owner's queues are filled and acknowledged in-process
-            }
             let key = (group.clone(), to.clone(), class.clone());
             live.insert(key.clone());
             let due = match self.retry.get(&key) {
@@ -264,12 +270,84 @@ impl Service {
             tracing::info!("re-sending {} seq {seq} in {group} to {to}", if class == "welcome" { "welcome" } else { "fan-out" });
             let resolver = self.resolver();
             for out in self.hub_out(&group, vec![e], now) {
-                if let Out::Identity(id, env) = out {
-                    federate(service, self, &id, env, &resolver);
+                match out {
+                    // Our own owner's queue is delivered in-process; it waits like any other when the mailbox refuses
+                    // its own hub (a moved group's handover, spec-gap 71).
+                    Out::Identity(id, env) if id == self.owner => {
+                        let outs = self.deliver_local(&group, env, now);
+                        self.send_local(outs);
+                    }
+                    Out::Identity(id, env) => federate(service, self, &id, env, &resolver),
+                    Out::Device(..) => {}
                 }
             }
         }
         self.retry.retain(|k, _| live.contains(k));
+    }
+
+    /// Advance the mailbox machine's clock to `now`. It keeps its own (timers: §19.4 holds, M§6.6 pending groups, the
+    /// M§7.4 handover wait), advanced before every message and on the retry tick, and catching up from the saved clock
+    /// after a restart.
+    fn catch_up(&mut self, now: i64) {
+        let behind = now - self.mailbox.now();
+        if behind > 0 {
+            let emissions = self.mailbox.step(&json!({"advance": behind}));
+            let outs = self.mailbox_out(emissions, now);
+            self.send_local(outs);
+        }
+    }
+
+    /// Send what is addressed to bound devices of our owner; nothing else arises outside a connection handler.
+    fn send_local(&self, outs: Vec<Out>) {
+        for out in outs {
+            if let Out::Device(to, env) = out {
+                if let Some(tx) = self.bound.get(&to) {
+                    let _ = tx.send(env.frame());
+                }
+            }
+        }
+    }
+
+    /// A hub fan-out addressed to our own owner: into the mailbox in-process. The hub's queue is acknowledged only
+    /// when the mailbox took the item (spec-gap 71: a moved group's mailbox holds even its own hub off until the old
+    /// hub's items arrive or the handover wait expires), and whatever that acknowledgement releases is delivered
+    /// the same way.
+    fn deliver_local(&mut self, group: &str, env: Envelope, now: i64) -> Vec<Out> {
+        let mut result = vec![];
+        let mut pending = vec![env];
+        while let Some(env) = pending.pop() {
+            let dep = wire::payload_of(&env).unwrap_or(json!({}));
+            let (outs, refused) = self.local_deposit(&dep, now);
+            result.extend(outs);
+            let (class, id) = (s_of(&dep["class"]), s_of(&dep["id"]));
+            if let Some(reason) = refused {
+                let queued = if dep["seq"].is_i64() || class == "welcome" { " (queued, retried)" } else { "" };
+                tracing::info!("our own mailbox refused hub fan-out {class} seq {} in {group}: {reason}{queued}", dep["seq"]);
+                continue;
+            }
+            // spec-gap 66: a welcome carries no seq; the one queued for it is remembered by deposit id
+            let welcome_seq = if class == "welcome" { self.welcomes_sent.remove(&id).map(|(_, _, s)| s) } else { None };
+            let Some(h) = self.hubs.get_mut(group) else { continue };
+            let mut more = vec![];
+            if let Some(s) = welcome_seq {
+                // the welcome for our own owner never leaves the process, so its queue is released here
+                more.extend(h.step(&json!({"ack": {"identity": self.owner, "seq": s, "class": "welcome"}})));
+            }
+            if let Some(s) = dep["seq"].as_i64() {
+                // A local ack may release the owner's next queued item; deliver it the same way.
+                more.extend(h.step(&json!({"ack": {"identity": self.owner, "seq": s}})));
+            }
+            if !more.is_empty() {
+                tracing::info!("local fan-out released {} more", more.len());
+            }
+            for o in self.hub_out(group, more, now) {
+                match o {
+                    Out::Identity(to, env) if to == self.owner => pending.push(env),
+                    other => result.push(other),
+                }
+            }
+        }
+        result
     }
 
     fn resolver(&self) -> StaticResolver {
@@ -316,6 +394,12 @@ impl Service {
                     }
                     let env = wire::accepted(&self.key, &to, now, body["in_reply_to"].as_str().unwrap_or(""), extra);
                     out.push(Out::Device(to, env));
+                }
+                "handover_expired" => {
+                    // spec-gap 71: the old hub never delivered its last items; the new hub is admitted regardless and
+                    // the owner's devices treat the missing seqs as a gap (M§6.5)
+                    tracing::info!("handover wait expired for group {}: admitting the new hub without the old hub {}'s seqs {}",
+                        body["group"], body["hub"], body["missing"]);
                 }
                 "error" => {
                     let mut fields = json!({"reason": body["reason"]});
@@ -457,16 +541,18 @@ impl Service {
         out
     }
 
-    /// Feed a hub fan-out addressed to our own owner straight into the mailbox (no socket).
-    fn local_deposit(&mut self, dep: &Value, now: i64) -> Vec<Out> {
+    /// Feed a hub fan-out addressed to our own owner straight into the mailbox (no socket). The second value is the
+    /// mailbox's refusal reason, if it refused.
+    fn local_deposit(&mut self, dep: &Value, now: i64) -> (Vec<Out>, Option<String>) {
         let item = Item::from_deposit(dep, &self.key.did(), now);
         let event = json!({"hub_deposit": {"id": dep["id"], "from": self.key.did(), "recipient": self.owner,
             "group": dep["group"], "seq": dep["seq"], "class": dep["class"], "expires_at": dep["expires_at"]}});
         let emissions = self.mailbox.step(&event);
+        let refused = emissions.iter().find_map(|e| e["error"]["reason"].as_str().map(String::from));
         let mut out = self.ephemeral_pushes(&emissions, dep, &self.key.did(), now);
         self.absorb(&emissions, item);
         out.extend(self.mailbox_out(emissions, now));
-        out
+        (out, refused)
     }
 
     /// Ephemeral pushes (no cursor) become `items` carrying the sealed activity and its originating expiry.
@@ -574,7 +660,8 @@ async fn main() -> Result<()> {
     tracing::info!("mailbox {} for {} on wss://{}/dsip (ca {})", key.did(), args.owner, args.listen, cert.display());
 
     let mailbox = Mailbox::new(&json!({"now": now_s(), "owner": args.owner, "serves": [args.owner], "devices": [],
-        "admit": args.admit, "intro_limit": args.intro_limit, "intro_window": args.intro_window, "inbox_cap": args.inbox_cap}));
+        "admit": args.admit, "intro_limit": args.intro_limit, "intro_window": args.intro_window, "inbox_cap": args.inbox_cap,
+        "handover_wait": args.handover_wait}));
     let service = Arc::new(Mutex::new(Service {
         key,
         owner: args.owner.clone(),
@@ -600,6 +687,7 @@ async fn main() -> Result<()> {
         replicate: vec![],
         replicate_later: vec![],
         welcomes_sent: HashMap::new(),
+        drop_fanout_to: args.drop_fanout_to.clone(),
     }));
     std::fs::create_dir_all(args.state.join("blobs"))?;
     // Bound before the state is reloaded: a connection waits in the backlog until the accept loop starts.
@@ -618,8 +706,9 @@ async fn main() -> Result<()> {
         loop {
             tick.tick().await;
             let mut st = retry_service.lock().await;
-            st.retry_fanout(&retry_service, restarted);
             let now = now_s();
+            st.catch_up(now);
+            st.retry_fanout(&retry_service, restarted);
             let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut st.replicate_later).into_iter().partition(|(_, _, at)| *at <= now);
             st.replicate_later = waiting;
             drop(st);
@@ -926,6 +1015,7 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
 async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, bound_identity: &str) -> Vec<String> {
     let now = now_s();
     let mut st = service.lock().await;
+    st.catch_up(now);
     let resolver = st.resolver();
     let inb = {
         let ctx = ctx_of(&resolver, &st.seen, &st.supported, &st.revocations);
@@ -1281,25 +1371,7 @@ fn hub_deposit(
     let mut result = vec![];
     for o in outs {
         match o {
-            Out::Identity(to, env) if to == st.owner => {
-                let dep = wire::payload_of(&env).unwrap_or(json!({}));
-                result.extend(st.local_deposit(&dep, now));
-                if dep["class"] == "welcome" {
-                    // spec-gap 66: the welcome for our own owner never leaves the process, so its queue is released here
-                    if let (Some(h), Some(s)) = (st.hubs.get_mut(&group), seq) {
-                        h.step(&json!({"ack": {"identity": st.owner, "seq": s, "class": "welcome"}}));
-                    }
-                }
-                if let Some(h) = st.hubs.get_mut(&group) {
-                    if let Some(s) = dep["seq"].as_i64() {
-                        // A local ack may release the owner's next queued item; deliver it the same way.
-                        let more = h.step(&json!({"ack": {"identity": st.owner, "seq": s}}));
-                        if !more.is_empty() {
-                            tracing::info!("local fan-out released {} more", more.len());
-                        }
-                    }
-                }
-            }
+            Out::Identity(to, env) if to == st.owner => result.extend(st.deliver_local(&group, env, now)),
             other => result.push(other),
         }
     }
@@ -1317,6 +1389,10 @@ fn federate(service: &Arc<Mutex<Service>>, st: &mut Service, identity: &str, env
         tracing::info!("no mailbox for {identity}: {}", choice);
         return;
     };
+    if st.drop_fanout_to.as_deref() == Some(mailbox_did.as_str()) {
+        tracing::info!("dropping fan-out to {mailbox_did} (fault injection: --drop-fanout-to)");
+        return;
+    }
     let uri = entries
         .iter()
         .find(|e| e["mailbox"] == json!(mailbox_did))
