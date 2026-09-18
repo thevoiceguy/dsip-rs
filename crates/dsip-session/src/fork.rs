@@ -315,9 +315,6 @@ impl Relay {
                 if let Some(att) = self.attempts.get_mut(session) {
                     if att.legs.get(leg) == Some(&LegState::Delivered) {
                         att.legs.insert(leg.clone(), LegState::Expired);
-                        if !att.reasons.iter().any(|(l, _)| l == leg) {
-                            att.reasons.push((leg.clone(), "endpoint.unavailable".into()));
-                        }
                         let sid = session.clone();
                         self.check_complete(&sid);
                     }
@@ -453,13 +450,27 @@ impl Relay {
         if att.outcome.is_some() || att.legs.values().any(|s| !s.terminated()) {
             return;
         }
+        if att.reasons.is_empty() {
+            // spec-gap 76: no leg said anything — nothing to forward, and the relay may not invent a reject in a
+            // leg's name (§15.2): it speaks for itself, in its own signed error
+            att.outcome = Some("no-response");
+            let to = att.initiator.clone();
+            self.out.push(Emission::Send(crate::event::SendMsg {
+                msg_type: "error".into(),
+                to,
+                session: Some(sid.to_string()),
+                reason: Some("transport.no-response".into()),
+                in_reply_to: Some(sid.to_string()),
+                ..Default::default()
+            }));
+            return;
+        }
         att.outcome = Some("rejected");
         let best = REASON_RANK
             .iter()
             .find(|r| att.reasons.iter().any(|(_, x)| x == *r))
             .map(|r| r.to_string())
-            .or_else(|| att.reasons.first().map(|(_, r)| r.clone()))
-            .unwrap_or_else(|| "endpoint.unavailable".into());
+            .unwrap_or_else(|| att.reasons[0].1.clone());
         let from = att.reasons.iter().find(|(_, r)| *r == best).map(|(l, _)| l.clone()).unwrap_or_default();
         self.out.push(Emission::Forward { msg_type: "reject".into(), status: None, reason: Some(best), from });
     }
