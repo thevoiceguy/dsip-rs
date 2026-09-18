@@ -793,16 +793,19 @@ impl Endpoint {
             return;
         }
         // §12.6 glare: an outbound invite to the identity this invite comes from
-        let glare = self
+        // Every live attempt of ours to that identity is a rival; the smallest id of all the invites wins.
+        let mut rivals: Vec<Session> = self
             .sessions
             .values()
-            .find(|s| {
+            .filter(|s| {
                 s.role == Role::Initiator
                     && matches!(s.state, SessionState::Inviting | SessionState::Proceeding)
                     && self.identity_of(s.invite_to.as_deref().unwrap_or("")) == from_identity
             })
-            .cloned();
-        if glare.is_none() {
+            .cloned()
+            .collect();
+        rivals.sort_by(|a, b| a.id.cmp(&b.id));
+        if rivals.is_empty() {
             if let Some(existing) = self.sessions.get(&sid) {
                 if existing.state == SessionState::Ended {
                     self.emit(Emission::Drop("ended-session"));
@@ -813,22 +816,24 @@ impl Endpoint {
                 return;
             }
         }
-        if let Some(g) = glare {
-            if g.id < sid {
+        if let Some(first) = rivals.first().map(|g| g.id.clone()) {
+            if first < sid {
                 // We win: reject the inbound losing invite; proceed as initiator.
                 self.send_simple("reject", &m.from, &sid, Some("session.glare"));
                 self.sessions.insert(sid.clone(), Session::new(&sid, Role::Responder, SessionState::Ended, &m.from));
                 return;
             }
-            // We lose (or pathological equal id): withdraw our invite.
+            // We lose (or pathological equal id): each of our invites lost, so each is withdrawn, in id order.
             // Impl (spec-gap 2): the loser withdraws via `cancel session.glare`.
-            self.stop_all(&g.id);
-            self.send_simple("cancel", g.invite_to.as_deref().unwrap_or(""), &g.id, Some("session.glare"));
-            let gm = self.sessions.get_mut(&g.id).expect("exists");
-            gm.cancelled = true;
-            gm.state = SessionState::Ended;
-            self.ui_with("ended", "reason", "session.glare");
-            if g.id == sid {
+            for g in &rivals {
+                self.stop_all(&g.id);
+                self.send_simple("cancel", g.invite_to.as_deref().unwrap_or(""), &g.id, Some("session.glare"));
+                let gm = self.sessions.get_mut(&g.id).expect("exists");
+                gm.cancelled = true;
+                gm.state = SessionState::Ended;
+                self.ui_with("ended", "reason", "session.glare");
+            }
+            if first == sid {
                 // §12.6: equal ids — both invites rejected; MAY retry after 1–4 s
                 self.send_simple("reject", &m.from, &sid, Some("session.glare"));
                 self.ui("glare_retry");

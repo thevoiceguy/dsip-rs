@@ -1192,8 +1192,13 @@ impl CommitRetry {
             if self.attempt >= self.max_attempts {
                 return self.surface(reason);
             }
-        } else if reason.split('.').next() == Some("mailbox") && !REASONS.iter().any(|(t, _)| *t == reason) && !self.unknown_retry_used {
-            self.unknown_retry_used = true; // §15.3 mailbox fallback: re-sync, retry once, then surface
+        } else if reason.split('.').next() == Some("mailbox")
+            && !REASONS.iter().any(|(t, _)| *t == reason)
+            && !self.unknown_retry_used
+            && self.attempt < self.max_attempts
+        {
+            // §15.3 mailbox fallback: re-sync, retry once, then surface — inside M§6.5's bound of three proposals
+            self.unknown_retry_used = true;
         } else {
             return self.surface(reason);
         }
