@@ -789,7 +789,14 @@ impl Client {
             // boxed: send_object → run_outage → here → send_object is the one recursion in the outbox
             let reply = Box::pin(self.send_object(&winner, &it["obj"], it["extra"].clone())).await?;
             self.sent(&winner, &reply, &it["obj"]);
-            println!("RESENT {} in={winner} seq={}", it["id"].as_str().unwrap_or(""), reply["seq"]);
+            let id = it["id"].as_str().unwrap_or("");
+            match reply["type"].as_str() {
+                Some("accepted") => println!("RESENT {id} in={winner} seq={}", reply["seq"]),
+                // M§9.4: the successor's hub is unreachable too; the item is in the successor's outbox under a new id,
+                // already announced as PENDING, and goes out (SENT-AFTER-OUTAGE) when that hub answers
+                Some("pending") => println!("RESEND-PENDING {id} in={winner} as={}", reply["id"].as_str().unwrap_or("")),
+                _ => println!("ERR resend {id} refused: {}", reply["reason"]),
+            }
         }
         Ok(())
     }
