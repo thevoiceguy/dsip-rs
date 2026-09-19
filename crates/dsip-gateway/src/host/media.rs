@@ -143,6 +143,7 @@ impl RtpLeg {
 ///
 /// - DSIP→SIP: forge `PeerEvent::Rtp` (Opus) → decode → decimate → G.711 → RTP to the trunk.
 /// - SIP→DSIP: RTP from the trunk → G.711 decode → upsample → Opus encode → `AudioSender`.
+///
 /// `event_pt` is the payload type the trunk uses for RFC 4733 telephone-event, if negotiated: such packets are
 /// not audio; a completed event (its end packet, once) is reported on `dtmf_out` (G§9).
 pub async fn bridge(

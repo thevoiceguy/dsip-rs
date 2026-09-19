@@ -23,6 +23,7 @@ pub const PROFILE: &str = dsip_endpoint::core::PROFILE;
 
 /// Something the application should know about.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // an event is built once and consumed at once; boxing the message would cost an allocation per event
 pub enum AgentEvent {
     /// An engine emission that is not a send (timers, ui, media, drops, refusals).
     Emission(Emission),

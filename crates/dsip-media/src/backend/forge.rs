@@ -58,7 +58,6 @@ impl ForgeLeg {
                     .collect(),
                 ..TransportConfig::default()
             },
-            ..PeerConfig::default()
         })
         .await
         .context("forge peer connection")?;

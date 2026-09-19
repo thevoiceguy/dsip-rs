@@ -535,7 +535,7 @@ async fn serve(
         set.remove(&device);
     }
     let _ = st.tracker.step(&RelayEvent::Relay(RelayAction::Unbind { device: device.clone(), identity: identity.clone() }));
-    if !st.identities.get(&identity).is_some_and(|s| !s.is_empty()) {
+    if st.identities.get(&identity).is_none_or(|s| s.is_empty()) {
         let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Unbind { device: device.clone(), identity: identity.clone() }));
         st.apply_authority(em);
     }

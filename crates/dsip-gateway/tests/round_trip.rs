@@ -23,6 +23,9 @@ use serde_json::json;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+/// One RFC 4733 event packet as the trunk saw it: (event, end, duration, marker).
+type EventPacket = (u8, bool, u16, bool);
+
 struct SipPeer {
     sip: Arc<UdpSocket>,
     rtp: Arc<UdpSocket>,
@@ -33,8 +36,8 @@ struct SipPeer {
     info_status: Arc<AtomicU64>,
     /// The INVITE we answered and where it came from, for in-dialog requests of our own.
     invite: Arc<Mutex<Option<(String, std::net::SocketAddr)>>>,
-    /// RFC 4733 event packets received: (event, end, duration, marker).
-    events_in: Arc<Mutex<Vec<(u8, bool, u16, bool)>>>,
+    /// RFC 4733 event packets received.
+    events_in: Arc<Mutex<Vec<EventPacket>>>,
     /// Whether our SDP answer offers telephone-event (payload type 101).
     telephone_event: bool,
 }

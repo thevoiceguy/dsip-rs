@@ -1949,9 +1949,9 @@ impl Client {
         }
         if e.iter().any(|x| x.get("apply").is_some()) && obj["object"] == "call-event" {
             let session = obj["session"].as_str().unwrap_or("").to_string();
-            if !self.calls.contains_key(&session) {
-                println!("HISTORY-CALL {} {} session={session}", obj["outcome"].as_str().unwrap_or(""), obj["peer"].as_str().unwrap_or(""));
-                self.calls.insert(session, obj.clone());
+            if let std::collections::btree_map::Entry::Vacant(slot) = self.calls.entry(session) {
+                println!("HISTORY-CALL {} {} session={}", obj["outcome"].as_str().unwrap_or(""), obj["peer"].as_str().unwrap_or(""), slot.key());
+                slot.insert(obj.clone());
                 let _ = self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls).unwrap_or_default());
             }
             return;
@@ -2189,14 +2189,14 @@ impl Client {
             Some("call-event") => {
                 // M§13.3 (spec-gap 63): every alerted device may report the call; one entry per session
                 let session = object["session"].as_str().unwrap_or("").to_string();
-                if self.calls.contains_key(&session) {
-                    println!("DUP-CALL session={session} from {sender_device}");
-                } else {
+                if let std::collections::btree_map::Entry::Vacant(slot) = self.calls.entry(session.clone()) {
                     println!("CALL {} {} {} session={session}", object["outcome"].as_str().unwrap_or(""),
                         object["direction"].as_str().unwrap_or(""), object["peer"].as_str().unwrap_or(""));
-                    self.calls.insert(session, object.clone());
+                    slot.insert(object.clone());
                     self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls)?).map_err(Self::state_err)?;
                     self.archive_object(gid, &object, sender, sender_device, seq);
+                } else {
+                    println!("DUP-CALL session={session} from {sender_device}");
                 }
             }
             Some("receipt") => {

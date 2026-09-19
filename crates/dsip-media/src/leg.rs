@@ -49,6 +49,7 @@ impl Backend {
     }
 
     /// Backends compiled into this build.
+    #[allow(clippy::vec_init_then_push)] // each push is behind its own feature; `vec![]` takes no `#[cfg]`
     pub fn available() -> Vec<Backend> {
         let mut v = vec![];
         #[cfg(feature = "webrtc-rs")]

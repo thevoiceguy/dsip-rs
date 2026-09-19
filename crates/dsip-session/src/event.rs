@@ -170,6 +170,7 @@ impl LocalEvent {
 /// An event into an [`crate::Endpoint`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)] // an event is built once and consumed at once; boxing the message would cost an allocation per event
 pub enum Event {
     /// Advance the clock by seconds; due timers fire.
     Advance {
