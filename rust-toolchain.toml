@@ -1,0 +1,8 @@
+# The Rust every build of the PoC uses, locally and in CI (the workflows install from this file).
+# Clippy runs with `-D warnings` in CI, so a new Rust release brings new lints: bump the version here, deliberately,
+# and clear what it finds in the same change.
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]  # dsip-wasm (demos/browser/build.sh)
