@@ -82,7 +82,7 @@ echo "online" >&5; wait_for "$DIR/bl.log" "^ERR hello refused: transport.hello-r
 wait_for "$DIR/mbx-b.log" "hello rejected: delegation-revoked" 10
 echo "introduce $ALICE Please let me back in" >&5
 wait_for "$DIR/mbx-a.log" "hello rejected: delegation-revoked" 15
-sleep 1
+for _ in $(seq 50); do [ "$(grep -c '^ERR hello refused: transport.hello-rejected delegation-revoked' "$DIR/bl.log")" -ge 2 ] && break; sleep 0.2; done
 [ "$(grep -c '^ERR hello refused: transport.hello-rejected delegation-revoked' "$DIR/bl.log")" -ge 2 ] \
   || { echo "FAIL: Alice's mailbox did not refuse the revoked laptop"; exit 1; }
 wait_for "$DIR/mbx-a.log" "hello rejected: delegation-revoked" 10

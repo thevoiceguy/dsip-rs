@@ -90,6 +90,7 @@ wait_for "$DIR/a.log" "^OUTAGE-SUCCESSOR group=$PRED pending=2" 60
 wait_for "$DIR/a.log" "^SUCCESSOR created group=" 30
 SUCC=$(grep -oE "^SUCCESSOR created group=[A-Za-z0-9_-]+" "$DIR/a.log" | cut -d= -f2)
 wait_for "$DIR/a.log" "^RESENT [A-Z0-9]+ in=$SUCC seq=" 60
+for _ in $(seq 150); do [ "$(grep -c "^RESENT " "$DIR/a.log")" -ge 2 ] && break; sleep 0.2; done  # the second follows the first
 [ "$(grep -c "^RESENT " "$DIR/a.log")" = 2 ] || { echo "FAIL: expected both pending items re-sent"; grep "^RESENT" "$DIR/a.log"; exit 1; }
 for x in b c; do
   wait_for "$DIR/$x.log" "^SUCCESSOR (joined|exists) group=$SUCC of=$PRED" 60
