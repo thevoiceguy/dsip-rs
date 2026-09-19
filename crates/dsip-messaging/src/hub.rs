@@ -102,7 +102,7 @@ impl Hub {
         let items = self
             .pending
             .iter()
-            .filter(|(i, _)| !self.welcomes.get(*i).is_some_and(|w| !w.is_empty()))
+            .filter(|(i, _)| self.welcomes.get(*i).is_none_or(|w| w.is_empty()))
             .filter_map(|(i, q)| q.first().map(|seq| json!({"fanout": {"to": i, "seq": seq, "class": self.seq_class[seq]}})));
         let welcomes = self
             .welcomes

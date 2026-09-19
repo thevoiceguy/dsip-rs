@@ -409,11 +409,7 @@ impl Endpoint {
     /// Advance the clock; due timers fire in deadline order (ties by start order).
     pub fn advance(&mut self, seconds: i64) {
         let target = self.now + seconds;
-        loop {
-            let Some(t) = self.timers.iter().filter(|t| t.deadline <= target).min_by_key(|t| (t.deadline, t.seq)).cloned()
-            else {
-                break;
-            };
+        while let Some(t) = self.timers.iter().filter(|t| t.deadline <= target).min_by_key(|t| (t.deadline, t.seq)).cloned() {
             self.now = t.deadline;
             self.timers.retain(|x| x.seq != t.seq);
             self.fire(&t);

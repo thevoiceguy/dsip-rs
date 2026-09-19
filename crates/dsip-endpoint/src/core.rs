@@ -81,6 +81,7 @@ pub struct ContactFile {
 
 /// What the core hands back to its host.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // an event is built once and consumed at once; boxing the message would cost an allocation per event
 pub enum CoreEvent {
     /// Transmit this frame.
     Send {
@@ -284,7 +285,7 @@ impl Core {
             Ok(i) => i,
             Err(v) => {
                 out.push(CoreEvent::Rejected {
-                    code: v.code.map(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).flatten().unwrap_or_default(),
+                    code: v.code.and_then(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).unwrap_or_default(),
                     detail: v.detail.unwrap_or_default(),
                 });
                 return Ok(out);
@@ -362,9 +363,7 @@ impl Core {
             Some("answer") => {
                 let key = p.get("in_reply_to").and_then(Value::as_str).or(p.get("session").and_then(Value::as_str)).unwrap_or("");
                 let offer = self.offers.get(key)?;
-                if offer.pointer("/transports/0/sdp").is_none() {
-                    return None;
-                }
+                offer.pointer("/transports/0/sdp")?;
                 dsip_webrtc_binding::check_answer(offer, p)
             }
             _ => return None,

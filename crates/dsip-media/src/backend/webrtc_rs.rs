@@ -60,7 +60,6 @@ impl WebRtcRsLeg {
                 urls: vec![t.uri.clone()],
                 username: t.username.clone(),
                 credential: t.password.clone(),
-                ..Default::default()
             });
         }
         let config = RTCConfiguration { ice_servers, ..Default::default() };

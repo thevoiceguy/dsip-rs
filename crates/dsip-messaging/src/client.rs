@@ -624,6 +624,7 @@ impl Client {
                     self.timeline.push(id.clone());
                     fresh.push(id);
                 }
+                #[allow(clippy::collapsible_match)] // `receipt` records the receipt: not a thing to do in a match guard
                 Some("receipt") => {
                     if self.receipt(o) {
                         // M§12.2 (spec-gap 64): a receipt that changes rendering is archived like content

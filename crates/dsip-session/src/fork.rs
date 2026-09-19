@@ -64,6 +64,7 @@ impl Attempt {
 /// Relay-side events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)] // an event is built once and consumed at once; boxing the message would cost an allocation per event
 pub enum RelayEvent {
     /// Clock advance (no relay timers in this model; kept for trace symmetry).
     Advance {

@@ -199,6 +199,7 @@ fn broadcast(v: &Value) -> Value {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // one per trace vector, held on the stack for the run
 enum Component {
     Endpoint(Endpoint),
     Relay(Relay),
