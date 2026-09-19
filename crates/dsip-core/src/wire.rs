@@ -52,7 +52,7 @@ pub fn check_core_shape(p: &Value) -> Result<(), Verdict> {
     if !p.get("type").is_some_and(Value::is_string) {
         return shape("type");
     }
-    if !p.get("id").and_then(Value::as_str).is_some_and(|s| Ulid::parse(s).is_some()) {
+    if p.get("id").and_then(Value::as_str).and_then(Ulid::parse).is_none() {
         return shape("id");
     }
     if !p.get("from").and_then(Value::as_str).is_some_and(is_did) {
