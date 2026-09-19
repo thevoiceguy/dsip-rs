@@ -49,7 +49,7 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, Resume, SuccessorTracker, HUB_RETRY_INITIAL_S, HUB_RETRY_MAX_S};
+use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
@@ -285,8 +285,6 @@ struct Client {
     outages: BTreeMap<String, HubOutage>,
     /// Pending items per group, oldest first: `{id, mls, obj, extra}`, kept durably until accepted (M§9.2).
     pending: BTreeMap<String, Vec<Value>>,
-    /// Dead groups whose pending items are not all in the successor yet: `(attempts, next attempt at)`, §13.2 backoff.
-    handover_retry: BTreeMap<String, (i64, i64)>,
     hub_timeout: i64,
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
     own: HashSet<String>,
@@ -766,6 +764,8 @@ impl Client {
             } else if let Some(d) = e["retry_in"].as_i64() {
                 let head = self.outages.get(group).and_then(|o| o.pending().first().cloned()).unwrap_or_default();
                 println!("PENDING {head} retry_in={d}");
+            } else if e.get("handover").is_some() {
+                self.trigger_successor(group).await?; // the hand-over that failed is due again
             } else if let Some(s) = e.get("successor") {
                 let ids: Vec<String> = s["pending"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
                 println!("OUTAGE-SUCCESSOR group={group} pending={}", ids.len());
@@ -779,20 +779,20 @@ impl Client {
     /// pending items are re-encrypted for the successor (their bytes were for the dead group's epoch).
     ///
     /// Impl (spec-gap 72): an item leaves the dead group's durable outbox only once the successor's outbox has it, so
-    /// neither a failure to create the successor nor a restart loses content. Until then the hand-over is tried again
-    /// with the §13.2 backoff; the dead group's outage stays (abandoned, its start kept), so nothing more is deposited
-    /// to the dead hub meanwhile and a restart resumes here.
+    /// neither a failure to create the successor nor a restart loses content. Until then the dead group's outbox
+    /// stays (abandoned, its start kept): it retries the hand-over with the vector-pinned §13.2 backoff
+    /// (`handover_failed`), nothing more is deposited to the dead hub meanwhile, and a restart resumes here.
     async fn trigger_successor(&mut self, dead: &str) -> Result<()> {
         let result = self.hand_over(dead).await;
         if self.pending.get(dead).is_some_and(|items| !items.is_empty()) {
-            let attempt = self.handover_retry.get(dead).map_or(0, |r| r.0);
-            let delay = (HUB_RETRY_INITIAL_S << attempt.min(30)).min(HUB_RETRY_MAX_S);
-            self.handover_retry.insert(dead.to_string(), (attempt + 1, now_s() + delay));
-            println!("SUCCESSOR-RETRY of={dead} retry_in={delay}");
+            for em in self.outages.get_mut(dead).map(HubOutage::handover_failed).unwrap_or_default() {
+                if let Some(d) = em["handover_retry_in"].as_i64() {
+                    println!("SUCCESSOR-RETRY of={dead} retry_in={d}");
+                }
+            }
         } else {
             self.pending.remove(dead);
             self.outages.remove(dead);
-            self.handover_retry.remove(dead);
             self.save_pending()?;
         }
         result
@@ -859,7 +859,8 @@ impl Client {
             return Ok(()); // a device with no network retries nothing; the backoff resumes when it is back
         }
         let now = now_s();
-        let down: Vec<String> = self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, _)| g.clone()).collect();
+        // an abandoned outbox still has a clock: it may be retrying the hand-over to its successor
+        let down: Vec<String> = self.outages.iter().filter(|(_, o)| o.is_down() || o.is_abandoned()).map(|(g, _)| g.clone()).collect();
         for g in down {
             let emissions = match self.outages.get_mut(&g) {
                 Some(o) if now > o.now() => o.advance(now - o.now()),
@@ -868,11 +869,6 @@ impl Client {
             if !emissions.is_empty() {
                 self.run_outage(&g, emissions).await?;
             }
-        }
-        // a hand-over to the successor that did not complete is due again (see `trigger_successor`)
-        let due: Vec<String> = self.handover_retry.iter().filter(|(_, r)| now >= r.1).map(|(g, _)| g.clone()).collect();
-        for g in due {
-            self.trigger_successor(&g).await?;
         }
         Ok(())
     }
@@ -2447,7 +2443,6 @@ async fn main() -> Result<()> {
         gap_timeout: args.gap_timeout,
         outages: BTreeMap::new(),
         pending: BTreeMap::new(),
-        handover_retry: BTreeMap::new(),
         hub_timeout: args.hub_timeout,
         own: HashSet::new(),
         resume,
