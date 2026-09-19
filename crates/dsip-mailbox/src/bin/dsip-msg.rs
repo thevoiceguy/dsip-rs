@@ -253,6 +253,8 @@ struct Client {
     resolver_files: Vec<PathBuf>,
     ca: Option<PathBuf>,
     conn: Option<Connection>,
+    /// The operator took this device `offline`: the outage ticker leaves it there until something connects again.
+    held_offline: bool,
     mailbox: (String, String),
     seen: SeenIds,
     /// Groups by base64url group id.
@@ -367,6 +369,7 @@ impl Client {
         anyhow::ensure!(conn.relay.did == self.mailbox.0, "mailbox is {} not {}", conn.relay.did, self.mailbox.0);
         println!("OK connected {} mailbox={}", self.identity, self.mailbox.0);
         self.conn = Some(conn);
+        self.held_offline = false;
         Ok(())
     }
 
@@ -435,7 +438,10 @@ impl Client {
         // M§14.1 (spec-gap 81): tell our own mailbox first, so the grant that answers this is not rate-limited there
         let sent = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
             json!({"subject": self.identity, "introductions_sent": [id]}));
-        self.send(&sent).await?;
+        // Best-effort: it only spares the answer a rate limit. A device that cannot reach its own mailbox still introduces.
+        if let Err(e) = self.send(&sent).await {
+            println!("WARN introduction {id} not announced to our own mailbox: {e}");
+        }
         let answer = self.deposit_first_contact("introduction", target, &env).await?;
         match answer["type"].as_str() {
             Some("accepted") => println!("OK introduction {id} to {target} accepted sealed={}", !plain),
@@ -790,6 +796,9 @@ impl Client {
 
     /// The ticker's share of M§9.4: time passes for every outage.
     async fn check_outages(&mut self) -> Result<()> {
+        if self.held_offline {
+            return Ok(()); // a device with no network retries nothing; the backoff resumes when it is back
+        }
         let now = now_s();
         let down: Vec<String> = self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, _)| g.clone()).collect();
         for g in down {
@@ -2356,6 +2365,7 @@ async fn main() -> Result<()> {
         resolver_files: args.resolver_files.clone(),
         ca: args.ca.clone(),
         conn: None,
+        held_offline: false,
         mailbox,
         seen: SeenIds::default(),
         convs: BTreeMap::new(),
@@ -2625,6 +2635,7 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
         "live" => client.sync(true).await,
         "offline" => {
             client.conn = None;
+            client.held_offline = true;
             println!("OK offline");
             Ok(())
         }

@@ -70,7 +70,8 @@ fn deposit_fields(class: &str) -> (&'static [&'static str], &'static [&'static s
     match class {
         "handshake" => (&["mls"], &["mls", "seq", "welcome", "group_info", "ratchet_tree_blob", "grants"]),
         "application" => (&["mls"], &["mls", "seq", "blobs"]),
-        "welcome" => (&["mls", "hub"], &["mls", "hub", "grants", "origin", "successor_of", "ratchet_tree_blob"]),
+        // `seq`: the adding commit's, so the new member knows where it starts counting the group (spec-gap 83)
+        "welcome" => (&["mls", "hub"], &["mls", "hub", "grants", "origin", "successor_of", "ratchet_tree_blob", "seq"]),
         "group-info" => (&["mls"], &["mls", "ratchet_tree_blob", "handover_seq"]),
         "ephemeral" => (&["sealed"], &["sealed"]),
         "introduction" | "grant" => (&["envelope"], &["envelope"]),

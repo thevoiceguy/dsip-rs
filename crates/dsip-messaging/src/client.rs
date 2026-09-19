@@ -926,6 +926,11 @@ impl Resume {
         if SEQUENCED_CLASSES.contains(&class) {
             self.sent(&group, item["seq"].as_i64().unwrap_or(0));
         } else if class == "welcome" {
+            // spec-gap 83: the welcome carries the seq of the commit that added this device — its exact position. What
+            // is at or below it is pre-join history; what follows is counted from there.
+            if let Some(seq) = item["seq"].as_i64() {
+                self.groups.insert(group.clone(), (seq, Default::default()));
+            }
             self.joined.insert(group);
         }
     }
@@ -935,6 +940,12 @@ impl Resume {
     /// Impl (spec-gap 47): the hub fans a device's own item back to its identity (M§6.5 rule 5) and MLS
     /// cannot decrypt a device's own message, so the copy must be recognised as already processed.
     pub fn sent(&mut self, group: &str, seq: i64) {
+        if !self.groups.contains_key(group) {
+            // spec-gap 69, the fallback of spec-gap 83: with no position from a welcome, a device counts from where it
+            // starts — the first sequenced item it processes — not from seq 1
+            self.groups.insert(group.to_string(), (seq, Default::default()));
+            return;
+        }
         let (contiguous, seen) = self.groups.entry(group.to_string()).or_default();
         if seq > *contiguous {
             seen.insert(seq);

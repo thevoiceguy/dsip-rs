@@ -333,7 +333,7 @@ impl Service {
                 // the welcome for our own owner never leaves the process, so its queue is released here
                 more.extend(h.step(&json!({"ack": {"identity": self.owner, "seq": s, "class": "welcome"}})));
             }
-            if let Some(s) = dep["seq"].as_i64() {
+            if let Some(s) = dep["seq"].as_i64().filter(|_| class != "welcome") {
                 // A local ack may release the owner's next queued item; deliver it the same way.
                 more.extend(h.step(&json!({"ack": {"identity": self.owner, "seq": s}})));
             }
@@ -491,6 +491,10 @@ impl Service {
                     if let Some(o) = item.origin {
                         fields["origin"] = json!(o);
                     }
+                    if let Some(s) = seq {
+                        // spec-gap 83: the adding commit's seq — where the new member starts counting the group
+                        fields["seq"] = json!(s);
+                    }
                     let env = wire::deposit(&self.key, "", now, group, "welcome", fields);
                     if let (Some(id), Some(seq)) = (wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)), seq) {
                         self.welcomes_sent.insert(id, (group.to_string(), to.clone(), seq));
@@ -545,8 +549,11 @@ impl Service {
     /// mailbox's refusal reason, if it refused.
     fn local_deposit(&mut self, dep: &Value, now: i64) -> (Vec<Out>, Option<String>) {
         let item = Item::from_deposit(dep, &self.key.did(), now);
+        // A welcome's `seq` (spec-gap 83) tells the new member where it starts counting; it is not a place in the
+        // mailbox's sequence — the commit holds that seq — so the mailbox stores the welcome unsequenced, as before.
+        let seq = if dep["class"] == "welcome" { Value::Null } else { dep["seq"].clone() };
         let event = json!({"hub_deposit": {"id": dep["id"], "from": self.key.did(), "recipient": self.owner,
-            "group": dep["group"], "seq": dep["seq"], "class": dep["class"], "expires_at": dep["expires_at"]}});
+            "group": dep["group"], "seq": seq, "class": dep["class"], "expires_at": dep["expires_at"]}});
         let emissions = self.mailbox.step(&event);
         let refused = emissions.iter().find_map(|e| e["error"]["reason"].as_str().map(String::from));
         let mut out = self.ephemeral_pushes(&emissions, dep, &self.key.did(), now);
