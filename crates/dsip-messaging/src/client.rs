@@ -121,7 +121,9 @@ pub const HUB_RETRY_MAX_S: i64 = 60;
 /// retry re-deposits the same bytes. Impl (spec-gap 72): the hub is down from the first `mailbox.hub-unreachable`
 /// (or no answer at all) until an `accepted`; the head is retried first and an `accepted` flushes the rest in order;
 /// after `hub_timeout` the pending items are handed to the successor to re-encrypt and the dead group's outbox is
-/// abandoned. Any other refusal is not an outage: the item leaves the outbox for its own handling.
+/// abandoned. Any other refusal is not an outage: the item leaves the outbox for its own handling. The hand-over to
+/// the successor can fail: once abandoned, `handover_failed` is answered with the §13.2 backoff started afresh and the
+/// `advance` that reaches it emits one `{"handover": "retry"}`; in any other state it is nothing.
 #[derive(Debug, Clone)]
 pub struct HubOutage {
     now: i64,
@@ -131,6 +133,8 @@ pub struct HubOutage {
     attempt: i64,
     retry_at: Option<i64>,
     state: &'static str,
+    handover_attempt: i64,
+    handover_at: Option<i64>,
 }
 
 impl HubOutage {
@@ -148,12 +152,19 @@ impl HubOutage {
             attempt: 0,
             retry_at: down_since.map(|_| now),
             state: if down_since.is_some() { "down" } else { "up" },
+            handover_attempt: 0,
+            handover_at: None,
         }
     }
 
     /// Whether the hub is currently unreachable.
     pub fn is_down(&self) -> bool {
         self.state == "down"
+    }
+
+    /// Whether the outbox is abandoned: its items went to the successor, whose hand-over it may still be retrying.
+    pub fn is_abandoned(&self) -> bool {
+        self.state == "abandoned"
     }
 
     /// The outbox's clock, seconds.
@@ -220,9 +231,27 @@ impl HubOutage {
         out
     }
 
-    /// Time passes: a retry when due, the successor trigger at the threshold.
+    /// The host could not complete the hand-over to the successor (none could be created or found, or an item could
+    /// not be moved into it): retried with the §13.2 backoff, started afresh. Nothing unless abandoned.
+    ///
+    /// Spec: M§9.4, §13.2. Impl (spec-gap 72): every failure counts; a later schedule replaces an earlier one.
+    pub fn handover_failed(&mut self) -> Vec<Value> {
+        if self.state != "abandoned" {
+            return vec![];
+        }
+        self.handover_attempt += 1;
+        let delay = (HUB_RETRY_INITIAL_S << (self.handover_attempt - 1).min(30)).min(HUB_RETRY_MAX_S);
+        self.handover_at = Some(self.now + delay);
+        vec![json!({"handover_retry_in": delay})]
+    }
+
+    /// Time passes: a retry when due, the successor trigger at the threshold, a hand-over retry once abandoned.
     pub fn advance(&mut self, n: i64) -> Vec<Value> {
         self.now += n;
+        if self.state == "abandoned" && self.handover_at.is_some_and(|at| self.now >= at) {
+            self.handover_at = None; // the next failure schedules the next attempt
+            return vec![json!({"handover": "retry"})];
+        }
         if self.state != "down" {
             return vec![];
         }
@@ -242,7 +271,7 @@ impl HubOutage {
         vec![]
     }
 
-    /// Apply one trace event (`deposit`, `answer`, `no_answer`, `advance`).
+    /// Apply one trace event (`deposit`, `answer`, `no_answer`, `handover_failed`, `advance`).
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         if let Some(d) = ev.get("deposit") {
             return self.deposit(d["id"].as_str().unwrap_or(""));
@@ -253,13 +282,16 @@ impl HubOutage {
         if let Some(a) = ev.get("no_answer") {
             return self.no_answer(a["id"].as_str().unwrap_or(""));
         }
+        if ev.get("handover_failed").is_some() {
+            return self.handover_failed();
+        }
         self.advance(ev["advance"].as_i64().unwrap_or(0))
     }
 
     /// Snapshot compared by the vectors.
     pub fn snapshot(&self) -> Value {
         json!({"state": self.state, "pending": self.pending, "attempt": self.attempt,
-               "down_for": self.down_since.map(|d| self.now - d)})
+               "down_for": self.down_since.map(|d| self.now - d), "handover_attempt": self.handover_attempt})
     }
 }
 
