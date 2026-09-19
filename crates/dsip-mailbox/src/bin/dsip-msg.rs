@@ -787,9 +787,32 @@ impl Client {
         };
         for it in items {
             // boxed: send_object → run_outage → here → send_object is the one recursion in the outbox
-            let reply = Box::pin(self.send_object(&winner, &it["obj"], it["extra"].clone())).await?;
-            self.sent(&winner, &reply, &it["obj"]);
             let id = it["id"].as_str().unwrap_or("");
+            let outbox_ids = |c: &Self| -> Vec<Value> { c.pending.get(&winner).into_iter().flatten().map(|i| i["id"].clone()).collect() };
+            let before = outbox_ids(self);
+            let reply = match Box::pin(self.send_object(&winner, &it["obj"], it["extra"].clone())).await {
+                Ok(reply) => reply,
+                Err(e) => {
+                    // The items have left the dead group's outbox: an error here must not lose this one or stop the
+                    // rest. Impl (spec-gap 72): a deposit that failed after the item reached the successor's outbox is
+                    // a deposit with no answer (M§9.4) — the item stays pending there, is retried with the §13.2
+                    // backoff, and the items after it queue behind it.
+                    let kept = outbox_ids(self).into_iter().find(|i| !before.contains(i)).and_then(|i| i.as_str().map(String::from));
+                    let Some(new_id) = kept else {
+                        println!("ERR resend {id} failed before it could be encrypted for {winner}: {e}");
+                        continue;
+                    };
+                    for em in self.outage_mut(&winner).no_answer(&new_id) {
+                        if let Some(d) = em["retry_in"].as_i64() {
+                            println!("PENDING {new_id} retry_in={d}");
+                        }
+                    }
+                    self.save_pending()?;
+                    println!("RESEND-PENDING {id} in={winner} as={new_id} after: {e}");
+                    continue;
+                }
+            };
+            self.sent(&winner, &reply, &it["obj"]);
             match reply["type"].as_str() {
                 Some("accepted") => println!("RESENT {id} in={winner} seq={}", reply["seq"]),
                 // M§9.4: the successor's hub is unreachable too; the item is in the successor's outbox under a new id,
