@@ -30,4 +30,4 @@ $B/dsip answer --identity "$D/bob-laptop" --relay $RELAY_URL --ca "$CA" --auto n
 P2=$!; sleep 1.5
 $B/dsip call --identity "$D/alice" --relay $RELAY_URL --ca "$CA" --to "$BOB" --script "sleep 3; hangup; sleep 1; quit"
 wait $P1 $P2; echo "──── laptop's side:"; cat "$D/laptop.log"
-echo "──── relay:"; grep -oE "(fork invite|per-leg cancel|attempt).*" "$D/relay.log"
+echo "──── relay:"; grep -oE "(invite|cancel) [0-9A-Z]+ → leg .*|attempt .*" "$D/relay.log"
