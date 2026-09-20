@@ -405,7 +405,9 @@ impl Mailbox {
         if let Some(digest) = e["digest"].as_str() {
             // spec-gap 66: the hub retries a welcome it saw no acknowledgement for. A redelivery is the same MLS bytes
             // (M§9.3), not merely another welcome for the group: adding a sibling device sends a new one (M§6.7).
-            if let Some(it) = self.items.iter().find(|it| it.class == "welcome" && it.digest.as_deref() == Some(digest)) {
+            // Among the welcomes still held for that group: one dropped with an expired pending registration is held no
+            // more, and the same bytes for another group are not this group's welcome (spec-gap 94).
+            if let Some(it) = self.items.iter().find(|it| it.class == "welcome" && it.group == group && it.digest.as_deref() == Some(digest)) {
                 return vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": it.cursor, "duplicate": true}})];
             }
         }
