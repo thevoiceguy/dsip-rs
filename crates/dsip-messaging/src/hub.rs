@@ -35,6 +35,11 @@ pub struct Hub {
     /// Unacknowledged welcomes per added identity, by the seq of the commit that added it (spec-gap 66).
     #[serde(default)]
     welcomes: BTreeMap<String, Vec<i64>>,
+    /// Identities a commit brought in whose welcome is not yet acknowledged: their mailbox has no registration for
+    /// the group and would refuse a sequenced item (M§6.6), so their queue is held (spec-gap 66). A member that
+    /// gained a device is not among them (spec-gap 87).
+    #[serde(default)]
+    unregistered: BTreeSet<String>,
 }
 
 fn s(v: &Value) -> String {
@@ -61,6 +66,7 @@ impl Hub {
             group_info: false,
             moved_to: None,
             welcomes: BTreeMap::new(),
+            unregistered: BTreeSet::new(),
         }
     }
 
@@ -102,7 +108,7 @@ impl Hub {
         let items = self
             .pending
             .iter()
-            .filter(|(i, _)| self.welcomes.get(*i).is_none_or(|w| w.is_empty()))
+            .filter(|(i, _)| !self.unregistered.contains(*i))
             .filter_map(|(i, q)| q.first().map(|seq| json!({"fanout": {"to": i, "seq": seq, "class": self.seq_class[seq]}})));
         let welcomes = self
             .welcomes
@@ -238,6 +244,8 @@ impl Hub {
                 .filter(|a| !before.get(&s(&a["identity"])).is_some_and(|devs| devs.contains(&s(&a["device"]))))
                 .map(|a| s(&a["identity"]))
                 .collect();
+            // spec-gap 87: only an identity the commit brought in has no registration to receive sequenced items with
+            self.unregistered.extend(gained.iter().filter(|i| !before.contains_key(*i)).cloned());
             let seq = self.digests[&s(&d["digest"])];
             for i in gained {
                 // spec-gap 66: a welcome is queued and retried like any fan-out, in its own queue — a member adding its
@@ -261,11 +269,12 @@ impl Hub {
         let mut out = vec![json!({"accepted": {"to": d["device"], "in_reply_to": d["id"], "seq": seq}})];
         for i in targets {
             // M§6.5 rule 5: per-mailbox seq order; an unacknowledged item blocks later ones
-            let held = self.welcomes.get(i).is_some_and(|w| !w.is_empty());
+            let held = self.unregistered.contains(i);
             let q = self.pending.entry(i.clone()).or_default();
             q.push(seq);
-            // spec-gap 66: nothing reaches a mailbox before the welcome it has not acknowledged — until then it has no
-            // registration for the group and would refuse the item (M§6.6)
+            // spec-gap 66: nothing reaches a mailbox the commit brought in before it acknowledges its welcome — until then
+            // it has no registration for the group and would refuse the item (M§6.6); a member that gained a device is
+            // registered and gets the commit at once (spec-gap 87)
             if q.len() == 1 && !held {
                 out.push(json!({"fanout": {"to": i, "seq": seq, "class": class}}));
             }
@@ -275,18 +284,24 @@ impl Hub {
 
     fn ack(&mut self, ident: &str, seq: i64, class: &str) -> Vec<Value> {
         let welcome = class == "welcome";
+        // the hold behind an unacknowledged welcome applies here too: the queue moves, nothing is sent (spec-gap 87)
+        let held = !welcome && self.unregistered.contains(ident);
         let queue = if welcome { &mut self.welcomes } else { &mut self.pending };
         let Some(q) = queue.get_mut(ident) else { return vec![] };
         if q.first() != Some(&seq) {
             return vec![];
         }
         q.remove(0);
+        if held {
+            return vec![];
+        }
         if let Some(next) = q.first() {
             let class = if welcome { "welcome".to_string() } else { self.seq_class[next].clone() };
             return vec![json!({"fanout": {"to": ident, "seq": next, "class": class}})];
         }
-        if welcome {
-            // the group is registered now: whatever waited behind the welcome goes
+        if welcome && self.unregistered.remove(ident) {
+            // the group is registered now: whatever waited behind the welcome goes (a member that gained a device
+            // waited for nothing: its head went out with the commit, spec-gap 87)
             if let Some(next) = self.pending.get(ident).and_then(|q| q.first()) {
                 return vec![json!({"fanout": {"to": ident, "seq": next, "class": self.seq_class[next]}})];
             }

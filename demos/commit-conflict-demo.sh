@@ -26,7 +26,10 @@ trap cleanup EXIT
 wait_for() { # file pattern seconds
   local f=$1 pat=$2 n=${3:-20}
   for _ in $(seq $((n * 5))); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
-  echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -30 "$f"; return 1
+  echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -8 "$f"
+  # the hub (Alice's mailbox) and Bob's mailbox tell where a fan-out stalled; CI shows the last 25 lines
+  for m in mbx-a mbx-b; do echo "--- $DIR/$m.log"; tail -6 "$DIR/$m.log" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-160; done
+  return 1
 }
 
 echo "=== mailboxes, documents, devices, a direct conversation hubbed at Alice's mailbox"
