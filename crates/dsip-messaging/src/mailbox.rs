@@ -471,7 +471,9 @@ impl Mailbox {
                     out.push(json!({"handover_expired": {"group": group, "hub": prev.hub, "missing": missing}}));
                 }
                 if seq_in.is_some_and(|n| n <= prev.through) {
-                    return Self::error(&e["from"], &e["id"], "policy.blocked"); // spec-gap 60: numbering continues
+                    // spec-gap 60: numbering continues — and the expiry just noticed is still announced (spec-gap 88)
+                    out.extend(Self::error(&e["from"], &e["id"], "policy.blocked"));
+                    return out;
                 }
             }
             None => {}
@@ -492,7 +494,9 @@ impl Mailbox {
             // spec-gap 59: a hub retries an unacknowledged fan-out (M§6.5 rule 5) and delivers in seq order, so a seq at
             // or below the group's highest stored is a redelivery: acknowledged as a duplicate, not stored or pushed again
             let mut acc = json!({"to": e["from"], "in_reply_to": e["id"], "duplicate": true});
-            if let Some(it) = self.items.iter().find(|it| it.group == group && it.seq == Some(seq)) {
+            // by group and seq, across a registration the owner left and made again; an archive record shares the seq
+            // space (its ref_seq) and is never the item (spec-gap 92)
+            if let Some(it) = self.items.iter().find(|it| it.group == group && it.seq == Some(seq) && it.class != "archive") {
                 acc["cursor"] = json!(it.cursor);
             }
             return vec![json!({"accepted": acc})];

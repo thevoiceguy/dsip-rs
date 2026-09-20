@@ -455,6 +455,11 @@ impl Endpoint {
     fn local(&mut self, ev: &LocalEvent) {
         match ev {
             LocalEvent::PlaceCall { session, to } => {
+                if self.sessions.contains_key(session) {
+                    // spec-gap 90: a session id is used once (§12.9); a held session, live or ended, is never overwritten
+                    self.emit(Emission::Refused("invalid-state"));
+                    return;
+                }
                 let mut s = Session::new(session, Role::Initiator, SessionState::Inviting, to);
                 s.invite_to = Some(to.clone());
                 self.sessions.insert(session.clone(), s);
