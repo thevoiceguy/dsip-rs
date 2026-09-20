@@ -1,8 +1,9 @@
 //! Forking relay: per-leg attempt tracking and attempt-outcome signaling.
 //!
 //! Spec: §12.7 rule 3 (track delivered legs; deliver `cancel` per-leg to every
-//! leg that has not terminated) and rule 6 (when the final outstanding leg
-//! terminates without an answer, forward the most informative `reject`:
+//! leg that has not terminated), rule 4 (an `answer` is never withheld: the
+//! initiator alone ends an answered leg) and rule 6 (when the final outstanding
+//! leg terminates without an answer, forward the most informative `reject`:
 //! `user.declined` > `user.no-answer` > `endpoint.busy` > `endpoint.unavailable`).
 //!
 //! This is the data model `dsip-relay` uses; it has no I/O so the vector
@@ -412,7 +413,23 @@ impl Relay {
             // spec-gap 82: not a leg of this attempt — routed like any envelope, never dropped
             return self.route_plain(m);
         };
-        if state.terminated() && !(m.msg_type == "answer" && state == LegState::Answered) {
+        if m.msg_type == "answer" {
+            // Never withheld, whatever the leg's state (spec-gap 86): only the initiator ends a leg that has
+            // answered — bye already-answered / cancelled / failed (§12.7 rule 4, §12.5 rule 3, §12.4). The
+            // record changes only for a leg that was still outstanding: a cancelled, expired or rejected leg
+            // that answers stays recorded as such.
+            if state == LegState::Delivered {
+                att.legs.insert(leg.clone(), LegState::Answered);
+                if att.outcome.is_none() {
+                    att.outcome = Some("answered");
+                }
+            }
+            self.out.push(Emission::Forward { msg_type: "answer".into(), status: None, reason: None, from: leg });
+            return;
+        }
+        if state.terminated() {
+            // A stale progress or a second reject from a leg that is done would read, at an initiator that
+            // cannot see legs, as the attempt's own; nobody needs it, so the relay screens it (spec-gap 86).
             self.out.push(Emission::Drop("leg-terminated"));
             return;
         }
@@ -423,14 +440,6 @@ impl Relay {
                 reason: None,
                 from: leg,
             }),
-            "answer" => {
-                att.legs.insert(leg.clone(), LegState::Answered);
-                if att.outcome.is_none() {
-                    att.outcome = Some("answered");
-                }
-                // Always forwarded: the initiator decides (first-accept; late → bye already-answered).
-                self.out.push(Emission::Forward { msg_type: "answer".into(), status: None, reason: None, from: leg });
-            }
             "reject" => {
                 att.legs.insert(leg.clone(), LegState::Rejected);
                 att.reasons.push((leg, m.reason.clone().unwrap_or_default()));
