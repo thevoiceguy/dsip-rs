@@ -34,7 +34,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("identity.suspended", &["reject"]),
     ("identity.unknown", &["reject", "error"]),
     ("session.expired", &["reject"]),
-    ("session.timeout", &["cancel"]),
+    ("session.timeout", &["cancel", "bye"]),
     ("session.glare", &["reject", "cancel"]),
     ("session.answered-elsewhere", &["cancel"]),
     ("session.already-answered", &["bye"]),
@@ -48,7 +48,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("session.version-downgrade-detected", &["error"]),
     ("session.unsupported-wire-format", &["error"]),
     ("session.failed", &["reject", "bye", "error"]),
-    ("media.unsupported", &["reject"]),
+    ("media.unsupported", &["reject", "bye"]),
     ("media.offer-required", &["reject"]),
     ("media.encryption-required", &["reject"]),
     ("media.failed", &["bye"]),
@@ -65,7 +65,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("transport.unknown-recipient", &["error"]),
     ("transport.rate-limited", &["error"]),
     ("transport.no-response", &["error"]), // §12.7 rule 6 (spec-gap 76)
-    ("gateway.unreachable", &["reject", "error"]),
+    ("gateway.unreachable", &["reject", "bye", "error"]),
     ("gateway.downgraded", &["error"]),
     ("gateway.mapped", &["reject", "bye", "error"]),
     // v0.8 (spec-gaps 38, 48): the Messaging Profile's mailbox conditions (M§16)
