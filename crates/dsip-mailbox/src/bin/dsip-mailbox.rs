@@ -86,6 +86,21 @@ struct Args {
     /// Fault injection for demos: never deliver hub fan-out to this peer mailbox (a hub that dies before delivering).
     #[arg(long)]
     drop_fanout_to: Option<String>,
+    /// Extra hostnames or addresses for the self-signed certificate (a mailbox dialled across hosts; same as the
+    /// relay's). The first one is also the host of the advertised `blob_endpoint` (M§4.3), since a wildcard
+    /// `--listen` address is not one a peer can dial.
+    #[arg(long)]
+    host: Vec<String>,
+}
+
+/// The advertised `blob_endpoint` (M§4.3): the listen port on the first `--host`, else on the listen address.
+fn blob_endpoint(listen: &SocketAddr, host: Option<&str>) -> String {
+    let port = listen.port();
+    match host {
+        Some(h) if h.contains(':') => format!("https://[{h}]:{port}/blobs"),
+        Some(h) => format!("https://{h}:{port}/blobs"),
+        None => format!("https://{listen}/blobs"),
+    }
 }
 
 fn s_of(v: &Value) -> String {
@@ -664,7 +679,9 @@ async fn main() -> Result<()> {
         k
     };
     std::fs::write(args.state.join("service.did"), key.did())?;
-    let (cert, keyfile) = tls::ensure_self_signed(&args.state, &["localhost".into(), "127.0.0.1".into()])?;
+    let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
+    hosts.extend(args.host.iter().cloned());
+    let (cert, keyfile) = tls::ensure_self_signed(&args.state, &hosts)?;
     let acceptor = tls::acceptor(&cert, &keyfile)?;
     tracing::info!("mailbox {} for {} on wss://{}/dsip (ca {})", key.did(), args.owner, args.listen, cert.display());
 
@@ -689,7 +706,7 @@ async fn main() -> Result<()> {
         peers: HashMap::new(),
         revocations: vec![],
         blob_dir: args.state.join("blobs"),
-        blob_endpoint: format!("https://{}/blobs", args.listen),
+        blob_endpoint: blob_endpoint(&args.listen, args.host.first().map(String::as_str)),
         max_blob_bytes: args.max_blob_bytes,
         state_dir: args.state.clone(),
         retry: HashMap::new(),
