@@ -38,6 +38,8 @@ pub enum RejectCode {
     ExpiryOrder,
     ReplayWindow,
     IntroductionValidity,
+    /// A `reachability-hint` whose `expires_at − issued_at` exceeds 3,600 s (§12.9, v0.8; spec-gap 96).
+    HintValidity,
     Expired,
     DuplicateId,
     UlidIssuedAtMismatch,
