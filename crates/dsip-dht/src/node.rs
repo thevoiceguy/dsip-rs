@@ -265,7 +265,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         if info.protocols.iter().any(|p| p.as_ref() == PROTOCOL) {
-                            for a in info.listen_addrs {
+                            for a in routable(info.listen_addrs) {
                                 swarm.behaviour_mut().kad.add_address(&peer_id, a);
                             }
                         }
@@ -408,6 +408,29 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
     Ok((Handle { tx }, peer_id))
 }
 
+/// The listen addresses worth routing to: a peer that advertises any non-loopback address
+/// loses its loopback ones.
+///
+/// Impl: a node listening on 0.0.0.0 advertises 127.0.0.1 too (libp2p expands the wildcard,
+/// loopback first). Once that sat in a routing table, a client on a host that runs its own
+/// node dialed the loopback address, reached the wrong node, and libp2p gave up on the peer
+/// (`WrongPeerId`): on the WAN testbed Bob's client on L2 never stored a hint on L3. A peer
+/// that advertises only loopback (a localhost testnet) keeps it.
+fn routable(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
+    let loopback = |a: &Multiaddr| {
+        a.iter().any(|p| match p {
+            libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback(),
+            libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
+            _ => false,
+        })
+    };
+    if addrs.iter().all(loopback) {
+        addrs
+    } else {
+        addrs.into_iter().filter(|a| !loopback(a)).collect()
+    }
+}
+
 /// Count one verification failure against `peer`, starting a fresh window when the last one has lapsed.
 fn charge(rejections: &mut HashMap<PeerId, (std::time::Instant, u32)>, peer: PeerId, now: std::time::Instant) {
     let e = rejections.entry(peer).or_insert((now, 0));
@@ -430,4 +453,25 @@ fn finish_get(g: PendingGet, resolver: &StaticResolver) {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_dropped_when_a_public_address_exists() {
+        let got = routable(vec![ma("/ip4/127.0.0.1/tcp/4001"), ma("/ip4/139.162.109.138/tcp/4001"), ma("/ip6/::1/tcp/4001")]);
+        assert_eq!(got, vec![ma("/ip4/139.162.109.138/tcp/4001")]);
+    }
+
+    #[test]
+    fn loopback_only_peer_keeps_its_addresses() {
+        let addrs = vec![ma("/ip4/127.0.0.1/tcp/4001")];
+        assert_eq!(routable(addrs.clone()), addrs);
+    }
 }
