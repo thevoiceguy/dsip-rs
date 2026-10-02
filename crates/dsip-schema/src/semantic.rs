@@ -32,6 +32,11 @@ pub struct SemanticContext {
     pub encoded_size: Option<usize>,
     /// The `kid` that signed the envelope, when known (`key-rotation` signer rule, §7.5).
     pub signer_kid: Option<String>,
+    /// The addressee's X25519 key agreement secret: with it the receiver opens sealed bodies (stage 12b, §10.4).
+    pub unseal_key: Option<[u8; 32]>,
+    /// This receiver only routes: it never opens a seal, and `sealed-body/1.0` is no critical-extension failure
+    /// for it — that rule binds the addressee (§10.4).
+    pub router: bool,
 }
 
 impl SemanticContext {
@@ -46,6 +51,11 @@ impl SemanticContext {
             }),
             encoded_size: ctx.get("encoded_size").and_then(Value::as_u64).map(|n| n as usize),
             signer_kid: ctx.get("signer_kid").and_then(Value::as_str).map(String::from),
+            unseal_key: ctx.get("unseal_key_hex").and_then(Value::as_str).and_then(|h| {
+                let b: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok()).collect::<Option<_>>()?;
+                b.try_into().ok()
+            }),
+            router: ctx.get("router").and_then(Value::as_bool).unwrap_or(false),
         }
     }
 }
@@ -210,15 +220,38 @@ pub fn registry_effects(payload: &Value) -> Map<String, Value> {
     out
 }
 
-/// Stages 12–14 in order: version, schema, semantic.
+/// Stages 12–14 in order: version, sealed body (12b, §10.4), schema, semantic.
+///
+/// An addressee holding `unseal_key` opens `sealed` and runs 13–14 on the merged payload, reporting the opened
+/// keys as `effective.sealed`; a router validates the clear part as it stands.
 pub fn check_payload(payload: &Value, ctx: &SemanticContext) -> Verdict {
-    let v = check_version(payload, &ctx.supported);
+    let sealed = payload.get("sealed").is_some();
+    let mut supported = ctx.supported.clone();
+    if ctx.router && sealed && !supported.extensions.iter().any(|e| e == crate::sealed::EXT) {
+        // §10.4: a router routes a sealed payload whether or not it implements the extension
+        supported.extensions.push(crate::sealed::EXT.to_string());
+    }
+    let v = check_version(payload, &supported);
     if !v.ok() {
         return v;
     }
-    let v = validate(payload);
+    let (payload, opened) = match ctx.unseal_key.filter(|_| sealed && !ctx.router) {
+        Some(sk) => match crate::sealed::open(payload, &sk) {
+            Ok(x) => x,
+            Err(v) => return v,
+        },
+        None => (payload.clone(), vec![]),
+    };
+    let v = validate(&payload);
     if !v.ok() {
         return v;
     }
-    check_semantic(payload, ctx)
+    let mut v = check_semantic(&payload, ctx);
+    if v.ok() && !opened.is_empty() {
+        let eff = v.extra.entry("effective").or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(m) = eff {
+            m.insert("sealed".into(), opened.into());
+        }
+    }
+    v
 }

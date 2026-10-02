@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 dsip-core.workspace = true
 dsip-schema.workspace = true
+rand.workspace = true
 dsip-session.workspace = true
 dsip-webrtc-binding.workspace = true
 serde.workspace = true

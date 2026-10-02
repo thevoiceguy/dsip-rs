@@ -165,6 +165,7 @@ impl Endpoint {
             t_ring: cfgv["t_ring"].as_i64(),
             t_ring_local: cfgv["t_ring_local"].as_i64(),
             first_contact_required: cfgv["first_contact_required"].as_bool().unwrap_or(false),
+            ..Default::default()
         };
         let resolver = StaticResolver::default();
         Ok(Endpoint {

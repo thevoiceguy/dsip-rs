@@ -44,6 +44,8 @@ pub struct ConsoleOpts {
     pub publish_hint: bool,
     /// Hint TTL.
     pub hint_ttl: i64,
+    /// §10.4: seal outbound session bodies (`sealed-body/1.0`).
+    pub seal: bool,
     /// Media source spec (`none` disables media).
     pub media: String,
     /// Record inbound audio here.
@@ -222,6 +224,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         t_ring: opts.t_ring,
         t_ring_local: opts.t_ring_local,
         first_contact_required: matches!(&mode, Mode::Answer { first_contact: true, .. }),
+        seal: opts.seal,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     if let Mode::Answer { first_contact, tokens, .. } = &mode {

@@ -267,6 +267,10 @@ struct ConnOpts {
     /// Hint lifetime in seconds, at most 3,600 (§12.9, DHT profile §2: nodes reject longer hints).
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(i64).range(3..=dsip_core::HINT_MAX_VALIDITY_S))]
     hint_ttl: i64,
+    /// Seal outbound session bodies — SDP, identity claims, DTMF, policy — to the peer's key agreement key
+    /// (extension `sealed-body/1.0`, §10.4). Relays then see only routing fields. Inbound sealed bodies open either way.
+    #[arg(long)]
+    seal: bool,
     /// Media source: `none`, `tone`, `tone:<hz>`, or `file:<path.ogg>`. Anything but none enables WebRTC media.
     #[arg(long, default_value = "none")]
     media: String,
@@ -321,7 +325,7 @@ impl ConnOpts {
         console::ConsoleOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
-            dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl,
+            dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
                 uri: uri.clone(),

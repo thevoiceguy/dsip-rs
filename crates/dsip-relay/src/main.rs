@@ -164,6 +164,12 @@ impl State {
     }
 
     fn deliver(&self, device: &str, frame: &str) -> bool {
+        if tracing::enabled!(tracing::Level::TRACE) {
+            // What this relay can read of what it routes (§20.7; with §10.4 sealing, only the routing fields).
+            if let Some(p) = Envelope::from_frame(frame).ok().and_then(|e| dsip_core::b64::decode(&e.payload)) {
+                tracing::trace!("routed payload → {device}: {}", String::from_utf8_lossy(&p));
+            }
+        }
         match self.devices.get(device) {
             Some(tx) => tx.send(frame.to_string()).is_ok(),
             None => false,

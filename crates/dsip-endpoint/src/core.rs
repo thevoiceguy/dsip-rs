@@ -58,6 +58,11 @@ pub struct CoreConfig {
     pub t_ring_local: Option<i64>,
     /// §19.4: reject invites from identities holding no grant.
     pub first_contact_required: bool,
+    /// §10.4: seal outbound session bodies to the addressee's key agreement key when it can be resolved.
+    pub seal: bool,
+    /// §10.4: X25519 secrets this endpoint opens sealed bodies with, by the DID they belong to (its identity and
+    /// its device); the one matching an inbound payload's `to` is used.
+    pub unseal_keys: Vec<(String, [u8; 32])>,
 }
 
 /// Persisted first-contact state.
@@ -206,6 +211,29 @@ impl Core {
         Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.keys.device, &self.keys.device.kid(), vec![self.keys.delegation.clone()]).frame())
     }
 
+    /// The X25519 key agreement key of `did`: converted from a `did:key`, or the `keyAgreement` of a resolved document.
+    ///
+    /// Spec: §10.4 rule 3, §7.2, §8.1 — never from a hint.
+    fn key_agreement_of(&self, did: &str) -> Option<[u8; 32]> {
+        match dsip_core::did::public_from_did_key(did) {
+            Some(public) => dsip_core::hpke::x25519_from_ed25519_public(&public),
+            None => dsip_core::did::Resolver::resolve(&self.resolver, did)?.x25519_key_agreement(),
+        }
+    }
+
+    /// The unseal key for an inbound frame: the configured secret of the DID its payload is addressed `to`.
+    ///
+    /// Spec: §10.4 — a sealed body opens with the key of the DID in `to`.
+    fn unseal_key_for(&self, frame: &str) -> Option<[u8; 32]> {
+        if self.cfg.unseal_keys.is_empty() {
+            return None;
+        }
+        let env = Envelope::from_frame(frame).ok()?;
+        let p: Value = serde_json::from_slice(&dsip_core::b64::decode(&env.payload)?).ok()?;
+        let to = p.get("to")?.as_str()?;
+        self.cfg.unseal_keys.iter().find(|(did, _)| did == to).map(|(_, sk)| *sk)
+    }
+
     /// A fresh ULID at `now` (seconds), unique within the second.
     pub fn new_id(&mut self, now: i64) -> String {
         self.counter = (self.counter + 1) % 1000;
@@ -280,7 +308,11 @@ impl Core {
     /// A frame arrived.
     pub fn inbound(&mut self, frame: &str, now: i64) -> Result<Vec<CoreEvent>> {
         let mut out = self.tick(now)?;
-        let sem = dsip_schema::SemanticContext { supported: self.supported.clone(), ..Default::default() };
+        let sem = dsip_schema::SemanticContext {
+            supported: self.supported.clone(),
+            unseal_key: self.unseal_key_for(frame),
+            ..Default::default()
+        };
         let inbound = match verify_frame(frame, now, &self.resolver, &self.peer_delegations, &mut self.seen, &sem) {
             Ok(i) => i,
             Err(v) => {
@@ -513,6 +545,12 @@ impl Core {
         }
         p["issued_at"] = now.into();
         p["expires_at"] = (now + ttl).into();
+        if self.cfg.seal {
+            // §10.4: seal to the DID in `to` when its key agreement key resolves (did:key, or a document key); else clear
+            if let Some(pk) = p["to"].as_str().and_then(|to| self.key_agreement_of(to)) {
+                dsip_schema::sealed::seal(&mut p, &pk, &rand::random());
+            }
+        }
         // The device signs; its delegation rides in the header so peers can learn and verify the identity (spec-gap 8).
         Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.keys.device, &self.keys.device.kid(), vec![self.keys.delegation.clone()]))
     }
