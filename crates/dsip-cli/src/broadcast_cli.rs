@@ -47,6 +47,7 @@ async fn connect(c: &Conn) -> Result<Agent> {
         t_ring: None,
         t_ring_local: None,
         first_contact_required: false,
+        seal: false,
     };
     let agent = Agent::connect(id, cfg, StaticResolver::default()).await?;
     println!("identity  {}", agent.identity_did());

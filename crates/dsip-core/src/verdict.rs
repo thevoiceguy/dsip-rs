@@ -45,6 +45,18 @@ pub enum RejectCode {
     UlidIssuedAtMismatch,
     HelloRequired,
     VersionUnsupported,
+    /// A payload carries `sealed` without `sealed-body/1.0` in `dsip.critical` (§10.4; spec-gap 97).
+    SealedNotCritical,
+    /// `sealed.alg` is not the 1.0 HPKE suite (§10.4, §19.4).
+    SealedAlgUnsupported,
+    /// A sealed body does not open: bad base64url, wrong key, tampering, or another message's AAD (§10.4).
+    BodyUnsealFailed,
+    /// An opened body is not a non-empty §10.3 JSON object padded to a multiple of 256 bytes (§10.4).
+    SealedPlaintextInvalid,
+    /// An opened body holds a field outside the type's sealable fields (§10.4).
+    SealedFieldNotSealable,
+    /// A field is present both sealed and in clear (§10.4).
+    SealedFieldInClear,
     UnknownType,
     SchemaInvalid,
     SelectionNotSubset,

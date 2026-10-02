@@ -28,13 +28,13 @@ impl Default for Supported {
 
 impl Supported {
     /// Everything this implementation speaks: both v1.0 profiles (provenance is a core
-    /// message since v0.7; no extension id).
+    /// message since v0.7; no extension id) and sealed bodies (`sealed-body/1.0`, §10.4).
     /// Live endpoints and relays use this; the vectors pin negotiation with explicit contexts.
     pub fn all_known() -> Supported {
         Supported {
             core: "1.0".into(),
             profiles: vec!["interactive-media/1.0".into(), "verified-broadcast/1.0".into()],
-            extensions: vec![],
+            extensions: vec!["sealed-body/1.0".into()],
         }
     }
 

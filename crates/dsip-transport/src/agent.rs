@@ -72,6 +72,8 @@ pub struct AgentConfig {
     pub t_ring_local: Option<i64>,
     /// §19.4: reject invites from identities holding no grant.
     pub first_contact_required: bool,
+    /// §10.4: seal outbound session bodies (`sealed-body/1.0`). Inbound sealed bodies are opened either way.
+    pub seal: bool,
 }
 
 /// The agent.
@@ -103,6 +105,11 @@ impl Agent {
             t_ring: cfg.t_ring,
             t_ring_local: cfg.t_ring_local,
             first_contact_required: cfg.first_contact_required,
+            seal: cfg.seal,
+            unseal_keys: vec![
+                (id.meta.identity.clone(), dsip_core::hpke::x25519_from_ed25519_seed(&id.controller.seed())),
+                (id.device.did(), dsip_core::hpke::x25519_from_ed25519_seed(&id.device.seed())),
+            ],
         };
         let mut core = Core::new(keys, core_cfg, resolver.clone(), now_s());
         // Seed persisted contacts (§19.4) so grants survive restarts.

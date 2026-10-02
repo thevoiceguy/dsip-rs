@@ -86,12 +86,18 @@ pub fn verify_frame(
     ctx.delegations = delegations.to_vec();
     ctx.seen_ids = seen.set();
     ctx.supported = sem.supported.clone();
-    let verified = envelope::verify(&envelope, &ctx, Some(frame))?;
+    let mut verified = envelope::verify(&envelope, &ctx, Some(frame))?;
     let mut sem = sem.clone();
     sem.encoded_size = Some(frame.len());
     let semantic = check_payload(&verified.payload, &sem);
     if !semantic.ok() {
         return Err(semantic);
+    }
+    // §10.4: the addressee works on the opened body (stage 12b already accepted it; the signature covered `sealed`)
+    if let (Some(sk), false, true) = (sem.unseal_key, sem.router, verified.payload.get("sealed").is_some()) {
+        if let Ok((opened, _)) = dsip_schema::sealed::open(&verified.payload, &sk) {
+            verified.payload = opened;
+        }
     }
     let p = &verified.payload;
     // Impl (spec-gap 31): held introductions stay replay-tracked until they expire.
