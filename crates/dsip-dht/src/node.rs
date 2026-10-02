@@ -27,6 +27,22 @@ use dsip_core::envelope::{Context, Envelope};
 use crate::record::{evaluate, key_for, select, Hint};
 use crate::PROTOCOL;
 
+/// Verification failures one peer may cause per [`REJECTION_WINDOW`] before its PUTs are dropped unverified.
+///
+/// Spec: DHT profile §4 — a node SHOULD count rejections per remote peer for rate limiting.
+/// Impl: only verification failures count (signature, signer binding, schema, key); `expired`
+/// and `replay-window` are what honest replication produces around a record's expiry, so they
+/// never throttle a peer. Run 5 of the WAN campaign measured the unthrottled cost: 50 forged
+/// PUTs/s took 3–6 % of a core on every honest node.
+pub const REJECTION_BUDGET: u32 = 20;
+/// The window [`REJECTION_BUDGET`] applies to.
+pub const REJECTION_WINDOW: Duration = Duration::from_secs(60);
+
+/// Whether a rejection code counts against the sending peer (see [`REJECTION_BUDGET`]).
+fn counts_against_peer(code: &str) -> bool {
+    !matches!(code, "expired" | "replay-window")
+}
+
 /// Node configuration.
 pub struct NodeConfig {
     /// libp2p identity (a `did:key` device seed makes the PeerId derive from the DSIP key).
@@ -41,6 +57,13 @@ pub struct NodeConfig {
     pub republish_interval: Duration,
     /// Kademlia query timeout.
     pub query_timeout: Duration,
+    /// Serve the overlay (Kademlia server mode). `false` for short-lived clients (`dsip resolve`,
+    /// `call`, `answer`): they query and publish but never enter other nodes' routing tables.
+    ///
+    /// Impl: on the WAN testbed every CLI run joined in server mode and its dead PeerId stayed in
+    /// the routing tables (7–17 entries in a 4-node overlay), so publishes and GETs spent their
+    /// parallelism on peers that no longer exist.
+    pub server: bool,
 }
 
 impl Default for NodeConfig {
@@ -52,6 +75,7 @@ impl Default for NodeConfig {
             resolver: StaticResolver::default(),
             republish_interval: Duration::from_secs(60),
             query_timeout: Duration::from_secs(10),
+            server: true,
         }
     }
 }
@@ -201,7 +225,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
             kcfg.set_replication_interval(Some(Duration::from_secs(120)));
             let store = kad::store::MemoryStore::new(key.public().to_peer_id());
             let mut kad = kad::Behaviour::with_config(key.public().to_peer_id(), store, kcfg);
-            kad.set_mode(Some(kad::Mode::Server));
+            kad.set_mode(Some(if cfg.server { kad::Mode::Server } else { kad::Mode::Client }));
             let identify = identify::Behaviour::new(identify::Config::new(PROTOCOL.into(), key.public()));
             Behaviour { kad, identify }
         })?
@@ -227,6 +251,8 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
         let mut puts: HashMap<QueryId, PendingPut> = HashMap::new();
         let mut held: HashMap<Vec<u8>, (String, i64)> = HashMap::new(); // key → (frame, expires_at)
         let mut stats = Stats::default();
+        // peer → (window start, verification failures in it)
+        let mut rejections: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
         let mut republish = tokio::time::interval(republish_interval);
         republish.tick().await;
         loop {
@@ -246,6 +272,13 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::InboundRequest {
                         request: kad::InboundRequest::PutRecord { record: Some(record), source, .. } })) => {
+                        let now = std::time::Instant::now();
+                        if let Some((start, n)) = rejections.get(&source) {
+                            if now.duration_since(*start) < REJECTION_WINDOW && *n >= REJECTION_BUDGET {
+                                *stats.puts_rejected.entry("rate-limited".into()).or_default() += 1;
+                                continue;
+                            }
+                        }
                         // §8.3 at the storage boundary: verify against the subject, compare with what we hold.
                         let frame = String::from_utf8_lossy(&record.value).into_owned();
                         let existing = swarm.behaviour_mut().kad.store_mut().get(&record.key)
@@ -257,6 +290,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                                 if record.key.as_ref() != key_for(&h.subject).as_slice() {
                                     *stats.puts_rejected.entry("key-mismatch".into()).or_default() += 1;
                                     tracing::warn!("rejected PUT from {source}: key does not match subject");
+                                    charge(&mut rejections, source, now);
                                 } else {
                                     let _ = swarm.behaviour_mut().kad.store_mut().put(record);
                                     stats.puts_accepted += 1;
@@ -266,6 +300,9 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                             (false, _, _) => {
                                 let code = ev.verdict.code.map(|c| serde_json::to_value(c).unwrap().as_str().unwrap_or("?").to_string()).unwrap_or_default();
                                 tracing::warn!("rejected PUT from {source}: {code}");
+                                if counts_against_peer(&code) {
+                                    charge(&mut rejections, source, now);
+                                }
                                 *stats.puts_rejected.entry(code).or_default() += 1;
                             }
                         }
@@ -288,7 +325,9 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                             kad::QueryResult::PutRecord(res) => {
                                 if let Some(p) = puts.remove(&id) {
                                     let acknowledged = match &res {
-                                        Ok(_) => 1,
+                                        // Quorum::All asks for K acknowledgements, so a small overlay
+                                        // ends in QuorumFailed carrying exactly the peers that stored it.
+                                        Ok(_) => kad::K_VALUE.get(),
                                         Err(kad::PutRecordError::QuorumFailed { success, .. }) => success.len(),
                                         Err(_) => 0,
                                     };
@@ -323,7 +362,10 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         let record = Record { key: RecordKey::new(&key), value: frame.clone().into_bytes(), publisher: None, expires: None };
                         let _ = swarm.behaviour_mut().kad.store_mut().put(record.clone());
                         held.insert(key.clone(), (frame.clone(), h.expires_at));
-                        match swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                        // Impl: Quorum::All, not One. libp2p-kad ends a put as soon as its quorum is met,
+                        // so with One the record reached only the first wave of closest peers (on the WAN
+                        // testbed: 2 of 4 nodes, never the farthest). All waits for every closest peer.
+                        match swarm.behaviour_mut().kad.put_record(record, Quorum::All) {
                             Ok(qid) => { puts.insert(qid, PendingPut { key: hex(&key), verdict: ev.to_expect(), reply }); }
                             Err(e) => { let _ = reply.send(Ok(PublishOutcome { key: hex(&key), acknowledged: 0, verdict: serde_json::json!({"stored_locally_only": e.to_string()}) })); }
                         }
@@ -332,7 +374,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         let key = key_for(&did);
                         let record = Record { key: RecordKey::new(&key), value: frame.into_bytes(), publisher: None, expires: None };
                         let _ = swarm.behaviour_mut().kad.store_mut().put(record.clone());
-                        match swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                        match swarm.behaviour_mut().kad.put_record(record, Quorum::All) {
                             Ok(qid) => { puts.insert(qid, PendingPut { key: hex(&key), verdict: serde_json::json!({"raw": true}), reply }); }
                             Err(e) => { let _ = reply.send(Ok(PublishOutcome { key: hex(&key), acknowledged: 0, verdict: serde_json::json!({"raw": true, "stored_locally_only": e.to_string()}) })); }
                         }
@@ -354,15 +396,29 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                 _ = republish.tick() => {
                     let now = now_s();
                     held.retain(|_, (_, exp)| *exp > now);
+                    rejections.retain(|_, (start, _)| start.elapsed() < REJECTION_WINDOW);
                     for (key, (frame, _)) in &held {
                         let record = Record { key: RecordKey::new(key), value: frame.clone().into_bytes(), publisher: None, expires: None };
-                        let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::One);
+                        let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::All);
                     }
                 }
             }
         }
     });
     Ok((Handle { tx }, peer_id))
+}
+
+/// Count one verification failure against `peer`, starting a fresh window when the last one has lapsed.
+fn charge(rejections: &mut HashMap<PeerId, (std::time::Instant, u32)>, peer: PeerId, now: std::time::Instant) {
+    let e = rejections.entry(peer).or_insert((now, 0));
+    if now.duration_since(e.0) >= REJECTION_WINDOW {
+        *e = (now, 0);
+    }
+    e.1 += 1;
+    if e.1 == REJECTION_BUDGET {
+        tracing::warn!("peer {peer} reached {REJECTION_BUDGET} rejected PUTs in {} s: dropping its PUTs unverified until the window ends",
+                       REJECTION_WINDOW.as_secs());
+    }
 }
 
 fn finish_get(g: PendingGet, resolver: &StaticResolver) {
