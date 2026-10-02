@@ -21,7 +21,7 @@ use crate::ulid::Ulid;
 use crate::verdict::{RejectCode, Verdict};
 use crate::version::Supported;
 use crate::wire::parse_payload;
-use crate::{INTRODUCTION_MAX_VALIDITY_S, REPLAY_WINDOW_S, ULID_TOLERANCE_S, WS_MAX_ENVELOPE_BYTES};
+use crate::{HINT_MAX_VALIDITY_S, INTRODUCTION_MAX_VALIDITY_S, REPLAY_WINDOW_S, ULID_TOLERANCE_S, WS_MAX_ENVELOPE_BYTES};
 
 /// The three-member JWS envelope.
 ///
@@ -248,6 +248,16 @@ pub fn verify(env: &Envelope, ctx: &Context, frame: Option<&str>) -> Result<Veri
         // `expires_at` (checked next), and the future bound stays.
         if ea - ia > INTRODUCTION_MAX_VALIDITY_S {
             return Err(Verdict::reject(RejectCode::IntroductionValidity));
+        }
+        if ia > ctx.now + REPLAY_WINDOW_S {
+            return Err(Verdict::reject(RejectCode::ReplayWindow));
+        }
+    } else if msg_type == "reachability-hint" {
+        // Spec: §12.9 (v0.8, spec-gap 96) — a hint is stored, replicated and read for its
+        // whole lifetime, so the age bound is `expires_at` (checked next) under the 3,600 s
+        // cap; the future bound stays. No id dedup: §8.3 decides a re-observed hint.
+        if ea - ia > HINT_MAX_VALIDITY_S {
+            return Err(Verdict::reject(RejectCode::HintValidity));
         }
         if ia > ctx.now + REPLAY_WINDOW_S {
             return Err(Verdict::reject(RejectCode::ReplayWindow));

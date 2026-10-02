@@ -264,8 +264,8 @@ struct ConnOpts {
     /// Publish a signed reachability hint for this identity at the relay we bind to (answer side).
     #[arg(long)]
     publish_hint: bool,
-    /// Hint lifetime in seconds.
-    #[arg(long, default_value_t = 3600)]
+    /// Hint lifetime in seconds, at most 3,600 (§12.9, DHT profile §2: nodes reject longer hints).
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(i64).range(3..=dsip_core::HINT_MAX_VALIDITY_S))]
     hint_ttl: i64,
     /// Media source: `none`, `tone`, `tone:<hz>`, or `file:<path.ogg>`. Anything but none enables WebRTC media.
     #[arg(long, default_value = "none")]

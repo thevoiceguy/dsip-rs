@@ -49,6 +49,12 @@ pub const ULID_TOLERANCE_S: i64 = 300;
 /// where it bounds how long a held introduction's id stays replay-tracked.
 pub const INTRODUCTION_MAX_VALIDITY_S: i64 = 604_800;
 
+/// Maximum validity of a `reachability-hint`, in seconds.
+///
+/// Spec: §12.9 (v0.8, spec-gap 96), DHT profile §2 — a hint's age is bounded by its
+/// own `expires_at` under this cap, not by the 300 s replay window.
+pub const HINT_MAX_VALIDITY_S: i64 = 3_600;
+
 /// Maximum encoded envelope size on `ws/1.0`, a fixed binding constant.
 ///
 /// Spec: §13.2.
