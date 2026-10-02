@@ -240,6 +240,12 @@ impl Core {
         Ulid::generate_at((now as u64) * 1000 + self.counter).to_string()
     }
 
+    /// Seal outbound session bodies from now on, or stop (§10.4; a sender MAY resend in clear after
+    /// `session.unsupported-critical-extension`).
+    pub fn set_seal(&mut self, on: bool) {
+        self.cfg.seal = on;
+    }
+
     /// SDP to embed in the next `invite`/`update`/`answer` transport descriptor (consumed on use).
     pub fn set_sdp(&mut self, sdp: Option<String>) {
         self.pending_sdp = sdp;
