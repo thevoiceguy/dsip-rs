@@ -17,12 +17,21 @@ use dsip_dht::record::{hint_payload, sign_hint, Endpoint, Hint};
 use dsip_transport::identity::Identity;
 use dsip_transport::now_s;
 
-/// Start an in-process DHT node bootstrapped to `bootstrap` and give the routing table a moment.
+/// Start an in-process DHT client bootstrapped to `bootstrap` and give the routing table a moment.
+///
+/// Impl: the client runs in Kademlia client mode, so it never lingers in other nodes' routing
+/// tables after it exits, and it reports how many peers it actually reached: a dead bootstrap
+/// otherwise looks exactly like "no hint published".
 pub async fn join(bootstrap: &[Multiaddr]) -> Result<Handle> {
-    let cfg = NodeConfig { bootstrap: bootstrap.to_vec(), ..NodeConfig::default() };
+    let cfg = NodeConfig { bootstrap: bootstrap.to_vec(), server: false, ..NodeConfig::default() };
     let (handle, peer) = start(cfg).await.context("starting DHT node")?;
-    println!("dht        joined as {peer} via {} bootstrap node(s)   §8.5 (experimental; bootstrap is configuration)", bootstrap.len());
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    let reached = handle.stats().await.map(|s| s.routing_peers).unwrap_or(0);
+    println!("dht        joined as {peer} via {} configured bootstrap node(s); {reached} peer(s) reached   §8.5 (experimental; bootstrap is configuration)",
+             bootstrap.len());
+    if reached == 0 {
+        println!("dht        ✗ no bootstrap node answered — the hints tier is unavailable, not empty");
+    }
     Ok(handle)
 }
 
