@@ -26,9 +26,17 @@ pub fn ensure_self_signed(dir: &Path, hosts: &[String]) -> Result<(std::path::Pa
     if cert_path.exists() && key_path.exists() {
         return Ok((cert_path, key_path));
     }
-    let cert = rcgen::generate_simple_self_signed(hosts.to_vec()).context("generating self-signed certificate")?;
-    std::fs::write(&cert_path, cert.cert.pem())?;
-    std::fs::write(&key_path, cert.key_pair.serialize_pem())?;
+    // Impl: a distinct subject per certificate. rcgen's default subject is the same everywhere
+    // ("rcgen self signed cert"), and OpenSSL picks a trust anchor from a PEM bundle by subject, so a
+    // bundle of several such roots verified only the first server (found on the WAN testbed).
+    let key_pair = rcgen::KeyPair::generate().context("generating key pair")?;
+    let tag: String = key_pair.public_key_raw().iter().rev().take(4).map(|b| format!("{b:02x}")).collect();
+    let first = hosts.first().map(String::as_str).unwrap_or("localhost");
+    let mut params = rcgen::CertificateParams::new(hosts.to_vec()).context("certificate parameters")?;
+    params.distinguished_name.push(rcgen::DnType::CommonName, format!("DSIP self-signed {first} {tag}"));
+    let cert = params.self_signed(&key_pair).context("generating self-signed certificate")?;
+    std::fs::write(&cert_path, cert.pem())?;
+    std::fs::write(&key_path, key_pair.serialize_pem())?;
     Ok((cert_path, key_path))
 }
 
