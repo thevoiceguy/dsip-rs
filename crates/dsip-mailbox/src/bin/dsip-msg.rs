@@ -255,6 +255,10 @@ struct Client {
     conn: Option<Connection>,
     /// The operator took this device `offline`: the outage ticker leaves it there until something connects again.
     held_offline: bool,
+    /// Unexpected connection loss: the ticker redials at this time (§13.2 backoff).
+    reconnect_at: Option<i64>,
+    /// The current backoff ceiling, seconds (§13.2: initial 1, factor 2, max 60).
+    reconnect_ceiling: i64,
     mailbox: (String, String),
     seen: SeenIds,
     /// Groups by base64url group id.
@@ -370,7 +374,42 @@ impl Client {
         println!("OK connected {} mailbox={}", self.identity, self.mailbox.0);
         self.conn = Some(conn);
         self.held_offline = false;
+        self.reconnect_at = None;
+        self.reconnect_ceiling = 1;
         Ok(())
+    }
+
+    /// The connection dropped without the operator asking: schedule a redial.
+    ///
+    /// Spec: §13.2 — on unexpected connection loss an endpoint SHOULD reconnect with exponential
+    /// backoff plus full jitter (initial 1 s, factor 2, max 60 s); `connect` sends the fresh `hello`.
+    fn lost_connection(&mut self) {
+        self.conn = None;
+        self.schedule_reconnect();
+    }
+
+    /// Pick the next redial time under full jitter and double the ceiling; returns the wait in seconds.
+    fn schedule_reconnect(&mut self) -> i64 {
+        let wait = (rand::random::<u64>() % (self.reconnect_ceiling as u64 + 1)) as i64;
+        self.reconnect_at = Some(now_s() + wait);
+        self.reconnect_ceiling = (self.reconnect_ceiling * 2).min(60);
+        wait
+    }
+
+    /// The ticker's redial: connect when due, then sync what arrived while the device was away (M§5.4).
+    async fn check_reconnect(&mut self) -> Result<()> {
+        match self.reconnect_at {
+            Some(at) if self.conn.is_none() && !self.held_offline && now_s() >= at => {}
+            _ => return Ok(()),
+        }
+        match self.connect().await {
+            Ok(()) => self.sync(false).await,
+            Err(e) => {
+                let wait = self.schedule_reconnect();
+                println!("RECONNECT failed ({e}); next attempt in {wait} s");
+                Ok(())
+            }
+        }
     }
 
     async fn send(&mut self, env: &Envelope) -> Result<()> {
@@ -1658,6 +1697,8 @@ impl Client {
                         }
                     }
                 }
+                // M§9.4: the hub is down; the receipt waits in the outbox and goes out with the rest
+                Some("pending") => println!("RECEIPT-PENDING {kind} {what}{via} id={}", reply["id"].as_str().unwrap_or("")),
                 _ => println!("ERR receipt refused: {}", reply["reason"]),
             }
         }
@@ -2426,6 +2467,8 @@ async fn main() -> Result<()> {
         ca: args.ca.clone(),
         conn: None,
         held_offline: false,
+        reconnect_at: None,
+        reconnect_ceiling: 1,
         mailbox,
         seen: SeenIds::default(),
         convs: BTreeMap::new(),
@@ -2541,6 +2584,9 @@ async fn main() -> Result<()> {
             }
             _ = ticker.tick() => {
                 client.tick();
+                if let Err(e) = client.check_reconnect().await {
+                    println!("ERR {e}");
+                }
                 // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)
                 if let Err(e) = client.check_gaps().await {
                     println!("ERR {e}");
@@ -2567,11 +2613,11 @@ async fn main() -> Result<()> {
                     }
                     Ok(None) => {
                         println!("DISCONNECTED by the mailbox");
-                        client.conn = None;
+                        client.lost_connection();
                     }
                     Err(e) => {
                         println!("ERR connection {e}");
-                        client.conn = None;
+                        client.lost_connection();
                     }
                 }
             }
