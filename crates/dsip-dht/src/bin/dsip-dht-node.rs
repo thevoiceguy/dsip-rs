@@ -34,6 +34,9 @@ struct Args {
     /// Re-announce interval in seconds.
     #[arg(long, default_value_t = 60)]
     republish: u64,
+    /// File that keeps learned peers across restarts (read at start, rewritten every re-announce).
+    #[arg(long)]
+    peers_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -63,6 +66,7 @@ async fn main() -> Result<()> {
         bootstrap: args.bootstrap.clone(),
         resolver,
         republish_interval: Duration::from_secs(args.republish),
+        peers_file: args.peers_file.clone(),
         ..NodeConfig::default()
     };
     let (handle, peer_id) = start(cfg).await?;

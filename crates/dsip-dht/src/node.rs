@@ -64,6 +64,13 @@ pub struct NodeConfig {
     /// the routing tables (7–17 entries in a 4-node overlay), so publishes and GETs spent their
     /// parallelism on peers that no longer exist.
     pub server: bool,
+    /// Where learned peers are kept across restarts (one `/…/p2p/<PeerId>` multiaddr per line).
+    ///
+    /// Spec: DHT profile §3 — implementations SHOULD persist learned peers across restarts.
+    /// Impl: read at start and dialed alongside `bootstrap`; rewritten every republish tick.
+    /// On the WAN testbed a restarted bootstrap node with nothing to dial sat with an empty
+    /// routing table for minutes, until another node happened to dial it.
+    pub peers_file: Option<std::path::PathBuf>,
 }
 
 impl Default for NodeConfig {
@@ -76,6 +83,7 @@ impl Default for NodeConfig {
             republish_interval: Duration::from_secs(60),
             query_timeout: Duration::from_secs(10),
             server: true,
+            peers_file: None,
         }
     }
 }
@@ -235,13 +243,13 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
     for addr in &cfg.listen {
         swarm.listen_on(addr.clone()).with_context(|| format!("listen on {addr}"))?;
     }
-    for addr in &cfg.bootstrap {
-        if let Some(peer) = peer_of(addr) {
-            swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
-            let _ = swarm.dial(addr.clone());
-        }
+    // Configured bootstrap peers first, then the peers this node learned before its last restart.
+    let mut known: Vec<Multiaddr> = cfg.bootstrap.clone();
+    if let Some(f) = &cfg.peers_file {
+        known.extend(read_peers(f).into_iter().filter(|a| !cfg.bootstrap.contains(a) && peer_of(a) != Some(peer_id)));
     }
-    let _ = swarm.behaviour_mut().kad.bootstrap();
+    dial_known(&mut swarm, &known);
+    let peers_file = cfg.peers_file.clone();
 
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let republish_interval = cfg.republish_interval;
@@ -394,6 +402,13 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                     Some(Command::Shutdown) | None => break,
                 },
                 _ = republish.tick() => {
+                    let in_table: usize = swarm.behaviour_mut().kad.kbuckets().map(|b| b.num_entries()).sum();
+                    if in_table == 0 {
+                        // nobody in the routing table: dial everything this node has ever known (DHT profile §3)
+                        dial_known(&mut swarm, &known);
+                    } else if let Some(f) = &peers_file {
+                        save_peers(f, &mut swarm);
+                    }
                     let now = now_s();
                     held.retain(|_, (_, exp)| *exp > now);
                     rejections.retain(|_, (start, _)| start.elapsed() < REJECTION_WINDOW);
@@ -406,6 +421,45 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
         }
     });
     Ok((Handle { tx }, peer_id))
+}
+
+/// Dial `addrs` (each `/…/p2p/<PeerId>`) and start a Kademlia bootstrap.
+fn dial_known(swarm: &mut libp2p::Swarm<Behaviour>, addrs: &[Multiaddr]) {
+    for addr in addrs {
+        if let Some(peer) = peer_of(addr) {
+            swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+            let _ = swarm.dial(addr.clone());
+        }
+    }
+    let _ = swarm.behaviour_mut().kad.bootstrap();
+}
+
+/// Peers saved by [`save_peers`]; a missing or unreadable file is an empty list.
+fn read_peers(path: &std::path::Path) -> Vec<Multiaddr> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<Multiaddr>().ok())
+        .filter(|a| peer_of(a).is_some())
+        .collect()
+}
+
+/// Write every routing-table entry's routable addresses as `/…/p2p/<PeerId>` lines.
+fn save_peers(path: &std::path::Path, swarm: &mut libp2p::Swarm<Behaviour>) {
+    let mut lines = vec![];
+    for bucket in swarm.behaviour_mut().kad.kbuckets() {
+        for entry in bucket.iter() {
+            let peer = *entry.node.key.preimage();
+            for a in routable(entry.node.value.iter().cloned().collect()) {
+                let full = if peer_of(&a).is_some() { a } else { a.with(libp2p::multiaddr::Protocol::P2p(peer)) };
+                lines.push(full.to_string());
+            }
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        tracing::warn!("could not save peers to {}", path.display());
+    }
 }
 
 /// The listen addresses worth routing to: a peer that advertises any non-loopback address
