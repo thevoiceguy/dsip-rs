@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
-use forge_webrtc::{Direction, PeerConfig, PeerConnection, PeerEvent, TransportConfig, TurnServer};
+use forge_webrtc::{AudioCodec, Direction, PeerConfig, PeerConnection, PeerEvent, TransportConfig, TurnServer};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::leg::{Candidate, MediaConfig, MediaEvent, Stats};
@@ -48,8 +48,10 @@ impl ForgeLeg {
         let pc = PeerConnection::with_config(PeerConfig {
             stun_servers: cfg.stun.clone(),
             direction,
-            opus_pt: 111,
+            // Opus only, as before forge offered a codec list: the recorder and the speech checks expect it
+            codecs: vec![(AudioCodec::Opus, 111)],
             dtmf: false,
+            video: None,
             transport: TransportConfig {
                 turn_servers: cfg
                     .turn
@@ -111,6 +113,8 @@ impl ForgeLeg {
                     PeerEvent::Failed(why) => {
                         let _ = tx.send(MediaEvent::State(format!("failed: {why}")));
                     }
+                    // audio-only leg: no video section is offered or accepted
+                    PeerEvent::VideoRtp(_) | PeerEvent::ContentRtp(_) => {}
                     PeerEvent::Closed => {
                         let _ = tx.send(MediaEvent::State("closed".into()));
                         break;
