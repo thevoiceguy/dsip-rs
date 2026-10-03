@@ -131,6 +131,8 @@ pub struct Relay {
     pub devices: BTreeMap<String, String>,
     /// recipient → queued envelopes with deadlines (§13.3 store-and-forward; §19.4 introductions).
     pub inbox: BTreeMap<String, Vec<Queued>>,
+    /// Envelopes queued so far: each queued one takes the next number (spec-gap 98).
+    pub arrivals: u64,
     /// Maximum seconds an envelope is held (`offline_retention_s`).
     pub retention: i64,
     /// session → invite (for legs added mid-attempt, §12.7 rule 3).
@@ -144,6 +146,8 @@ pub struct Queued {
     pub message: Message,
     /// Drop at this time.
     pub deadline: i64,
+    /// Arrival order across every queue of this relay: a flush delivers in it (spec-gap 98).
+    pub arrival: u64,
 }
 
 impl Relay {
@@ -161,6 +165,7 @@ impl Relay {
             bindings: BTreeMap::new(),
             devices: BTreeMap::new(),
             inbox: BTreeMap::new(),
+            arrivals: 0,
             retention,
             invites: BTreeMap::new(),
         }
@@ -174,7 +179,9 @@ impl Relay {
     fn enqueue(&mut self, m: &Message) {
         let to = m.to.clone().unwrap_or_default();
         let deadline = m.expires_at.unwrap_or(self.now + self.retention).min(self.now + self.retention);
-        self.inbox.entry(to.clone()).or_default().push(Queued { message: m.clone(), deadline });
+        self.arrivals += 1;
+        let arrival = self.arrivals;
+        self.inbox.entry(to.clone()).or_default().push(Queued { message: m.clone(), deadline, arrival });
         self.out.push(Emission::Queue { to, msg_type: m.msg_type.clone() });
     }
 
@@ -287,11 +294,13 @@ impl Relay {
             RelayAction::Bind { device, identity } => {
                 self.bindings.entry(identity.clone()).or_default().insert(device.clone());
                 self.devices.insert(device.clone(), identity.clone());
-                // §13.3: flush the queues for the identity and the device, in order
-                for key in [identity.clone(), device.clone()] {
-                    for q in self.inbox.remove(&key).unwrap_or_default() {
-                        self.flush_to(device, q.message);
-                    }
+                // §13.3: flush the identity's and the device's queues together, in the order the envelopes
+                // arrived (spec-gap 98) — not the identity's queue first
+                let mut queued = self.inbox.remove(identity).unwrap_or_default();
+                queued.extend(self.inbox.remove(device).unwrap_or_default());
+                queued.sort_by_key(|q| q.arrival);
+                for q in queued {
+                    self.flush_to(device, q.message);
                 }
                 // §12.7 rule 3: a device binding while an attempt for its identity is live becomes a new leg
                 let live: Vec<String> = self
