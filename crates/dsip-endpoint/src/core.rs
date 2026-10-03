@@ -322,6 +322,10 @@ impl Core {
         let inbound = match verify_frame(frame, now, &self.resolver, &self.peer_delegations, &mut self.seen, &sem) {
             Ok(i) => i,
             Err(v) => {
+                // Spec: §12.4 — an invalid invite gets "Send `error` or silently drop per policy".
+                // Impl: drop, for every frame that fails verification (decided 2026-10-02): a reply would tell
+                // a prober the identity exists and is reachable. Relays, which MUST reply (§13.3), still
+                // give a sealed-body sender its `session.unsupported-critical-extension` (§10.4 fallback).
                 out.push(CoreEvent::Rejected {
                     code: v.code.and_then(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).unwrap_or_default(),
                     detail: v.detail.unwrap_or_default(),
