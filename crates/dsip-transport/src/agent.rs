@@ -193,6 +193,11 @@ impl Agent {
         self.core.set_sdp(sdp);
     }
 
+    /// Seal outbound session bodies from now on, or stop (§10.4).
+    pub fn set_seal(&mut self, on: bool) {
+        self.core.set_seal(on);
+    }
+
     /// Claims for the next invite's `identity.claims` (§18.1).
     pub fn set_claims(&mut self, claims: Vec<serde_json::Value>) {
         self.core.set_claims(claims);

@@ -80,6 +80,24 @@ fn media_enabled(opts: &ConsoleOpts) -> bool {
     opts.media != "none" || opts.record.is_some()
 }
 
+/// Place a call to `to`: attach a held grant, create the media offer, send the invite.
+///
+/// Spec: §12.4 (invite), §19.4 (held grant), §16.3 (SDP in the transport descriptor).
+async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(String, Option<Media>)> {
+    if let Some(g) = agent.endpoint().contacts.held_from(to, dsip_transport::now_s()) {
+        println!("contacts  holding grant …{} from {} — attached to the invite   §19.4", sid8(&g), short(to));
+    }
+    let mut media = None;
+    if media_enabled(opts) {
+        let m = new_leg(opts, false).await?;
+        let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
+        println!("media     WebRTC offer created ({} bytes SDP, backend {}) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len(), m.leg.backend().name());
+        agent.set_sdp(Some(sdp));
+        media = Some(m);
+    }
+    Ok((agent.place_call(to).await?, media))
+}
+
 async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
     let source = if screening { Source::None } else { Source::parse(&opts.media)? };
     let backend = dsip_media::Backend::parse(&opts.media_backend)?;
@@ -280,20 +298,13 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     let mut intro_deadline: Option<tokio::time::Instant> = None;
     let mut cmds_closed = false;
     let mut media: Option<Media> = None;
+    // §10.4: a sealed call refused as an unknown critical extension is placed once more in clear
+    let mut resent_in_clear = false;
     match &mode {
         Mode::Call { to } => {
-            if let Some(g) = agent.endpoint().contacts.held_from(to, dsip_transport::now_s()) {
-                println!("contacts  holding grant …{} from {} — attached to the invite   §19.4", sid8(&g), short(to));
-            }
-            if media_enabled(&opts) {
-                let m = new_leg(&opts, false).await?;
-                let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
-                println!("media     WebRTC offer created ({} bytes SDP, backend {}) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len(), m.leg.backend().name());
-                agent.set_sdp(Some(sdp));
-                media = Some(m);
-            }
-            let sid = agent.place_call(to).await?;
+            let (sid, m) = start_call(&mut agent, &opts, to).await?;
             current = Some(sid);
+            media = m;
             println!("(commands: cancel | update | answer-update | reject-update | info | hangup | quit)");
         }
         Mode::Introduce { to, purpose, token, wait } => {
@@ -336,6 +347,23 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                     }
                                 }
                                 println!("  🔎 trust: {}   §18.1", dsip_core::trust::verification_basis(&identity, &claims));
+                            }
+                            // §10.4, §11.3: a relay or callee without sealed-body/1.0 refuses the sealed invite as an
+                            // unknown critical extension; the sender MAY send a new message in clear — once.
+                            if matches!(message.msg_type.as_str(), "error" | "reject")
+                                && message.reason.as_deref() == Some("session.unsupported-critical-extension")
+                                && opts.seal && !resent_in_clear {
+                                if let Mode::Call { to } = &mode {
+                                    resent_in_clear = true;
+                                    println!("seal      sealed body refused by {} — placing the call again in clear   §10.4, §11.3", short(&identity));
+                                    if let Some(m) = media.take() {
+                                        m.leg.close().await;
+                                    }
+                                    agent.set_seal(false);
+                                    let (sid, m) = start_call(&mut agent, &opts, to).await?;
+                                    current = Some(sid);
+                                    media = m;
+                                }
                             }
                             // §6.3 / G§7: a gateway.downgraded error names what crossing the PSTN lost.
                             if message.msg_type == "error" && message.reason.as_deref() == Some("gateway.downgraded") {
