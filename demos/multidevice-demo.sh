@@ -97,7 +97,9 @@ wait_for "$DIR/bp.log" "^RECV $ALICE: Great" 30
 wait_for "$DIR/bl.log" "^RECV $ALICE: Great" 30
 echo "send Sent from my laptop" >&5
 wait_for "$DIR/a.log" "^RECV $BOB: Sent from my laptop" 30
-wait_for "$DIR/bp.log" "^RECV $BOB: Sent from my laptop" 30
+# The phone gets its sibling's message twice: the group fan-out and the laptop's archive record in Bob's own mailbox
+# (M§12.3). Their order is not fixed; whichever lands first is shown (RECV or HISTORY) and the other is a duplicate.
+wait_for "$DIR/bp.log" "^(RECV|HISTORY seq=[0-9]+) $BOB: Sent from my laptop" 30
 
 echo "=== an undisclosed read on the laptop reaches the phone through the personal group (M§10.5)"
 echo "read" >&5
