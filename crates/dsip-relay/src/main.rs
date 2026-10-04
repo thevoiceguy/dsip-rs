@@ -64,6 +64,10 @@ struct Args {
     /// Maximum queued envelopes per recipient (§13.3 store-and-forward boundary).
     #[arg(long, default_value_t = 100)]
     inbox_cap: usize,
+    /// Maximum bytes of queued envelopes across all recipients — the relay's store-and-forward memory budget.
+    /// Beyond it new envelopes for offline recipients are refused `transport.routing-refused` (§13.3).
+    #[arg(long, default_value_t = 67_108_864)]
+    queue_budget_bytes: usize,
     /// Maximum seconds an envelope is held for an offline recipient (advertised as offline_retention_s).
     #[arg(long, default_value_t = 86_400)]
     offline_retention: i64,
@@ -93,6 +97,7 @@ struct State {
     intro_limit: usize,
     intro_window: i64,
     inbox_cap: usize,
+    queue_budget_bytes: usize,
     offline_retention: i64,
     /// §9.3/§22: this relay is the authority for identities bound to it.
     authority: Authority,
@@ -161,6 +166,17 @@ impl State {
             p["detail"] = d.into();
         }
         sign(&p, &self.key, &self.key.kid()).frame()
+    }
+
+    /// Bytes of the envelopes currently queued for offline recipients (their frames are held in `frames`).
+    fn queued_bytes(&self) -> usize {
+        self.tracker
+            .inbox
+            .values()
+            .flatten()
+            .filter_map(|q| self.frames.get(&q.message.id))
+            .map(|(frame, _)| frame.len())
+            .sum()
     }
 
     fn deliver(&self, device: &str, frame: &str) -> bool {
@@ -277,10 +293,25 @@ impl State {
                 return;
             }
         }
+        // A cancel for an invite still queued for this recipient only shrinks the queue (§12.11): neither bound
+        // below refuses it.
+        let shrinks_queue = t == "cancel"
+            && self.tracker.inbox.get(&to).is_some_and(|q| q.iter().any(|m| m.message.msg_type == "invite" && m.message.id == sid));
         // Inbox cap (§13.3 boundary): refuse when the recipient's queue is full.
-        if self.tracker.legs_for(&to).is_empty() && self.tracker.inbox.get(&to).map(|q| q.len()).unwrap_or(0) >= self.inbox_cap {
+        if !shrinks_queue && self.tracker.legs_for(&to).is_empty() && self.tracker.inbox.get(&to).map(|q| q.len()).unwrap_or(0) >= self.inbox_cap {
             if t != "introduction" {
                 let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some("recipient inbox full"));
+                self.deliver(sender, &f);
+            }
+            return;
+        }
+        // Memory budget across all recipients (§13.3: refuse, never drop silently). Impl (spec-gap 99): a relay holds
+        // queued envelopes in memory, so the per-recipient cap alone lets traffic to many recipients grow it without
+        // bound. Introductions are dropped silently, as at the inbox cap, so a full relay reveals nothing (§19.4).
+        if !shrinks_queue && self.tracker.legs_for(&to).is_empty() && self.queued_bytes() + inbound.frame.len() > self.queue_budget_bytes {
+            tracing::warn!("queue budget of {} bytes reached: refusing {t} for {to}", self.queue_budget_bytes);
+            if t != "introduction" {
+                let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some("relay queue full"));
                 self.deliver(sender, &f);
             }
             return;
@@ -366,6 +397,7 @@ async fn main() -> Result<()> {
         intro_limit: args.intro_limit,
         intro_window: args.intro_window,
         inbox_cap: args.inbox_cap,
+        queue_budget_bytes: args.queue_budget_bytes,
         offline_retention: args.offline_retention,
         authority: Authority::new(now_s(), HashMap::new()),
         records: HashMap::new(),
