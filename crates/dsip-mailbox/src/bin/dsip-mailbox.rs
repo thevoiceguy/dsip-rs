@@ -1229,6 +1229,10 @@ fn dispatch(
                 let emissions = st.mailbox.step(&event);
                 let mut out = st.ephemeral_pushes(&emissions, &p, &identity, now);
                 let emissions = st.commit(before, emissions, item);
+                if let Some(a) = emissions.iter().find_map(|e| e.get("accepted")) {
+                    tracing::info!("stored fan-out {class} seq {} in {group} as {}{}", p["seq"], a["cursor"],
+                        if a["duplicate"] == json!(true) { " (duplicate)" } else { "" });
+                }
                 out.extend(st.mailbox_out(emissions, now));
                 return out;
             }
@@ -1268,6 +1272,8 @@ fn dispatch(
                 e["limit"] = l.clone();
             }
             let emissions = st.mailbox.step(&json!({"sync": e}));
+            let n = emissions.iter().find_map(|e| e["items"]["cursors"].as_array().map(Vec::len)).unwrap_or(0);
+            tracing::info!("sync from {device} since {} live={}: {n} items", p["since"], p["live"] == json!(true));
             st.mailbox_out(emissions, now)
         }
         "key-packages" => {
