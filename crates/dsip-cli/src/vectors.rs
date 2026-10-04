@@ -131,6 +131,7 @@ fn run_one(v: &Value) -> Result<(bool, Value, Value)> {
         "gateway" => dsip_gateway::run_vector(v),
         "messaging" => dsip_messaging::run_vector(v),
         "trust" => dsip_core::trust::run_vector(v),
+        "did-webvh" => dsip_core::webvh::run_vector(v),
         "state" => return state(v),
         other => anyhow::bail!("unknown kind {other}"),
     };
