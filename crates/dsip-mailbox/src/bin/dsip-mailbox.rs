@@ -1229,6 +1229,10 @@ fn dispatch(
                 let emissions = st.mailbox.step(&event);
                 let mut out = st.ephemeral_pushes(&emissions, &p, &identity, now);
                 let emissions = st.commit(before, emissions, item);
+                if let Some(a) = emissions.iter().find_map(|e| e.get("accepted")) {
+                    tracing::info!("stored fan-out {class} seq {} in {group} as {}{}", p["seq"], a["cursor"],
+                        if a["duplicate"] == json!(true) { " (duplicate)" } else { "" });
+                }
                 out.extend(st.mailbox_out(emissions, now));
                 return out;
             }
@@ -1268,6 +1272,8 @@ fn dispatch(
                 e["limit"] = l.clone();
             }
             let emissions = st.mailbox.step(&json!({"sync": e}));
+            let n = emissions.iter().find_map(|e| e["items"]["cursors"].as_array().map(Vec::len)).unwrap_or(0);
+            tracing::info!("sync from {device} since {} live={}: {n} items", p["since"], p["live"] == json!(true));
             st.mailbox_out(emissions, now)
         }
         "key-packages" => {
@@ -1353,6 +1359,40 @@ fn dispatch(
     }
 }
 
+/// One group's hub state as it was before a deposit (M§9.3, spec-gap 99).
+struct HubSnapshot {
+    hub: Option<Value>,
+    view: Option<Vec<u8>>,
+    conversation: Option<Value>,
+    /// The latest group-info / ephemeral payload (fan-out key `-1`).
+    latest: Option<Item>,
+}
+
+impl HubSnapshot {
+    /// Undo a deposit whose state could not be saved: the hub machine, its public view (a commit is merged into it
+    /// on validation), the conversation, and the payload kept for fan-out.
+    fn restore(self, st: &mut Service, group: &str, seq: Option<i64>) {
+        let g = group.to_string();
+        match self.hub.as_ref().and_then(Hub::from_full_state) {
+            Some(h) => st.hubs.insert(g.clone(), h),
+            None => st.hubs.remove(&g),
+        };
+        match self.view.as_deref().map(HubView::load) {
+            Some(Ok(v)) => st.views.insert(g.clone(), v),
+            _ => st.views.remove(&g),
+        };
+        match self.conversation {
+            Some(c) => st.conversations.insert(g.clone(), c),
+            None => st.conversations.remove(&g),
+        };
+        match (seq, self.latest) {
+            (Some(s), _) => st.fanout.remove(&(g, s)),
+            (None, Some(l)) => st.fanout.insert((g, -1), l),
+            (None, None) => st.fanout.remove(&(g, -1)),
+        };
+    }
+}
+
 /// Hub path: bootstrap the public view from a GroupInfo, validate commits, sequence, fan out.
 fn hub_deposit(
     st: &mut Service,
@@ -1369,6 +1409,13 @@ fn hub_deposit(
     let mls = p["mls"].as_str().unwrap_or("");
     let bytes = dsip_core::b64::decode(mls).unwrap_or_default();
     let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
+    // Spec: M§9.3 (spec-gap 99) — what a deposit may change here, restored if it cannot be made durable
+    let before = HubSnapshot {
+        hub: st.hubs.get(&group).map(Hub::full_state),
+        view: st.views.get(&group).map(HubView::save),
+        conversation: st.conversations.get(&group).cloned(),
+        latest: st.fanout.get(&(group.clone(), -1)).cloned(),
+    };
 
     let mut refreshed = None;
     if class == "group-info" {
@@ -1445,6 +1492,16 @@ fn hub_deposit(
     // Remember the payload so the fan-out can carry it: by seq, or as the latest of its class.
     let seq = emissions.iter().find_map(|e| e.get("accepted").and_then(|a| a.get("seq")).and_then(Value::as_i64));
     st.fanout.insert((group.clone(), seq.unwrap_or(-1)), item);
+    // M§9.3 (spec-gap 99): a newly accepted item is durable before anyone hears of it — the depositor's `accepted`
+    // and the fan-out both wait for the write. If it fails, the deposit is undone and refused, and the sender
+    // retries it (M§9.3) as if the hub had been unreachable.
+    let stored = emissions.iter().filter_map(|e| e.get("accepted")).any(|a| a["duplicate"] != json!(true));
+    if stored && !st.persist() {
+        before.restore(st, &group, seq);
+        tracing::warn!("refusing {class} {id} from {identity} in {group}: its state could not be saved");
+        let fields = json!({"reason": "mailbox.quota-exceeded", "in_reply_to": id, "retry_after": SAVE_RETRY_AFTER_S});
+        return vec![Out::Device(device.to_string(), wire::message(&st.key, "error", device, now, wire::TTL_S, fields))];
+    }
     let outs = st.hub_out(&group, emissions, now);
     // Fan-out addressed to our own owner never leaves the process.
     let mut result = vec![];

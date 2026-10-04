@@ -774,7 +774,8 @@ impl Client {
             Ok(reply) => {
                 let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
                 let emissions = self.outage_mut(group).answer(&id, reason.as_deref());
-                let still_pending = reason.as_deref() == Some("mailbox.hub-unreachable");
+                // M§9.4: the outbox keeps it for an unreachable hub, or one that could not store it (spec-gap 99)
+                let still_pending = matches!(reason.as_deref(), Some("mailbox.hub-unreachable" | "mailbox.quota-exceeded"));
                 Ok((emissions, (!still_pending).then_some(reply)))
             }
             Err(e) if e.to_string().contains("no answer") => Ok((self.outage_mut(group).no_answer(&id), None)),
@@ -1061,12 +1062,22 @@ impl Client {
     }
 
     /// Sync and process frames until the group has moved past `epoch` (the winning commit is applied).
+    ///
+    /// The hub refused us because it already sequenced the winning commit, but its fan-out may reach our mailbox only
+    /// after our sync: a device that is not live is pushed nothing, so it syncs again whenever a second passes with
+    /// no frame, until the deadline.
     async fn catch_up(&mut self, group: &str, epoch: u64) -> Result<()> {
         self.sync(false).await?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         while self.conv(group)?.group.epoch().as_u64() <= epoch {
+            anyhow::ensure!(tokio::time::Instant::now() < deadline, "the winning commit never arrived");
+            let idle = (tokio::time::Instant::now() + std::time::Duration::from_secs(1)).min(deadline);
             let conn = self.conn.as_mut().context("offline")?;
-            let frame = tokio::time::timeout_at(deadline, conn.recv()).await.context("the winning commit never arrived")??.context("mailbox closed")?;
+            let Ok(frame) = tokio::time::timeout_at(idle, conn.recv()).await else {
+                self.sync(false).await?; // nothing yet: the fan-out may have landed since the last sync
+                continue;
+            };
+            let frame = frame?.context("mailbox closed")?;
             if let Err(e) = self.inbound(&frame).await {
                 println!("ERR {e}");
             }
