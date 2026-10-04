@@ -70,12 +70,21 @@ wait_for "$DIR/bl.log" "^RECV $ALICE: Hello, both of Bob's devices" 30
 echo "=== while its delegation verifies, Alice may not remove the laptop's leaf (M§7.3)"
 echo "remove-leaf $LAPTOP" >&3; wait_for "$DIR/a.log" "^ERR the leaf's delegation still verifies" 15
 
+echo "=== Alice goes offline; the laptop sends one last message; then it is lost"
+echo "offline" >&3; wait_for "$DIR/a.log" "OK offline" 10
+echo "send Sent just before the revocation" >&5; wait_for "$DIR/bl.log" "^OK sent" 15
+
 echo "=== the laptop is lost: Bob's phone revokes its delegation (spec-gap 57)"
 echo "revoke-device $LAPTOP" >&4
 wait_for "$DIR/bp.log" "^OK revoked $LAPTOP published=.*bob.json mailbox=accepted" 15
 grep -q dsipDelegationRevocations "$DIR/docs/bob.json" || { echo "FAIL: the revocation is not in Bob's document"; exit 1; }
 wait_for "$DIR/bl.log" "^DISCONNECTED by the mailbox" 15
 wait_for "$DIR/mbx-b.log" "closed the binding of revoked device $LAPTOP" 5
+
+echo "=== Alice syncs after the revocation: the laptop's last message is unauthenticated, not shown (M§6.2)"
+echo "online" >&3; wait_for "$DIR/a.log" "OK connected" 15; echo "sync" >&3
+wait_for "$DIR/a.log" "^UNAUTHENTICATED .* from $LAPTOP: its delegation no longer verifies" 30
+if grep -q "^RECV $BOB: Sent just before the revocation" "$DIR/a.log"; then echo "FAIL: Alice showed a revoked device's message"; exit 1; fi
 
 echo "=== the laptop cannot come back, to Bob's mailbox or to Alice's (M§4.3)"
 echo "online" >&5; wait_for "$DIR/bl.log" "^ERR hello refused: transport.hello-rejected delegation-revoked" 15
@@ -100,8 +109,14 @@ sleep 1
 echo "quit" >&3; echo "quit" >&4; echo "quit" >&5; sleep 0.5
 if grep -q "Just your phone now" "$DIR/bl.log"; then echo "FAIL: the revoked laptop read a later message"; exit 1; fi
 if grep -HE "^(\?\?|DROP)" "$DIR/a.log" "$DIR/bp.log"; then echo "FAIL: a device hit an item it could not process"; exit 1; fi
+# M§6.2: content the laptop sent just before its revocation became known may reach a device after it — it is then
+# unauthenticated and not shown. That is expected, but only ever from the revoked laptop.
+if grep -hE "^UNAUTHENTICATED" "$DIR/a.log" "$DIR/bp.log" | grep -v "from $LAPTOP:"; then
+  echo "FAIL: content from a device other than the revoked laptop was treated as unauthenticated"; exit 1
+fi
 echo "=== laptop:"; grep -E "^(JOINED|RECV|DISCONNECTED|ERR)" "$DIR/bl.log" | sed 's/^/  /'
 echo "=== mailboxes:"; grep -hE "revoked|hello rejected|closed the binding" "$DIR"/mbx-*.log | sed 's/.*dsip_mailbox[^ ]* /  /'
 echo
 echo "PASS: a revoked device is disconnected, refused by its own and a foreign mailbox, removable by any member,"
-echo "      removed from its identity's groups with the archive key rotated, and reads nothing afterwards."
+echo "      removed from its identity's groups with the archive key rotated, reads nothing afterwards, and what it sent"
+echo "      just before is unauthenticated to a member that processes it after the revocation (M§6.2)."
