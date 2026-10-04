@@ -10,7 +10,8 @@
 //! `min(expires_at, offline_retention_s)` and flushed on the next `hello`;
 //! never-seen recipients get `transport.unknown-recipient` — spec-gap 17),
 //! §19.4 (introductions: mandatory per-sender and per-inbox rate limits; unknown
-//! and offline recipients treated identically — Impl, spec-gap 14).
+//! and offline recipients treated identically — Impl, spec-gap 14), §13.6
+//! (service scope: open by default, private with `--serve` — spec-gap 100).
 //!
 //! Envelopes are forwarded as the exact text frames received (§10.2: the
 //! signature covers the bytes; a relay never re-serializes).
@@ -68,6 +69,15 @@ struct Args {
     /// Beyond it new envelopes for offline recipients are refused `transport.routing-refused` (§13.3).
     #[arg(long, default_value_t = 67_108_864)]
     queue_budget_bytes: usize,
+    /// Serve only these identities (repeatable): a *private* relay (§13.6). Any verified device may still bind, so
+    /// outside parties can reach the served identities, but only traffic to or from a served identity is routed,
+    /// envelopes are held only for served identities, and only they may publish here. Unset: an *open* relay that
+    /// serves every identity that binds.
+    #[arg(long)]
+    serve: Vec<String>,
+    /// File of identities to serve, one DID per line (`#` comments), added to `--serve`.
+    #[arg(long)]
+    serve_file: Option<PathBuf>,
     /// Maximum seconds an envelope is held for an offline recipient (advertised as offline_retention_s).
     #[arg(long, default_value_t = 86_400)]
     offline_retention: i64,
@@ -98,6 +108,8 @@ struct State {
     intro_window: i64,
     inbox_cap: usize,
     queue_budget_bytes: usize,
+    /// §13.6: the identities a private relay serves; `None` = open.
+    served: Option<HashSet<String>>,
     offline_retention: i64,
     /// §9.3/§22: this relay is the authority for identities bound to it.
     authority: Authority,
@@ -166,6 +178,40 @@ impl State {
             p["detail"] = d.into();
         }
         sign(&p, &self.key, &self.key.kid()).frame()
+    }
+
+    /// Whether this relay serves `identity`: every identity for an open relay, the configured ones for a private one.
+    ///
+    /// Spec: §13.6.
+    fn serves(&self, identity: &str) -> bool {
+        self.served.as_ref().is_none_or(|s| s.contains(identity))
+    }
+
+    /// The identity behind a `to` that may name a device bound here.
+    fn identity_of(&self, to: &str) -> String {
+        self.tracker.devices.get(to).cloned().unwrap_or_else(|| to.to_string())
+    }
+
+    /// Why a private relay refuses this envelope, if it does (§13.6); `None` for an open relay or allowed traffic.
+    /// Introductions refused here are dropped silently by the caller (§19.4).
+    fn private_refusal(&self, t: &str, sender_identity: &str, to: &str, p: &Value) -> Option<&'static str> {
+        self.served.as_ref()?;
+        match t {
+            // §9.3/§22: the relay is the authority only for the identities it serves
+            "publish" | "unpublish" | "provenance" if !self.serves(sender_identity) => Some("relay does not serve this identity"),
+            "subscribe" if !self.serves(p["target"].as_str().unwrap_or("")) => Some("relay does not serve the target"),
+            "publish" | "unpublish" | "provenance" | "subscribe" => None,
+            _ => {
+                let recipient = self.identity_of(to);
+                if !self.serves(&recipient) && !self.serves(sender_identity) {
+                    Some("relay serves neither party")
+                } else if !self.serves(&recipient) && self.tracker.legs_for(to).is_empty() {
+                    Some("relay holds envelopes only for the identities it serves")
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Bytes of the envelopes currently queued for offline recipients (their frames are held in `frames`).
@@ -293,6 +339,15 @@ impl State {
                 return;
             }
         }
+        // §13.6 private relay: only traffic to or from a served identity, and nothing held for anyone else.
+        if let Some(refusal) = self.private_refusal(&t, sender_identity, &to, p) {
+            tracing::info!("private relay: refusing {t} from {sender_identity} for {to}: {refusal}");
+            if t != "introduction" {
+                let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some(refusal));
+                self.deliver(sender, &f);
+            }
+            return;
+        }
         // A cancel for an invite still queued for this recipient only shrinks the queue (§12.11): neither bound
         // below refuses it.
         let shrinks_queue = t == "cancel"
@@ -382,6 +437,16 @@ async fn main() -> Result<()> {
     tracing::info!("relay did: {}", key.did());
     tracing::info!("listening on wss://{}/dsip  (clients: --ca {})", args.listen, cert.display());
 
+    let mut served: HashSet<String> = args.serve.iter().cloned().collect();
+    if let Some(path) = &args.serve_file {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        served.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from));
+    }
+    let served = (!served.is_empty()).then_some(served);
+    match &served {
+        Some(s) => tracing::info!("private relay: serving {} identities (§13.6)", s.len()),
+        None => tracing::info!("open relay: serving every identity that binds (§13.6)"),
+    }
     let state = Arc::new(Mutex::new(State {
         key,
         supported: Supported::all_known(),
@@ -398,6 +463,7 @@ async fn main() -> Result<()> {
         intro_window: args.intro_window,
         inbox_cap: args.inbox_cap,
         queue_budget_bytes: args.queue_budget_bytes,
+        served,
         offline_retention: args.offline_retention,
         authority: Authority::new(now_s(), HashMap::new()),
         records: HashMap::new(),
