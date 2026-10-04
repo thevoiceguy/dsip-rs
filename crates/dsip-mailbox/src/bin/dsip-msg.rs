@@ -335,6 +335,9 @@ enum Outcome {
     NotForDevice,
     Object { sender: String, sender_device: String, object: Value },
     Dropped(String),
+    /// M§6.2: content from a member leaf whose delegation no longer verifies (revoked, expired) is unauthenticated —
+    /// not rendered, not archived. Expected, not an error: a device can send just before its revocation is known.
+    Unauthenticated(String),
     /// M§7.3: every roster change is rendered, attributed to the committing identity. `hub` is set when the commit
     /// changed the group's hub reference (M§7.4).
     Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String>, hub: Option<Value> },
@@ -2184,6 +2187,7 @@ impl Client {
             }
             Outcome::Object { sender, sender_device, object } => self.object_in(&gid, item, &sender, &sender_device, object).await?,
             Outcome::Dropped(why) => println!("DROP {why}"),
+            Outcome::Unauthenticated(what) => println!("UNAUTHENTICATED {what}"),
             Outcome::NotForDevice => println!("SIBLING welcome {cursor}"),
             Outcome::Epoch { epoch, by, added, removed, hub } => {
                 let kind = self.conv(&gid).map(|c| c.kind.clone()).unwrap_or_default();
@@ -2355,11 +2359,26 @@ fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &st
         Sender::Member(idx) => member_identity(group, *idx, ctx).ok(),
         _ => None,
     };
+    // M§6.2: a member leaf whose credential no longer authenticates (delegation revoked or expired)
+    let lapsed_leaf = match processed.sender() {
+        Sender::Member(idx) if who.is_none() => Some(
+            group
+                .public_group()
+                .leaf(*idx)
+                .and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
+                .map(|b| String::from_utf8_lossy(b.identity()).into_owned())
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    };
     let external = matches!(processed.sender(), Sender::NewMemberCommit);
     let (mut sender, sender_device) = who.map(|w| (w.identity, w.device)).unwrap_or_default();
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app) => {
             let obj: Value = serde_json::from_slice(&app.into_bytes()).map_err(mls_err("content json"))?;
+            if let Some(device) = lapsed_leaf {
+                return Ok(Outcome::Unauthenticated(format!("{} from {device}: its delegation no longer verifies", obj["id"])));
+            }
             let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender});
             let verdict = check_object(&obj, &octx);
             if verdict["verdict"] != "accept" {
