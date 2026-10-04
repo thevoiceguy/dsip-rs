@@ -11,6 +11,7 @@ members = [
     "crates/dsip-webrtc-binding",
     "crates/dsip-gateway",
     "crates/dsip-messaging",
+    "crates/dsip-events",
     "crates/dsip-mls",
     "crates/dsip-mailbox",
     "crates/dsip-broadcast",
@@ -37,6 +38,7 @@ dsip-media = { path = "crates/dsip-media" }
 dsip-webrtc-binding = { path = "crates/dsip-webrtc-binding" }
 dsip-gateway = { path = "crates/dsip-gateway" }
 dsip-messaging = { path = "crates/dsip-messaging" }
+dsip-events = { path = "crates/dsip-events" }
 dsip-mls = { path = "crates/dsip-mls" }
 dsip-mailbox = { path = "crates/dsip-mailbox" }
 dsip-broadcast = { path = "crates/dsip-broadcast" }
