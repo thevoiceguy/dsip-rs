@@ -69,6 +69,15 @@ pub struct Item {
 }
 
 impl Item {
+    /// Bytes this record holds for its owner, counted against the quota (spec-gap 99): the encoded payload fields
+    /// as stored.
+    pub fn stored_bytes(&self) -> i64 {
+        [&self.mls, &self.archive, &self.welcome, &self.sealed, &self.envelope]
+            .iter()
+            .map(|f| f.as_deref().map_or(0, str::len) as i64)
+            .sum()
+    }
+
     /// The `items[]` element for this record.
     pub fn to_value(&self, cursor: &str) -> Value {
         let mut v = json!({"cursor": cursor, "stored_at": self.stored_at, "class": self.class, "source": self.source});
@@ -135,6 +144,11 @@ impl Store {
     /// Record an item under the cursor the state machine assigned.
     pub fn put(&mut self, cursor: &str, item: Item) {
         self.items.insert(cursor.to_string(), item);
+    }
+
+    /// Forget one cursor (a deposit rolled back because its state could not be saved, spec-gap 99).
+    pub fn remove(&mut self, cursor: &str) {
+        self.items.remove(cursor);
     }
 
     /// The item at a cursor.

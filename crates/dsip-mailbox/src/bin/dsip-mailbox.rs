@@ -79,6 +79,10 @@ struct Args {
     /// Largest blob accepted on the blob endpoint, bytes (M§4.3 `max_blob_bytes`).
     #[arg(long, default_value_t = 16_777_216)]
     max_blob_bytes: i64,
+    /// The owner's storage quota, bytes: stored items plus blobs (M§4.3 `quota_bytes`; spec-gap 99). Deposits and
+    /// uploads that would exceed it are refused `mailbox.quota-exceeded`.
+    #[arg(long, default_value_t = 10_737_418_240)]
+    quota_bytes: i64,
     /// How long a moved group's new hub is held off while the old hub's last items are missing, seconds
     /// (M§7.4, RECOMMENDED 300; spec-gap 71).
     #[arg(long, default_value_t = dsip_messaging::mailbox::HANDOVER_WAIT_S)]
@@ -109,6 +113,8 @@ fn s_of(v: &Value) -> String {
 
 /// The saved service state, in the state directory.
 const STATE_FILE: &str = "mailbox-state.json";
+/// `retry_after` on a deposit refused because the state could not be saved (spec-gap 99).
+const SAVE_RETRY_AFTER_S: i64 = 60;
 /// Seconds between checks for unacknowledged fan-out.
 const RETRY_TICK_S: u64 = 2;
 /// First and largest delay before re-sending a fan-out head that stays unacknowledged, seconds.
@@ -149,6 +155,8 @@ struct Service {
     /// `https://…/blobs` as advertised (M§4.3).
     blob_endpoint: String,
     max_blob_bytes: i64,
+    /// The owner's quota, bytes (spec-gap 99).
+    quota_bytes: i64,
     /// Where [`STATE_FILE`] lives.
     state_dir: PathBuf,
     /// Unacknowledged fan-out heads by (group, member identity, class): (seq, next retry at, current delay). A welcome
@@ -188,7 +196,7 @@ const CLOSE_SENTINEL: &str = "\u{0}close";
 impl Service {
     /// Save everything that must survive a restart (spec-gap 59). A failed write is logged, not fatal: the
     /// in-memory state is still correct and the next change writes again.
-    fn persist(&mut self) {
+    fn persist(&mut self) -> bool {
         let now = now_s();
         self.seen.sweep(now);
         let queued: HashMap<&String, std::collections::BTreeSet<i64>> = self.hubs.iter().map(|(g, h)| (g, h.queued_seqs())).collect();
@@ -215,7 +223,37 @@ impl Service {
         let bytes = serde_json::to_vec(&state).unwrap_or_default();
         if let Err(e) = write_atomically(&self.state_dir.join(STATE_FILE), &bytes) {
             tracing::warn!("saving state failed: {e}");
+            return false;
         }
+        true
+    }
+
+    /// Absorb a storing step's emissions, then make the new item durable before acknowledging it.
+    ///
+    /// Spec: M§9 — `accepted` is where the sender stops retrying. Impl (spec-gap 99): a deposit that stored a new
+    /// item is acknowledged only once the state is written. If the write fails (a full disk), the step is rolled
+    /// back — machine and payload — and the deposit is refused `mailbox.quota-exceeded` with `retry_after`, so the
+    /// sender keeps it pending and retries instead of losing it at the next restart.
+    /// `before` is the machine as it was before the step — a clone, not a saved state: restoring a saved state is a
+    /// restart and would also drop the live device bindings, so a rolled-back mailbox would stop pushing to them.
+    fn commit(&mut self, before: Mailbox, emissions: Vec<Value>, item: Item) -> Vec<Value> {
+        let stored = emissions
+            .iter()
+            .find_map(|e| e.get("accepted"))
+            .filter(|a| a["cursor"].is_string() && a["duplicate"] != json!(true))
+            .cloned();
+        self.absorb(&emissions, item);
+        let Some(acc) = stored else { return emissions };
+        if self.persist() {
+            return emissions;
+        }
+        self.mailbox = before;
+        if let Some(c) = acc["cursor"].as_str() {
+            self.store.remove(c);
+        }
+        tracing::warn!("refusing deposit {}: its state could not be saved", acc["in_reply_to"]);
+        vec![json!({"error": {"to": acc["to"], "in_reply_to": acc["in_reply_to"], "reason": "mailbox.quota-exceeded",
+            "retry_after": SAVE_RETRY_AFTER_S}})]
     }
 
     /// Reload what [`Service::persist`] saved. Returns false when there is nothing to reload.
@@ -228,6 +266,8 @@ impl Service {
         anyhow::ensure!(v["format"] == 1, "unknown state format {}", v["format"]);
         anyhow::ensure!(v["owner"] == json!(self.owner), "saved state is for {}, not {}", v["owner"], self.owner);
         self.mailbox = Mailbox::from_full_state(&v["mailbox"]).context("saved mailbox")?;
+        // the configured quota wins over a saved one (or a state saved before quotas existed; spec-gap 99)
+        self.mailbox.set_quota(Some(self.quota_bytes));
         for (g, h) in v["hubs"].as_object().into_iter().flatten() {
             self.hubs.insert(g.clone(), Hub::from_full_state(h).context("saved hub")?);
         }
@@ -687,7 +727,7 @@ async fn main() -> Result<()> {
 
     let mailbox = Mailbox::new(&json!({"now": now_s(), "owner": args.owner, "serves": [args.owner], "devices": [],
         "admit": args.admit, "intro_limit": args.intro_limit, "intro_window": args.intro_window, "inbox_cap": args.inbox_cap,
-        "handover_wait": args.handover_wait}));
+        "handover_wait": args.handover_wait, "quota_bytes": args.quota_bytes}));
     let service = Arc::new(Mutex::new(Service {
         key,
         owner: args.owner.clone(),
@@ -708,6 +748,7 @@ async fn main() -> Result<()> {
         blob_dir: args.state.join("blobs"),
         blob_endpoint: blob_endpoint(&args.listen, args.host.first().map(String::as_str)),
         max_blob_bytes: args.max_blob_bytes,
+        quota_bytes: args.quota_bytes,
         state_dir: args.state.clone(),
         retry: HashMap::new(),
         replicate: vec![],
@@ -821,7 +862,11 @@ async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>)
                     let id = a["payload"]["id"].as_str().unwrap_or("").to_string();
                     st.seen.insert(&id, now, now);
                 }
-                let mbx = json!({"did": st.key.did(), "serves": [st.owner], "max_blob_bytes": st.max_blob_bytes});
+                // spec-gap 99: the quota covers stored items and the blobs on disk
+                let blob_bytes: i64 = std::fs::read_dir(&st.blob_dir).into_iter().flatten().flatten()
+                    .filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len() as i64).sum();
+                let mbx = json!({"did": st.key.did(), "serves": [st.owner], "max_blob_bytes": st.max_blob_bytes,
+                    "quota_bytes": st.quota_bytes, "used_bytes": st.mailbox.used_bytes() + blob_bytes});
                 let stored = valid_name && st.blob_dir.join(&sha).exists();
                 (auth.unwrap_or(Value::Null), mbx, stored)
             };
@@ -1147,7 +1192,7 @@ fn dispatch(
                 let w_digest = p["mls"].as_str().and_then(dsip_core::b64::decode).map(|b| digest(&b));
                 let mut w = json!({"id": id, "from": device, "adder_identity": identity,
                     "recipient": st.owner, "group": group, "hub": p["hub"]["did"], "grant": grant,
-                    "successor_of": p["successor_of"], "digest": w_digest});
+                    "successor_of": p["successor_of"], "digest": w_digest, "size": item.stored_bytes()});
                 // A service-signed welcome (no delegation) came from a hub: only `origin` names the adder (M§14.2).
                 if device == hello_device && bound_identity == device {
                     w["via_hub"] = json!(true);
@@ -1157,29 +1202,33 @@ fn dispatch(
                         w["origin"] = o;
                     }
                 }
+                let before = st.mailbox.clone();
                 let emissions = st.mailbox.step(&json!({"welcome": w}));
                 if let Some(e) = emissions.iter().find_map(|e| e.get("error")) {
                     tracing::info!("welcome for {group} refused: {} (origin {})", e["reason"], w.get("origin").is_some());
                 }
+                let emissions = st.commit(before, emissions, item);
                 if emissions.iter().any(|e| e.get("accepted").is_some()) {
                     st.hub_refs.insert(group.clone(), p["hub"].clone());
                 }
-                st.absorb(&emissions, item);
                 return st.mailbox_out(emissions, now);
             }
             if class == "archive" {
-                let event = json!({"archive": {"id": id, "device": device, "ref_group": p["ref_group"], "ref_seq": p["ref_seq"]}});
+                let event = json!({"archive": {"id": id, "device": device, "ref_group": p["ref_group"], "ref_seq": p["ref_seq"],
+                    "size": item.stored_bytes()}});
+                let before = st.mailbox.clone();
                 let emissions = st.mailbox.step(&event);
-                st.absorb(&emissions, item);
+                let emissions = st.commit(before, emissions, item);
                 return st.mailbox_out(emissions, now);
             }
             if p["recipient"].as_str() == Some(st.owner.as_str()) {
                 // Fan-out from another hub for our owner.
                 let event = json!({"hub_deposit": {"id": id, "from": identity, "recipient": st.owner,
-                    "group": group, "seq": p["seq"], "class": class, "expires_at": p["expires_at"]}});
+                    "group": group, "seq": p["seq"], "class": class, "expires_at": p["expires_at"], "size": item.stored_bytes()}});
+                let before = st.mailbox.clone();
                 let emissions = st.mailbox.step(&event);
                 let mut out = st.ephemeral_pushes(&emissions, &p, &identity, now);
-                st.absorb(&emissions, item);
+                let emissions = st.commit(before, emissions, item);
                 out.extend(st.mailbox_out(emissions, now));
                 return out;
             }

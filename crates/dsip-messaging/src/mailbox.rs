@@ -57,7 +57,7 @@ struct Previous {
     late: Vec<i64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Group {
     hub: String,
     state: String,
@@ -70,7 +70,7 @@ struct Group {
     previous: Option<Previous>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Item {
     cursor: String,
     n: i64,
@@ -81,6 +81,9 @@ struct Item {
     /// Digest of a welcome's MLS bytes, which tells a redelivery from a new invitation (spec-gap 66).
     #[serde(default)]
     digest: Option<String>,
+    /// Bytes the deposit declared, counted against the owner's quota (spec-gap 99).
+    #[serde(default)]
+    size: i64,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -90,7 +93,7 @@ struct KeyPackages {
 }
 
 /// Mailbox state for one served owner.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Mailbox {
     now: i64,
     owner: String,
@@ -100,6 +103,9 @@ pub struct Mailbox {
     admit: String,
     pending_ttl: i64,
     pending_max: i64,
+    /// The owner's quota in bytes (M§4.3 `quota_bytes`); `None` = unlimited (spec-gap 99).
+    #[serde(default)]
+    quota: Option<i64>,
     #[serde(default = "default_handover_wait")]
     handover_wait: i64,
     groups: BTreeMap<String, Group>,
@@ -203,6 +209,7 @@ impl Mailbox {
             admit: ctx["admit"].as_str().unwrap_or("grant").to_string(),
             pending_ttl: ctx["pending_group_ttl"].as_i64().unwrap_or(604_800),
             pending_max: ctx["pending_group_max_items"].as_i64().unwrap_or(500),
+            quota: ctx["quota_bytes"].as_i64(),
             handover_wait: ctx["handover_wait"].as_i64().unwrap_or(HANDOVER_WAIT_S),
             groups,
             kp,
@@ -305,6 +312,31 @@ impl Mailbox {
             && !self.revoked.contains(&s(&grant["id"]))
     }
 
+    /// Bytes held for the owner: the declared sizes of the retained items (spec-gap 99).
+    pub fn used_bytes(&self) -> i64 {
+        self.items.iter().map(|it| it.size).sum()
+    }
+
+    /// Spec: M§4.3 `quota_bytes`, M§4.4, M§14.3. Impl (spec-gap 99): would storing this deposit's declared `size`
+    /// take the owner past the quota? Checked after the duplicate checks (a redelivery stores nothing) and before
+    /// anything is stored or registered.
+    fn over_quota(&self, e: &Value) -> bool {
+        self.quota.is_some_and(|q| self.used_bytes() + e["size"].as_i64().unwrap_or(0) > q)
+    }
+
+    /// Set the owner's quota (M§4.3 `quota_bytes`; `None` = unlimited). A host applies its configuration after
+    /// reloading saved state, which may predate the quota (spec-gap 99).
+    pub fn set_quota(&mut self, quota: Option<i64>) {
+        self.quota = quota;
+    }
+
+    /// Record the declared size on the item just stored.
+    fn size_last(&mut self, e: &Value) {
+        if let Some(it) = self.items.last_mut() {
+            it.size = e["size"].as_i64().unwrap_or(0);
+        }
+    }
+
     fn store(&mut self, class: &str, group: &str, depositor: Option<&str>) -> (String, Vec<Value>) {
         if class == "group-info" {
             // M§5.2: latest per group only
@@ -313,7 +345,7 @@ impl Mailbox {
         self.counter += 1;
         let c = cursor(self.counter);
         self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into(), expires_at: None, seq: None,
-            digest: None });
+            digest: None, size: 0 });
         let pushes =
             self.bound.iter().filter(|d| Some(d.as_str()) != depositor).map(|d| json!({"push": {"to": d, "cursor": c}})).collect();
         (c, pushes)
@@ -411,11 +443,15 @@ impl Mailbox {
                 return vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": it.cursor, "duplicate": true}})];
             }
         }
+        if self.over_quota(e) {
+            return Self::error(&e["from"], &e["id"], "mailbox.quota-exceeded");
+        }
         self.groups.entry(group.clone()).or_insert_with(|| Group { hub: s(&e["hub"]), state: "pending".into(), since: now, items: 0, high_seq: 0, previous: None });
         let (c, pushes) = self.store("welcome", &group, None);
         if let Some(it) = self.items.last_mut() {
             it.digest = e["digest"].as_str().map(String::from);
         }
+        self.size_last(e);
         let mut out = vec![json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}})];
         out.extend(pushes);
         out
@@ -506,6 +542,10 @@ impl Mailbox {
         if reg.state == "pending" && reg.items >= self.pending_max {
             return Self::error(&e["from"], &e["id"], "mailbox.quota-exceeded");
         }
+        if self.over_quota(e) {
+            out.extend(Self::error(&e["from"], &e["id"], "mailbox.quota-exceeded"));
+            return out;
+        }
         if let Some(r) = self.groups.get_mut(&group) {
             r.items += 1;
             match (seq, late, &mut r.previous) {
@@ -518,6 +558,7 @@ impl Mailbox {
         if let Some(it) = self.items.last_mut() {
             it.seq = seq;
         }
+        self.size_last(e);
         out.push(json!({"accepted": {"to": e["from"], "in_reply_to": e["id"], "cursor": c}}));
         out.extend(pushes);
         out
@@ -611,7 +652,11 @@ impl Mailbox {
             return vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"], "cursor": c, "duplicate": true}})];
         }
         let dev = s(&e["device"]);
+        if self.over_quota(e) {
+            return Self::error(&e["device"], &e["id"], "mailbox.quota-exceeded");
+        }
         let (c, pushes) = self.store("archive", &key.0, Some(&dev));
+        self.size_last(e);
         self.archived.insert(key, c.clone());
         let mut out = vec![json!({"accepted": {"to": e["device"], "in_reply_to": e["id"], "cursor": c}})];
         out.extend(pushes);
@@ -670,7 +715,11 @@ impl Mailbox {
             .iter()
             .map(|(d, k)| (d.clone(), json!({"one_time": k.one_time, "last_resort": k.last_resort})))
             .collect();
-        json!({"items": self.items.iter().map(|it| it.cursor.as_str()).collect::<Vec<_>>(), "groups": groups, "key_packages": kps})
+        let mut snap = json!({"items": self.items.iter().map(|it| it.cursor.as_str()).collect::<Vec<_>>(), "groups": groups, "key_packages": kps});
+        if self.quota.is_some() {
+            snap["used_bytes"] = json!(self.used_bytes()); // spec-gap 99
+        }
+        snap
     }
 }
 
@@ -762,6 +811,14 @@ pub fn blob_put(inp: &Value) -> Value {
     }
     if p["size"].as_i64().unwrap_or(i64::MAX) > mbx["max_blob_bytes"].as_i64().unwrap_or(0) {
         return json!({"status": 413, "reason": "mailbox.object-too-large"});
+    }
+    // Impl (spec-gap 99): the owner's quota, decided from the authorized size before the body is read; a hash already
+    // stored stores nothing more and is never refused for quota.
+    let stored = inp["stored"].as_array().is_some_and(|a| a.contains(&p["sha256"]));
+    if let Some(quota) = mbx["quota_bytes"].as_i64() {
+        if !stored && mbx["used_bytes"].as_i64().unwrap_or(0) + p["size"].as_i64().unwrap_or(0) > quota {
+            return json!({"status": 507, "reason": "mailbox.quota-exceeded"});
+        }
     }
     if req["body_size"] != p["size"] || req["body_sha256"] != p["sha256"] {
         return json!({"status": 400, "reason": "mailbox.blob-mismatch"});
