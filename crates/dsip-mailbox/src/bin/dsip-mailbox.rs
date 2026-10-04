@@ -1039,6 +1039,10 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     {
         let mut st = service.lock().await;
         if identity == st.owner {
+            // M§5.4: live push belongs to a connection. A new binding starts not live, whatever an earlier connection
+            // of this device asked for, until it syncs live; otherwise a push could jump its cursor past items stored
+            // while it was away, which it would then never sync.
+            st.mailbox.step(&json!({"unbind": {"device": device}}));
             st.bound.insert(device.clone(), tx.clone());
             // The owner's registered devices are the ones that have bound (M§4.4), including before a restart.
             let mut devices: Vec<String> = st.mailbox.devices().to_vec();
@@ -1048,30 +1052,35 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
         st.persist();
     }
 
-    loop {
-        tokio::select! {
-            outbound = rx.recv() => match outbound {
-                Some(frame) if frame == CLOSE_SENTINEL => {
-                    // The device's delegation was revoked: end the binding now (M§12.4, spec-gap 57).
-                    let _ = ws.close(None).await;
-                    break;
-                }
-                Some(frame) => ws.send(WsMessage::Text(frame.into())).await?,
-                None => break,
-            },
-            inbound = ws.next() => match inbound {
-                Some(Ok(WsMessage::Text(t))) => {
-                    let replies = handle(&service, t.to_string(), &device, &identity).await;
-                    for frame in replies {
-                        ws.send(WsMessage::Text(frame.into())).await?;
+    // The binding ends however the connection does (a clean close, a send error, a dropped socket), so the cleanup
+    // below always runs.
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                outbound = rx.recv() => match outbound {
+                    Some(frame) if frame == CLOSE_SENTINEL => {
+                        // The device's delegation was revoked: end the binding now (M§12.4, spec-gap 57).
+                        let _ = ws.close(None).await;
+                        return Ok(());
                     }
-                }
-                Some(Ok(WsMessage::Close(_))) | None => break,
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e.into()),
-            },
+                    Some(frame) => ws.send(WsMessage::Text(frame.into())).await?,
+                    None => return Ok(()),
+                },
+                inbound = ws.next() => match inbound {
+                    Some(Ok(WsMessage::Text(t))) => {
+                        let replies = handle(&service, t.to_string(), &device, &identity).await;
+                        for frame in replies {
+                            ws.send(WsMessage::Text(frame.into())).await?;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None => return Ok(()),
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                },
+            }
         }
     }
+    .await;
     let mut st = service.lock().await;
     // A device may hold a second, short-lived connection; only its own binding ends here.
     if st.bound.get(&device).is_some_and(|t| t.same_channel(&tx)) {
@@ -1079,7 +1088,7 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
         st.mailbox.step(&json!({"unbind": {"device": device}}));
         tracing::info!("unbound {device}");
     }
-    Ok(())
+    result
 }
 
 /// Verify one frame and run it through the state machines; returns frames for this connection.

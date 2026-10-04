@@ -92,6 +92,9 @@ wait_for "$DIR/b.log" "^BLOB-SOURCE-REJECTED https://127.0.0.1:9572/blobs/$COPY:
 grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9571/blobs/$COPY" || { echo "FAIL: the damaged copy was not rejected in favour of the original"; exit 1; }
 
 echo "=== a fetch that finds nothing to serve is tried again until the blob is there (spec-gap 67)"
+# Bob's device stays offline until the replication has succeeded: a device that is online is pushed the message at
+# once and would fetch it before Bob's mailbox has a copy (a device does not retry a failed fetch).
+echo "offline" >&4; wait_nth "$DIR/b.log" "^OK offline" 3 20
 crash "$MBX_B"
 echo "voice $DIR/third.ogg" >&3; wait_nth "$DIR/a.log" "^OK sent" 3 30
 THIRD=$(grep "^OK sent audio" "$DIR/a.log" | tail -1 | sed -E 's/.*blob=([0-9a-f]+).*/\1/')
@@ -105,7 +108,7 @@ wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 3 60
 grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9572/blobs/$THIRD" || { echo "FAIL: the retried copy was not used"; exit 1; }
 
 echo "=== Bob's mailbox now takes blobs only up to 4 KiB, so the next one is not replicated"
-echo "offline" >&4; wait_nth "$DIR/b.log" "^OK offline" 3 20; crash "$MBX_B"
+echo "offline" >&4; wait_nth "$DIR/b.log" "^OK offline" 4 20; crash "$MBX_B"
 start_b --max-blob-bytes 4096; wait_nth "$DIR/mbx-b.log" "restored state" 1 20
 sleep 2
 echo "voice $DIR/long.ogg" >&3; wait_nth "$DIR/a.log" "^OK sent" 4 30

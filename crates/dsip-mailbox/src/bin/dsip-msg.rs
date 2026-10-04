@@ -255,6 +255,8 @@ struct Client {
     conn: Option<Connection>,
     /// The operator took this device `offline`: the outage ticker leaves it there until something connects again.
     held_offline: bool,
+    /// The user asked for live push (`live`); every later sync, on any connection, asks for it again (M§5.4).
+    want_live: bool,
     /// Unexpected connection loss: the ticker redials at this time (§13.2 backoff).
     reconnect_at: Option<i64>,
     /// The current backoff ceiling, seconds (§13.2: initial 1, factor 2, max 60).
@@ -1800,7 +1802,10 @@ impl Client {
     async fn sync(&mut self, live: bool) -> Result<()> {
         // M§5.4: `ack_through` is the last committed item, never ahead of it (spec-gap 44).
         let mut fields = self.resume.sync_fields();
-        fields["live"] = json!(live);
+        // Live push is per connection (the mailbox starts each binding not live): once asked for, every sync asks
+        // again, so a reconnected device is pushed to only after a sync has delivered what was stored meanwhile.
+        self.want_live |= live;
+        fields["live"] = json!(self.want_live);
         let env = wire::message(&self.keys.device, "sync", &self.mailbox.0, now_s(), wire::TTL_S, fields);
         self.send(&env).await
     }
@@ -2478,6 +2483,7 @@ async fn main() -> Result<()> {
         ca: args.ca.clone(),
         conn: None,
         held_offline: false,
+        want_live: false,
         reconnect_at: None,
         reconnect_ceiling: 1,
         mailbox,
