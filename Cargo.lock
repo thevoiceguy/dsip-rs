@@ -1189,6 +1189,7 @@ dependencies = [
  "dsip-broadcast",
  "dsip-core",
  "dsip-dht",
+ "dsip-events",
  "dsip-gateway",
  "dsip-media",
  "dsip-messaging",
@@ -1250,6 +1251,13 @@ dependencies = [
  "dsip-webrtc-binding",
  "rand 0.8.7",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsip-events"
+version = "0.1.0"
+dependencies = [
  "serde_json",
 ]
 
