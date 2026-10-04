@@ -69,7 +69,10 @@ echo "=== two epochs behind (mailbox.stale-epoch)"
 echo "offline" >&4; wait_for "$DIR/b.log" "OK offline" 10
 echo "rekey" >&3; wait_for "$DIR/a.log" "^OK rekeyed epoch=4 " 30
 echo "rekey" >&3; wait_for "$DIR/a.log" "^OK rekeyed epoch=5 " 30
-echo "online" >&4; sleep 1
+echo "online" >&4; wait_for "$DIR/b.log" "OK connected" 15; sleep 0.5
+# Alice writes while Bob is back but not yet synced. His mailbox must not push it to him: live push belongs to the
+# connection that asked for it (M§5.4), and pushing it here would move his cursor past Alice's two commits.
+echo "send Pushed before Bob syncs" >&3; wait_for "$DIR/a.log" "^OK sent" 15; sleep 1
 echo "rekey" >&4
 wait_for "$DIR/b.log" "^CONFLICT rekeyed: mailbox.stale-epoch at epoch 3" 30
 wait_for "$DIR/b.log" "^OK rekeyed epoch=6 " 30
