@@ -16,7 +16,7 @@ serde_json.workspace = true
 webrtc = { version = "0.13", optional = true }
 webrtc-media = "0.10"
 rtp = "0.13"
-forge-webrtc = { git = "https://github.com/thevoiceguy/forge-media", rev = "5767eaee7f11dabcef6acb02b5c56290750cdd18", optional = true }
+forge-webrtc = { git = "https://github.com/thevoiceguy/forge-media", rev = "0e4b41264ad7bdd7aab83b9dc3b7beb8c2369afe", optional = true }
 audiopus = "0.3.0-rc.0"
 bytes = "1"
 
