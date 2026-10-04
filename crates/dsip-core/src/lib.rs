@@ -26,6 +26,7 @@ pub mod trust;
 pub mod ulid;
 pub mod verdict;
 pub mod version;
+pub mod webvh;
 pub mod wire;
 
 pub use envelope::{Context, Envelope, Verified};
