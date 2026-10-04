@@ -1,6 +1,6 @@
 [package]
 name = "dsip-messaging"
-description = "DSIP Messaging Profile 1.0 (v0.8 draft): profile schemas embedded at build time, stateless message/object checks, and the hub and mailbox state machines (pure; MLS abstracted)"
+description = "DSIP Messaging Profile 1.0 (v0.9 draft): profile schemas embedded at build time, stateless message/object checks, and the hub and mailbox state machines (pure; MLS abstracted)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
