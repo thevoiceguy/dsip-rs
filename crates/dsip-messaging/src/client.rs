@@ -212,7 +212,8 @@ impl HubOutage {
 
     /// The hub's (or the mailbox's) answer to a pending deposit; `reason` is `None` for `accepted`.
     pub fn answer(&mut self, id: &str, reason: Option<&str>) -> Vec<Value> {
-        if reason == Some("mailbox.hub-unreachable") {
+        // M§9.4: a hub that cannot be reached, or cannot store the deposit (M§9.3, spec-gap 99), is unavailable
+        if matches!(reason, Some("mailbox.hub-unreachable" | "mailbox.quota-exceeded")) {
             return self.unreachable(id);
         }
         let Some(pos) = self.pending.iter().position(|p| p == id) else { return vec![] };

@@ -774,7 +774,8 @@ impl Client {
             Ok(reply) => {
                 let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
                 let emissions = self.outage_mut(group).answer(&id, reason.as_deref());
-                let still_pending = reason.as_deref() == Some("mailbox.hub-unreachable");
+                // M§9.4: the outbox keeps it for an unreachable hub, or one that could not store it (spec-gap 99)
+                let still_pending = matches!(reason.as_deref(), Some("mailbox.hub-unreachable" | "mailbox.quota-exceeded"));
                 Ok((emissions, (!still_pending).then_some(reply)))
             }
             Err(e) if e.to_string().contains("no answer") => Ok((self.outage_mut(group).no_answer(&id), None)),
