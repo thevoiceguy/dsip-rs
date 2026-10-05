@@ -56,6 +56,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("policy.first-contact-required", &["reject"]),
     ("policy.blocked", &["reject", "cancel"]),
     ("policy.terminated", &["bye"]),
+    ("policy.recording-declined", &["reject", "bye"]), // Recording Profile C§4 (draft)
     ("policy.rate-limited", &["reject", "error"]),
     ("policy.subscription-lifetime", &["error"]), // v0.7 (spec-gap 19): expires_in above the §9.3 cap
     ("transport.envelope-too-large", &["error"]),

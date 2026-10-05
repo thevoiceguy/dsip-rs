@@ -1,0 +1,11 @@
+[package]
+name = "dsip-recording"
+description = "DSIP Recording Profile (draft): a counterparty's consent, recorded conversations, the recorder leg's checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true

@@ -1204,6 +1204,7 @@ dependencies = [
  "dsip-kt",
  "dsip-media",
  "dsip-messaging",
+ "dsip-recording",
  "dsip-schema",
  "dsip-session",
  "dsip-transport",
@@ -1400,6 +1401,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "dsip-recording"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
