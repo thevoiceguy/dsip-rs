@@ -23,6 +23,7 @@ dsip-webrtc-binding.workspace = true
 dsip-gateway.workspace = true
 dsip-messaging.workspace = true
 dsip-events.workspace = true
+dsip-kt.workspace = true
 libp2p.workspace = true
 serde_json.workspace = true
 clap.workspace = true

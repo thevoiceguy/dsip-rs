@@ -1,0 +1,16 @@
+[package]
+name = "dsip-kt"
+description = "DSIP Alias Transparency Profile (draft): KEYTRANS building blocks — ECVRF-EDWARDS25519-SHA512-TAI, commitments, prefix and log trees, tree heads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+ed25519-dalek.workspace = true
+curve25519-dalek.workspace = true
+hex.workspace = true
