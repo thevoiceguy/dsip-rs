@@ -21,6 +21,7 @@ pub mod did;
 pub mod envelope;
 pub mod hpke;
 pub mod keys;
+pub mod pkarr;
 pub mod registry;
 pub mod trust;
 pub mod ulid;
