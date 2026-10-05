@@ -57,10 +57,13 @@ pub enum LocalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered_by: Option<String>,
     },
-    /// User declines (`reject user.declined`).
+    /// User declines (`reject user.declined`, or the given reason, e.g. `policy.recording-declined`, Recording Profile C§4).
     Decline {
         /// Session id.
         session: String,
+        /// The reject's reason; `user.declined` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Send an `update`.
     Update {
@@ -158,7 +161,7 @@ impl LocalEvent {
             | LocalEvent::Alert { session, .. }
             | LocalEvent::AutoReject { session, .. }
             | LocalEvent::Accept { session, .. }
-            | LocalEvent::Decline { session }
+            | LocalEvent::Decline { session, .. }
             | LocalEvent::Update { session, .. }
             | LocalEvent::AnswerUpdate { session, .. }
             | LocalEvent::RejectUpdate { session, .. }
