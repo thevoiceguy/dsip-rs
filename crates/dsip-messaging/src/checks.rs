@@ -47,7 +47,7 @@ pub const DEPOSIT_CLASSES: &[&str] = &["handshake", "application", "welcome", "g
 /// Spec: M§14.1. Impl (spec-gap 54).
 pub const FIRST_CONTACT_CLASSES: &[&str] = &["introduction", "grant"];
 /// Registry `dsip-content-kind` (M§17).
-pub const CONTENT_KINDS: &[&str] = &["text", "audio", "video", "image", "file", "contact", "location"];
+pub const CONTENT_KINDS: &[&str] = &["text", "audio", "video", "image", "file", "contact", "location", "device-event", "alarm-ack"];
 /// Registry `dsip-content-purpose` (M§17).
 pub const CONTENT_PURPOSES: &[&str] =
     &["message", "voice-message", "video-message", "voicemail", "attachment", "reaction", "callback-request"];
@@ -244,6 +244,8 @@ fn kind_body(kind: &str) -> &'static [&'static str] {
         "image" => &["blob"],
         "file" => &["blob", "name"],
         "contact" => &["did"],
+        "device-event" => &["event"],        // v0.9, E§5
+        "alarm-ack" => &["alarm", "state"], // v0.9, E§5
         _ => &["lat_e7", "lon_e7"],
     }
 }

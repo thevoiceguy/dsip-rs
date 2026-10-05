@@ -13,6 +13,8 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod ber;
+
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};

@@ -101,6 +101,16 @@ struct Args {
     /// Do not send `delivered` receipts.
     #[arg(long)]
     no_delivered: bool,
+    /// Act as a Device Events escalation agent (E§6): escalate alarms at or above this severity…
+    #[arg(long)]
+    escalate_min: Option<String>,
+    /// …left unacknowledged for this many seconds…
+    #[arg(long, default_value_t = 300)]
+    escalate_after: i64,
+    /// …by running this shell command (the alarm in `ALARM_RESOURCE`, `ALARM_TYPE`, `ALARM_SEVERITY`), e.g. a
+    /// `dsip call` to the on-call person.
+    #[arg(long)]
+    escalate_cmd: Option<String>,
 }
 
 /// The device's persistent keys: an identity controller key and a device key.
@@ -286,6 +296,10 @@ struct Client {
     gaps: BTreeMap<String, GapTracker>,
     /// Items held behind a gap, by group, kept durably until the gap fills or this device re-joins.
     held_items: BTreeMap<String, Vec<Value>>,
+    /// The alarm list of each group carrying device events (E§5), and when it was last advanced.
+    alarms: BTreeMap<String, (dsip_events::AlarmList, i64)>,
+    /// The escalation policy when this device is an escalation agent (E§6), and its command.
+    escalation: Option<(Value, Option<String>)>,
     /// Blob fetches to try again (M§8.4 "Fetching", spec-gap 106): `{object, blobs, sender, attempt, next_at}`, persisted.
     pending_blobs: Vec<Value>,
     gap_timeout: i64,
@@ -1846,6 +1860,110 @@ impl Client {
         Ok(())
     }
 
+    /// Send a `device-event` (E§5) from a `dsip-trapd` line: this device is the gateway that signs it.
+    async fn send_device_event(&mut self, event_json: &str) -> Result<()> {
+        let event: Value = serde_json::from_str(event_json.trim()).context("device-event: not JSON")?;
+        let group = self.active()?;
+        let now = now_s();
+        let obj = json!({"object": "content", "id": wire::new_id(now), "conversation": self.conv(&group)?.conversation,
+            "sender": self.identity, "sent_at": now, "kind": "device-event", "purpose": "message", "event": event});
+        let reply = self.send_object(&group, &obj, json!({})).await?;
+        self.sent(&group, &reply, &obj);
+        match reply["type"].as_str() {
+            Some("accepted") => println!("OK sent event seq={}", reply["seq"]),
+            Some("pending") => {}
+            _ => println!("ERR send refused: {}", reply["reason"]),
+        }
+        Ok(())
+    }
+
+    /// Send an `alarm-ack` (E§5): this operator owns the alarm (`ack`) or has finished with it (`closed`).
+    async fn send_alarm_ack(&mut self, resource: &str, kind: &str, state: &str) -> Result<()> {
+        let group = self.active()?;
+        let now = now_s();
+        let obj = json!({"object": "content", "id": wire::new_id(now), "conversation": self.conv(&group)?.conversation,
+            "sender": self.identity, "sent_at": now, "kind": "alarm-ack", "purpose": "message",
+            "alarm": {"resource": resource, "type": kind, "qualifier": ""}, "state": state});
+        let reply = self.send_object(&group, &obj, json!({})).await?;
+        self.sent(&group, &reply, &obj);
+        // our own acknowledgement counts in our own alarm list too (it is fanned back to us as SELF)
+        self.alarm_step(&group, &json!({"ack": {"alarm": obj["alarm"], "state": state, "by": self.identity}}));
+        match reply["type"].as_str() {
+            Some("accepted") => println!("OK sent alarm-ack seq={}", reply["seq"]),
+            Some("pending") => {}
+            _ => println!("ERR send refused: {}", reply["reason"]),
+        }
+        Ok(())
+    }
+
+    /// Apply one event to a group's alarm list (E§5) and act on what it emits: print each transition, and as an
+    /// escalation agent run the escalation command (E§6).
+    fn alarm_step(&mut self, group: &str, event: &Value) {
+        let now = now_s();
+        let policy = self.escalation.as_ref().map(|(p, _)| p.clone());
+        let (list, last) = self.alarms.entry(group.to_string()).or_insert_with(|| {
+            let mut ctx = json!({"now": now});
+            if let Some(p) = policy {
+                ctx["escalation"] = p;
+            }
+            (dsip_events::AlarmList::new(&ctx), now)
+        });
+        let mut emitted = list.step(&json!({"advance": now - *last}));
+        *last = now;
+        emitted.extend(list.step(event));
+        self.alarm_out(emitted);
+    }
+
+    fn alarm_out(&self, emitted: Vec<Value>) {
+        for e in emitted {
+            let (what, body) = match e.as_object().and_then(|o| o.iter().next()) {
+                Some((k, v)) => (k.clone(), v.clone()),
+                None => continue,
+            };
+            let key = &body["key"];
+            let k = format!("{}/{}", key[0].as_str().unwrap_or(""), key[1].as_str().unwrap_or(""));
+            match what.as_str() {
+                "raised" => println!("ALARM raised {k} severity={} reopened={}", body["severity"].as_str().unwrap_or(""), body["reopened"]),
+                "changed" => println!("ALARM changed {k} severity={}", body["severity"].as_str().unwrap_or("")),
+                "cleared" => println!("ALARM cleared {k}"),
+                "operator" => println!("ALARM {} {k} by {}", body["state"].as_str().unwrap_or(""), body["by"].as_str().unwrap_or("")),
+                "escalate" => {
+                    println!("ESCALATE {k} severity={}", body["severity"].as_str().unwrap_or(""));
+                    if let Some((_, Some(cmd))) = &self.escalation {
+                        let spawned = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(cmd)
+                            .env("ALARM_RESOURCE", key[0].as_str().unwrap_or(""))
+                            .env("ALARM_TYPE", key[1].as_str().unwrap_or(""))
+                            .env("ALARM_SEVERITY", body["severity"].as_str().unwrap_or(""))
+                            .spawn();
+                        if let Err(e) = spawned {
+                            println!("ERR escalation command: {e}");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Advance every alarm list to now (E§6 timers, E§5 gateway silence), from the ticker.
+    fn tick_alarms(&mut self) {
+        let groups: Vec<String> = self.alarms.keys().cloned().collect();
+        for g in groups {
+            let now = now_s();
+            let emitted = match self.alarms.get_mut(&g) {
+                Some((list, last)) if now > *last => {
+                    let e = list.step(&json!({"advance": now - *last}));
+                    *last = now;
+                    e
+                }
+                _ => continue,
+            };
+            self.alarm_out(emitted);
+        }
+    }
+
     async fn send_text(&mut self, text: &str) -> Result<()> {
         let group = self.active()?;
         let now = now_s();
@@ -2344,7 +2462,21 @@ impl Client {
                 self.sent_at.insert(key, object["sent_at"].as_i64().unwrap_or(0));
                 self.archive_requests(gid, &emissions, &object, sender, sender_device, seq);
                 self.batch.push((gid.to_string(), json!({"seq": seq, "object": object.clone()})));
-                if object.get("blob").is_some() {
+                if object["kind"] == "device-event" {
+                    // E§5: the gateway signed it; the device is a claim with its basis
+                    let ev = &object["event"];
+                    if let Some(h) = ev.get("heartbeat") {
+                        self.alarm_step(gid, &json!({"heartbeat": {"gateway": sender, "interval_s": h["interval_s"]}}));
+                    } else {
+                        println!("EVENT {sender} source={} basis={} trap={}", ev["source"]["address"].as_str().unwrap_or(""),
+                            ev["source"]["basis"].as_str().unwrap_or(""), ev["raw"]["snmp"]["trap_oid"].as_str().unwrap_or("-"));
+                        if let Some(a) = ev.get("alarm") {
+                            self.alarm_step(gid, &json!({"report": a}));
+                        }
+                    }
+                } else if object["kind"] == "alarm-ack" {
+                    self.alarm_step(gid, &json!({"ack": {"alarm": object["alarm"], "state": object["state"], "by": sender}}));
+                } else if object.get("blob").is_some() {
                     if let Some(c) = self.convs.get_mut(gid) {
                         c.last_media = object["id"].as_str().map(String::from);
                     }
@@ -2574,6 +2706,10 @@ async fn main() -> Result<()> {
         gaps: BTreeMap::new(),
         held_items: get("held_items")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         pending_blobs: get("pending_blobs")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
+        alarms: BTreeMap::new(),
+        escalation: args.escalate_min.as_ref().map(|min| {
+            (json!({"min_severity": min, "after_s": args.escalate_after}), args.escalate_cmd.clone())
+        }),
         gap_timeout: args.gap_timeout,
         outages: BTreeMap::new(),
         pending: BTreeMap::new(),
@@ -2682,6 +2818,8 @@ async fn main() -> Result<()> {
                 if let Err(e) = client.retry_blobs().await {
                     println!("ERR {e}");
                 }
+                // E§5–E§6: alarm timers (escalation, gateway silence)
+                client.tick_alarms();
                 // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)
                 if let Err(e) = client.check_gaps().await {
                     println!("ERR {e}");
@@ -2823,6 +2961,15 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
             client.commit_op(&group, CommitOp::Update, "rekeyed").await
         }
         "send" => client.send_text(rest).await,
+        "device-event" => client.send_device_event(rest).await,
+        "alarm-ack" => {
+            // alarm-ack <resource> <type> ack|closed
+            let w: Vec<&str> = rest.split_whitespace().collect();
+            match w.as_slice() {
+                [resource, kind, state] => client.send_alarm_ack(resource, kind, state).await,
+                _ => Err(anyhow::anyhow!("usage: alarm-ack <resource> <type> ack|closed")),
+            }
+        }
         "voice" => client.send_audio(rest.trim(), "voice-message", None, None).await,
         "voicemail" => {
             // voicemail <session> <call outcome reason> <file.ogg>

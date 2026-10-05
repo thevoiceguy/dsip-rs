@@ -1309,6 +1309,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dsip-core",
+ "dsip-events",
  "dsip-messaging",
  "dsip-mls",
  "dsip-transport",
