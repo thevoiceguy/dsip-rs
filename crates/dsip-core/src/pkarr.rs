@@ -242,6 +242,119 @@ pub fn read(did: &str, payload: &[u8], now: i64) -> Result<Hint, Reject> {
     Ok(Hint { subject: did.to_string(), seq: ts, issued_at: issued, expires_at: expires, endpoints: eps })
 }
 
+/// Whether a relay payload is signed by `key` (BEP 44, no salt); nothing else is checked.
+///
+/// Spec: DHT Hints Profile §9 — a publisher trusts a previous packet's timestamp and records only if it is its own.
+pub fn verify_payload(key: &[u8; 32], payload: &[u8]) -> bool {
+    payload.len() >= 72
+        && verify(key, &bep44_signable(u64::from_be_bytes(payload[64..72].try_into().unwrap_or_default()), &payload[72..], b""), &payload[..64])
+}
+
+/// A publisher's endpoint: the relay URI, its bindings, and the optional service it stands in for.
+#[derive(Debug, Clone)]
+pub struct PublishEndpoint {
+    /// `wss://…`.
+    pub uri: String,
+    /// One or more bindings, e.g. `ws/1.0`.
+    pub bindings: Vec<String>,
+    /// The `svc=` value, when given.
+    pub service: Option<String>,
+}
+
+/// A DNS answer record kept from a previous packet: owner labels, type, TTL and rdata.
+pub type ForeignRecord = (Vec<Vec<u8>>, u16, u32, Vec<u8>);
+
+fn push_name_labels(out: &mut Vec<u8>, labels: &[Vec<u8>]) {
+    for l in labels {
+        out.push(l.len() as u8);
+        out.extend_from_slice(l);
+    }
+    out.push(0);
+}
+
+/// The answer records of a previously published packet that this publisher must keep (DHT Hints Profile §9: one slot
+/// per key, shared by every Pkarr use): TXT, A and AAAA records outside `_dsip`, whose rdata holds no names.
+/// Returns `(labels, type, ttl, rdata)` and the number of other records that could not be kept.
+pub fn foreign_records(key: &[u8; 32], payload: &[u8]) -> (Vec<ForeignRecord>, usize) {
+    let Some(dns) = payload.get(72..) else { return (vec![], 0) };
+    let owner: Vec<Vec<u8>> = vec![b"_dsip".to_vec(), z32_encode(key).into_bytes()];
+    let Ok(answers) = parse_dns(dns) else { return (vec![], 0) };
+    let (mut keep, mut dropped) = (vec![], 0);
+    for (nm, rtype, rclass, ttl, rdata) in answers {
+        if nm == owner || rclass != 1 {
+            continue;
+        }
+        if matches!(rtype, 1 | 16 | 28) {
+            keep.push((nm, rtype, ttl, rdata));
+        } else {
+            dropped += 1;
+        }
+    }
+    (keep, dropped)
+}
+
+/// Build and sign a relay payload (`signature ‖ ts ‖ dns`) publishing `endpoints` as `_dsip` TXT records with `ttl`
+/// (≤ 3600), plus any `foreign` records kept from the previous packet. The DSIP owner name is written once and
+/// pointed to (RFC 1035 compression), and the DNS message must stay within 996 bytes.
+///
+/// Spec: DHT Hints Profile §9 (publishing): signed by the identity key over BEP 44's buffer, no salt.
+pub fn build_payload(
+    key: &crate::keys::KeyPair,
+    endpoints: &[PublishEndpoint],
+    ttl: u32,
+    ts: u64,
+    foreign: &[ForeignRecord],
+) -> Result<Vec<u8>, &'static str> {
+    if endpoints.is_empty() || ttl > MAX_TTL {
+        return Err("an endpoint and a TTL of at most 3600 s are required");
+    }
+    let mut dns = vec![0, 0, 0x80, 0, 0, 0];
+    dns.extend_from_slice(&((endpoints.len() + foreign.len()) as u16).to_be_bytes());
+    dns.extend_from_slice(&[0, 0, 0, 0]);
+    let owner = [b"_dsip".to_vec(), z32_encode(&key.public()).into_bytes()];
+    let owner_at = dns.len();
+    for (i, ep) in endpoints.iter().enumerate() {
+        if i == 0 {
+            push_name_labels(&mut dns, &owner);
+        } else {
+            dns.extend_from_slice(&(0xC000u16 | owner_at as u16).to_be_bytes());
+        }
+        let mut rdata = vec![];
+        let mut strings = vec![format!("uri={}", ep.uri)];
+        strings.extend(ep.bindings.iter().map(|b| format!("b={b}")));
+        if let Some(s) = &ep.service {
+            strings.push(format!("svc={s}"));
+        }
+        for s in strings {
+            if s.len() > 255 {
+                return Err("a TXT string is longer than 255 bytes");
+            }
+            rdata.push(s.len() as u8);
+            rdata.extend_from_slice(s.as_bytes());
+        }
+        dns.extend_from_slice(&16u16.to_be_bytes());
+        dns.extend_from_slice(&1u16.to_be_bytes());
+        dns.extend_from_slice(&ttl.to_be_bytes());
+        dns.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        dns.extend_from_slice(&rdata);
+    }
+    for (labels, rtype, rttl, rdata) in foreign {
+        push_name_labels(&mut dns, labels);
+        dns.extend_from_slice(&rtype.to_be_bytes());
+        dns.extend_from_slice(&1u16.to_be_bytes());
+        dns.extend_from_slice(&rttl.to_be_bytes());
+        dns.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        dns.extend_from_slice(rdata);
+    }
+    if dns.len() > 996 {
+        return Err("the DNS message exceeds 996 bytes (BEP 44's 1000 once bencoded)");
+    }
+    let mut out = key.sign(&bep44_signable(ts, &dns, b"")).to_vec();
+    out.extend_from_slice(&ts.to_be_bytes());
+    out.extend_from_slice(&dns);
+    Ok(out)
+}
+
 fn hexv(v: &Value) -> Vec<u8> {
     v.as_str().and_then(|s| (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect()).unwrap_or_default()
 }
@@ -289,5 +402,34 @@ pub fn run_vector(v: &Value) -> Value {
         },
         "z32-decode" => z32_decode(i["z32"].as_str().unwrap_or("")).map(|k| json!({"key": hex(&k)})).unwrap_or_else(rejected),
         other => json!({"error": format!("unknown check {other}")}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::KeyPair;
+
+    #[test]
+    fn publish_then_read_round_trip_keeping_foreign_records() {
+        let key = KeyPair::from_seed([7u8; 32]);
+        let did = key.did();
+        let ts = 1_790_000_000_000_000u64;
+        let eps = [
+            PublishEndpoint { uri: "wss://relay.example/dsip".into(), bindings: vec!["ws/1.0".into()], service: None },
+            PublishEndpoint { uri: "wss://backup.example/dsip".into(), bindings: vec!["ws/1.0".into()], service: Some("DSIPSignaling".into()) },
+        ];
+        let foreign = vec![(vec![b"_iroh".to_vec(), z32_encode(&key.public()).into_bytes()], 16u16, 300u32, vec![5, b'h', b'e', b'l', b'l', b'o'])];
+        let payload = build_payload(&key, &eps, 1800, ts, &foreign).unwrap();
+        assert!(verify_payload(&key.public(), &payload));
+        let hint = read(&did, &payload, 1_790_000_010).unwrap();
+        assert_eq!(hint.seq, ts);
+        assert_eq!(hint.expires_at, 1_790_000_000 + 1800);
+        assert_eq!(hint.endpoints.len(), 2);
+        assert_eq!(hint.endpoints[1]["service"], "DSIPSignaling");
+        let (kept, dropped) = foreign_records(&key.public(), &payload);
+        assert_eq!((kept.len(), dropped), (1, 0));
+        assert_eq!(kept[0].3, vec![5, b'h', b'e', b'l', b'l', b'o']);
+        assert!(build_payload(&key, &eps, 7200, ts, &[]).is_err());
     }
 }

@@ -44,6 +44,10 @@ pub struct ConsoleOpts {
     pub publish_hint: bool,
     /// Hint TTL.
     pub hint_ttl: i64,
+    /// Pkarr relays (DHT Hints Profile §9).
+    pub pkarr_relays: Vec<String>,
+    /// Publish our `_dsip` records to the Pkarr relays.
+    pub publish_pkarr: bool,
     /// §10.4: seal outbound session bodies (`sealed-body/1.0`).
     pub seal: bool,
     /// Media source spec (`none` disables media).
@@ -233,6 +237,12 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
             }
         }
     }
+    // …or the Pkarr carrier of the hints tier (v0.9, DHT Hints Profile §9)
+    if let (Mode::Call { to }, None, false) = (&mode, &relay_url, opts.pkarr_relays.is_empty()) {
+        if let Some(hint) = crate::pkarr_cli::discover(&opts.pkarr_relays, to).await? {
+            relay_url = hint.endpoints.first().and_then(|e| e["uri"].as_str()).map(String::from);
+        }
+    }
     let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY.to_string());
     let cfg = AgentConfig {
         relay_url: relay_url.clone(),
@@ -265,6 +275,10 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     }
     let mut republish = tokio::time::interval(Duration::from_secs((opts.hint_ttl.max(3) as u64) * 2 / 3));
     republish.tick().await;
+    if opts.publish_pkarr {
+        anyhow::ensure!(!opts.pkarr_relays.is_empty(), "--publish-pkarr needs --pkarr-relay <https://…>");
+        crate::pkarr_cli::publish(&opts.pkarr_relays, &Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await?;
+    }
 
     // command source: script or stdin
     let (ctx, mut crx) = mpsc::unbounded_channel::<String>();
@@ -488,10 +502,14 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                 println!("·  no response — silence is the default outcome and means nothing (§19.4)");
                 break;
             }
-            _ = republish.tick(), if opts.publish_hint => {
+            _ = republish.tick(), if opts.publish_hint || opts.publish_pkarr => {
                 // Re-sign before expiry (§8.3: expired records are invalid); the node re-announces in between.
                 if let Some(h) = &dht {
                     crate::hints::publish(h, &Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl).await?;
+                }
+                if opts.publish_pkarr {
+                    // DHT Hints Profile §9: the identity key re-signs before expires_at (re-announcing never extends it)
+                    crate::pkarr_cli::publish(&opts.pkarr_relays, &Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await?;
                 }
             }
             cmd = crx.recv(), if !cmds_closed => {

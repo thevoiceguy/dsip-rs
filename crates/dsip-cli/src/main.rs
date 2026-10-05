@@ -16,6 +16,7 @@ use dsip_core::keys::KeyPair;
 mod broadcast_cli;
 mod console;
 mod hints;
+mod pkarr_cli;
 mod vectors;
 
 #[derive(Parser)]
@@ -264,6 +265,14 @@ struct ConnOpts {
     /// Publish a signed reachability hint for this identity at the relay we bind to (answer side).
     #[arg(long)]
     publish_hint: bool,
+    /// Pkarr relay(s) (https://…): discover the callee's relay from its `_dsip` records (did:key subjects; DHT Hints
+    /// Profile §9), or publish our own with --publish-pkarr.
+    #[arg(long = "pkarr-relay")]
+    pkarr_relays: Vec<String>,
+    /// Publish this identity's `_dsip` records to the Pkarr relays, signed by the identity key, and re-publish before
+    /// they expire (answer side).
+    #[arg(long)]
+    publish_pkarr: bool,
     /// Hint lifetime in seconds, at most 3,600 (§12.9, DHT profile §2: nodes reject longer hints).
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(i64).range(3..=dsip_core::HINT_MAX_VALIDITY_S))]
     hint_ttl: i64,
@@ -326,6 +335,7 @@ impl ConnOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
+            pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
                 uri: uri.clone(),

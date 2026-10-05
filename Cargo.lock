@@ -1199,6 +1199,7 @@ dependencies = [
  "dsip-transport",
  "dsip-webrtc-binding",
  "libp2p",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing-subscriber",
