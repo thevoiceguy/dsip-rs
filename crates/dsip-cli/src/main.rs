@@ -76,6 +76,22 @@ enum Cmd {
         /// Also consult the DHT hints tier via these bootstrap peers (never authoritative).
         #[arg(long)]
         dht: Vec<libp2p::Multiaddr>,
+        /// Also consult these Pkarr relays (DHT Hints Profile §9; never authoritative).
+        #[arg(long = "pkarr-relay")]
+        pkarr_relays: Vec<String>,
+        /// Also consult the Mainline DHT directly (DHT Hints Profile §9; never authoritative).
+        #[arg(long)]
+        mainline: bool,
+        /// Mainline bootstrap node(s) `host:port` (default: Mainline's public bootstrap nodes).
+        #[arg(long = "mainline-bootstrap", value_delimiter = ',')]
+        mainline_bootstrap: Vec<String>,
+    },
+    /// Run a local Mainline DHT on 127.0.0.1 for demos and tests (nothing reaches the public DHT); prints its
+    /// bootstrap addresses and runs until killed.
+    MainlineTestnet {
+        /// Number of nodes.
+        #[arg(long, default_value_t = 10)]
+        nodes: usize,
     },
     /// Place a signed call through a relay (a held grant for the callee is attached automatically).
     Call {
@@ -273,6 +289,13 @@ struct ConnOpts {
     /// they expire (answer side).
     #[arg(long)]
     publish_pkarr: bool,
+    /// Use the Mainline DHT directly for Pkarr (with or without --pkarr-relay): discover the callee's `_dsip` records,
+    /// or publish our own with --publish-pkarr. Never authoritative (§8.1).
+    #[arg(long)]
+    mainline: bool,
+    /// Mainline bootstrap node(s) `host:port` (default: Mainline's public bootstrap nodes).
+    #[arg(long = "mainline-bootstrap", value_delimiter = ',')]
+    mainline_bootstrap: Vec<String>,
     /// Hint lifetime in seconds, at most 3,600 (§12.9, DHT profile §2: nodes reject longer hints).
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(i64).range(3..=dsip_core::HINT_MAX_VALIDITY_S))]
     hint_ttl: i64,
@@ -336,6 +359,7 @@ impl ConnOpts {
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
             pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr,
+            mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
                 uri: uri.clone(),
@@ -444,15 +468,21 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&id.meta)?);
             println!("delegation: {}", id.delegation.frame());
         }
-        Cmd::Resolve { did, dht } => {
+        Cmd::MainlineTestnet { nodes } => pkarr_cli::testnet(nodes).await?,
+        Cmd::Resolve { did, dht, pkarr_relays, mainline, mainline_bootstrap } => {
             if let Some(pk) = dsip_core::did::public_from_did_key(&did) {
                 println!("method     did:key (self-certifying; no network resolution)          §7.2, §8.5");
                 println!("key        {}", dsip_core::did::multibase_ed25519(&pk));
                 println!("kid        {}", dsip_core::did::did_key_kid(&pk));
                 println!("authority  the key itself (§8.1 step 2); no DID document ⇒ no authoritative service endpoint");
-                if dht.is_empty() {
-                    println!("signaling  — (pass --dht <bootstrap> to consult the hints tier)");
-                } else {
+                if let Some(p) = pkarr_cli::Pkarr::new(&pkarr_relays, mainline, &mainline_bootstrap).await? {
+                    if p.discover(&did).await?.is_none() {
+                        println!("hint       pkarr: no valid hint found");
+                    }
+                }
+                if dht.is_empty() && pkarr_relays.is_empty() && !mainline {
+                    println!("signaling  — (pass --dht, --pkarr-relay or --mainline to consult the hints tier)");
+                } else if !dht.is_empty() {
                     let h = hints::join(&dht).await?;
                     hints::discover(&h, &did).await?;
                     h.shutdown().await;

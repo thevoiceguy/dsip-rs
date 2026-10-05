@@ -72,6 +72,7 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 rcgen = "0.13"
 futures-util = "0.3"
+mainline = { version = "8.0.1", default-features = false, features = ["async"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "kad", "identify", "macros", "ed25519"] }
