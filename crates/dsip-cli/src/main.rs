@@ -17,6 +17,8 @@ mod broadcast_cli;
 mod console;
 mod hints;
 mod pkarr_cli;
+mod record_fork;
+mod recorder;
 mod vectors;
 
 #[derive(Parser)]
@@ -85,6 +87,27 @@ enum Cmd {
         /// Mainline bootstrap node(s) `host:port` (default: Mainline's public bootstrap nodes).
         #[arg(long = "mainline-bootstrap", value_delimiter = ',')]
         mainline_bootstrap: Vec<String>,
+    },
+    /// Run a recorder service (Recording Profile C§6): answer recording sessions only and record each stream.
+    Recorder {
+        /// Identity directory (its delegation should carry `dsip.record`).
+        #[arg(long)]
+        identity: PathBuf,
+        /// Relay URL.
+        #[arg(long)]
+        relay: String,
+        /// CA for the relay's certificate.
+        #[arg(long)]
+        ca: Option<PathBuf>,
+        /// Where recordings and their metadata go.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Media stack.
+        #[arg(long, default_value = "forge")]
+        media_backend: String,
+        /// Run for this many seconds.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
     },
     /// Run a local Mainline DHT on 127.0.0.1 for demos and tests (nothing reaches the public DHT); prints its
     /// bootstrap addresses and runs until killed.
@@ -258,6 +281,9 @@ enum IdentityCmd {
         /// Make this a second device of the identity in this directory (reuses its controller key).
         #[arg(long)]
         controller_from: Option<PathBuf>,
+        /// Delegate this capability too (repeatable), e.g. `dsip.record` for a recorder (Recording Profile C§1).
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
     },
     /// Show an identity directory.
     Show {
@@ -296,6 +322,10 @@ struct ConnOpts {
     /// With --recorded-by: declare nothing until `record on` (recording begun mid-call, C§3).
     #[arg(long)]
     record_later: bool,
+    /// With --recorded-by: open the recorder leg (C§6) from this second device of our identity, forwarding both
+    /// voices to the recorder once the call's media flows.
+    #[arg(long)]
+    record_device: Option<PathBuf>,
     /// The declared recording purpose (C§7 registry: compliance, quality, personal).
     #[arg(long, default_value = "compliance")]
     record_purpose: String,
@@ -374,7 +404,7 @@ impl ConnOpts {
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
             pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr,
             mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
-            recorded_by: self.recorded_by, record_later: self.record_later, record_purpose: self.record_purpose, recording_accept: self.recording_accept,
+            recorded_by: self.recorded_by, record_later: self.record_later, record_device: self.record_device, fork_taps: None, record_purpose: self.record_purpose, recording_accept: self.recording_accept,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
                 uri: uri.clone(),
@@ -472,8 +502,8 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Cmd::Identity { cmd: IdentityCmd::Init { dir, name, fixture, controller_from } } => {
-            let id = dsip_transport::identity::Identity::init(&dir, &name, fixture.as_deref(), controller_from.as_deref())?;
+        Cmd::Identity { cmd: IdentityCmd::Init { dir, name, fixture, controller_from, capabilities } } => {
+            let id = dsip_transport::identity::Identity::init_with(&dir, &name, fixture.as_deref(), controller_from.as_deref(), &capabilities)?;
             println!("identity   {}", id.meta.identity);
             println!("device     {}", id.meta.device);
             println!("delegation {}/delegation.json (controller→device, dsip.signaling, 1 year)   §7.4", dir.display());
@@ -484,6 +514,7 @@ async fn main() -> Result<()> {
             println!("delegation: {}", id.delegation.frame());
         }
         Cmd::MainlineTestnet { nodes } => pkarr_cli::testnet(nodes).await?,
+        Cmd::Recorder { identity, relay, ca, dir, media_backend, seconds } => recorder::run(identity, relay, ca, dir, media_backend, seconds).await?,
         Cmd::Resolve { did, dht, pkarr_relays, mainline, mainline_bootstrap } => {
             if let Some(pk) = dsip_core::did::public_from_did_key(&did) {
                 println!("method     did:key (self-certifying; no network resolution)          §7.2, §8.5");

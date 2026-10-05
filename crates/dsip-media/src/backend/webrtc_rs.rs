@@ -41,6 +41,7 @@ pub struct WebRtcRsLeg {
     bytes_in: Arc<AtomicU64>,
     frames_out: Arc<AtomicU64>,
     sending: Arc<AtomicBool>,
+    tap_out: Option<mpsc::UnboundedSender<bytes::Bytes>>,
 }
 
 impl WebRtcRsLeg {
@@ -81,7 +82,19 @@ impl WebRtcRsLeg {
                 "audio".to_owned(),
                 "dsip".to_owned(),
             ));
-            let sender = pc.add_track(Arc::clone(&t) as Arc<dyn TrackLocal + Send + Sync>).await.context("add track")?;
+            let sender = if cfg.send_only {
+                // C§6: a recorder leg sends and receives nothing
+                let tr = pc
+                    .add_transceiver_from_track(
+                        Arc::clone(&t) as Arc<dyn TrackLocal + Send + Sync>,
+                        Some(RTCRtpTransceiverInit { direction: RTCRtpTransceiverDirection::Sendonly, send_encodings: vec![] }),
+                    )
+                    .await
+                    .context("sendonly transceiver")?;
+                tr.sender().await
+            } else {
+                pc.add_track(Arc::clone(&t) as Arc<dyn TrackLocal + Send + Sync>).await.context("add track")?
+            };
             // Drain RTCP for the sender so the interceptors keep working.
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 1500];
@@ -114,9 +127,9 @@ impl WebRtcRsLeg {
         // Inbound: count packets and optionally record to Ogg.
         let packets_in = Arc::new(AtomicU64::new(0));
         let bytes_in = Arc::new(AtomicU64::new(0));
-        let (pi, bi, record, ftx) = (packets_in.clone(), bytes_in.clone(), cfg.record.clone(), tx.clone());
+        let (pi, bi, record, ftx, tin) = (packets_in.clone(), bytes_in.clone(), cfg.record.clone(), tx.clone(), cfg.tap_in.clone());
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
-            let (pi, bi, record, ftx) = (pi.clone(), bi.clone(), record.clone(), ftx.clone());
+            let (pi, bi, record, ftx, tin) = (pi.clone(), bi.clone(), record.clone(), ftx.clone(), tin.clone());
             Box::pin(async move {
                 let mime = track.codec().capability.mime_type.to_lowercase();
                 tracing::info!("inbound track {mime}");
@@ -132,6 +145,9 @@ impl WebRtcRsLeg {
                     }
                     pi.fetch_add(1, Ordering::Relaxed);
                     bi.fetch_add(pkt.payload.len() as u64, Ordering::Relaxed);
+                    if let Some(t) = &tin {
+                        let _ = t.send(pkt.payload.clone());
+                    }
                     if let Some(r) = rec.as_mut() {
                         r.write(&pkt);
                     }
@@ -151,6 +167,7 @@ impl WebRtcRsLeg {
             bytes_in,
             frames_out: Arc::new(AtomicU64::new(0)),
             sending: Arc::new(AtomicBool::new(false)),
+            tap_out: cfg.tap_out,
         })
     }
 
@@ -228,7 +245,7 @@ impl WebRtcRsLeg {
         }
         let Some(track) = self.track.clone() else { return };
         let (frames, sending, src) = (self.frames_out.clone(), self.sending.clone(), self.source.clone());
-        tokio::spawn(source::pump(src, sending, frames, move |data| {
+        tokio::spawn(source::pump(src, sending, frames, self.tap_out.clone(), move |data| {
             let track = track.clone();
             Box::pin(async move { track.write_sample(&Sample { data, duration: FRAME_DURATION, ..Default::default() }).await.is_ok() })
         }));

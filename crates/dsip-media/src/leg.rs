@@ -113,6 +113,12 @@ pub struct MediaConfig {
     pub turn: Vec<TurnConfig>,
     /// Media stack.
     pub backend: Backend,
+    /// Offer and send only, receiving nothing (Recording Profile C§6: a recorder leg is `sendonly`).
+    pub send_only: bool,
+    /// Every inbound Opus payload is also sent here (C§6: the far side's voice, for the recorder leg).
+    pub tap_in: Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>,
+    /// Every outbound Opus frame is also sent here (C§6: this side's voice, for the recorder leg).
+    pub tap_out: Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>,
 }
 
 /// Events from the leg to its host.

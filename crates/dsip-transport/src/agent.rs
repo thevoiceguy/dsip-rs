@@ -193,6 +193,16 @@ impl Agent {
         self.core.set_sdp(sdp);
     }
 
+    /// A patch for the next invite only (Recording Profile C§6).
+    pub fn set_invite_patch(&mut self, patch: Option<serde_json::Value>) {
+        self.core.set_invite_patch(patch);
+    }
+
+    /// Whether `device` presented a delegation granting `capability` (Recording Profile C§6).
+    pub fn peer_has_capability(&self, device: &str, capability: &str) -> bool {
+        self.core.peer_has_capability(device, capability, crate::now_s())
+    }
+
     /// This side's recording declaration from now on (Recording Profile C§3).
     pub fn set_recording(&mut self, declaration: Option<serde_json::Value>) {
         self.core.set_recording(declaration);

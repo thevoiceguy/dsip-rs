@@ -39,12 +39,18 @@ pub struct ForgeLeg {
     bytes_in: Arc<AtomicU64>,
     frames_out: Arc<AtomicU64>,
     sending: Arc<AtomicBool>,
+    tap_in: Option<mpsc::UnboundedSender<Bytes>>,
+    tap_out: Option<mpsc::UnboundedSender<Bytes>>,
 }
 
 impl ForgeLeg {
     /// Build the peer connection; nothing is sent until [`ForgeLeg::start_sending`].
     pub async fn new(cfg: MediaConfig) -> Result<ForgeLeg> {
-        let direction = if cfg.source == Source::None { Direction::RecvOnly } else { Direction::SendRecv };
+        let direction = match (&cfg.source, cfg.send_only) {
+            (Source::None, _) => Direction::RecvOnly,
+            (_, true) => Direction::SendOnly,
+            _ => Direction::SendRecv,
+        };
         let pc = PeerConnection::with_config(PeerConfig {
             stun_servers: cfg.stun.clone(),
             direction,
@@ -75,6 +81,8 @@ impl ForgeLeg {
             bytes_in: Arc::new(AtomicU64::new(0)),
             frames_out: Arc::new(AtomicU64::new(0)),
             sending: Arc::new(AtomicBool::new(false)),
+            tap_in: cfg.tap_in,
+            tap_out: cfg.tap_out,
         })
     }
 
@@ -88,6 +96,7 @@ impl ForgeLeg {
             return;
         };
         let (tx, pi, bi, record) = (self.events_tx.clone(), self.packets_in.clone(), self.bytes_in.clone(), self.record.clone());
+        let tap_in = self.tap_in.clone();
         tokio::spawn(async move {
             let mut rec: Option<Recorder> = None;
             let mut first = true;
@@ -127,6 +136,9 @@ impl ForgeLeg {
                         }
                         pi.fetch_add(1, Ordering::Relaxed);
                         bi.fetch_add(pkt.payload.len() as u64, Ordering::Relaxed);
+                        if let Some(t) = &tap_in {
+                            let _ = t.send(pkt.payload.clone());
+                        }
                         if let Some(r) = rec.as_mut() {
                             let h = &pkt.header;
                             let (seq, ts, ssrc) = (h.sequence_number, h.timestamp, h.ssrc);
@@ -202,6 +214,7 @@ impl ForgeLeg {
             return;
         }
         let (pc, src, sending, frames) = (self.pc.clone(), self.source.clone(), self.sending.clone(), self.frames_out.clone());
+        let tap_out = self.tap_out.clone();
         tokio::spawn(async move {
             let sender = match pc.lock().await.sender() {
                 Ok(s) => s,
@@ -210,7 +223,7 @@ impl ForgeLeg {
                     return;
                 }
             };
-            source::pump(src, sending, frames, move |data: Bytes| {
+            source::pump(src, sending, frames, tap_out, move |data: Bytes| {
                 let sender = sender.clone();
                 // Frames offered before ICE/DTLS complete are dropped, not fatal
                 // (the session is ACTIVE but the transport may still be connecting).
