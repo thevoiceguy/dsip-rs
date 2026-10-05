@@ -116,9 +116,36 @@ struct Args {
     /// hub has accepted its event.
     #[arg(long)]
     snmp_listen: Option<String>,
-    /// The gateway's E§4 rule table (JSON array).
-    #[arg(long)]
+    /// The gateway's E§4 rule table (JSON array): trap rules (`trap_oid`) and syslog rules (`syslog`).
+    #[arg(long, alias = "event-rules")]
     snmp_rules: Option<PathBuf>,
+    /// SNMPv3 USM users (JSON array of `{engine_id|null, user, auth, auth_password|auth_key, priv: "aes128"|null,
+    /// priv_password|priv_key}`, E§3). Without it, SNMPv3 is refused.
+    #[arg(long)]
+    snmp_users: Option<PathBuf>,
+    /// The gateway's SNMP engine ID (hex). Default: generated once and kept in the state directory. Its boots are
+    /// kept there too, one more at every start (RFC 3414 §2.2).
+    #[arg(long)]
+    snmp_engine_id: Option<String>,
+    /// Receive syslog over UDP (RFC 5426) on this address: basis `syslog-udp` (E§2–E§3).
+    #[arg(long)]
+    syslog_listen: Option<String>,
+    /// Receive syslog over TLS (RFC 5425, octet-counted frames) on this address. Devices must present a certificate
+    /// chaining to --syslog-tls-ca: basis `syslog-tls`, with the certificate's SHA-256 in the claim (E§2).
+    #[arg(long, requires_all = ["syslog_tls_cert", "syslog_tls_key", "syslog_tls_ca"])]
+    syslog_tls_listen: Option<String>,
+    /// The gateway's TLS certificate (PEM) for --syslog-tls-listen.
+    #[arg(long)]
+    syslog_tls_cert: Option<PathBuf>,
+    /// The gateway's TLS private key (PEM).
+    #[arg(long)]
+    syslog_tls_key: Option<PathBuf>,
+    /// The CA (PEM) that devices' syslog client certificates must chain to.
+    #[arg(long)]
+    syslog_tls_ca: Option<PathBuf>,
+    /// The gateway's syslog severity table overrides (JSON object, e.g. `{"5": "minor"}`; E§3).
+    #[arg(long)]
+    syslog_table: Option<PathBuf>,
     /// As a gateway, deposit a heartbeat every this many seconds (E§5).
     #[arg(long)]
     heartbeat: Option<i64>,
@@ -315,6 +342,9 @@ struct Client {
     /// whose acceptance answers them, and the heartbeat (interval, last sent).
     snmp: Option<std::sync::Arc<tokio::net::UdpSocket>>,
     snmp_rules: Value,
+    /// SNMPv3 (E§3): the USM receiver, when users are configured.
+    usm: Option<dsip_events::usm::UsmReceiver>,
+    syslog_table: Value,
     informs: dsip_events::InformTracker,
     inform_responses: HashMap<(String, i64), (Vec<u8>, std::net::SocketAddr)>,
     inform_items: HashMap<String, (String, i64)>,
@@ -1907,21 +1937,49 @@ impl Client {
     /// Gateway mode (E§3): one SNMP datagram from the LAN → a signed `device-event`; an inform is answered only
     /// once the hub has accepted its event, and its retransmissions never deposit a second one.
     async fn snmp_in(&mut self, datagram: &[u8], from: std::net::SocketAddr) -> Result<()> {
-        let trap = match dsip_events::ber::decode_trap(datagram) {
-            Ok(t) => t,
-            Err(e) => {
-                println!("SNMP dropped from {from}: {}", e.0);
+        let address = from.ip().to_string();
+        let (trap, source, response) = if dsip_events::usm::is_v3(datagram) {
+            let Some(usm) = self.usm.as_mut() else {
+                println!("SNMP dropped from {from}: SNMPv3, and no --snmp-users");
                 return Ok(());
+            };
+            usm.set_now(now_s());
+            match usm.receive(datagram) {
+                dsip_events::usm::Verdict::Accepted { trap, usm, response } => {
+                    // E§2: the authenticated identity is the engine and the user, not the address
+                    let basis = if usm["level"] == "authPriv" { "snmpv3-authpriv" } else { "snmpv3-auth" };
+                    let source = json!({"address": address, "basis": basis,
+                                        "usm": {"engine_id": usm["engine_id"], "user": usm["user"]}});
+                    (trap, source, response)
+                }
+                dsip_events::usm::Verdict::Refused { reason, report } => {
+                    // E§3: only discovery and time synchronization are answered
+                    let sent = match (&report, &self.snmp) {
+                        (Some(r), Some(sock)) => sock.send_to(r, from).await.is_ok(),
+                        _ => false,
+                    };
+                    println!("SNMPv3 refused from {from}: {reason}{}", if sent { " (Report sent)" } else { "" });
+                    return Ok(());
+                }
             }
+        } else {
+            let trap = match dsip_events::ber::decode_trap(datagram) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("SNMP dropped from {from}: {}", e.0);
+                    return Ok(());
+                }
+            };
+            let basis = if trap["version"] == "v1" { "snmpv1" } else { "snmpv2c" }; // E§2: community only, unauthenticated
+            let response = dsip_events::ber::inform_response(datagram);
+            (trap, json!({"address": address, "basis": basis}), response)
         };
         let raw = dsip_events::normalize_trap(&trap);
         if raw.get("error").is_some() {
             println!("SNMP dropped from {from}: malformed");
             return Ok(());
         }
-        let address = from.ip().to_string();
-        let basis = if trap["version"] == "v1" { "snmpv1" } else { "snmpv2c" }; // E§2: community only, unauthenticated
-        let mut event = json!({"source": {"address": address, "basis": basis}, "raw": raw});
+        let mut event = json!({"source": source, "raw": raw});
         if let Some(alarm) = dsip_events::map_alarm(&raw, &self.snmp_rules, &address).get("alarm") {
             event["alarm"] = alarm.clone();
         }
@@ -1930,7 +1988,8 @@ impl Client {
             return self.deposit_event(event).await.map(|_| ());
         };
         let key = (from.to_string(), rid);
-        if let Some(resp) = dsip_events::ber::inform_response(datagram) {
+        // the response to the latest copy: a v3 retransmission may carry a new msgID, which its sender matches on
+        if let Some(resp) = response {
             self.inform_responses.insert(key.clone(), (resp, from));
         }
         let emitted = self.informs.step(&json!({"inform": {"source": key.0, "request_id": rid}}));
@@ -1958,6 +2017,29 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// Gateway mode (E§3): one syslog message, over UDP or (with the device's verified certificate) TLS → a signed
+    /// `device-event`.
+    async fn syslog_in(&mut self, message: &[u8], from: std::net::SocketAddr, certificate: Option<String>) -> Result<()> {
+        let raw = dsip_events::syslog::parse_syslog(message);
+        if raw.get("error").is_some() {
+            println!("SYSLOG dropped from {from}: malformed");
+            return Ok(());
+        }
+        let address = from.ip().to_string();
+        let mut source = json!({"address": address, "basis": if certificate.is_some() { "syslog-tls" } else { "syslog-udp" }});
+        if let Some(c) = certificate {
+            source["certificate_sha256"] = json!(c);
+        }
+        let mut event = json!({"source": source, "raw": raw});
+        if let Some(alarm) = dsip_events::syslog::map_syslog(&raw, &self.snmp_rules, &address, &self.syslog_table).get("alarm") {
+            event["alarm"] = alarm.clone();
+        }
+        let sl = &raw["syslog"];
+        println!("SYSLOG from {from} ({}): severity {} {} {}", event["source"]["basis"].as_str().unwrap_or("-"),
+                 sl["severity"], sl["app_name"].as_str().unwrap_or("-"), sl["msg"].as_str().unwrap_or(""));
+        self.deposit_event(event).await.map(|_| ())
     }
 
     /// The hub's verdict on an inform's event (E§3): answer it, or forget it so its next retransmission deposits anew.
@@ -2593,8 +2675,7 @@ impl Client {
                     if let Some(h) = ev.get("heartbeat") {
                         self.alarm_step(gid, &json!({"heartbeat": {"gateway": sender, "interval_s": h["interval_s"]}}));
                     } else {
-                        println!("EVENT {sender} source={} basis={} trap={}", ev["source"]["address"].as_str().unwrap_or(""),
-                            ev["source"]["basis"].as_str().unwrap_or(""), ev["raw"]["snmp"]["trap_oid"].as_str().unwrap_or("-"));
+                        println!("EVENT {sender} {}", render_event(ev));
                         if let Some(a) = ev.get("alarm") {
                             self.alarm_step(gid, &json!({"report": a}));
                         }
@@ -2843,6 +2924,14 @@ async fn main() -> Result<()> {
             Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?).context("snmp rules")?,
             None => json!([]),
         },
+        usm: match &args.snmp_users {
+            Some(p) => Some(usm_receiver(&args.state, args.snmp_engine_id.as_deref(), p)?),
+            None => None,
+        },
+        syslog_table: match &args.syslog_table {
+            Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?).context("syslog table")?,
+            None => json!({}),
+        },
         informs: dsip_events::InformTracker::new(&json!({"now": now_s()})),
         inform_responses: HashMap::new(),
         inform_items: HashMap::new(),
@@ -2923,15 +3012,27 @@ async fn main() -> Result<()> {
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-    let snmp = client.snmp.clone();
-    if let Some(s) = &snmp {
-        println!("GATEWAY listening for SNMP on {}", s.local_addr()?);
+    let (gw_tx, mut gw_rx) = tokio::sync::mpsc::unbounded_channel::<GatewayInput>();
+    if let Some(s) = client.snmp.clone() {
+        println!("GATEWAY listening for SNMP on {}{}", s.local_addr()?, if client.usm.is_some() { " (v1, v2c, v3 USM)" } else { " (v1, v2c)" });
+        spawn_udp(s, gw_tx.clone(), false);
     }
-    let mut dgram = vec![0u8; 65535];
+    if let Some(a) = &args.syslog_listen {
+        let s = std::sync::Arc::new(tokio::net::UdpSocket::bind(a).await.with_context(|| format!("binding {a}"))?);
+        println!("GATEWAY listening for syslog on udp {}", s.local_addr()?);
+        spawn_udp(s, gw_tx.clone(), true);
+    }
+    if let Some(a) = &args.syslog_tls_listen {
+        let l = tokio::net::TcpListener::bind(a).await.with_context(|| format!("binding {a}"))?;
+        let cfg = syslog_tls_config(args.syslog_tls_cert.as_deref(), args.syslog_tls_key.as_deref(), args.syslog_tls_ca.as_deref())?;
+        println!("GATEWAY listening for syslog on tls {} (client certificates required)", l.local_addr()?);
+        spawn_syslog_tls(l, cfg, gw_tx.clone());
+    }
+    drop(gw_tx);
     loop {
-        let udp = async {
-            match &snmp {
-                Some(s) => s.recv_from(&mut dgram).await,
+        let gw = async {
+            match gw_rx.recv().await {
+                Some(x) => x,
                 None => std::future::pending().await,
             }
         };
@@ -2942,10 +3043,12 @@ async fn main() -> Result<()> {
             }
         };
         tokio::select! {
-            got = udp => {
-                let (n, from) = got?;
-                let datagram = dgram[..n].to_vec();
-                if let Err(e) = client.snmp_in(&datagram, from).await {
+            input = gw => {
+                let r = match input {
+                    GatewayInput::Snmp(d, from) => client.snmp_in(&d, from).await,
+                    GatewayInput::Syslog(d, from, cert) => client.syslog_in(&d, from, cert).await,
+                };
+                if let Err(e) = r {
                     println!("ERR {e}");
                 }
                 std::io::stdout().flush()?;
@@ -3209,4 +3312,149 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// One input to a Device Events gateway (E§3), from the listener tasks.
+enum GatewayInput {
+    /// An SNMP datagram.
+    Snmp(Vec<u8>, std::net::SocketAddr),
+    /// A syslog message, with the SHA-256 of the device's verified TLS certificate when it came over TLS.
+    Syslog(Vec<u8>, std::net::SocketAddr, Option<String>),
+}
+
+fn spawn_udp(sock: std::sync::Arc<tokio::net::UdpSocket>, tx: tokio::sync::mpsc::UnboundedSender<GatewayInput>, syslog: bool) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            let d = buf[..n].to_vec();
+            let input = if syslog { GatewayInput::Syslog(d, from, None) } else { GatewayInput::Snmp(d, from) };
+            if tx.send(input).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// The largest syslog frame accepted over TLS (RFC 5425 §4.3.1 requires at least 2048; 8192 SHOULD).
+const SYSLOG_TLS_MAX: usize = 65536;
+
+/// TLS for syslog (RFC 5425): the gateway's certificate, and client certificates required, chaining to `ca`.
+fn syslog_tls_config(cert: Option<&Path>, key: Option<&Path>, ca: Option<&Path>) -> Result<std::sync::Arc<tokio_rustls::rustls::ServerConfig>> {
+    use tokio_rustls::rustls;
+    let (cert, key, ca) = (cert.context("--syslog-tls-cert")?, key.context("--syslog-tls-key")?, ca.context("--syslog-tls-ca")?);
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cert)?)).collect::<Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key)?))?.context("no private key")?;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(ca)?)) {
+        roots.add(c?)?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots)).build()?;
+    Ok(std::sync::Arc::new(rustls::ServerConfig::builder().with_client_cert_verifier(verifier).with_single_cert(certs, key)?))
+}
+
+/// Accept syslog-over-TLS connections; each verified connection's octet-counted frames (RFC 5425 §4.3:
+/// `MSG-LEN SP SYSLOG-MSG`) become inputs carrying its leaf certificate's SHA-256.
+fn spawn_syslog_tls(l: tokio::net::TcpListener, cfg: std::sync::Arc<tokio_rustls::rustls::ServerConfig>, tx: tokio::sync::mpsc::UnboundedSender<GatewayInput>) {
+    use sha2::Digest as _;
+    use tokio::io::AsyncReadExt as _;
+    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+    tokio::spawn(async move {
+        while let Ok((tcp, from)) = l.accept().await {
+            let (acceptor, tx) = (acceptor.clone(), tx.clone());
+            tokio::spawn(async move {
+                let mut tls = match acceptor.accept(tcp).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        println!("SYSLOG tls refused from {from}: {e}");
+                        return;
+                    }
+                };
+                let Some(leaf) = tls.get_ref().1.peer_certificates().and_then(|c| c.first()) else { return };
+                let fp: String = sha2::Sha256::digest(leaf.as_ref()).iter().map(|b| format!("{b:02x}")).collect();
+                loop {
+                    let mut len = 0usize;
+                    let mut digits = 0;
+                    loop {
+                        let Ok(c) = tls.read_u8().await else { return };
+                        match c {
+                            b'0'..=b'9' if digits < 9 && !(digits == 0 && c == b'0') => {
+                                len = len * 10 + (c - b'0') as usize;
+                                digits += 1;
+                            }
+                            b' ' if digits > 0 => break,
+                            _ => {
+                                println!("SYSLOG tls from {from}: bad frame, closing");
+                                return;
+                            }
+                        }
+                    }
+                    if len > SYSLOG_TLS_MAX {
+                        println!("SYSLOG tls from {from}: frame of {len} bytes, closing");
+                        return;
+                    }
+                    let mut msg = vec![0u8; len];
+                    if tls.read_exact(&mut msg).await.is_err() || tx.send(GatewayInput::Syslog(msg, from, Some(fp.clone()))).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// The gateway's USM receiver (E§3): its engine ID (given, or generated once and kept in `state`), its boots (kept in
+/// `state`, one more at every start, RFC 3414 §2.2), and the users file.
+fn usm_receiver(state: &Path, engine: Option<&str>, users: &Path) -> Result<dsip_events::usm::UsmReceiver> {
+    let unhex = |h: &str| -> Option<Vec<u8>> { (0..h.len() / 2).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect() };
+    std::fs::create_dir_all(state)?;
+    let id_file = state.join("snmp-engine-id");
+    let engine_hex = match engine {
+        Some(h) => h.to_lowercase(),
+        None => match std::fs::read_to_string(&id_file) {
+            Ok(h) => h.trim().to_string(),
+            Err(_) => {
+                // RFC 3411 §5 SnmpEngineID, format 5 (octets): 0x80 | enterprise 0, then 8 random bytes
+                let r: [u8; 8] = rand::random();
+                let h = format!("8000000005{}", r.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                std::fs::write(&id_file, &h)?;
+                h
+            }
+        },
+    };
+    let engine = unhex(&engine_hex).filter(|e| (5..=32).contains(&e.len())).context("--snmp-engine-id: 5–32 bytes of hex")?;
+    let boots_file = state.join("snmp-engine-boots");
+    let boots = std::fs::read_to_string(&boots_file).ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0) + 1;
+    std::fs::write(&boots_file, boots.to_string())?;
+    let list: Value = serde_json::from_str(&std::fs::read_to_string(users)?).context("--snmp-users")?;
+    let mut parsed = vec![];
+    for u in list.as_array().context("--snmp-users: a JSON array")? {
+        anyhow::ensure!(u["priv"].is_null() || u["priv"] == "aes128", "--snmp-users: privacy must be aes128 (DES is refused, E§3)");
+        parsed.push(dsip_events::usm::User::from_json(u).with_context(|| format!("--snmp-users: bad entry {u}"))?);
+    }
+    println!("GATEWAY SNMP engine {engine_hex} boots {boots}, {} USM user(s)", parsed.len());
+    Ok(dsip_events::usm::UsmReceiver::new(engine, boots.min((1 << 31) - 1), 0, now_s(), parsed))
+}
+
+/// One received device event as a line: the device claim with its basis (E§2: a client MUST render the basis; an
+/// unknown basis renders as unauthenticated), the authenticated identity the basis adds, and what happened.
+fn render_event(ev: &Value) -> String {
+    let src = &ev["source"];
+    let basis = src["basis"].as_str().unwrap_or("");
+    let known = ["snmpv1", "snmpv2c", "snmpv3-auth", "snmpv3-authpriv", "syslog-tls", "syslog-udp", "gateway"];
+    let mut out = format!("source={} basis={}", src["address"].as_str().unwrap_or(""),
+                          if known.contains(&basis) { basis.to_string() } else { format!("{basis}(unauthenticated)") });
+    if let Some(u) = src.get("usm") {
+        out += &format!(" usm={}@{}", u["user"].as_str().unwrap_or(""), u["engine_id"].as_str().unwrap_or(""));
+    }
+    if let Some(c) = src["certificate_sha256"].as_str() {
+        out += &format!(" cert={}…", c.get(..16).unwrap_or(c));
+    }
+    let raw = &ev["raw"];
+    if let Some(t) = raw["snmp"]["trap_oid"].as_str() {
+        out += &format!(" trap={t}");
+    } else if let Some(sl) = raw.get("syslog") {
+        out += &format!(" syslog={} severity={} app={} msg={:?}", sl["format"].as_str().unwrap_or(""), sl["severity"],
+                        sl["app_name"].as_str().unwrap_or("-"), sl["msg"].as_str().unwrap_or(""));
+    }
+    out
 }
