@@ -111,6 +111,17 @@ struct Args {
     /// `dsip call` to the on-call person.
     #[arg(long)]
     escalate_cmd: Option<String>,
+    /// Act as a Device Events gateway (E§2–E§3): receive SNMPv1/v2c traps and v2c informs on this UDP address and
+    /// deposit each as a signed `device-event` into the active conversation. An inform is answered only once the
+    /// hub has accepted its event.
+    #[arg(long)]
+    snmp_listen: Option<String>,
+    /// The gateway's E§4 rule table (JSON array).
+    #[arg(long)]
+    snmp_rules: Option<PathBuf>,
+    /// As a gateway, deposit a heartbeat every this many seconds (E§5).
+    #[arg(long)]
+    heartbeat: Option<i64>,
 }
 
 /// The device's persistent keys: an identity controller key and a device key.
@@ -300,6 +311,15 @@ struct Client {
     alarms: BTreeMap<String, (dsip_events::AlarmList, i64)>,
     /// The escalation policy when this device is an escalation agent (E§6), and its command.
     escalation: Option<(Value, Option<String>)>,
+    /// Gateway mode (E§3): the SNMP socket, the rule table, the informs, their responses and the outbox items
+    /// whose acceptance answers them, and the heartbeat (interval, last sent).
+    snmp: Option<std::sync::Arc<tokio::net::UdpSocket>>,
+    snmp_rules: Value,
+    informs: dsip_events::InformTracker,
+    inform_responses: HashMap<(String, i64), (Vec<u8>, std::net::SocketAddr)>,
+    inform_items: HashMap<String, (String, i64)>,
+    inform_clock: i64,
+    heartbeat: Option<(i64, i64)>,
     /// Blob fetches to try again (M§8.4 "Fetching", spec-gap 106): `{object, blobs, sender, attempt, next_at}`, persisted.
     pending_blobs: Vec<Value>,
     gap_timeout: i64,
@@ -827,8 +847,10 @@ impl Client {
                     if r["type"] == "accepted" {
                         self.sent(group, &r, &item["obj"]);
                         println!("SENT-AFTER-OUTAGE {id} seq={}", r["seq"]);
+                        self.inform_outcome(&id, true).await;
                     } else {
                         println!("ERR pending {id} refused: {}", r["reason"]);
+                        self.inform_outcome(&id, false).await;
                     }
                 }
                 queue.extend(more);
@@ -1860,9 +1882,14 @@ impl Client {
         Ok(())
     }
 
-    /// Send a `device-event` (E§5) from a `dsip-trapd` line: this device is the gateway that signs it.
+    /// Send a `device-event` (E§5) given as JSON: this device is the gateway that signs it.
     async fn send_device_event(&mut self, event_json: &str) -> Result<()> {
         let event: Value = serde_json::from_str(event_json.trim()).context("device-event: not JSON")?;
+        self.deposit_event(event).await.map(|_| ())
+    }
+
+    /// Deposit one `device-event`; the hub's answer (`accepted`, `pending` with the outbox id, or a refusal).
+    async fn deposit_event(&mut self, event: Value) -> Result<Value> {
         let group = self.active()?;
         let now = now_s();
         let obj = json!({"object": "content", "id": wire::new_id(now), "conversation": self.conv(&group)?.conversation,
@@ -1873,6 +1900,104 @@ impl Client {
             Some("accepted") => println!("OK sent event seq={}", reply["seq"]),
             Some("pending") => {}
             _ => println!("ERR send refused: {}", reply["reason"]),
+        }
+        Ok(reply)
+    }
+
+    /// Gateway mode (E§3): one SNMP datagram from the LAN → a signed `device-event`; an inform is answered only
+    /// once the hub has accepted its event, and its retransmissions never deposit a second one.
+    async fn snmp_in(&mut self, datagram: &[u8], from: std::net::SocketAddr) -> Result<()> {
+        let trap = match dsip_events::ber::decode_trap(datagram) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("SNMP dropped from {from}: {}", e.0);
+                return Ok(());
+            }
+        };
+        let raw = dsip_events::normalize_trap(&trap);
+        if raw.get("error").is_some() {
+            println!("SNMP dropped from {from}: malformed");
+            return Ok(());
+        }
+        let address = from.ip().to_string();
+        let basis = if trap["version"] == "v1" { "snmpv1" } else { "snmpv2c" }; // E§2: community only, unauthenticated
+        let mut event = json!({"source": {"address": address, "basis": basis}, "raw": raw});
+        if let Some(alarm) = dsip_events::map_alarm(&raw, &self.snmp_rules, &address).get("alarm") {
+            event["alarm"] = alarm.clone();
+        }
+        let Some(rid) = trap["inform"]["request_id"].as_i64() else {
+            println!("SNMP trap from {from}: {}", raw["snmp"]["trap_oid"].as_str().unwrap_or("-"));
+            return self.deposit_event(event).await.map(|_| ());
+        };
+        let key = (from.to_string(), rid);
+        if let Some(resp) = dsip_events::ber::inform_response(datagram) {
+            self.inform_responses.insert(key.clone(), (resp, from));
+        }
+        let emitted = self.informs.step(&json!({"inform": {"source": key.0, "request_id": rid}}));
+        if emitted.is_empty() {
+            println!("SNMP inform {from} rid={rid}: retransmission while pending, not answered yet");
+        }
+        for e in emitted {
+            if e.get("respond").is_some() {
+                println!("SNMP inform {from} rid={rid}: retransmission, answered again");
+                self.inform_respond(&key).await;
+            } else if e.get("deposit").is_some() {
+                println!("SNMP inform {from} rid={rid}: {}", raw["snmp"]["trap_oid"].as_str().unwrap_or("-"));
+                let reply = self.deposit_event(event.clone()).await?;
+                match reply["type"].as_str() {
+                    Some("accepted") => self.inform_outcome_key(&key, true).await,
+                    Some("pending") => {
+                        // M§9.4: the hub is unreachable; the inform is answered when the outbox's deposit is accepted
+                        if let Some(id) = reply["id"].as_str() {
+                            self.inform_items.insert(id.to_string(), key.clone());
+                        }
+                        println!("SNMP inform {from} rid={rid}: pending, not answered");
+                    }
+                    _ => self.inform_outcome_key(&key, false).await,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The hub's verdict on an inform's event (E§3): answer it, or forget it so its next retransmission deposits anew.
+    async fn inform_outcome_key(&mut self, key: &(String, i64), accepted: bool) {
+        let verdict = if accepted { "accepted" } else { "refused" };
+        for e in self.informs.step(&json!({verdict: {"key": [key.0, key.1]}})) {
+            if e.get("respond").is_some() {
+                println!("SNMP inform {} rid={}: stored, answered", key.0, key.1);
+                self.inform_respond(key).await;
+            }
+        }
+    }
+
+    /// An outbox item was finally accepted or refused (M§9.4): if it carried an inform's event, settle the inform.
+    async fn inform_outcome(&mut self, item_id: &str, accepted: bool) {
+        if let Some(key) = self.inform_items.remove(item_id) {
+            self.inform_outcome_key(&key, accepted).await;
+        }
+    }
+
+    async fn inform_respond(&mut self, key: &(String, i64)) {
+        if let (Some(sock), Some((resp, to))) = (&self.snmp, self.inform_responses.get(key)) {
+            if let Err(e) = sock.send_to(resp, to).await {
+                println!("ERR SNMP response to {to}: {e}");
+            }
+        }
+    }
+
+    /// Gateway mode, from the ticker: the heartbeat (E§5) and the inform memory's clock (E§3).
+    async fn gateway_tick(&mut self) -> Result<()> {
+        let now = now_s();
+        if now > self.inform_clock {
+            self.informs.step(&json!({"advance": now - self.inform_clock}));
+            self.inform_clock = now;
+        }
+        if let Some((every, last)) = self.heartbeat {
+            if now - last >= every {
+                self.heartbeat = Some((every, now));
+                self.deposit_event(json!({"heartbeat": {"interval_s": every}})).await?;
+            }
         }
         Ok(())
     }
@@ -2710,6 +2835,19 @@ async fn main() -> Result<()> {
         escalation: args.escalate_min.as_ref().map(|min| {
             (json!({"min_severity": min, "after_s": args.escalate_after}), args.escalate_cmd.clone())
         }),
+        snmp: match &args.snmp_listen {
+            Some(a) => Some(std::sync::Arc::new(tokio::net::UdpSocket::bind(a).await.with_context(|| format!("binding {a}"))?)),
+            None => None,
+        },
+        snmp_rules: match &args.snmp_rules {
+            Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?).context("snmp rules")?,
+            None => json!([]),
+        },
+        informs: dsip_events::InformTracker::new(&json!({"now": now_s()})),
+        inform_responses: HashMap::new(),
+        inform_items: HashMap::new(),
+        inform_clock: now_s(),
+        heartbeat: args.heartbeat.map(|n| (n, 0)),
         gap_timeout: args.gap_timeout,
         outages: BTreeMap::new(),
         pending: BTreeMap::new(),
@@ -2785,7 +2923,18 @@ async fn main() -> Result<()> {
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    let snmp = client.snmp.clone();
+    if let Some(s) = &snmp {
+        println!("GATEWAY listening for SNMP on {}", s.local_addr()?);
+    }
+    let mut dgram = vec![0u8; 65535];
     loop {
+        let udp = async {
+            match &snmp {
+                Some(s) => s.recv_from(&mut dgram).await,
+                None => std::future::pending().await,
+            }
+        };
         let recv = async {
             match client.conn.as_mut() {
                 Some(c) => c.recv().await,
@@ -2793,6 +2942,14 @@ async fn main() -> Result<()> {
             }
         };
         tokio::select! {
+            got = udp => {
+                let (n, from) = got?;
+                let datagram = dgram[..n].to_vec();
+                if let Err(e) = client.snmp_in(&datagram, from).await {
+                    println!("ERR {e}");
+                }
+                std::io::stdout().flush()?;
+            }
             line = stdin.next_line() => {
                 let Some(line) = line? else { break };
                 let line = line.trim().to_string();
@@ -2820,6 +2977,11 @@ async fn main() -> Result<()> {
                 }
                 // E§5–E§6: alarm timers (escalation, gateway silence)
                 client.tick_alarms();
+                if client.snmp.is_some() || client.heartbeat.is_some() {
+                    if let Err(e) = client.gateway_tick().await {
+                        println!("ERR {e}");
+                    }
+                }
                 // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)
                 if let Err(e) = client.check_gaps().await {
                     println!("ERR {e}");

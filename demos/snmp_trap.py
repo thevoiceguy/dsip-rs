@@ -3,10 +3,12 @@
 `snmptrap`, so the demo needs no net-snmp.
 
   snmp_trap.py v2c HOST:PORT COMMUNITY UPTIME TRAP_OID [OID=TYPE:VALUE ...]
+  snmp_trap.py inform HOST:PORT COMMUNITY UPTIME TRAP_OID [rid=N] [OID=TYPE:VALUE ...]   (retries until answered)
   snmp_trap.py v1  HOST:PORT COMMUNITY UPTIME ENTERPRISE AGENT_ADDR GENERIC SPECIFIC [OID=TYPE:VALUE ...]
 
 TYPE is i (INTEGER), s (OCTET STRING), o (OBJECT IDENTIFIER), a (IpAddress), t (TimeTicks).
 """
+import os
 import socket
 import sys
 
@@ -57,10 +59,11 @@ def varbinds(items) -> bytes:
 def main(argv):
     version, target, community, uptime = argv[1], argv[2], argv[3], int(argv[4])
     host, port = target.rsplit(":", 1)
-    if version == "v2c":
+    if version in ("v2c", "inform"):
         trap_oid, rest = argv[5], argv[6:]
+        request_id = int(rest.pop(0).split("=", 1)[1]) if rest and rest[0].startswith("rid=") else 1
         vbs = varbinds([f"1.3.6.1.2.1.1.3.0=t:{uptime}", f"1.3.6.1.6.3.1.1.4.1.0=o:{trap_oid}"] + rest)
-        pdu = tlv(0xA7, integer(1) + integer(0) + integer(0) + vbs)
+        pdu = tlv(0xA6 if version == "inform" else 0xA7, integer(request_id) + integer(0) + integer(0) + vbs)
         msg = tlv(0x30, integer(1) + tlv(0x04, community.encode()) + pdu)
     else:
         enterprise, agent, generic, specific, rest = argv[5], argv[6], int(argv[7]), int(argv[8]), argv[9:]
@@ -70,7 +73,25 @@ def main(argv):
     if host == "-":
         print(msg.hex())
         return
-    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(msg, (host, int(port)))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if version != "inform":
+        sock.sendto(msg, (host, int(port)))
+        return
+    # An inform is retransmitted, with the same request id, until a Response-PDU answers it (RFC 3416 §4.2.7)
+    timeout, retries = float(os.environ.get("INFORM_TIMEOUT", "2")), int(os.environ.get("INFORM_RETRIES", "30"))
+    sock.settimeout(timeout)
+    for attempt in range(1, retries + 1):
+        sock.sendto(msg, (host, int(port)))
+        try:
+            data, _ = sock.recvfrom(65535)
+        except socket.timeout:
+            print(f"inform request-id {request_id}: no response (attempt {attempt})", flush=True)
+            continue
+        if b"\xa2" in data:
+            print(f"inform request-id {request_id}: RESPONSE after {attempt} attempt(s)", flush=True)
+            return
+    print(f"inform request-id {request_id}: GAVE UP", flush=True)
+    sys.exit(1)
 
 
 if __name__ == "__main__":
