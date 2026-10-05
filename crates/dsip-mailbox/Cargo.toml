@@ -12,6 +12,7 @@ rust-version = "1.91"
 dsip-core.workspace = true
 dsip-messaging.workspace = true
 dsip-events.workspace = true
+dsip-recording.workspace = true
 dsip-mls = { workspace = true, features = ["sqlite"] }
 dsip-transport.workspace = true
 serde.workspace = true

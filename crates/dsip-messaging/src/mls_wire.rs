@@ -99,6 +99,15 @@ pub struct LeafIdentity {
     pub identity: String,
     /// The device DID named by the credential.
     pub device: String,
+    /// The capabilities its delegation grants (Recording Profile C§5: `dsip.record` marks a recorder).
+    pub capabilities: Vec<String>,
+}
+
+impl LeafIdentity {
+    /// Whether this leaf is a recorder device (Recording Profile C§5): its content is never rendered.
+    pub fn is_recorder(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "dsip.record")
+    }
 }
 
 /// Authenticate an MLS leaf: basic credential, `dsip_delegation`, and signature key.
@@ -150,7 +159,7 @@ pub fn authenticate_leaf(
     if public_from_did_key(device).is_none_or(|k| k.as_slice() != signature_key) {
         return Err("credential-key-mismatch");
     }
-    Ok(LeafIdentity { identity: subject, device: device.to_string() })
+    Ok(LeafIdentity { identity: subject, device: device.to_string(), capabilities: dsip_core::delegation::capabilities(&deleg) })
 }
 
 /// Check `dsip_conversation` extension bytes.

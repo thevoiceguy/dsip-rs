@@ -143,6 +143,13 @@ struct Args {
     /// The CA (PEM) that devices' syslog client certificates must chain to.
     #[arg(long)]
     syslog_tls_ca: Option<PathBuf>,
+    /// This device is a compliance recorder (Recording Profile C§5): its delegation also carries `dsip.record`; it
+    /// sends no content or receipts and archives what it receives to `<state>/recorder-archive.jsonl`.
+    #[arg(long)]
+    recorder: bool,
+    /// TEST ONLY: a recorder that sends anyway, to show members dropping its content (C§5).
+    #[arg(long, hide = true)]
+    recorder_misbehave: bool,
     /// The gateway's syslog severity table overrides (JSON object, e.g. `{"5": "minor"}`; E§3).
     #[arg(long)]
     syslog_table: Option<PathBuf>,
@@ -342,6 +349,12 @@ struct Client {
     /// whose acceptance answers them, and the heartbeat (interval, last sent).
     snmp: Option<std::sync::Arc<tokio::net::UdpSocket>>,
     snmp_rules: Value,
+    /// Recording Profile C§5: this device is a recorder; the recorder devices accepted per conversation; the
+    /// recorder devices last seen per conversation.
+    recorder_mode: bool,
+    recorder_misbehave: bool,
+    rec_accepted: BTreeMap<String, std::collections::BTreeSet<String>>,
+    rec_seen: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// SNMPv3 (E§3): the USM receiver, when users are configured.
     usm: Option<dsip_events::usm::UsmReceiver>,
     syslog_table: Value,
@@ -692,6 +705,53 @@ impl Client {
         self.convs.get(group).context("not a member of that group")
     }
 
+    /// Recording Profile C§5 for one conversation: `dsip_recording::conversation` over its authenticated leaves. A
+    /// recorder of this member's own identity is its own (organisation's) recording and needs no acceptance from it.
+    fn recording_state(&self, gid: &str) -> Option<Value> {
+        let c = self.convs.get(gid)?;
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let leaves: Vec<Value> = c.group.members()
+            .filter_map(|m| member_identity(&c.group, m.index, &ctx).ok())
+            .map(|l| json!({"device": l.device, "subject": l.identity, "capabilities": l.capabilities}))
+            .collect();
+        let mut accepted: Vec<String> = self.rec_accepted.get(gid).into_iter().flatten().cloned().collect();
+        accepted.extend(leaves.iter().filter(|l| l["subject"] == json!(self.identity)).filter_map(|l| l["device"].as_str().map(String::from)));
+        Some(dsip_recording::conversation(&json!({"leaves": leaves, "accepted": accepted})))
+    }
+
+    /// Whether `device` is a recorder leaf of the group (C§5: its content is never rendered).
+    fn is_recorder_leaf(&self, gid: &str, device: &str) -> bool {
+        self.recording_state(gid).is_some_and(|st| st["recorders"].as_array().into_iter().flatten().any(|r| r["device"] == device))
+    }
+
+    /// From the ticker: render a conversation becoming recorded, or no longer recorded (C§5).
+    fn check_recordings(&mut self) {
+        if self.recorder_mode {
+            return;
+        }
+        let gids: Vec<String> = self.convs.iter().filter(|(_, c)| c.kind != "personal").map(|(g, _)| g.clone()).collect();
+        for gid in gids {
+            let Some(st) = self.recording_state(&gid) else { continue };
+            let now: std::collections::BTreeSet<String> =
+                st["recorders"].as_array().into_iter().flatten().filter_map(|r| r["device"].as_str().map(String::from)).collect();
+            let before = self.rec_seen.get(&gid).cloned().unwrap_or_default();
+            if now == before {
+                continue;
+            }
+            for r in st["recorders"].as_array().into_iter().flatten().filter(|r| r["device"].as_str().is_some_and(|d| !before.contains(d))) {
+                let subject = r["subject"].as_str().unwrap_or("");
+                let own = subject == self.identity;
+                println!("RECORDED group={gid} by recorder device {} of {subject}{}   C§5", r["device"].as_str().unwrap_or(""),
+                         if own { " (this identity's own recording)" } else { " — type accept-recording, or decline-recording to leave" });
+            }
+            if now.is_empty() {
+                println!("RECORDING ENDED group={gid}   C§5");
+            }
+            self.rec_seen.insert(gid, now);
+        }
+    }
+
     fn active(&self) -> Result<String> {
         self.active.clone().context("no conversation")
     }
@@ -781,6 +841,16 @@ impl Client {
     /// hub the group has left is followed by a sync and, if it shows the move, the object is encrypted again and sent to
     /// the new hub (M§7.4, spec-gap 60).
     async fn send_object(&mut self, group: &str, obj: &Value, extra: Value) -> Result<Value> {
+        if matches!(obj["object"].as_str(), Some("content") | Some("receipt")) {
+            // Recording Profile C§5: a recorder never speaks; a member sends nothing into a recorded conversation
+            // before accepting every recorder present
+            if self.recorder_mode && !self.recorder_misbehave {
+                bail!("a recorder device is receive-only (C§5)");
+            }
+            if self.recording_state(group).is_some_and(|st| st["may_send"] == false) {
+                bail!("recorded conversation: type accept-recording first (C§5)");
+            }
+        }
         let mut retry = CommitRetry::new(&json!({}));
         let item_id = wire::new_id(now_s());
         loop {
@@ -1445,10 +1515,22 @@ impl Client {
     /// epoch after the commit), then to each conversation group.
     async fn add_device(&mut self, device: &str) -> Result<()> {
         let personal = self.personal.clone().context("no personal group: create it first (M§7.1)")?;
-        let mut order = vec![personal.clone()];
-        order.extend(self.convs.keys().filter(|g| **g != personal).cloned());
+        // Recording Profile C§5: a recorder device joins conversations only — never the personal group, so it holds no
+        // archive key and records only what is sent while it is a visible member
+        let probe = self.fetch_key_package(&self.identity.clone(), None, Some(device)).await?;
+        let r = resolver(&self.resolver_files);
+        let recorder = dsip_mls::authenticate_leaf_node(probe.leaf_node(), &self.ctx(&r)).is_ok_and(|w| w.is_recorder());
+        let mut order = if recorder { vec![] } else { vec![personal.clone()] };
+        order.extend(self.convs.iter().filter(|(g, c)| **g != personal && c.kind != "personal").map(|(g, _)| g.clone()));
+        if recorder {
+            println!("RECORDER {device}: conversations only, never the personal group or the archive key   C§5");
+        }
+        let mut first = Some(probe);
         for group in order {
-            let kp = self.fetch_key_package(&self.identity.clone(), None, Some(device)).await?;
+            let kp = match first.take() {
+                Some(kp) => kp,
+                None => self.fetch_key_package(&self.identity.clone(), None, Some(device)).await?,
+            };
             let what = format!("added device {device} to {}", self.conv(&group)?.kind);
             let op = CommitOp::Add { kp: Box::new(kp), grants: vec![], identity: self.identity.clone(), device: Some(device.to_string()) };
             self.commit_op(&group, op, &what).await?;
@@ -2569,7 +2651,22 @@ impl Client {
                     self.apply_successor(emissions, &pred).await?;
                 }
             }
-            Outcome::Object { sender, sender_device, object } => self.object_in(&gid, item, &sender, &sender_device, object).await?,
+            Outcome::Object { sender, sender_device, object } => {
+                if self.is_recorder_leaf(&gid, &sender_device) {
+                    // C§5: a recorder is receive-only — whatever it sends is treated as unauthenticated
+                    println!("DROP recorder content from {sender_device} (C§5: a recorder is receive-only)");
+                } else {
+                    if self.recorder_mode && object["object"] == "content" {
+                        // C§5: the compliance archive
+                        let line = json!({"group": gid, "seq": item["seq"], "sender": sender, "sender_device": sender_device, "object": object});
+                        use std::io::Write as _;
+                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.state.join("recorder-archive.jsonl"))?;
+                        writeln!(f, "{line}")?;
+                        println!("ARCHIVED {sender}: {}", display(&object));
+                    }
+                    self.object_in(&gid, item, &sender, &sender_device, object).await?
+                }
+            }
             Outcome::Dropped(why) => println!("DROP {why}"),
             Outcome::Unauthenticated(what) => println!("UNAUTHENTICATED {what}"),
             Outcome::NotForDevice => println!("SIBLING welcome {cursor}"),
@@ -2874,7 +2971,9 @@ async fn main() -> Result<()> {
     }
 
     let now = now_s();
-    let deleg = delegation_payload(&args.identity, &keys.device.did(), now - 60, now + 365 * 86_400, &["dsip.signaling", "dsip.messaging"]);
+    // C§5: a recorder device's delegation also carries dsip.record, which every member reads from its leaf
+    let caps: &[&str] = if args.recorder { &["dsip.signaling", "dsip.messaging", "dsip.record"] } else { &["dsip.signaling", "dsip.messaging"] };
+    let deleg = delegation_payload(&args.identity, &keys.device.did(), now - 60, now + 365 * 86_400, caps);
     let delegation = sign(&deleg, &keys.controller, &format!("{}#key-1", args.identity));
     let provider = SqliteProvider::open(&args.state.join("device.sqlite")).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mls = Device::with_provider(KeyPair::from_seed(keys.device.seed()), compact(&delegation), provider);
@@ -2882,7 +2981,10 @@ async fn main() -> Result<()> {
     let mailbox = mailbox_of(&args.identity, &r)?;
     println!("DEVICE {}", keys.device.did());
 
-    let policy = json!({"delivered": !args.no_delivered, "read": args.disclose.iter().any(|d| d == "read"),
+    let provider_state: Option<BTreeMap<String, std::collections::BTreeSet<String>>> =
+        mls.provider().get_state("recording-accepted").ok().flatten().and_then(|v| serde_json::from_value(v).ok());
+    // C§5: a recorder discloses nothing (it sends no receipts)
+    let policy = json!({"delivered": !args.no_delivered && !args.recorder, "read": !args.recorder && args.disclose.iter().any(|d| d == "read"),
         "played": args.disclose.iter().any(|d| d == "played"), "activity": args.disclose.iter().any(|d| d == "activity")});
     let get = |k: &str| mls.provider().get_state(k).map_err(|e| anyhow::anyhow!("{e}"));
     let resume = Resume::new(&get("resume")?.unwrap_or(Value::Null));
@@ -2920,6 +3022,10 @@ async fn main() -> Result<()> {
             Some(a) => Some(std::sync::Arc::new(tokio::net::UdpSocket::bind(a).await.with_context(|| format!("binding {a}"))?)),
             None => None,
         },
+        recorder_mode: args.recorder,
+        recorder_misbehave: args.recorder_misbehave,
+        rec_accepted: provider_state.unwrap_or_default(),
+        rec_seen: BTreeMap::new(),
         snmp_rules: match &args.snmp_rules {
             Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?).context("snmp rules")?,
             None => json!([]),
@@ -3080,6 +3186,8 @@ async fn main() -> Result<()> {
                 }
                 // E§5–E§6: alarm timers (escalation, gateway silence)
                 client.tick_alarms();
+                // Recording Profile C§5: render recorders arriving or leaving
+                client.check_recordings();
                 if client.snmp.is_some() || client.heartbeat.is_some() {
                     if let Err(e) = client.gateway_tick().await {
                         println!("ERR {e}");
@@ -3226,6 +3334,25 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
             client.commit_op(&group, CommitOp::Update, "rekeyed").await
         }
         "send" => client.send_text(rest).await,
+        "accept-recording" => {
+            // C§5: per conversation, every recorder device present now
+            let gid = client.active()?;
+            let st = client.recording_state(&gid).context("no conversation")?;
+            let devices: Vec<String> = st["recorders"].as_array().into_iter().flatten().filter_map(|r| r["device"].as_str().map(String::from)).collect();
+            if devices.is_empty() {
+                println!("OK not recorded");
+                return Ok(());
+            }
+            client.rec_accepted.entry(gid.clone()).or_default().extend(devices.iter().cloned());
+            client.mls.provider().put_state("recording-accepted", &serde_json::to_value(&client.rec_accepted)?).map_err(Client::state_err)?;
+            println!("OK recording accepted group={gid} recorders={devices:?}");
+            Ok(())
+        }
+        "decline-recording" => {
+            // C§5: declining is leaving the conversation
+            let gid = client.active()?;
+            client.leave_group(&gid, "declined being recorded, C§5").await
+        }
         "device-event" => client.send_device_event(rest).await,
         "alarm-ack" => {
             // alarm-ack <resource> <type> ack|closed

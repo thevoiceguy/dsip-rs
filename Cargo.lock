@@ -1331,6 +1331,7 @@ dependencies = [
  "dsip-events",
  "dsip-messaging",
  "dsip-mls",
+ "dsip-recording",
  "dsip-transport",
  "futures-util",
  "openmls",
