@@ -60,6 +60,7 @@ pub fn run_vector(v: &Value) -> Value {
         "blob-put" => mailbox::blob_put(inp),
         "blob-get" => mailbox::blob_get(inp),
         "blob-replicate" => mailbox::blob_replicate(inp),
+        "blob-fetch" => client::blob_fetch(inp),
         "items-blobs" => mailbox::items_blobs(inp),
         "blob-sources" => client::blob_sources(inp),
         "voicemail-offer" => client::voicemail_offer(inp),
