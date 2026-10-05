@@ -134,6 +134,7 @@ fn run_one(v: &Value) -> Result<(bool, Value, Value)> {
         "did-webvh" => dsip_core::webvh::run_vector(v),
         "device-events" => dsip_events::run_vector(v),
         "alias-transparency" => dsip_kt::run_vector(v),
+        "pkarr" => dsip_core::pkarr::run_vector(v),
         "state" => return state(v),
         other => anyhow::bail!("unknown kind {other}"),
     };
