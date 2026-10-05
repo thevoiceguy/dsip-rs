@@ -3,8 +3,8 @@
 //! Spec: E§3 (a gateway receives traps on its LAN). RFC 1157 §4.1.6 (the v1 Trap-PDU), RFC 3416 §3 (PDUs, the
 //! SNMPv2-Trap-PDU), RFC 3417 / X.690 (BER, the SMIv2 application types).
 //!
-//! Impl: community-based v1 and v2c traps only. InformRequest and SNMPv3 are refused for now: an inform must be
-//! answered only after the hub's `accepted` (E§3), which this decoder alone cannot know.
+//! Impl: community-based v1 and v2c traps, and v2c InformRequests (answered by the gateway only once the hub
+//! accepted the event, E§3 — see [`inform_response`]). SNMPv3 is refused for now.
 
 use serde_json::{json, Value};
 
@@ -155,10 +155,59 @@ pub fn decode_trap(datagram: &[u8]) -> Result<Value, NotATrap> {
             let vbs = varbinds(p.expect(0x30)?)?;
             Ok(json!({"version": "v2c", "community": community, "varbinds": vbs}))
         }
-        (1, 0xA6) => Err(bad("InformRequest: not handled yet (an inform is answered only after `accepted`, E§3)")),
+        (1, 0xA6) => {
+            let request_id = int(p.expect(0x02)?);
+            let _error_status = p.expect(0x02)?;
+            let _error_index = p.expect(0x02)?;
+            let vbs = varbinds(p.expect(0x30)?)?;
+            Ok(json!({"version": "v2c", "community": community, "varbinds": vbs, "inform": {"request_id": request_id}}))
+        }
         (3, _) => Err(bad("SNMPv3: not handled yet")),
         (v, t) => Err(bad(&format!("not a trap (version {v}, PDU {t:#04x})"))),
     }
+}
+
+fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let len: Vec<u8> = n.to_be_bytes().iter().copied().skip_while(|b| *b == 0).collect();
+        out.push(0x80 | len.len() as u8);
+        out.extend_from_slice(&len);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// The Response-PDU answering an SNMPv2c InformRequest datagram: the same version, community, request-id and
+/// variable bindings, with error-status and error-index 0 (RFC 3416 §4.2.7). `None` if it is not an inform.
+///
+/// Spec: E§3 — the gateway sends it only once the hub has accepted the inform's event.
+pub fn inform_response(datagram: &[u8]) -> Option<Vec<u8>> {
+    let mut top = Reader { b: datagram, pos: 0 };
+    let msg = top.expect(0x30).ok()?;
+    let mut m = Reader { b: msg, pos: 0 };
+    let version = m.expect(0x02).ok()?;
+    let community = m.expect(0x04).ok()?;
+    let (tag, pdu) = m.tlv().ok()?;
+    if tag != 0xA6 || int(version) != 1 {
+        return None;
+    }
+    let mut p = Reader { b: pdu, pos: 0 };
+    let request_id = p.expect(0x02).ok()?;
+    p.expect(0x02).ok()?;
+    p.expect(0x02).ok()?;
+    let vbs = p.expect(0x30).ok()?;
+    let mut body = tlv(0x02, request_id);
+    body.extend(tlv(0x02, &[0]));
+    body.extend(tlv(0x02, &[0]));
+    body.extend(tlv(0x30, vbs));
+    let mut inner = tlv(0x02, version);
+    inner.extend(tlv(0x04, community));
+    inner.extend(tlv(0xA2, &body));
+    Some(tlv(0x30, &inner))
 }
 
 #[cfg(test)]

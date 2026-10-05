@@ -312,6 +312,80 @@ impl AlarmList {
     }
 }
 
+/// How long an answered inform is remembered, to answer its retransmissions (seconds).
+pub const INFORM_MEMORY_S: i64 = 300;
+
+/// The gateway's informs: each deposits one event and is answered only once the hub accepts it.
+///
+/// Spec: E§3 — an inform is acknowledged to the device only after `accepted` (M§9.3: stored), so the device's own
+/// retries carry the event across a hub outage; a retransmission never deposits a second event.
+#[derive(Default)]
+pub struct InformTracker {
+    now: i64,
+    informs: BTreeMap<(String, i64), (bool, i64)>, // key → (answered, remembered until)
+}
+
+impl InformTracker {
+    /// A tracker from the trace context `{now}`.
+    pub fn new(ctx: &Value) -> InformTracker {
+        InformTracker { now: ctx["now"].as_i64().unwrap_or(0), informs: BTreeMap::new() }
+    }
+
+    fn key(v: &Value) -> (String, i64) {
+        (v[0].as_str().unwrap_or("").to_string(), v[1].as_i64().unwrap_or(0))
+    }
+
+    /// Apply `inform`, `accepted`, `refused` or `advance`; returns `deposit` / `respond` emissions.
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        if let Some(i) = ev.get("inform") {
+            let k = (i["source"].as_str().unwrap_or("").to_string(), i["request_id"].as_i64().unwrap_or(0));
+            let jk = json!([k.0, k.1]);
+            return match self.informs.get(&k) {
+                None => {
+                    self.informs.insert(k, (false, 0));
+                    vec![json!({"deposit": {"key": jk}})]
+                }
+                Some((true, _)) => vec![json!({"respond": {"key": jk}})], // answer a lost response again
+                Some((false, _)) => vec![],                                // pending: no second event
+            };
+        }
+        let outcome = ev.get("accepted").map(|a| (true, a)).or_else(|| ev.get("refused").map(|r| (false, r)));
+        if let Some((accepted, body)) = outcome {
+            let k = Self::key(&body["key"]);
+            if self.informs.get(&k) != Some(&(false, 0)) {
+                return vec![];
+            }
+            if !accepted {
+                self.informs.remove(&k); // the next retransmission deposits anew
+                return vec![];
+            }
+            self.informs.insert(k.clone(), (true, self.now + INFORM_MEMORY_S));
+            return vec![json!({"respond": {"key": [k.0, k.1]}})];
+        }
+        if let Some(n) = ev.get("advance").and_then(Value::as_i64) {
+            self.now += n;
+            let now = self.now;
+            self.informs.retain(|_, (answered, until)| !*answered || *until > now);
+        }
+        vec![]
+    }
+
+    /// Whether an inform is pending (deposited, not yet accepted).
+    pub fn is_pending(&self, source: &str, request_id: i64) -> bool {
+        self.informs.get(&(source.to_string(), request_id)) == Some(&(false, 0))
+    }
+
+    /// The tracked informs, sorted by key, as the traces compare them.
+    pub fn snapshot(&self) -> Value {
+        Value::Array(
+            self.informs
+                .iter()
+                .map(|((s, r), (answered, _))| json!({"key": [s, r], "status": if *answered { "answered" } else { "pending" }}))
+                .collect(),
+        )
+    }
+}
+
 /// Run a `device-events/` vector: a stateless check or an alarm-list trace.
 pub fn run_vector(v: &Value) -> Value {
     let i = &v["input"];
@@ -320,6 +394,17 @@ pub fn run_vector(v: &Value) -> Value {
         Some("syslog-severity") => json!({"severity": syslog_severity(i["severity"].as_i64().unwrap_or(-1), &i["table"])}),
         Some("map") => map_alarm(&i["raw"], &i["rules"], i["source"].as_str().unwrap_or("")),
         Some(_) => json!({"error": "unknown check"}),
+        None if v["context"]["component"] == "informs" => {
+            let mut m = InformTracker::new(&v["context"]);
+            Value::Array(
+                i["steps"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|st| json!({"emit": m.step(&st["event"]), "informs": m.snapshot()}))
+                    .collect(),
+            )
+        }
         None => {
             let mut m = AlarmList::new(&v["context"]);
             Value::Array(
