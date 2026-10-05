@@ -50,6 +50,14 @@ pub struct ConsoleOpts {
     pub publish_pkarr: bool,
     /// Use the Mainline DHT directly for Pkarr.
     pub mainline: bool,
+    /// Declare this side recorded by this recorder identity (Recording Profile C§3).
+    pub recorded_by: Option<String>,
+    /// Declare nothing until `record on`.
+    pub record_later: bool,
+    /// The declared recording purpose.
+    pub record_purpose: String,
+    /// `ask`, `always` or `never` when the other side declares recording (C§4).
+    pub recording_accept: String,
     /// Mainline bootstrap nodes (empty: the public ones).
     pub mainline_bootstrap: Vec<String>,
     /// §10.4: seal outbound session bodies (`sealed-body/1.0`).
@@ -159,6 +167,24 @@ pub enum Mode {
 
 fn short(did: &str) -> String {
     if did.len() > 24 { format!("{}…{}", &did[..16], &did[did.len() - 6..]) } else { did.to_string() }
+}
+
+/// One line for a Recording Profile consent emission (C§4).
+fn print_recording(e: &serde_json::Value) {
+    if let Some(r) = e.get("render") {
+        let purpose = r["purpose"].as_str().map(|p| format!("  purpose {p}")).unwrap_or_default();
+        match r["state"].as_str() {
+            Some("off") => println!("  ⏺  recording ended (recorder {})   C§4", short(r["recorder"].as_str().unwrap_or(""))),
+            Some(s) => println!("  ⏺  RECORDED: the other side declares recording {s} by {}{purpose}   C§3", short(r["recorder"].as_str().unwrap_or(""))),
+            None => {}
+        }
+    } else if let Some(a) = e.get("accepted") {
+        println!("  ⏺  recording by {} accepted ({})   C§4", short(a["recorder"].as_str().unwrap_or("")), a["by"].as_str().unwrap_or(""));
+    } else if let Some(s) = e.get("send") {
+        println!("  ⏺  declining to be recorded → {} {}   C§4", s["type"].as_str().unwrap_or(""), dsip_recording::DECLINED);
+    } else if e.get("blocked").is_some() {
+        println!("  ⏺  not answering before the recording is accepted   C§4");
+    }
 }
 
 fn sid8(s: &str) -> &str {
@@ -310,6 +336,18 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
 
     let mut current: Option<String> = None;
     let mut pending_update: Option<String> = None;
+    // Recording Profile C§3–C§4: our declaration, and our consent to the other side's
+    let accept_policy = match opts.recording_accept.as_str() {
+        "always" => dsip_recording::AcceptPolicy::Always,
+        "never" => dsip_recording::AcceptPolicy::Never,
+        _ => dsip_recording::AcceptPolicy::Ask,
+    };
+    if let (Some(r), false) = (&opts.recorded_by, opts.record_later) {
+        agent.set_recording(Some(serde_json::json!({"state": "on", "recorder": r, "purpose": opts.record_purpose})));
+        println!("recording this side is recorded by {}  (purpose {}) — declared on every invite/answer/update   C§3", short(r), opts.record_purpose);
+    }
+    let mut consent = dsip_recording::Consent::new(matches!(mode, Mode::Answer { .. }), accept_policy);
+    let mut deferred_answer: Option<&'static str> = None;
     let auto = match &mode {
         Mode::Answer { auto, .. } => auto.clone(),
         _ => String::new(),
@@ -394,6 +432,26 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             print_state(&agent, &sid);
                             let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
                             let remote_sdp = payload.pointer("/transports/0/sdp").and_then(|v| v.as_str()).map(String::from);
+                            // C§4: the other side's recording declaration — render it, hold, or decline
+                            let mut recording_decline: Option<String> = None;
+                            if matches!(message.msg_type.as_str(), "invite" | "answer" | "update") {
+                                if message.msg_type == "invite" && offered {
+                                    consent = dsip_recording::Consent::new(true, accept_policy);
+                                }
+                                for e in consent.received(&message.msg_type, payload.get("recording")) {
+                                    if let Some(send) = e.get("send") {
+                                        recording_decline = send["type"].as_str().map(String::from);
+                                    }
+                                    print_recording(&e);
+                                }
+                                if consent.hold_media() {
+                                    if let Some(m) = media.as_ref() { m.leg.hold_sending(); }
+                                    println!("  ⏺  holding our media until you accept — type accept-recording / decline-recording   C§4");
+                                }
+                                if recording_decline.as_deref() == Some("bye") {
+                                    agent.local(LocalEvent::Hangup { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }).await?;
+                                }
+                            }
                             if message.msg_type == "invite" && offered {
                                 current = Some(sid.clone());
                                 if media_enabled(&opts) {
@@ -402,7 +460,20 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                     }
                                     media = Some(Media { leg: new_leg(&opts, auto == "screen").await?.leg, pending: vec![], remote_offer: remote_sdp.clone() });
                                 }
-                                match auto.as_str() {
+                                let auto_now = if recording_decline.is_some() {
+                                    // C§4: declined by standing policy — ring, then reject policy.recording-declined
+                                    agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
+                                    agent.local(LocalEvent::Decline { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }).await?;
+                                    "done"
+                                } else if consent.pending() && matches!(auto.as_str(), "accept" | "screen") {
+                                    // C§4: never answer before acceptance
+                                    deferred_answer = Some(if auto == "screen" { "screen" } else { "accept" });
+                                    "none"
+                                } else {
+                                    auto.as_str()
+                                };
+                                match auto_now {
+                                    "done" => {}
                                     "accept" | "screen" => {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
                                         if let Some(m) = media.as_mut() {
@@ -417,7 +488,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                     }
                                     "decline" => {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
-                                        agent.local(LocalEvent::Decline { session: sid.clone() }).await?;
+                                        agent.local(LocalEvent::Decline { session: sid.clone(), reason: None }).await?;
                                     }
                                     _ => {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(120) }).await?;
@@ -456,10 +527,12 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             if let Emission::Media(what) = &e {
                                 match (*what, media.as_mut()) {
                                     ("start", Some(m)) => {
-                                        m.leg.start_sending();   // §14.1: only now, after the signed answer
+                                        if !consent.hold_media() {
+                                            m.leg.start_sending();   // §14.1: only now, after the signed answer (C§4: and accepted)
+                                        }
                                         flush_candidates(&mut agent, &mut media, &current).await?;
                                     }
-                                    ("apply_update", Some(m)) => m.leg.start_sending(),
+                                    ("apply_update", Some(m)) if !consent.hold_media() => m.leg.start_sending(),
                                     ("stop", Some(m)) => {
                                         let st = m.leg.stats();
                                         println!("  media   closed — received {} RTP packets / {} bytes, sent {} Opus frames", st.packets_in, st.bytes_in, st.frames_out);
@@ -525,8 +598,54 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     continue;
                 };
                 let mut parts = cmd.splitn(2, ' ');
-                let verb = parts.next().unwrap_or("");
+                let verb = parts.next().unwrap_or("").to_string();
                 let arg = parts.next().map(str::trim).filter(|a| !a.is_empty()).map(String::from);
+                let verb = verb.as_str();
+                // Recording Profile C§3–C§4 commands
+                let cmd = match verb {
+                    "accept-recording" => {
+                        let emitted = consent.accept();
+                        emitted.iter().for_each(print_recording);
+                        if emitted.is_empty() {
+                            println!("nothing to accept");
+                            continue;
+                        }
+                        if let Some(c) = deferred_answer.take() {
+                            c.to_string()
+                        } else {
+                            let active = current.as_ref().and_then(|s| agent.endpoint().session(s)).map(|s| s.state) == Some(dsip_session::SessionState::Active);
+                            if let (Some(m), true) = (media.as_ref(), active) {
+                                m.leg.start_sending();
+                                println!("  media   sending resumed");
+                            }
+                            continue;
+                        }
+                    }
+                    "decline-recording" => {
+                        let Some(sid) = current.clone() else { continue };
+                        for e in consent.decline_now() {
+                            print_recording(&e);
+                            let ev = if e["send"]["type"] == "reject" {
+                                LocalEvent::Decline { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }
+                            } else {
+                                LocalEvent::Hangup { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }
+                            };
+                            agent.local(ev).await?;
+                        }
+                        deferred_answer = None;
+                        continue;
+                    }
+                    "record" => {
+                        let Some(r) = &opts.recorded_by else { println!("no recorder configured (--recorded-by <did>)"); continue };
+                        let state = match arg.as_deref() { Some("pause") => "paused", Some("off") => "off", _ => "on" };
+                        let decl = if state == "off" { serde_json::json!({"state": "off"}) }
+                                   else { serde_json::json!({"state": state, "recorder": r, "purpose": opts.record_purpose}) };
+                        println!("recording declared {state} — sent with an update   C§3");
+                        agent.set_recording(Some(decl));
+                        "update".to_string()
+                    }
+                    _ => cmd.clone(),
+                };
                 let latest_request = || agent.requests().last().map(|(id, _)| id.clone());
                 let year = dsip_transport::now_s() + 31_536_000;
                 match verb {
@@ -604,7 +723,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     "hangup" => Some(LocalEvent::Hangup { session: sid, reason: None }),
                     "accept" => Some(LocalEvent::Accept { session: sid, answered_by: Some("user".into()) }),
                     "screen" => Some(LocalEvent::Accept { session: sid, answered_by: Some("screening".into()) }),
-                    "decline" => Some(LocalEvent::Decline { session: sid }),
+                    "decline" => Some(LocalEvent::Decline { session: sid, reason: None }),
                     "update" => Some(LocalEvent::Update { session: sid, id: Ulid::generate().to_string(), answered_by: None }),
                     "escalate" => Some(LocalEvent::Update { session: sid, id: Ulid::generate().to_string(), answered_by: Some("user".into()) }),
                     "answer-update" => pending_update.take().map(|u| LocalEvent::AnswerUpdate { session: sid, in_reply_to: u, answered_by: Some("user".into()) }),

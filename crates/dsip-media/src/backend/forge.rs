@@ -188,6 +188,11 @@ impl ForgeLeg {
         self.events.recv().await
     }
 
+    /// Stop transmitting until the next `start_sending` (Recording Profile C§4: media held until acceptance).
+    pub fn hold_sending(&self) {
+        self.sending.store(false, Ordering::SeqCst);
+    }
+
     /// Begin transmitting the configured source. Spec §14.1: the host calls this only once ACTIVE.
     pub fn start_sending(&self) {
         if self.sending.swap(true, Ordering::SeqCst) {

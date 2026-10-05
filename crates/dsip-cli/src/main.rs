@@ -289,6 +289,20 @@ struct ConnOpts {
     /// they expire (answer side).
     #[arg(long)]
     publish_pkarr: bool,
+    /// Declare this side recorded (Recording Profile C§3) by this recorder identity: every invite, answer and update
+    /// carries the signed declaration; change it mid-call with `record on|pause|off`.
+    #[arg(long)]
+    recorded_by: Option<String>,
+    /// With --recorded-by: declare nothing until `record on` (recording begun mid-call, C§3).
+    #[arg(long)]
+    record_later: bool,
+    /// The declared recording purpose (C§7 registry: compliance, quality, personal).
+    #[arg(long, default_value = "compliance")]
+    record_purpose: String,
+    /// When the other side declares recording (C§4): `ask` (the user types accept-recording / decline-recording),
+    /// `always`, or `never` (decline at once, as `policy.recording: forbidden`).
+    #[arg(long, default_value = "ask", value_parser = ["ask", "always", "never"])]
+    recording_accept: String,
     /// Use the Mainline DHT directly for Pkarr (with or without --pkarr-relay): discover the callee's `_dsip` records,
     /// or publish our own with --publish-pkarr. Never authoritative (§8.1).
     #[arg(long)]
@@ -360,6 +374,7 @@ impl ConnOpts {
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
             pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr,
             mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
+            recorded_by: self.recorded_by, record_later: self.record_later, record_purpose: self.record_purpose, recording_accept: self.recording_accept,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
                 uri: uri.clone(),

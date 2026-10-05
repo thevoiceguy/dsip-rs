@@ -220,6 +220,12 @@ impl MediaLeg {
         dispatch!(self, l => l.start_sending())
     }
 
+    /// Stop transmitting until the next `start_sending`. Recording Profile C§4: a counterparty holds its media
+    /// until it accepts being recorded.
+    pub fn hold_sending(&self) {
+        dispatch!(self, l => l.hold_sending())
+    }
+
     /// Counters.
     pub fn stats(&self) -> Stats {
         dispatch!(self, l => l.stats())

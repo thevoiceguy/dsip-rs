@@ -606,10 +606,10 @@ impl Endpoint {
                     self.emit(Emission::Refused("invalid-state"));
                 }
             }
-            LocalEvent::Decline { .. } => {
+            LocalEvent::Decline { reason, .. } => {
                 if s.role == Role::Responder && s.state == SessionState::Alerting {
                     self.stop_all(&sid);
-                    self.send_simple("reject", &s.peer, &sid, Some("user.declined"));
+                    self.send_simple("reject", &s.peer, &sid, Some(reason.as_deref().unwrap_or("user.declined")));
                     self.end(&sid, None, false);
                 } else {
                     self.emit(Emission::Refused("invalid-state"));

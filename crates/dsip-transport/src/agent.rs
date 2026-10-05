@@ -193,6 +193,11 @@ impl Agent {
         self.core.set_sdp(sdp);
     }
 
+    /// This side's recording declaration from now on (Recording Profile C§3).
+    pub fn set_recording(&mut self, declaration: Option<serde_json::Value>) {
+        self.core.set_recording(declaration);
+    }
+
     /// Seal outbound session bodies from now on, or stop (§10.4).
     pub fn set_seal(&mut self, on: bool) {
         self.core.set_seal(on);

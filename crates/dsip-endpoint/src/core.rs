@@ -133,6 +133,8 @@ pub struct Core {
     offers: HashMap<String, Value>,
     peer_delegations: Vec<Envelope>,
     pending_sdp: Option<String>,
+    /// This side's recording declaration (Recording Profile C§3), carried on every invite, answer and update.
+    recording: Option<serde_json::Value>,
     /// `identity.claims` to put on the next invite (a gateway's PSTN caller claim, §18.1).
     pending_claims: Vec<Value>,
     pending_info_data: Option<Value>,
@@ -166,6 +168,7 @@ impl Core {
             offers: HashMap::new(),
             peer_delegations: vec![],
             pending_sdp: None,
+            recording: None,
             pending_claims: vec![],
             pending_info_data: None,
             counter: 0,
@@ -244,6 +247,12 @@ impl Core {
     /// `session.unsupported-critical-extension`).
     pub fn set_seal(&mut self, on: bool) {
         self.cfg.seal = on;
+    }
+
+    /// This side's recording declaration, `{state, recorder, purpose?}`, from now on (Recording Profile C§3): it
+    /// rides on every `invite`, `answer` and `update` this endpoint sends; `None` sends none (meaning `off`).
+    pub fn set_recording(&mut self, declaration: Option<serde_json::Value>) {
+        self.recording = declaration;
     }
 
     /// SDP to embed in the next `invite`/`update`/`answer` transport descriptor (consumed on use).
@@ -552,6 +561,11 @@ impl Core {
                 p["data"] = self.pending_info_data.take().unwrap_or_else(|| json!({"candidates": [], "end_of_candidates": true}));
             }
             other => anyhow::bail!("engine asked to send unsupported type {other}"),
+        }
+        if matches!(m.msg_type.as_str(), "invite" | "answer" | "update") {
+            if let Some(r) = &self.recording {
+                p["recording"] = r.clone(); // C§3: the sender's side, signed with the envelope
+            }
         }
         p["issued_at"] = now.into();
         p["expires_at"] = (now + ttl).into();
