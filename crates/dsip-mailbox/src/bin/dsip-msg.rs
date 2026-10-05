@@ -286,6 +286,8 @@ struct Client {
     gaps: BTreeMap<String, GapTracker>,
     /// Items held behind a gap, by group, kept durably until the gap fills or this device re-joins.
     held_items: BTreeMap<String, Vec<Value>>,
+    /// Blob fetches to try again (M§8.4 "Fetching", spec-gap 106): `{object, blobs, sender, attempt, next_at}`, persisted.
+    pending_blobs: Vec<Value>,
     gap_timeout: i64,
     /// The outbox per group while its hub cannot be reached (M§9.4; spec-gap 72).
     outages: BTreeMap<String, HubOutage>,
@@ -329,6 +331,16 @@ enum CommitOp {
 }
 
 /// What processing one inbound item produced, reported only once it is committed.
+/// What fetching a content's blob came to (M§8.4, spec-gap 106).
+enum Fetched {
+    /// Verified and decrypted: the file, the plaintext digest, the source used.
+    Played(PathBuf, String, String),
+    /// No source had it yet: try again later.
+    Retry,
+    /// Given up, with the reason (`mismatch`, or `unavailable` after the last attempt).
+    GaveUp(String),
+}
+
 enum Outcome {
     Joined { members: Vec<String>, group: String, conv: Value, epoch: u64 },
     /// A welcome for another device of this identity: it holds none of our KeyPackages (M§12.3 step 5).
@@ -1520,29 +1532,29 @@ impl Client {
     ///
     /// Sources come from the pinned [`blob_sources`](dsip_messaging::client::blob_sources): this identity's mailbox's
     /// copy first when the item's manifest names one, then the content's own `uri` (M§8.4 rule 6, spec-gap 65).
-    async fn fetch_media(&self, object: &Value, manifest: &Value) -> Result<(PathBuf, String, String)> {
+    async fn fetch_media(&self, object: &Value, manifest: &Value, attempt: i64) -> Result<Fetched> {
         let b = &object["blob"];
         let key: [u8; 32] = unb64(&b["key"]).try_into().ok().context("blob key")?;
         let sources = dsip_messaging::client::blob_sources(&json!({"blob": b, "manifest": manifest}));
-        let mut errors = vec![];
+        let mut tried = vec![];
         for uri in sources["sources"].as_array().into_iter().flatten().filter_map(Value::as_str) {
             let stored = match self.http.get(uri).send().await {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                     Ok(body) => body,
                     Err(e) => {
                         println!("BLOB-SOURCE-REJECTED {uri}: {e}");
-                        errors.push(format!("{uri}: {e}"));
+                        tried.push(json!({"uri": uri, "status": 0}));
                         continue;
                     }
                 },
                 Ok(resp) => {
                     println!("BLOB-SOURCE-REJECTED {uri}: {}", resp.status());
-                    errors.push(format!("{uri}: {}", resp.status()));
+                    tried.push(json!({"uri": uri, "status": resp.status().as_u16()}));
                     continue;
                 }
                 Err(e) => {
                     println!("BLOB-SOURCE-REJECTED {uri}: {e}");
-                    errors.push(format!("{uri}: {e}"));
+                    tried.push(json!({"uri": uri, "status": 0}));
                     continue;
                 }
             };
@@ -1553,15 +1565,62 @@ impl Client {
                     std::fs::create_dir_all(&dir)?;
                     let path = dir.join(format!("{}.ogg", object["id"].as_str().unwrap_or("blob")));
                     std::fs::write(&path, &plain)?;
-                    return Ok((path, digest(&plain), uri.to_string()));
+                    return Ok(Fetched::Played(path, digest(&plain), uri.to_string()));
                 }
                 Err(c) => {
                     println!("BLOB-SOURCE-REJECTED {uri}: {c}");
-                    errors.push(format!("{uri}: {c}"));
+                    // a 200 that is not the content's blob: other bytes (M§8.4 rule 7)
+                    tried.push(json!({"uri": uri, "status": 200, "sha256": digest(&stored), "size": stored.len()}));
                 }
             }
         }
-        bail!("no source served the blob: {}", errors.join("; "))
+        // M§8.4 "Fetching" (spec-gap 106): try again when a source had nothing to serve; never when all served other bytes
+        let decision = dsip_messaging::client::blob_fetch(&json!({"blob": {"sha256": b["sha256"], "size": b["size"]}, "tried": tried,
+            "attempt": attempt}));
+        Ok(if decision["action"] == "retry" { Fetched::Retry } else { Fetched::GaveUp(decision["reason"].as_str().unwrap_or("").to_string()) })
+    }
+
+    /// Fetch a received content's blob now; a fetch that found nothing is kept and tried again (spec-gap 106).
+    async fn media_in(&mut self, sender: &str, object: &Value, blobs: &Value, attempt: i64) -> Result<()> {
+        match self.fetch_media(object, blobs, attempt).await? {
+            Fetched::Played(path, sha, from) => println!(
+                "RECV-AUDIO {sender} purpose={} duration_ms={} session={} file={} sha256={sha} from={from}",
+                object["purpose"].as_str().unwrap_or("message"), object["duration_ms"],
+                object["session"].as_str().unwrap_or("-"), path.display()
+            ),
+            Fetched::Retry => {
+                // the mailbox replication schedule (spec-gap 67): 4 s, doubling, at most 60 s
+                let delay = (4i64 << (attempt - 1).clamp(0, 4)).min(60);
+                println!("AUDIO-PENDING {} attempt={attempt} retry_in={delay}", object["id"].as_str().unwrap_or(""));
+                self.pending_blobs.push(json!({"object": object, "blobs": blobs, "sender": sender, "attempt": attempt + 1,
+                    "next_at": now_s() + delay}));
+                self.save_pending_blobs()?;
+            }
+            Fetched::GaveUp(why) => println!("ERR blob {}: given up ({why})", object["id"]),
+        }
+        Ok(())
+    }
+
+    fn save_pending_blobs(&mut self) -> Result<()> {
+        let v = serde_json::to_value(&self.pending_blobs)?;
+        self.mls.provider().put_state("pending_blobs", &v).map_err(Self::state_err)
+    }
+
+    /// Try again the blob fetches that are due (spec-gap 106), from the ticker.
+    async fn retry_blobs(&mut self) -> Result<()> {
+        let now = now_s();
+        let (due, later): (Vec<Value>, Vec<Value>) =
+            std::mem::take(&mut self.pending_blobs).into_iter().partition(|p| p["next_at"].as_i64().unwrap_or(0) <= now);
+        self.pending_blobs = later;
+        if due.is_empty() {
+            return Ok(());
+        }
+        self.save_pending_blobs()?;
+        for p in due {
+            let sender = p["sender"].as_str().unwrap_or("").to_string();
+            self.media_in(&sender, &p["object"], &p["blobs"], p["attempt"].as_i64().unwrap_or(2)).await?;
+        }
+        Ok(())
     }
 
     /// Our own content, accepted by the hub: known to the receipt rules (M§10.2) and archived (M§12.2, spec-gap 51).
@@ -2289,14 +2348,9 @@ impl Client {
                     if let Some(c) = self.convs.get_mut(gid) {
                         c.last_media = object["id"].as_str().map(String::from);
                     }
-                    // The item is committed; a failed fetch leaves the content visible and the blob re-fetchable.
-                    match self.fetch_media(&object, &item["blobs"]).await {
-                        Ok((path, sha, from)) => println!(
-                            "RECV-AUDIO {sender} purpose={} duration_ms={} session={} file={} sha256={sha} from={from}",
-                            object["purpose"].as_str().unwrap_or("message"), object["duration_ms"],
-                            object["session"].as_str().unwrap_or("-"), path.display()
-                        ),
-                        Err(e) => println!("ERR blob {}: {e}", object["id"]),
+                    // The item is committed; a fetch that found nothing is tried again (spec-gap 106).
+                    if let Err(e) = self.media_in(sender, &object, &item["blobs"], 1).await {
+                        println!("ERR blob {}: {e}", object["id"]);
                     }
                 } else {
                     println!("RECV {sender}: {}", object["text"].as_str().unwrap_or(""));
@@ -2519,6 +2573,7 @@ async fn main() -> Result<()> {
         calls: get("calls")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         gaps: BTreeMap::new(),
         held_items: get("held_items")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
+        pending_blobs: get("pending_blobs")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         gap_timeout: args.gap_timeout,
         outages: BTreeMap::new(),
         pending: BTreeMap::new(),
@@ -2621,6 +2676,10 @@ async fn main() -> Result<()> {
             _ = ticker.tick() => {
                 client.tick();
                 if let Err(e) = client.check_reconnect().await {
+                    println!("ERR {e}");
+                }
+                // M§8.4 (spec-gap 106): blob fetches that found nothing are tried again
+                if let Err(e) = client.retry_blobs().await {
                     println!("ERR {e}");
                 }
                 // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)

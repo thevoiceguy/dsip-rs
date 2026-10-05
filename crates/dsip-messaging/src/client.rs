@@ -341,6 +341,26 @@ pub fn select_direct(candidates: &[Value]) -> Value {
     }
     json!({"winner": kept.into_iter().min(), "discarded": discarded})
 }
+/// What a device does after trying a content's blob sources in order (`tried`: each source's
+/// `{uri, status, sha256?, size?}`): `play` the first matching 200, otherwise `retry` (or `give-up` on the last
+/// attempt) when some source had nothing to serve, or `give-up` at once when every source served other bytes.
+///
+/// Spec: M§8.4 "Fetching". Impl (spec-gap 106): the device retries like a mailbox's replication (spec-gap 67),
+/// bounded by `max_attempts` (default 5); a mismatch everywhere is never retried.
+pub fn blob_fetch(inp: &Value) -> Value {
+    let b = &inp["blob"];
+    let tried = inp["tried"].as_array().cloned().unwrap_or_default();
+    if let Some(t) = tried.iter().find(|t| t["status"] == json!(200) && t["sha256"] == b["sha256"] && t["size"] == b["size"]) {
+        return json!({"action": "play", "source": t["uri"]});
+    }
+    if tried.is_empty() || tried.iter().any(|t| t["status"] != json!(200)) {
+        let attempts = inp["max_attempts"].as_i64().unwrap_or(crate::mailbox::BLOB_REPLICATION_ATTEMPTS);
+        let more = inp["attempt"].as_i64().unwrap_or(1) < attempts;
+        return json!({"action": if more { "retry" } else { "give-up" }, "reason": "unavailable"});
+    }
+    json!({"action": "give-up", "reason": "mismatch"})
+}
+
 
 /// Where a device fetches a content blob from, in order: its own mailbox's copy (a manifest entry for the same
 /// `sha256` and `size` at another `uri`), then the content object's `uri`.

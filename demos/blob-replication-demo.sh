@@ -113,7 +113,12 @@ start_b --max-blob-bytes 4096; wait_nth "$DIR/mbx-b.log" "restored state" 1 20
 sleep 2
 echo "voice $DIR/long.ogg" >&3; wait_nth "$DIR/a.log" "^OK sent" 4 30
 wait_for "$DIR/mbx-b.log" "not replicating https://127.0.0.1:9571/blobs/[0-9a-f]+: \"too-large\"" 60
+LONG=$(grep "^OK sent audio" "$DIR/a.log" | tail -1 | sed -E 's/.*blob=([0-9a-f]+).*/\1/')
+mv "$DIR/mbx-a/blobs/$LONG" "$DIR/long.blob"            # the origin, its only source, has nothing to serve for now
 echo "live" >&4
+echo "=== the device's own fetch finds nothing, so it tries again until the blob is there (spec-gap 106)"
+wait_for "$DIR/b.log" "^AUDIO-PENDING .* attempt=1 retry_in=" 30
+mv "$DIR/long.blob" "$DIR/mbx-a/blobs/$LONG"            # …and now it has
 wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 4 60
 grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9571/blobs/" || { echo "FAIL: the second message did not come from the original"; exit 1; }
 [ "$(grep '^RECV-AUDIO' "$DIR/b.log" | tail -1 | sed -E 's/.* sha256=([0-9a-f]+) .*/\1/')" = "$LONG_SHA" ] || { echo "FAIL: second audio differs"; exit 1; }
