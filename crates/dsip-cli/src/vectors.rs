@@ -133,6 +133,7 @@ fn run_one(v: &Value) -> Result<(bool, Value, Value)> {
         "trust" => dsip_core::trust::run_vector(v),
         "did-webvh" => dsip_core::webvh::run_vector(v),
         "device-events" => dsip_events::run_vector(v),
+        "recording" => dsip_recording::run_vector(v),
         "alias-transparency" => dsip_kt::run_vector(v),
         "pkarr" => dsip_core::pkarr::run_vector(v),
         "state" => return state(v),
