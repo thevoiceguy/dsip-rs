@@ -396,7 +396,8 @@ struct Client {
 /// A membership or key change a device commits (M§6.5, M§7.3, M§12.3–M§12.4).
 enum CommitOp {
     /// Add a KeyPackage's device: a new identity, or `device` of an existing one.
-    Add { kp: Box<KeyPackage>, grants: Vec<String>, identity: String, device: Option<String> },
+    /// Every device of an identity is added in one commit (M§7.2); `device` names one when adding just that device.
+    Add { kps: Vec<KeyPackage>, grants: Vec<String>, identity: String, device: Option<String> },
     /// Remove every leaf of an identity.
     RemoveIdentity(String),
     /// Remove the leaves whose credential names a device (whether or not they still authenticate).
@@ -699,6 +700,57 @@ impl Client {
             }
         }
         bail!("no key package for {target}{}", device.map(|d| format!(" device {d}")).unwrap_or_default())
+    }
+
+    /// Every KeyPackage to add for `target`: what its directory returned (M§5.5, one per device), selected by the
+    /// vector-pinned rule — never this device, never only recorders for someone else, never a recorder for the
+    /// personal group (Recording Profile C§5, `check: "add-devices"`).
+    async fn fetch_key_packages(&mut self, target: &str, grant: Option<&str>, successor_of: Option<&str>, purpose: &str) -> Result<Vec<KeyPackage>> {
+        let mut fields = json!({"target": target});
+        if let Some(g) = grant {
+            fields["grant"] = json!(g);
+        }
+        if let Some(g) = successor_of {
+            fields["successor_of"] = json!(g);
+        }
+        let payload = if target == self.identity {
+            let env = wire::message(&self.keys.device, "key-package-fetch", &self.mailbox.0, now_s(), wire::TTL_S, fields);
+            let id = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)).context("id")?;
+            self.send(&env).await?;
+            self.await_reply(&id).await?
+        } else {
+            let mut peer_conn = self.peer_connect(target).await?;
+            let env = wire::message(&self.keys.device, "key-package-fetch", &peer_conn.relay.did.clone(), now_s(), wire::TTL_S, fields);
+            peer_conn.send(&env).await?;
+            let reply = peer_conn.recv().await?.context("no reply to key-package-fetch")?;
+            peer_conn.close(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, "done").await;
+            wire::payload_of(&Envelope::from_frame(&reply).map_err(|v| anyhow::anyhow!("{:?}", v.code))?).context("bad reply")?
+        };
+        if payload["type"] != "key-packages" {
+            bail!("key-package-fetch refused: {} {}", payload["type"], payload["reason"]);
+        }
+        let r = resolver(&self.resolver_files);
+        let ctx = self.ctx(&r);
+        let mut found: Vec<(KeyPackage, dsip_messaging::mls_wire::LeafIdentity)> = vec![];
+        let candidates = payload["key_packages"].as_array().cloned().unwrap_or_default().into_iter().chain(payload.get("last_resort").cloned());
+        for c in candidates {
+            if let Ok((kp, who)) = authenticate_key_package(&unb64(&c), self.mls.provider(), &ctx) {
+                found.push((kp, who));
+            }
+        }
+        let listed: Vec<Value> = found.iter().map(|(_, w)| json!({"device": w.device, "identity": w.identity, "capabilities": w.capabilities})).collect();
+        let pick = dsip_recording::add_devices(&json!({"target": target, "self_identity": self.identity, "self_device": self.keys.device.did(),
+                                                         "purpose": purpose, "key_packages": listed}));
+        if let Some(why) = pick["refused"].as_str() {
+            bail!("no device of {target} to add: {why} (C§5)");
+        }
+        let mut out = vec![];
+        for d in pick["add"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            if let Some(i) = found.iter().position(|(_, w)| w.device == d) {
+                out.push(found.swap_remove(i).0);
+            }
+        }
+        Ok(out)
     }
 
     fn conv(&self, group: &str) -> Result<&Conv> {
@@ -1077,8 +1129,8 @@ impl Client {
         let (provider, signer) = (self.mls.provider(), self.mls.signer());
         let e = |x: &dyn std::fmt::Debug| anyhow::anyhow!("{x:?}");
         Ok(match op {
-            CommitOp::Add { kp, .. } => {
-                let (commit, welcome, _) = c.group.add_members(provider, &signer, std::slice::from_ref(kp.as_ref())).map_err(|x| e(&x))?;
+            CommitOp::Add { kps, .. } => {
+                let (commit, welcome, _) = c.group.add_members(provider, &signer, kps).map_err(|x| e(&x))?;
                 (commit, Some(welcome))
             }
             CommitOp::RemoveIdentity(_) | CommitOp::RemoveDevice(_) => {
@@ -1282,9 +1334,19 @@ impl Client {
     /// Create a conversation of `kind` with `peer` (M§7.2, M§7.3), presenting a held grant when none is given.
     async fn create(&mut self, kind: &str, peer: &str, grant: Option<String>) -> Result<()> {
         let grant = grant.or_else(|| self.grants_held.get(peer).cloned());
-        let kp = self.fetch_key_package(peer, grant.as_deref(), None).await?;
+        let mut kps = self.fetch_key_packages(peer, grant.as_deref(), None, "conversation").await?;
+        // M§7.2: the creator adds its own other devices and the peer's devices in one commit — recorder devices
+        // included (C§5), so a conversation created after a recorder exists is recorded too
+        let own = self.identity.clone();
+        match self.fetch_key_packages(&own, None, None, "conversation").await {
+            Ok(mine) => {
+                println!("OWN-DEVICES {} added with the peer's", mine.len());
+                kps.extend(mine);
+            }
+            Err(e) => println!("OWN-DEVICES none ({e})"),
+        }
         let gid = self.new_group(kind).await?;
-        self.add(&gid, peer, grant, Some(kp)).await
+        self.add(&gid, peer, grant, Some(kps)).await
     }
 
     /// The personal group and the first archive key (M§7.1, M§12.1).
@@ -1398,9 +1460,9 @@ impl Client {
             if !self.convs.contains_key(&gid) {
                 return Ok(()); // a lower successor arrived meanwhile and this one was left
             }
-            match self.fetch_key_package_for(&peer, None, None, Some(&pred)).await {
-                Ok(kp) => {
-                    let op = CommitOp::Add { kp: Box::new(kp), grants: vec![], identity: peer.clone(), device: None };
+            match self.fetch_key_packages(&peer, None, Some(&pred), "conversation").await {
+                Ok(kps) => {
+                    let op = CommitOp::Add { kps, grants: vec![], identity: peer.clone(), device: None };
                     if let Err(e) = self.commit_op(&gid, op, &format!("added {peer}")).await {
                         if !self.convs.contains_key(&gid) {
                             return Ok(()); // converged on another successor while adding
@@ -1478,13 +1540,14 @@ impl Client {
         }
     }
 
-    async fn add(&mut self, group: &str, peer: &str, grant: Option<String>, kp: Option<KeyPackage>) -> Result<()> {
-        let kp = match kp.or_else(|| self.prefetched.remove(peer)) {
+    async fn add(&mut self, group: &str, peer: &str, grant: Option<String>, kps: Option<Vec<KeyPackage>>) -> Result<()> {
+        let kps = match kps.or_else(|| self.prefetched.remove(peer).map(|k| vec![k])) {
             Some(k) => k,
-            None => self.fetch_key_package(peer, grant.as_deref(), None).await?,
+            None => self.fetch_key_packages(peer, grant.as_deref(), None, "conversation").await?,
         };
-        let op = CommitOp::Add { kp: Box::new(kp), grants: grant.into_iter().collect(), identity: peer.to_string(), device: None };
-        self.commit_op(group, op, &format!("added {peer}")).await
+        let n = kps.len();
+        let op = CommitOp::Add { kps, grants: grant.into_iter().collect(), identity: peer.to_string(), device: None };
+        self.commit_op(group, op, &format!("added {peer} ({n} device(s))")).await
     }
 
     fn leaves_where(&self, group: &str, pred: impl Fn(&dsip_messaging::mls_wire::LeafIdentity) -> bool) -> Result<Vec<LeafNodeIndex>> {
@@ -1532,7 +1595,7 @@ impl Client {
                 None => self.fetch_key_package(&self.identity.clone(), None, Some(device)).await?,
             };
             let what = format!("added device {device} to {}", self.conv(&group)?.kind);
-            let op = CommitOp::Add { kp: Box::new(kp), grants: vec![], identity: self.identity.clone(), device: Some(device.to_string()) };
+            let op = CommitOp::Add { kps: vec![kp], grants: vec![], identity: self.identity.clone(), device: Some(device.to_string()) };
             self.commit_op(&group, op, &what).await?;
             if group == personal {
                 // M§12.3 step 3: a new member cannot read earlier epochs, so every live archive key is re-sent.
