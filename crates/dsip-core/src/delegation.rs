@@ -37,6 +37,16 @@ pub fn names(deleg: &Envelope) -> Option<(String, String)> {
     Some((p.get("subject")?.as_str()?.to_string(), p.get("device")?.as_str()?.to_string()))
 }
 
+/// The capabilities a delegation names, without verifying it (empty if it cannot be decoded); use it on a delegation
+/// already verified.
+///
+/// Spec: §7.4; Recording Profile C§5 (a member reads `dsip.record` from a leaf's delegation).
+pub fn capabilities(deleg: &Envelope) -> Vec<String> {
+    let Some(raw) = crate::b64::decode(&deleg.payload) else { return vec![] };
+    let Ok(p) = serde_json::from_slice::<Value>(&raw) else { return vec![] };
+    p["capabilities"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect()
+}
+
 /// Verify that `deleg` authorizes `device` to act for `subject` at `ctx.now`.
 ///
 /// Spec: §7.4. Checks, in order: envelope validity (signature over bytes),
