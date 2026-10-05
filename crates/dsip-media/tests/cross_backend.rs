@@ -30,6 +30,9 @@ async fn run(a: Backend, b: Backend) {
         stun: vec![],
         turn: vec![],
         backend: a,
+        send_only: false,
+        tap_in: None,
+        tap_out: None,
     })
     .await
     .unwrap();
@@ -39,6 +42,9 @@ async fn run(a: Backend, b: Backend) {
         stun: vec![],
         turn: vec![],
         backend: b,
+        send_only: false,
+        tap_in: None,
+        tap_out: None,
     })
     .await
     .unwrap();

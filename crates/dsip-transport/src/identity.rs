@@ -55,6 +55,11 @@ fn unhex(s: &str) -> Result<[u8; 32]> {
 impl Identity {
     /// Create a new identity directory with fresh keys and a one-year delegation.
     pub fn init(dir: &Path, display_name: &str, fixture: Option<&str>, controller_from: Option<&Path>) -> Result<Identity> {
+        Identity::init_with(dir, display_name, fixture, controller_from, &[])
+    }
+
+    /// As [`Identity::init`], delegating `extra` capabilities as well (e.g. `dsip.record`, Recording Profile C§1).
+    pub fn init_with(dir: &Path, display_name: &str, fixture: Option<&str>, controller_from: Option<&Path>, extra: &[String]) -> Result<Identity> {
         std::fs::create_dir_all(dir)?;
         let (controller, device) = match (fixture, controller_from) {
             // A second device of an existing identity: reuse its controller, mint a new device key.
@@ -68,7 +73,11 @@ impl Identity {
             &device.did(),
             now - 60,
             now + 365 * 86_400,
-            &["dsip.signaling", "dsip.media.interactive", "dsip.messaging"],
+            &["dsip.signaling", "dsip.media.interactive", "dsip.messaging"]
+                .iter()
+                .copied()
+                .chain(extra.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
         );
         let delegation = sign(&payload, &controller, &controller.kid());
         let meta = IdentityMeta { identity: controller.did(), device: device.did(), display_name: display_name.into() };

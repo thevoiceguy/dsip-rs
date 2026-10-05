@@ -135,6 +135,8 @@ pub struct Core {
     pending_sdp: Option<String>,
     /// This side's recording declaration (Recording Profile C§3), carried on every invite, answer and update.
     recording: Option<serde_json::Value>,
+    /// A patch for the next invite only: `{direction?, recording_session?}` (C§6: a recording session's offer).
+    invite_patch: Option<serde_json::Value>,
     /// `identity.claims` to put on the next invite (a gateway's PSTN caller claim, §18.1).
     pending_claims: Vec<Value>,
     pending_info_data: Option<Value>,
@@ -169,6 +171,7 @@ impl Core {
             peer_delegations: vec![],
             pending_sdp: None,
             recording: None,
+            invite_patch: None,
             pending_claims: vec![],
             pending_info_data: None,
             counter: 0,
@@ -253,6 +256,23 @@ impl Core {
     /// rides on every `invite`, `answer` and `update` this endpoint sends; `None` sends none (meaning `off`).
     pub fn set_recording(&mut self, declaration: Option<serde_json::Value>) {
         self.recording = declaration;
+    }
+
+    /// For the next invite only: every media descriptor's `direction`, and `recording_session` metadata
+    /// (Recording Profile C§6: a recording session offers its streams `sendonly`).
+    pub fn set_invite_patch(&mut self, patch: Option<serde_json::Value>) {
+        self.invite_patch = patch;
+    }
+
+    /// Whether `device` presented a delegation, verified now, that grants `capability` (e.g. `dsip.record`,
+    /// Recording Profile C§6: the recording party checks its recorder before sending media).
+    pub fn peer_has_capability(&self, device: &str, capability: &str, now: i64) -> bool {
+        let ctx = Context::new(now, &self.resolver);
+        self.peer_delegations.iter().any(|d| {
+            dsip_core::delegation::names(d).is_some_and(|(subject, dev)| {
+                dev == device && dsip_core::delegation::verify_delegation_for(d, &subject, &dev, capability, &ctx).ok()
+            })
+        })
     }
 
     /// SDP to embed in the next `invite`/`update`/`answer` transport descriptor (consumed on use).
@@ -471,7 +491,16 @@ impl Core {
             if screening && m["type"] != "audio" {
                 continue;
             }
-            let direction = if screening { "recvonly" } else { m["direction"].as_str().unwrap_or("sendrecv") };
+            // §14.2 subset rule: an offered sendonly is answered recvonly and vice versa (C§6: a recorder receives)
+            let direction = if screening {
+                "recvonly"
+            } else {
+                match m["direction"].as_str().unwrap_or("sendrecv") {
+                    "sendonly" => "recvonly",
+                    "recvonly" => "sendonly",
+                    other => other,
+                }
+            };
             let codec = m["codecs"].as_array().and_then(|c| c.first()).cloned().unwrap_or(json!({}));
             let mut d = json!({"type": m["type"], "direction": direction, "codecs": [{"id": codec["id"]}]});
             if let Some(p) = m.get("purpose") {
@@ -519,6 +548,17 @@ impl Core {
                 p["media"] = offer["media"].clone();
                 p["transports"] = offer["transports"].clone();
                 p["policy"] = json!({"recording": "consent-required", "ai_processing": "denied"});
+                if let Some(patch) = self.invite_patch.take() {
+                    if let Some(d) = patch["direction"].as_str() {
+                        for m in p["media"].as_array_mut().into_iter().flatten() {
+                            m["direction"] = d.into();
+                        }
+                    }
+                    if let Some(rs) = patch.get("recording_session") {
+                        p["recording_session"] = rs.clone(); // C§6
+                    }
+                    self.offers.insert(session.clone(), json!({"media": p["media"], "transports": p["transports"]}));
+                }
             }
             "progress" => {
                 p["status"] = m.status.clone().unwrap_or_else(|| "ringing".into()).into();

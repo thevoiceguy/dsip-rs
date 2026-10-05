@@ -31,6 +31,33 @@ pub enum Source {
     },
     /// An Ogg/Opus file, replayed packet by packet (looped).
     File(PathBuf),
+    /// Opus frames from a channel, sent as they arrive (Recording Profile C§6: a recorder leg forwards a call's
+    /// media unchanged — no transcoding).
+    Feed(Feed),
+}
+
+/// The receiving end of a frame channel, shareable so a [`Source`] stays `Clone`.
+#[derive(Clone)]
+pub struct Feed(pub Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>>);
+
+impl Feed {
+    /// A feed and the sender that fills it.
+    pub fn channel() -> (tokio::sync::mpsc::UnboundedSender<Bytes>, Feed) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, Feed(Arc::new(tokio::sync::Mutex::new(rx))))
+    }
+}
+
+impl PartialEq for Feed {
+    fn eq(&self, other: &Feed) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for Feed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Feed")
+    }
 }
 
 impl Source {
@@ -86,11 +113,29 @@ pub type SinkFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 /// differs (a webrtc-rs track, a forge `AudioSender`).
 ///
 /// Spec: §14.1 — the caller sets `sending` only once the session is ACTIVE.
-pub async fn pump(source: Source, sending: Arc<AtomicBool>, frames: Arc<AtomicU64>, mut sink: impl FnMut(Bytes) -> SinkFuture + Send) {
+pub async fn pump(source: Source, sending: Arc<AtomicBool>, frames: Arc<AtomicU64>, tap: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+                  mut sink: impl FnMut(Bytes) -> SinkFuture + Send) {
+    // every frame sent is also handed to the tap (Recording Profile C§6: the recorder leg forwards it)
+    let mut sink = move |data: Bytes| {
+        if let Some(t) = &tap {
+            let _ = t.send(data.clone());
+        }
+        sink(data)
+    };
     let mut tick = tokio::time::interval(FRAME_DURATION);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     match source {
         Source::None => {}
+        Source::Feed(feed) => {
+            let mut rx = feed.0.lock().await;
+            while sending.load(Ordering::SeqCst) {
+                let Some(data) = rx.recv().await else { break };
+                if !sending.load(Ordering::SeqCst) || !sink(data).await {
+                    break;
+                }
+                frames.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         Source::Tone { hz } => {
             let mut enc = match ToneEncoder::new(hz) {
                 Ok(e) => e,

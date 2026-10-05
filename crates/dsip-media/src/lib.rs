@@ -34,4 +34,6 @@ pub mod ogg;
 pub mod source;
 
 pub use leg::{Backend, Candidate, MediaConfig, MediaEvent, MediaLeg, Stats, TurnConfig};
-pub use source::Source;
+pub use source::{Feed, Source};
+/// Opus frames as the taps and feeds carry them.
+pub use bytes::Bytes;

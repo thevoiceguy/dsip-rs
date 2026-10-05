@@ -54,6 +54,10 @@ pub struct ConsoleOpts {
     pub recorded_by: Option<String>,
     /// Declare nothing until `record on`.
     pub record_later: bool,
+    /// A second device of our identity that opens the recorder leg (C§6).
+    pub record_device: Option<PathBuf>,
+    /// Taps on the call's media for the recorder leg: (inbound, outbound).
+    pub fork_taps: Option<(tokio::sync::mpsc::UnboundedSender<dsip_media::Bytes>, tokio::sync::mpsc::UnboundedSender<dsip_media::Bytes>)>,
     /// The declared recording purpose.
     pub record_purpose: String,
     /// `ask`, `always` or `never` when the other side declares recording (C§4).
@@ -117,7 +121,9 @@ async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(
 async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
     let source = if screening { Source::None } else { Source::parse(&opts.media)? };
     let backend = dsip_media::Backend::parse(&opts.media_backend)?;
-    let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone(), turn: opts.turn.clone(), backend }).await?;
+    let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone(), turn: opts.turn.clone(), backend,
+                                         send_only: false, tap_in: opts.fork_taps.as_ref().map(|t| t.0.clone()),
+                                         tap_out: opts.fork_taps.as_ref().map(|t| t.1.clone()) }).await?;
     Ok(Media { leg, pending: vec![], remote_offer: None })
 }
 
@@ -247,8 +253,23 @@ fn relay_only_sdp(sdp: String, on: bool) -> String {
     out
 }
 
+/// A running recorder leg (C§6): stop, pause, and its task.
+type ForkHandle = (tokio::sync::oneshot::Sender<()>, tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<Result<()>>);
+
 pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
+    let mut opts = opts;
+    // C§6: taps on the call's media feed the recorder leg, started once the media flows
+    let mut fork_feeds: Option<(dsip_media::Feed, dsip_media::Feed)> = None;
+    if opts.recorded_by.is_some() && opts.record_device.is_some() {
+        let (tin, peer_feed) = dsip_media::Feed::channel();
+        let (tout, self_feed) = dsip_media::Feed::channel();
+        opts.fork_taps = Some((tin, tout));
+        fork_feeds = Some((self_feed, peer_feed));
+    }
+    let mut fork: Option<ForkHandle> = None;
+    let mut peer_identity: Option<String> = None;
     let id = Identity::load(&opts.identity)?;
+    let my_identity = id.meta.identity.clone();
     println!("identity  {}  (\"{}\")", id.meta.identity, id.meta.display_name);
     println!("device    {}", id.meta.device);
     let fetch: Vec<String> = match &mode {
@@ -429,6 +450,9 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                 println!("  ⚠  {}", dsip_core::trust::downgrade_summary(&losses));
                             }
                             let sid = message.session_id().to_string();
+                            if matches!(message.msg_type.as_str(), "invite" | "answer") {
+                                peer_identity = Some(identity.clone());
+                            }
                             print_state(&agent, &sid);
                             let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
                             let remote_sdp = payload.pointer("/transports/0/sdp").and_then(|v| v.as_str()).map(String::from);
@@ -529,6 +553,17 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                     ("start", Some(m)) => {
                                         if !consent.hold_media() {
                                             m.leg.start_sending();   // §14.1: only now, after the signed answer (C§4: and accepted)
+                                        }
+                                        // C§6: the recorder leg, from our second device, once media flows
+                                        if let (Some((self_feed, peer_feed)), Some(dev), Some(rec), Some(of), Some(peer)) =
+                                            (fork_feeds.take(), opts.record_device.clone(), opts.recorded_by.clone(), current.clone(), peer_identity.clone()) {
+                                            let me = my_identity.clone();
+                                            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+                                            let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+                                            let f = crate::record_fork::Fork { device: dev, relay: relay_url.clone(), ca: opts.ca.clone(), recorder: rec,
+                                                of, me: me.clone(), peer: peer.clone(), backend: opts.media_backend.clone(),
+                                                feeds: vec![(me, self_feed), (peer, peer_feed)] };
+                                            fork = Some((stop_tx, pause_tx, tokio::spawn(crate::record_fork::run(f, stop_rx, pause_rx))));
                                         }
                                         flush_candidates(&mut agent, &mut media, &current).await?;
                                     }
@@ -641,6 +676,9 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         let decl = if state == "off" { serde_json::json!({"state": "off"}) }
                                    else { serde_json::json!({"state": state, "recorder": r, "purpose": opts.record_purpose}) };
                         println!("recording declared {state} — sent with an update   C§3");
+                        if let Some((_, pause, _)) = &fork {
+                            let _ = pause.send(state != "on");
+                        }
                         agent.set_recording(Some(decl));
                         "update".to_string()
                     }
@@ -742,6 +780,12 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         let st = m.leg.stats();
         println!("media     received {} RTP packets / {} bytes, sent {} Opus frames", st.packets_in, st.bytes_in, st.frames_out);
         m.leg.close().await;
+    }
+    if let Some((stop, _, task)) = fork.take() {
+        let _ = stop.send(());
+        if let Ok(Err(e)) = task.await {
+            println!("  ⏺  recorder leg error: {e}");
+        }
     }
     agent.close().await;
     if let Some(h) = dht {
