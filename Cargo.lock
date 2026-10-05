@@ -1272,7 +1272,12 @@ dependencies = [
 name = "dsip-events"
 version = "0.1.0"
 dependencies = [
+ "aes 0.8.4",
+ "hmac 0.12.1",
+ "md-5",
  "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1330,6 +1335,7 @@ dependencies = [
  "openmls",
  "rand 0.8.7",
  "reqwest",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",

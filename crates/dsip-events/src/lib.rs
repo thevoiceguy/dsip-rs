@@ -4,7 +4,8 @@
 //! Spec: sections owned by this crate — E§3 (a received notification becomes an event: RFC 3584 §3.1
 //! translation, the community never carried, the syslog severity table — [`normalize_trap`],
 //! [`syslog_severity`]), E§4 (the rule table — [`map_alarm`]), E§5 and E§6 (the alarm list and the
-//! escalation trigger — [`AlarmList`]).
+//! escalation trigger — [`AlarmList`]), and the inputs beyond v1/v2c: SNMPv3 with USM ([`usm`]) and
+//! syslog ([`syslog`]).
 //!
 //! Impl (spec-gap 103): a re-raise reopens the same alarm and resets its operator state; the syslog
 //! default table; escalation is run by a member (the agent), never by a mailbox. Every rule is pinned
@@ -14,6 +15,8 @@
 #![forbid(unsafe_code)]
 
 pub mod ber;
+pub mod syslog;
+pub mod usm;
 
 use std::collections::BTreeMap;
 
@@ -392,8 +395,17 @@ pub fn run_vector(v: &Value) -> Value {
     match i["check"].as_str() {
         Some("trap") => normalize_trap(&i["trap"]),
         Some("syslog-severity") => json!({"severity": syslog_severity(i["severity"].as_i64().unwrap_or(-1), &i["table"])}),
+        Some("map") if i["raw"].get("syslog").is_some() => {
+            syslog::map_syslog(&i["raw"], &i["rules"], i["source"].as_str().unwrap_or(""), &i["syslog_table"])
+        }
         Some("map") => map_alarm(&i["raw"], &i["rules"], i["source"].as_str().unwrap_or("")),
+        Some("syslog") => {
+            let b: Vec<u8> = i["datagram"].as_str().map(|h| (0..h.len() / 2).filter_map(|k| u8::from_str_radix(&h[2 * k..2 * k + 2], 16).ok()).collect()).unwrap_or_default();
+            syslog::parse_syslog(&b)
+        }
+        Some("usm-key") => usm::usm_key(i),
         Some(_) => json!({"error": "unknown check"}),
+        None if v["context"]["component"] == "snmpv3" => usm::run_trace(v),
         None if v["context"]["component"] == "informs" => {
             let mut m = InformTracker::new(&v["context"]);
             Value::Array(
