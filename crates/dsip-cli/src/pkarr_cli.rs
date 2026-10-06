@@ -116,14 +116,11 @@ impl Pkarr {
             let ts = u64::from_be_bytes(p[64..72].try_into().unwrap_or_default());
             if ts > prev_ts {
                 prev_ts = ts;
-                let (keep, dropped) = pkarr::foreign_records(&public, p);
-                if dropped > 0 {
-                    println!("hint       pkarr: {dropped} foreign record(s) of a type that cannot be carried over were dropped");
-                }
-                foreign = keep;
+                foreign = pkarr::foreign_records(&public, p);
             }
         }
-        let ts = now_us().max(prev_ts + 1);
+        let ts = pkarr::next_ts(now_us(), (prev_ts > 0).then_some(prev_ts))
+            .context("this key's timestamps are exhausted (above 2^53−1 µs): nothing can be signed")?;
         let ep = PublishEndpoint { uri: relay_uri.to_string(), bindings: vec!["ws/1.0".into()], service: None };
         let payload = pkarr::build_payload(key, &[ep], ttl, ts, &foreign).map_err(|e| anyhow::anyhow!(e))?;
         let mut stored = vec![];

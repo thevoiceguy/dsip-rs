@@ -38,7 +38,14 @@ now = int(time.time() * 1_000_000)
 def pl(records, ts, signer):
     d = dns(records, bob)
     return (signer.sign(bep44_signable(ts, d)) + struct.pack("!Q", ts) + d).hex()
-iroh = pl([("_iroh", 16, 300, txt("relay=https://iroh.example"))], now - 5_000_000, bob)
+# another application's records: a TXT, and a CNAME whose target is compressed into the zone name (spec-gap 105: the
+# publisher must re-encode it, not drop it)
+from dsipvec.gen.pkarr import _rr
+z = z32_encode(bob.public)
+d = (struct.pack("!HHHHHH", 0, 0x8400, 0, 2, 0, 0) + _rr(b"\x05_iroh" + bytes([len(z)]) + z.encode() + b"\x00", 16, txt("relay=https://iroh.example"))
+     + _rr(b"\x03www\xc0\x12", 5, b"\x04edge\xc0\x12"))
+ts0 = now - 5_000_000
+iroh = (bob.sign(bep44_signable(ts0, d)) + struct.pack("!Q", ts0) + d).hex()
 forged = pl([("_dsip", 16, 3600, txt("uri=wss://127.0.0.1:9666/evil", "b=ws/1.0"))], now + 30_000_000, evil)
 print(z32_encode(bob.public), iroh, forged)
 PY
@@ -68,7 +75,7 @@ grep -q "^hint .*pkarr wss://127.0.0.1:$RELAY_PORT/dsip" "$D/alice.log" || fail 
 ! grep -q "9666" "$D/alice.log" || fail "Alice followed the forgery"
 grep -qiE "answered|accepted" "$D/alice.log" || fail "the call was not answered"
 
-echo; echo "════════ Bob re-signs before expiry; another application's record in his zone survives"
+echo; echo "════════ Bob re-signs before expiry; another application's records in his zone survive, re-encoded where needed"
 wait "$BOBP" || true
 SEQS=$(grep -oE "pkarr published .* seq [0-9]+" "$D/bob.log" | grep -oE "[0-9]+$")
 N=$(echo "$SEQS" | wc -l)
@@ -80,9 +87,16 @@ import sys, urllib.request
 sys.path.insert(0, "tools")
 from dsipvec.pkarr import parse_dns
 p = urllib.request.urlopen(sys.argv[1]).read()
-names = sorted({".".join(l.decode() for l in r[0][:1]) for r in parse_dns(p[72:])})
+from dsipvec.pkarr import carry, z32_encode
+recs = parse_dns(p[72:])
+names = sorted({".".join(l.decode() for l in r[0][:1]) for r in recs})
 print("  honest relay's packet for Bob now holds:", ", ".join(names))
-assert names == ["_dsip", "_iroh"], names
+assert names == ["_dsip", "_iroh", "www"], names
+zone = sys.argv[1].rsplit("/", 1)[1]
+cname = [k for k in carry(zone, p[72:])["keep"] if k["type"] == 5]
+target = bytes.fromhex(cname[0]["rdata"])
+assert target == b"\x04edge" + bytes([len(zone)]) + zone.encode() + b"\x00", target
+print(f"  www CNAME still points at edge.{zone[:8]}…: carried over and re-encoded")
 PY
 
 echo

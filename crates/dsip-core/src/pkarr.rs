@@ -272,25 +272,165 @@ fn push_name_labels(out: &mut Vec<u8>, labels: &[Vec<u8>]) {
     out.push(0);
 }
 
-/// The answer records of a previously published packet that this publisher must keep (DHT Hints Profile §9: one slot
-/// per key, shared by every Pkarr use): TXT, A and AAAA records outside `_dsip`, whose rdata holds no names.
-/// Returns `(labels, type, ttl, rdata)` and the number of other records that could not be kept.
-pub fn foreign_records(key: &[u8; 32], payload: &[u8]) -> (Vec<ForeignRecord>, usize) {
-    let Some(dns) = payload.get(72..) else { return (vec![], 0) };
-    let owner: Vec<Vec<u8>> = vec![b"_dsip".to_vec(), z32_encode(key).into_bytes()];
-    let Ok(answers) = parse_dns(dns) else { return (vec![], 0) };
-    let (mut keep, mut dropped) = (vec![], 0);
-    for (nm, rtype, rclass, ttl, rdata) in answers {
-        if nm == owner || rclass != 1 {
+/// RFC 3597 §4: the RFC 1035 types in which name compression may occur, as their rdata layout.
+fn name_rdata(rtype: u16) -> Option<&'static [Part]> {
+    const ONE: &[Part] = &[Part::Name];
+    Some(match rtype {
+        2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 => ONE,
+        6 => &[Part::Name, Part::Name, Part::Bytes(20)],
+        14 => &[Part::Name, Part::Name],
+        15 => &[Part::Bytes(2), Part::Name],
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Part {
+    Name,
+    Bytes(usize),
+}
+
+/// The name at `off` in uncompressed wire form, label bytes as given; its inline bytes must end by `limit`.
+fn expand(pkt: &[u8], mut off: usize, limit: usize) -> Result<(Vec<u8>, usize), Reject> {
+    let bad = || Reject("malformed");
+    let (mut out, mut end, mut start) = (vec![], None, off);
+    loop {
+        let n = *pkt.get(off).ok_or_else(bad)?;
+        if end.is_none() && off >= limit {
+            return Err(bad());
+        }
+        if n & 0xC0 == 0xC0 {
+            let lo = *pkt.get(off + 1).ok_or_else(bad)?;
+            if end.is_none() && off + 1 >= limit {
+                return Err(bad());
+            }
+            let ptr = (((n & 0x3F) as usize) << 8) | lo as usize;
+            if ptr >= start {
+                return Err(bad());
+            }
+            end.get_or_insert(off + 2);
+            off = ptr;
+            start = ptr;
             continue;
         }
-        if matches!(rtype, 1 | 16 | 28) {
-            keep.push((nm, rtype, ttl, rdata));
-        } else {
-            dropped += 1;
+        if n & 0xC0 != 0 {
+            return Err(bad());
         }
+        if n == 0 {
+            out.push(0);
+            let next = end.unwrap_or(off + 1);
+            if next > limit {
+                return Err(bad());
+            }
+            return Ok((out, next));
+        }
+        let stop = off + 1 + n as usize;
+        if stop > pkt.len() || (end.is_none() && stop > limit) {
+            return Err(bad());
+        }
+        out.extend_from_slice(&pkt[off..stop]);
+        off = stop;
     }
-    (keep, dropped)
+}
+
+fn labels_of(wire: &[u8]) -> Vec<Vec<u8>> {
+    let (mut out, mut i) = (vec![], 0);
+    while i < wire.len() && wire[i] != 0 {
+        let n = wire[i] as usize;
+        out.push(wire[i + 1..i + 1 + n].to_vec());
+        i += 1 + n;
+    }
+    out
+}
+
+/// The records a publisher carries over from its previous packet's DNS message (DHT Hints Profile §9: one slot per
+/// key, shared by every Pkarr use): every IN answer record not owned by `_dsip.<zone>`, with the names inside the
+/// rdata of the RFC 1035 types RFC 3597 §4 lets compress expanded, and every other rdata kept as it is.
+///
+/// Spec: DHT Hints Profile §9 (publishing); `check: "carry"`; spec-gap 105 (decided: re-encode, never drop).
+pub fn carry(zone: &str, dns: &[u8]) -> Result<Vec<ForeignRecord>, Reject> {
+    let bad = || Reject("malformed");
+    if dns.len() < 12 {
+        return Err(bad());
+    }
+    let count = |k: usize| u16::from_be_bytes([dns[k], dns[k + 1]]) as usize;
+    let (qd, an, ns, ar) = (count(4), count(6), count(8), count(10));
+    let mut off = 12;
+    for _ in 0..qd {
+        off = expand(dns, off, dns.len())?.1 + 4;
+    }
+    let mut dsip_owner = vec![5u8];
+    dsip_owner.extend_from_slice(b"_dsip");
+    dsip_owner.push(zone.len() as u8);
+    dsip_owner.extend_from_slice(zone.as_bytes());
+    dsip_owner.push(0);
+    let mut keep = vec![];
+    for i in 0..an + ns + ar {
+        let (name, next) = expand(dns, off, dns.len())?;
+        off = next;
+        let h = dns.get(off..off + 10).ok_or_else(bad)?;
+        let rtype = u16::from_be_bytes([h[0], h[1]]);
+        let rclass = u16::from_be_bytes([h[2], h[3]]);
+        let ttl = u32::from_be_bytes([h[4], h[5], h[6], h[7]]);
+        let rdlen = u16::from_be_bytes([h[8], h[9]]) as usize;
+        let (rs, re) = (off + 10, off + 10 + rdlen);
+        if re > dns.len() {
+            return Err(bad());
+        }
+        off = re;
+        if i >= an || rclass != 1 || name.eq_ignore_ascii_case(&dsip_owner) {
+            continue;
+        }
+        let rdata = match name_rdata(rtype) {
+            None => dns[rs..re].to_vec(),
+            Some(parts) => {
+                let (mut out, mut p) = (vec![], rs);
+                for part in parts {
+                    match *part {
+                        Part::Name => {
+                            let (w, n) = expand(dns, p, re)?;
+                            out.extend(w);
+                            p = n;
+                        }
+                        Part::Bytes(k) => {
+                            if p + k > re {
+                                return Err(bad());
+                            }
+                            out.extend_from_slice(&dns[p..p + k]);
+                            p += k;
+                        }
+                    }
+                }
+                if p != re {
+                    return Err(bad());
+                }
+                out
+            }
+        };
+        keep.push((labels_of(&name), rtype, ttl, rdata));
+    }
+    if off != dns.len() {
+        return Err(bad());
+    }
+    Ok(keep)
+}
+
+/// The records to carry from a previously published relay payload of this key (`signature ‖ ts ‖ dns`); none if it
+/// does not parse. The caller has verified it under its own key.
+///
+/// Spec: DHT Hints Profile §9 (publishing).
+pub fn foreign_records(key: &[u8; 32], payload: &[u8]) -> Vec<ForeignRecord> {
+    payload.get(72..).and_then(|dns| carry(&z32_encode(key), dns).ok()).unwrap_or_default()
+}
+
+/// The timestamp to sign: the clock, or one above the previous packet's when that is not below the clock (a clock
+/// stepped back — the one case signed ahead of the clock, since a lower `seq` is refused everywhere).
+///
+/// Spec: DHT Hints Profile §9 (publishing); `check: "next-ts"`; spec-gap 105.
+pub fn next_ts(clock: u64, previous: Option<u64>) -> Option<u64> {
+    let ts = previous.map_or(clock, |p| clock.max(p.saturating_add(1)));
+    // above 2^53−1 every reader rejects it (`check: "hint"`): sign nothing
+    (ts <= (1u64 << 53) - 1).then_some(ts)
 }
 
 /// Build and sign a relay payload (`signature ‖ ts ‖ dns`) publishing `endpoints` as `_dsip` TXT records with `ttl`
@@ -396,6 +536,18 @@ pub fn run_vector(v: &Value) -> Value {
             let msg = bep44_signable(i["seq"].as_u64().unwrap_or(0), &hexv(&i["value"]), &hexv(&i["salt"]));
             json!({"valid": key.is_some_and(|k| verify(&k, &msg, &hexv(&i["signature"])))})
         }
+        "carry" => match carry(i["zone"].as_str().unwrap_or(""), &hexv(&i["dns"])) {
+            Ok(keep) => json!({"keep": keep.iter().map(|(labels, t, ttl, rdata)| {
+                let mut w = vec![];
+                push_name_labels(&mut w, labels);
+                json!({"name": hex(&w), "type": t, "ttl": ttl, "rdata": hex(rdata)})
+            }).collect::<Vec<_>>()}),
+            Err(_) => json!({"error": "malformed"}),
+        },
+        "next-ts" => match next_ts(i["clock"].as_u64().unwrap_or(0), i["previous"].as_u64()) {
+            Some(ts) => json!({"ts": ts}),
+            None => json!({"error": "exhausted"}),
+        },
         "z32-encode" => match <[u8; 32]>::try_from(hexv(&i["key"])) {
             Ok(k) => json!({"z32": z32_encode(&k)}),
             Err(_) => rejected(Reject("malformed")),
@@ -427,8 +579,8 @@ mod tests {
         assert_eq!(hint.expires_at, 1_790_000_000 + 1800);
         assert_eq!(hint.endpoints.len(), 2);
         assert_eq!(hint.endpoints[1]["service"], "DSIPSignaling");
-        let (kept, dropped) = foreign_records(&key.public(), &payload);
-        assert_eq!((kept.len(), dropped), (1, 0));
+        let kept = foreign_records(&key.public(), &payload);
+        assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].3, vec![5, b'h', b'e', b'l', b'l', b'o']);
         assert!(build_payload(&key, &eps, 7200, ts, &[]).is_err());
     }
