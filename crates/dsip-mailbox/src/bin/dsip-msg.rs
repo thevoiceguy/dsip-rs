@@ -173,6 +173,14 @@ struct Args {
     /// `source.name` claim (E§2, v0.10).
     #[arg(long)]
     syslog_tls_names: Option<PathBuf>,
+    /// Signed syslog (RFC 5848; E§3, v0.10): the signers whose messages are held until a verified Signature Block
+    /// lists them. A JSON array of `{"hostname", "certificate": "<PEM path>"}` (key blob type C, a DSA certificate)
+    /// or `{"hostname", "key": "<base64 of the four MPIs p, q, g, y>"}` (type K).
+    #[arg(long)]
+    syslog_signers: Option<PathBuf>,
+    /// How long a signer's message waits for its Signature Block before it is deposited unsigned (E§3).
+    #[arg(long, default_value_t = 10)]
+    syslog_sign_hold: i64,
     /// The gateway's syslog severity table overrides (JSON object, e.g. `{"5": "minor"}`; E§3).
     #[arg(long)]
     syslog_table: Option<PathBuf>,
@@ -378,6 +386,9 @@ struct Client {
     recorder_misbehave: bool,
     /// E§4 hold-down (v0.10) and the events whose clears it holds, by alarm key; E§2 certificate names.
     hold_down: dsip_events::HoldDown,
+    /// E§3 signed syslog: the collector, its clock, and each held message's transport (address, TLS certificate).
+    syslog_sign: Option<(dsip_events::syslog_sign::Collector, i64)>,
+    syslog_held: HashMap<String, std::collections::VecDeque<(std::net::SocketAddr, Option<String>)>>,
     held_events: HashMap<(String, String, String), Value>,
     tls_names: Value,
     rec_accepted: BTreeMap<String, std::collections::BTreeSet<String>>,
@@ -2253,6 +2264,48 @@ impl Client {
     /// Gateway mode (E§3): one syslog message, over UDP or (with the device's verified certificate) TLS → a signed
     /// `device-event`.
     async fn syslog_in(&mut self, message: &[u8], from: std::net::SocketAddr, certificate: Option<String>) -> Result<()> {
+        let Some((col, _)) = self.syslog_sign.as_mut() else { return self.syslog_event(message, from, certificate, None).await };
+        let outs = col.receive(message);
+        if outs.is_empty() {
+            // E§3: held for its Signature Block; remember how it came, for an unsigned deposit later
+            use sha2::Digest as _;
+            let sha: String = sha2::Sha256::digest(message).iter().map(|b| format!("{b:02x}")).collect();
+            self.syslog_held.entry(sha).or_default().push_back((from, certificate.clone()));
+            println!("SYSLOG from {from}: held for its signature   E§3");
+        }
+        self.syslog_sign_out(outs, Some((from, certificate))).await
+    }
+
+    /// What the signed-syslog collector released: deposits (signed, or with the transport's basis) and block verdicts.
+    async fn syslog_sign_out(&mut self, outs: dsip_events::syslog_sign::Emits,
+                             current: Option<(std::net::SocketAddr, Option<String>)>) -> Result<()> {
+        use dsip_events::syslog_sign::Out;
+        use sha2::Digest as _;
+        for o in outs {
+            match o {
+                Out::Deposit { message, signed } => {
+                    let sha: String = sha2::Sha256::digest(&message).iter().map(|b| format!("{b:02x}")).collect();
+                    // a held message deposits with the transport it came by; the current one with its own
+                    let held = self.syslog_held.get_mut(&sha).and_then(|q| q.pop_front());
+                    if self.syslog_held.get(&sha).is_some_and(|q| q.is_empty()) {
+                        self.syslog_held.remove(&sha);
+                    }
+                    let Some((from, cert)) = held.or_else(|| current.clone()) else { continue };
+                    self.syslog_event(&message, from, cert, signed).await?;
+                }
+                Out::Session(s) => println!("SYSLOG-SIGN session {}/{}/{} rsid {} established, key {}…   RFC 5848",
+                                            s["hostname"].as_str().unwrap_or(""), s["app_name"].as_str().unwrap_or(""),
+                                            s["procid"].as_str().unwrap_or(""), s["rsid"], &s["key_sha256"].as_str().unwrap_or("")[..16]),
+                Out::Refused(r) => println!("SYSLOG-SIGN {} refused: {}", r["block"].as_str().unwrap_or(""), r["reason"].as_str().unwrap_or("")),
+            }
+        }
+        Ok(())
+    }
+
+    /// One syslog message → a `device-event`: basis `syslog-signed` with E§2's `signed` claim when a Signature Block
+    /// verified it, otherwise the transport's.
+    async fn syslog_event(&mut self, message: &[u8], from: std::net::SocketAddr, certificate: Option<String>,
+                          signed: Option<Value>) -> Result<()> {
         let raw = dsip_events::syslog::parse_syslog(message);
         if raw.get("error").is_some() {
             println!("SYSLOG dropped from {from}: malformed");
@@ -2266,6 +2319,10 @@ impl Client {
                 source["name"] = json!(name);
             }
             source["certificate_sha256"] = json!(c);
+        }
+        if let Some(s) = signed {
+            source["basis"] = json!("syslog-signed");
+            source["signed"] = s;
         }
         let mut event = json!({"source": source, "raw": raw});
         if let Some(alarm) = dsip_events::syslog::map_syslog(&raw, &self.snmp_rules, &address, &self.syslog_table).get("alarm") {
@@ -2315,6 +2372,12 @@ impl Client {
     /// Gateway mode, from the ticker: the heartbeat (E§5) and the inform memory's clock (E§3).
     async fn gateway_tick(&mut self) -> Result<()> {
         let now = now_s();
+        // E§3 signed syslog: messages whose signature did not come in time are deposited with their transport's basis
+        if let Some((col, last)) = self.syslog_sign.as_mut() {
+            let outs = col.advance(now - *last);
+            *last = now;
+            self.syslog_sign_out(outs, None).await?;
+        }
         // E§4 hold-down: the clears that held long enough are deposited now
         for r in self.hold_down.advance_to(now) {
             let key = (r["resource"].as_str().unwrap_or("").to_string(), r["type"].as_str().unwrap_or("").to_string(),
@@ -3204,6 +3267,11 @@ async fn main() -> Result<()> {
             None => None,
         },
         hold_down: dsip_events::HoldDown::new(now_s(), args.hold_down),
+        syslog_sign: match &args.syslog_signers {
+            Some(p) => Some((dsip_events::syslog_sign::Collector::new(now_s(), args.syslog_sign_hold, &syslog_signers(p)?), now_s())),
+            None => None,
+        },
+        syslog_held: HashMap::new(),
         held_events: HashMap::new(),
         tls_names: match &args.syslog_tls_names {
             Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?).context("--syslog-tls-names")?,
@@ -3393,7 +3461,7 @@ async fn main() -> Result<()> {
                 client.tick_alarms();
                 // Recording Profile C§5: render recorders arriving or leaving
                 client.check_recordings();
-                if client.snmp.is_some() || client.heartbeat.is_some() || !client.held_events.is_empty() {
+                if client.snmp.is_some() || client.heartbeat.is_some() || !client.held_events.is_empty() || client.syslog_sign.is_some() {
                     if let Err(e) = client.gateway_tick().await {
                         println!("ERR {e}");
                     }
@@ -3858,6 +3926,25 @@ fn spawn_syslog_tls(l: tokio::net::TcpListener, cfg: std::sync::Arc<tokio_rustls
 
 /// The gateway's USM receiver (E§3): its engine ID (given, or generated once and kept in `state`), its boots (kept in
 /// `state`, one more at every start, RFC 3414 §2.2), and the users file.
+/// `--syslog-signers` → the collector's signers (`{hostname, type, key}`, key base64): a certificate's DER for `C`.
+fn syslog_signers(path: &Path) -> Result<Value> {
+    use base64::Engine as _;
+    let list: Value = serde_json::from_str(&std::fs::read_to_string(path)?).context("--syslog-signers")?;
+    let mut out = vec![];
+    for s in list.as_array().context("--syslog-signers: a JSON array")? {
+        let host = s["hostname"].as_str().context("--syslog-signers: each entry needs a hostname")?;
+        if let Some(pem) = s["certificate"].as_str() {
+            let der = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(pem)?)).next()
+                .context("--syslog-signers: no certificate in the PEM file")??;
+            out.push(json!({"hostname": host, "type": "C", "key": base64::engine::general_purpose::STANDARD.encode(der.as_ref())}));
+        } else {
+            out.push(json!({"hostname": host, "type": "K", "key": s["key"].as_str().context("--syslog-signers: certificate or key")?}));
+        }
+    }
+    println!("GATEWAY syslog-sign: {} signer(s)   RFC 5848", out.len());
+    Ok(Value::Array(out))
+}
+
 /// The gateway's snmpEngineID: given, or generated once and kept in `state`. USM and TSM (discovery) share it.
 fn snmp_engine_id(state: &Path, engine: Option<&str>) -> Result<(Vec<u8>, String)> {
     let unhex = |h: &str| -> Option<Vec<u8>> { (0..h.len() / 2).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect() };
@@ -3900,11 +3987,15 @@ fn usm_receiver(state: &Path, engine: Option<&str>, users: &Path) -> Result<dsip
 fn render_event(ev: &Value) -> String {
     let src = &ev["source"];
     let basis = src["basis"].as_str().unwrap_or("");
-    let known = ["snmpv1", "snmpv2c", "snmpv3-auth", "snmpv3-authpriv", "snmpv3-tls", "syslog-tls", "syslog-udp", "gateway"];
+    let known = ["snmpv1", "snmpv2c", "snmpv3-auth", "snmpv3-authpriv", "snmpv3-tls", "syslog-signed", "syslog-tls", "syslog-udp", "gateway"];
     let mut out = format!("source={} basis={}", src["address"].as_str().unwrap_or(""),
                           if known.contains(&basis) { basis.to_string() } else { format!("{basis}(unauthenticated)") });
     if let Some(u) = src.get("usm") {
         out += &format!(" usm={}@{}", u["user"].as_str().unwrap_or(""), u["engine_id"].as_str().unwrap_or(""));
+    }
+    if let Some(s) = src.get("signed") {
+        out += &format!(" signed={}/{} rsid={} #{} key={}…", s["hostname"].as_str().unwrap_or(""), s["app_name"].as_str().unwrap_or(""),
+                        s["rsid"], s["message_number"], s["key_sha256"].as_str().unwrap_or("").get(..16).unwrap_or(""));
     }
     if let Some(t) = src["tsm"]["security_name"].as_str() {
         out += &format!(" tsm={t:?}");
