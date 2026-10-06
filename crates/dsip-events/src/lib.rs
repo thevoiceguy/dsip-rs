@@ -389,6 +389,68 @@ impl InformTracker {
     }
 }
 
+/// A gateway's clear hold-down: clears wait `hold_s`, and a raise of the same alarm while its clear is held cancels
+/// it, so a flapping link is one alarm with a count.
+///
+/// Spec: E§4 (hold-down, v0.10); the `device-events/holddown-*` traces.
+pub struct HoldDown {
+    now: i64,
+    hold: i64,
+    held: BTreeMap<Key, (i64, Value)>,
+}
+
+impl HoldDown {
+    /// A hold-down of `hold_s` seconds (0 turns it off), at `now`.
+    pub fn new(now: i64, hold_s: i64) -> HoldDown {
+        HoldDown { now, hold: hold_s, held: BTreeMap::new() }
+    }
+
+    /// An alarm report (`{resource, type, qualifier?, severity, cleared}`) the gateway would deposit: what to deposit now.
+    pub fn report(&mut self, report: &Value) -> Vec<Value> {
+        let mut r = report.clone();
+        if r.get("qualifier").is_none() {
+            r["qualifier"] = json!("");
+        }
+        let k: Key = (
+            r["resource"].as_str().unwrap_or("").to_string(),
+            r["type"].as_str().unwrap_or("").to_string(),
+            r["qualifier"].as_str().unwrap_or("").to_string(),
+        );
+        if r["cleared"] == true {
+            if self.hold == 0 {
+                return vec![r];
+            }
+            self.held.entry(k).or_insert((self.now + self.hold, r));
+            return vec![];
+        }
+        self.held.remove(&k);
+        vec![r]
+    }
+
+    /// Advance the clock to `now`: the held clears now due, in due order then key.
+    pub fn advance_to(&mut self, now: i64) -> Vec<Value> {
+        self.now = now.max(self.now);
+        let mut due: Vec<(i64, Key)> = self.held.iter().filter(|(_, (d, _))| *d <= self.now).map(|(k, (d, _))| (*d, k.clone())).collect();
+        due.sort();
+        due.into_iter().filter_map(|(_, k)| self.held.remove(&k).map(|(_, r)| r)).collect()
+    }
+
+    fn step(&mut self, ev: &Value) -> Vec<Value> {
+        if let Some(r) = ev.get("report") {
+            return self.report(r).into_iter().map(|r| json!({"deposit": r})).collect();
+        }
+        if let Some(e) = ev.get("event") {
+            return vec![json!({"deposit": e})];
+        }
+        let to = self.now + ev["advance"].as_i64().unwrap_or(0);
+        self.advance_to(to).into_iter().map(|r| json!({"deposit": r})).collect()
+    }
+
+    fn snapshot(&self) -> Value {
+        Value::Array(self.held.iter().map(|(k, (d, _))| json!({"key": [k.0, k.1, k.2], "due": d})).collect())
+    }
+}
+
 /// Run a `device-events/` vector: a stateless check or an alarm-list trace.
 pub fn run_vector(v: &Value) -> Value {
     let i = &v["input"];
@@ -406,6 +468,13 @@ pub fn run_vector(v: &Value) -> Value {
         Some("usm-key") => usm::usm_key(i),
         Some(_) => json!({"error": "unknown check"}),
         None if v["context"]["component"] == "snmpv3" => usm::run_trace(v),
+        None if v["context"]["component"] == "holddown" => {
+            let c = &v["context"];
+            let mut m = HoldDown::new(c["now"].as_i64().unwrap_or(0), c["hold_s"].as_i64().unwrap_or(0));
+            Value::Array(
+                i["steps"].as_array().into_iter().flatten().map(|st| json!({"emit": m.step(&st["event"]), "held": m.snapshot()})).collect(),
+            )
+        }
         None if v["context"]["component"] == "informs" => {
             let mut m = InformTracker::new(&v["context"]);
             Value::Array(
