@@ -48,6 +48,8 @@ pub struct ConsoleOpts {
     pub pkarr_relays: Vec<String>,
     /// Publish our `_dsip` records to the Pkarr relays and/or the Mainline DHT.
     pub publish_pkarr: bool,
+    /// Publish this device's own zone (§9.1) rather than the identity's.
+    pub pkarr_device: bool,
     /// Use the Mainline DHT directly for Pkarr.
     pub mainline: bool,
     /// Declare this side recorded by this recorder identity (Recording Profile C§3).
@@ -330,7 +332,11 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     if opts.publish_pkarr {
         let Some(p) = &pkarr else { anyhow::bail!("--publish-pkarr needs --pkarr-relay <https://…> or --mainline") };
         // a hint is best-effort (§8.1): a failed publish is reported and tried again at the next re-sign
-        if let Err(e) = p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await {
+        if let Err(e) = if opts.pkarr_device {
+                p.publish_device(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await
+            } else {
+                p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await
+            } {
             println!("hint       pkarr publish failed, retrying at the next re-sign: {e}");
         }
     }
@@ -626,7 +632,11 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                 if let (true, Some(p)) = (opts.publish_pkarr, &pkarr) {
                     // DHT Hints Profile §9: the identity key re-signs before expires_at (re-announcing never extends it);
                     // a failed publish is reported and tried again at the next re-sign, never fatal to the session
-                    if let Err(e) = p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await {
+                    if let Err(e) = if opts.pkarr_device {
+                p.publish_device(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await
+            } else {
+                p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await
+            } {
                         println!("hint       pkarr publish failed, retrying at the next re-sign: {e}");
                     }
                 }

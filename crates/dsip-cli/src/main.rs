@@ -88,6 +88,28 @@ enum Cmd {
         #[arg(long = "mainline-bootstrap", value_delimiter = ',')]
         mainline_bootstrap: Vec<String>,
     },
+    /// Publish this identity's Pkarr pointer to its devices (DHT Hints Profile §9.1), signed by the identity key: the
+    /// occasional step (valid up to 7 days) that lets each device publish its own hint.
+    PkarrPointer {
+        /// Identity directory (its identity key signs).
+        #[arg(long)]
+        identity: PathBuf,
+        /// A device's did:key (repeatable), in the order resolvers should try them.
+        #[arg(long = "device", required = true)]
+        devices: Vec<String>,
+        /// Pointer lifetime in seconds, at most 604,800.
+        #[arg(long, default_value_t = 604_800, value_parser = clap::value_parser!(u32).range(60..=604_800))]
+        ttl: u32,
+        /// Pkarr relays.
+        #[arg(long = "pkarr-relay")]
+        pkarr_relays: Vec<String>,
+        /// Also put it on the Mainline DHT directly.
+        #[arg(long)]
+        mainline: bool,
+        /// Mainline bootstrap nodes.
+        #[arg(long = "mainline-bootstrap", value_delimiter = ',')]
+        mainline_bootstrap: Vec<String>,
+    },
     /// Run a recorder service (Recording Profile C§6): answer recording sessions only and record each stream.
     Recorder {
         /// Identity directory (its delegation should carry `dsip.record`).
@@ -333,6 +355,11 @@ struct ConnOpts {
     /// `always`, or `never` (decline at once, as `policy.recording: forbidden`).
     #[arg(long, default_value = "ask", value_parser = ["ask", "always", "never"])]
     recording_accept: String,
+    /// With --publish-pkarr: publish this **device's** own zone (its endpoint and its delegation, signed by the device
+    /// key) instead of the identity's, so the identity key can stay offline (DHT Hints Profile §9.1). The identity
+    /// lists its devices once with `dsip pkarr-pointer`.
+    #[arg(long)]
+    pkarr_device: bool,
     /// Use the Mainline DHT directly for Pkarr (with or without --pkarr-relay): discover the callee's `_dsip` records,
     /// or publish our own with --publish-pkarr. Never authoritative (§8.1).
     #[arg(long)]
@@ -402,7 +429,7 @@ impl ConnOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
-            pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr,
+            pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr, pkarr_device: self.pkarr_device,
             mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
             recorded_by: self.recorded_by, record_later: self.record_later, record_device: self.record_device, fork_taps: None, record_purpose: self.record_purpose, recording_accept: self.recording_accept,
             media: self.media, record: self.record, stun: self.stun,
@@ -514,6 +541,11 @@ async fn main() -> Result<()> {
             println!("delegation: {}", id.delegation.frame());
         }
         Cmd::MainlineTestnet { nodes } => pkarr_cli::testnet(nodes).await?,
+        Cmd::PkarrPointer { identity, devices, ttl, pkarr_relays, mainline, mainline_bootstrap } => {
+            let p = pkarr_cli::Pkarr::new(&pkarr_relays, mainline, &mainline_bootstrap).await?
+                .context("give --pkarr-relay or --mainline")?;
+            p.publish_pointer(&dsip_transport::identity::Identity::load(&identity)?, &devices, ttl).await?;
+        }
         Cmd::Recorder { identity, relay, ca, dir, media_backend, seconds } => recorder::run(identity, relay, ca, dir, media_backend, seconds).await?,
         Cmd::Resolve { did, dht, pkarr_relays, mainline, mainline_bootstrap } => {
             if let Some(pk) = dsip_core::did::public_from_did_key(&did) {
