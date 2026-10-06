@@ -2791,6 +2791,16 @@ impl Client {
                 }
                 self.save_archive()?;
             }
+            Some("recording-acceptance") => {
+                // C§5 (v0.10): a sibling device's acceptance, from the personal group, applies here too
+                let conv = object["conversation"].as_str().unwrap_or("").to_string();
+                if let Some(target) = self.convs.iter().find(|(_, c)| c.conversation == conv).map(|(g, _)| g.clone()) {
+                    let devices: Vec<String> = object["recorders"].as_array().into_iter().flatten().filter_map(|d| d.as_str().map(String::from)).collect();
+                    self.rec_accepted.entry(target.clone()).or_default().extend(devices.iter().cloned());
+                    self.mls.provider().put_state("recording-accepted", &serde_json::to_value(&self.rec_accepted)?).map_err(Self::state_err)?;
+                    println!("RECORDING-ACCEPTED group={target} recorders={devices:?} by sibling {sender_device}   C§5");
+                }
+            }
             Some("call-event") => {
                 // M§13.3 (spec-gap 63): every alerted device may report the call; one entry per session
                 let session = object["session"].as_str().unwrap_or("").to_string();
@@ -3409,6 +3419,15 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
             client.rec_accepted.entry(gid.clone()).or_default().extend(devices.iter().cloned());
             client.mls.provider().put_state("recording-accepted", &serde_json::to_value(&client.rec_accepted)?).map_err(Client::state_err)?;
             println!("OK recording accepted group={gid} recorders={devices:?}");
+            // C§5 (v0.10): the acceptance is the person's — tell this identity's other devices
+            if let Some(personal) = client.personal.clone() {
+                let obj = json!({"object": "recording-acceptance", "conversation": client.conv(&gid)?.conversation,
+                                 "recorders": devices, "accepted_at": now_s()});
+                let reply = client.send_object(&personal, &obj, json!({})).await?;
+                if reply["type"] == "accepted" {
+                    println!("OK recording acceptance shared with this identity's devices");
+                }
+            }
             Ok(())
         }
         "decline-recording" => {

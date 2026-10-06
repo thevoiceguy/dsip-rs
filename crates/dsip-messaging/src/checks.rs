@@ -38,7 +38,7 @@ pub const REACTION_MAX_BYTES: usize = 32;
 pub const MESSAGE_SCHEMAS: &[&str] =
     &["deposit", "accepted", "sync", "items", "key-packages", "key-package-fetch", "blob-put", "mailbox-config"];
 /// Content object types with schemas.
-pub const OBJECT_SCHEMAS: &[&str] = &["content", "receipt", "activity", "archive-key", "call-event", "archive-record"];
+pub const OBJECT_SCHEMAS: &[&str] = &["content", "receipt", "activity", "archive-key", "call-event", "archive-record", "recording-acceptance"];
 
 /// Registry `dsip-deposit-class` (M§17).
 pub const DEPOSIT_CLASSES: &[&str] = &["handshake", "application", "welcome", "group-info", "ephemeral", "archive", "introduction", "grant"];
@@ -208,8 +208,8 @@ pub fn check_object(o: &Value, ctx: &Value) -> Value {
             return reject("ulid-sent-at-mismatch", None);
         }
     }
-    if matches!(name, "archive-key" | "call-event") && ctx["conversation_kind"].as_str() != Some("personal") {
-        return reject("personal-group-only", None); // M§12.1, M§13.3
+    if matches!(name, "archive-key" | "call-event" | "recording-acceptance") && ctx["conversation_kind"].as_str() != Some("personal") {
+        return reject("personal-group-only", None); // M§12.1, M§13.3, Recording Profile C§5
     }
     match name {
         "content" => check_content(o),
