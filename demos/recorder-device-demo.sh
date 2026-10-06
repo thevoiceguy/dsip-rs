@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 DIR=${DEMO_DIR:-/tmp/dsip-recorder-device-demo}
 ALICE=did:web:alice.example
 BOB=did:web:bob.example
-rm -rf "$DIR"; mkdir -p "$DIR"/{mbx-a,mbx-b,dev-a,dev-bp,dev-br,docs}
+rm -rf "$DIR"; mkdir -p "$DIR"/{mbx-a,mbx-b,dev-a,dev-al,dev-bp,dev-br,docs}
 cargo build -q -p dsip-mailbox
 MBX=target/debug/dsip-mailbox
 MSG=target/debug/dsip-msg
@@ -37,7 +37,7 @@ $MSG --state "$DIR/dev-a" --identity "$ALICE" --write-doc "$DIR/docs/alice.json"
   --mailbox-did "$(cat "$DIR/mbx-a/service.did")" --mailbox-uri "wss://127.0.0.1:9491/dsip" >/dev/null
 $MSG --state "$DIR/dev-bp" --identity "$BOB" --write-doc "$DIR/docs/bob.json" \
   --mailbox-did "$(cat "$DIR/mbx-b/service.did")" --mailbox-uri "wss://127.0.0.1:9492/dsip" >/dev/null
-mkfifo "$DIR/a.in" "$DIR/bp.in" "$DIR/br.in"
+mkfifo "$DIR/a.in" "$DIR/al.in" "$DIR/bp.in" "$DIR/br.in"
 $MSG --state "$DIR/dev-a" --identity "$ALICE" "${RESOLVER[@]}" --ca "$DIR/ca.pem" <"$DIR/a.in" >"$DIR/a.log" 2>&1 &
 $MSG --state "$DIR/dev-bp" --identity "$BOB" "${RESOLVER[@]}" --ca "$DIR/ca.pem" <"$DIR/bp.in" >"$DIR/bp.log" 2>&1 &
 exec 3>"$DIR/a.in"; exec 4>"$DIR/bp.in"
@@ -47,6 +47,7 @@ echo "kp 3" >&4; wait_for "$DIR/bp.log" "OK uploaded" 10
 echo "grant $ALICE" >&4; wait_for "$DIR/bp.log" "^GRANT " 10
 grep -m1 "^GRANT " "$DIR/bp.log" | cut -d' ' -f2 > "$DIR/grant.txt"
 echo "live" >&4
+echo "personal" >&3; wait_for "$DIR/a.log" "^OK archive-key" 30
 echo "kp 1" >&3; wait_for "$DIR/a.log" "OK uploaded" 10
 echo "create direct $BOB $DIR/grant.txt" >&3; wait_for "$DIR/bp.log" "^JOINED .* kind=direct" 30
 echo "live" >&3
@@ -81,8 +82,29 @@ echo "send I am the recorder" >&5; wait_for "$DIR/br.log" "^ERR a recorder devic
 echo "  alice: $(grep -m1 '^ERR recorded' "$DIR/a.log")"
 echo "  recorder: $(grep -m1 '^ERR a recorder' "$DIR/br.log")"
 
-echo "=== Alice accepts; the conversation goes on, and the recorder archives it"
+echo "=== Alice's laptop joins: it is told the conversation is recorded, and cannot send either"
+$MSG --state "$DIR/dev-al" --identity "$ALICE" --controller "$DIR/dev-a/controller.key" "${RESOLVER[@]}" --ca "$DIR/ca.pem" \
+  <"$DIR/al.in" >"$DIR/al.log" 2>&1 &
+exec 6>"$DIR/al.in"
+wait_for "$DIR/al.log" "OK connected" 20
+LAPTOP=$(grep -m1 "^DEVICE " "$DIR/al.log" | cut -d' ' -f2)
+echo "kp 3" >&6; wait_for "$DIR/al.log" "OK uploaded" 10
+echo "add-device $LAPTOP" >&3
+wait_for "$DIR/a.log" "^OK added device $LAPTOP to direct" 30
+echo "live" >&6
+wait_for "$DIR/al.log" "^JOINED .* kind=direct" 30
+wait_for "$DIR/al.log" "^RECORDED group=.* by recorder device $REC" 20
+echo "send From my laptop" >&6; wait_for "$DIR/al.log" "^ERR recorded conversation: type accept-recording first" 10
+
+echo "=== Alice accepts on her phone; the acceptance reaches her laptop through her personal group (C§5)"
 echo "accept-recording" >&3; wait_for "$DIR/a.log" "^OK recording accepted" 10
+wait_for "$DIR/a.log" "^OK recording acceptance shared with this identity's devices" 20
+wait_for "$DIR/al.log" "^RECORDING-ACCEPTED group=.* by sibling" 30
+echo "  laptop: $(grep -m1 '^RECORDING-ACCEPTED' "$DIR/al.log" | cut -c1-110)…"
+echo "send From my laptop, accepted on my phone" >&6
+wait_for "$DIR/bp.log" "^RECV $ALICE: From my laptop, accepted on my phone" 30
+echo "  the laptop sends without being asked again"
+echo "=== the conversation goes on, and the recorder archives it"
 echo "send Understood, go ahead" >&3; wait_for "$DIR/bp.log" "^RECV $ALICE: Understood, go ahead" 30
 wait_for "$DIR/br.log" "^ARCHIVED $ALICE: Understood, go ahead" 30
 wait_for "$DIR/br.log" "^ARCHIVED $BOB: Yes, by my firm, from here on" 30
@@ -104,7 +126,7 @@ NB=$(grep -c "^JOINED .* kind=group" "$DIR/br.log" || true)
 echo "  Alice creates a group with Bob: every Bob device is added — his phone AND his recorder"
 echo "grant $ALICE" >&4; sleep 2; grep "^GRANT " "$DIR/bp.log" | tail -1 | cut -d' ' -f2 > "$DIR/grant2.txt"
 echo "create group $BOB $DIR/grant2.txt" >&3
-wait_for "$DIR/a.log" "^OK added $BOB \(2 device\(s\)\)" 30
+wait_for "$DIR/a.log" "^OK added $BOB \([0-9]+ device\(s\)\)" 30
 wait_for "$DIR/bp.log" "^JOINED .* kind=group" 30
 for _ in $(seq 100); do [ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt "$NB" ] && break; sleep 0.2; done
 [ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt "$NB" ] || fail "A: the recorder did not join Alice's new conversation"
@@ -139,7 +161,8 @@ echo "  alice: $(grep -m1 '^RECORDING ENDED' "$DIR/a.log")"
 
 echo
 echo "PASS: the recorder device was visible to every member, joined every conversation — including ones created later by"
-echo "      either side — but never Bob's personal group"
+echo "      either side — but never Bob's personal group; Alice's acceptance on her phone reached her laptop through her"
+echo "      personal group"
 echo "      (so nothing from before it joined reached it), held Alice's sending until she accepted, never spoke —"
 echo "      a misbehaving one was dropped by both members — archived what was sent while disclosed, and its removal"
 echo "      ended the recording for everyone."
