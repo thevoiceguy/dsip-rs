@@ -14,3 +14,6 @@ sha2.workspace = true
 sha1.workspace = true
 md-5.workspace = true
 aes.workspace = true
+dsa.workspace = true
+x509-parser.workspace = true
+base64.workspace = true

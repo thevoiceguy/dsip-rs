@@ -5,7 +5,7 @@
 //! translation, the community never carried, the syslog severity table — [`normalize_trap`],
 //! [`syslog_severity`]), E§4 (the rule table — [`map_alarm`]), E§5 and E§6 (the alarm list and the
 //! escalation trigger — [`AlarmList`]), and the inputs beyond v1/v2c: SNMPv3 with USM ([`usm`]), SNMPv3
-//! over TLS with TSM ([`tsm`]) and syslog ([`syslog`]).
+//! over TLS with TSM ([`tsm`]), syslog ([`syslog`]) and signed syslog ([`syslog_sign`]).
 //!
 //! Impl (spec-gap 103): a re-raise reopens the same alarm and resets its operator state; the syslog
 //! default table; escalation is run by a member (the agent), never by a mailbox. Every rule is pinned
@@ -16,6 +16,7 @@
 
 pub mod ber;
 pub mod syslog;
+pub mod syslog_sign;
 pub mod tsm;
 pub mod usm;
 
@@ -470,6 +471,7 @@ pub fn run_vector(v: &Value) -> Value {
         Some("tsm" | "tls-frames" | "tsm-name") => tsm::run_check(i),
         Some(_) => json!({"error": "unknown check"}),
         None if v["context"]["component"] == "snmpv3" => usm::run_trace(v),
+        None if v["context"]["component"] == "syslog-sign" => syslog_sign::run_trace(v),
         None if v["context"]["component"] == "holddown" => {
             let c = &v["context"];
             let mut m = HoldDown::new(c["now"].as_i64().unwrap_or(0), c["hold_s"].as_i64().unwrap_or(0));
