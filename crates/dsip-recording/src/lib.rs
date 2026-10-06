@@ -1,5 +1,5 @@
 //! `dsip-recording` — the rules of the DSIP Recording Profile (draft `recording/0.1`,
-//! `v0.9/dsip-recording-profile-v0.9-draft.md`, cited `C§n`). Pure: no network, no media.
+//! `v0.10/dsip-recording-profile-v0.10-draft.md`, cited `C§n`). Pure: no network, no media.
 //!
 //! Spec: sections owned by this crate — C§4 (a counterparty's consent: render, hold until
 //! acceptance, decline with `policy.recording-declined` — [`Consent`]), C§5 (a recorded

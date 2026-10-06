@@ -2,13 +2,13 @@
 //!
 //! Spec: §10.3 — "JSON Schema files for every message type accompany this
 //! specification and are normative for payload shape." The files are read
-//! from `v0.9/…/schemas/` at compile time; `build.rs` fails the build if they
+//! from `v0.10/…/schemas/` at compile time; `build.rs` fails the build if they
 //! drift from `generate_schemas.py`. Switching the path *is* the schema-layer
 //! migration between spec revisions (v0.6 → v0.7 on 2026-08-21).
 
 macro_rules! schema {
     ($name:literal) => {
-        ($name, include_str!(concat!("../../../../v0.9/dsip-schemas-v0.9-draft/dsip-schemas/schemas/", $name, ".schema.json")))
+        ($name, include_str!(concat!("../../../../v0.10/dsip-schemas-v0.10-draft/dsip-schemas/schemas/", $name, ".schema.json")))
     };
 }
 
