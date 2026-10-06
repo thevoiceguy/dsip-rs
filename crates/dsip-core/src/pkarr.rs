@@ -200,6 +200,21 @@ fn endpoint(rdata: &[u8]) -> Result<Value, Reject> {
 ///
 /// Spec: §8.5; DHT Hints Profile §9.
 pub fn read(did: &str, payload: &[u8], now: i64) -> Result<Hint, Reject> {
+    let (key, ts, records) = open(did, payload, now)?;
+    let owner: Vec<Vec<u8>> = vec![b"_dsip".to_vec(), z32_encode(&key).into_bytes()];
+    let (mut eps, mut ttls) = (vec![], vec![]);
+    for (nm, rtype, rclass, ttl, rdata) in records {
+        if nm != owner || rtype != 16 || rclass != 1 {
+            continue; // another record of this zone, or outside it: not DSIP's
+        }
+        eps.push(endpoint(&rdata)?);
+        ttls.push(ttl);
+    }
+    finish_hint(did, ts, eps, ttls, now)
+}
+
+/// Steps 1–5 of `check: "hint"`: the DID's key, the timestamp and the parsed answer records.
+fn open(did: &str, payload: &[u8], now: i64) -> Result<([u8; 32], u64, Vec<Answer>), Reject> {
     let key = did
         .strip_prefix("did:key:")
         .filter(|s| s.starts_with('z'))
@@ -219,15 +234,10 @@ pub fn read(did: &str, payload: &[u8], now: i64) -> Result<Hint, Reject> {
     if ts as i128 > ((now + FUTURE_TOLERANCE_S) as i128) * 1_000_000 {
         return Err(Reject("future"));
     }
-    let owner: Vec<Vec<u8>> = vec![b"_dsip".to_vec(), z32_encode(&key).into_bytes()];
-    let (mut eps, mut ttls) = (vec![], vec![]);
-    for (nm, rtype, rclass, ttl, rdata) in parse_dns(dns)? {
-        if nm != owner || rtype != 16 || rclass != 1 {
-            continue; // another record of this zone, or outside it: not DSIP's
-        }
-        eps.push(endpoint(&rdata)?);
-        ttls.push(ttl);
-    }
+    Ok((key, ts, parse_dns(dns)?))
+}
+
+fn finish_hint(did: &str, ts: u64, eps: Vec<Value>, ttls: Vec<u32>, now: i64) -> Result<Hint, Reject> {
     if eps.is_empty() {
         return Err(Reject("no-endpoints"));
     }
@@ -240,6 +250,126 @@ pub fn read(did: &str, payload: &[u8], now: i64) -> Result<Hint, Reject> {
         return Err(Reject("expired"));
     }
     Ok(Hint { subject: did.to_string(), seq: ts, issued_at: issued, expires_at: expires, endpoints: eps })
+}
+
+fn strings(rdata: &[u8]) -> Result<Vec<&[u8]>, Reject> {
+    let (mut out, mut i) = (vec![], 0);
+    while i < rdata.len() {
+        let n = rdata[i] as usize;
+        out.push(rdata.get(i + 1..i + 1 + n).ok_or(Reject("malformed"))?);
+        i += 1 + n;
+    }
+    Ok(out)
+}
+
+/// A pointer's TTL bound: 7 days (§9.1).
+pub const POINTER_MAX_TTL: u32 = 604_800;
+
+/// A multi-device identity's pointer (§9.1): the devices it lists, in record order, its `seq` and its expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pointer {
+    /// The signed timestamp, µs.
+    pub seq: u64,
+    /// The timestamp's seconds plus the smallest `_dsip-devices` TTL.
+    pub expires_at: i64,
+    /// Listed device `did:key`s, a repeated one kept once.
+    pub devices: Vec<String>,
+}
+
+/// Read an identity's pointer (`_dsip-devices` records signed by the identity key).
+///
+/// Spec: DHT Hints Profile §9.1; `check: "devices"`.
+pub fn read_pointer(did: &str, payload: &[u8], now: i64) -> Result<Pointer, Reject> {
+    let (key, ts, records) = open(did, payload, now)?;
+    let owner: Vec<Vec<u8>> = vec![b"_dsip-devices".to_vec(), z32_encode(&key).into_bytes()];
+    let (mut devices, mut ttls) = (Vec::<String>::new(), vec![]);
+    for (nm, rtype, rclass, ttl, rdata) in records {
+        if nm != owner || rtype != 16 || rclass != 1 {
+            continue;
+        }
+        let vals: Vec<String> = strings(&rdata)?
+            .into_iter()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .filter_map(|t| t.strip_prefix("dev=").map(String::from))
+            .collect();
+        if vals.len() != 1 || crate::did::public_from_did_key(&vals[0]).is_none() || !vals[0].starts_with("did:key:z") {
+            return Err(Reject("bad-pointer"));
+        }
+        if !devices.contains(&vals[0]) {
+            devices.push(vals[0].clone());
+        }
+        ttls.push(ttl);
+    }
+    if ttls.is_empty() {
+        return Err(Reject("no-devices"));
+    }
+    if ttls.iter().any(|t| *t > POINTER_MAX_TTL) {
+        return Err(Reject("ttl-too-long"));
+    }
+    let expires = (ts / 1_000_000) as i64 + *ttls.iter().min().unwrap_or(&0) as i64;
+    if now >= expires {
+        return Err(Reject("expired"));
+    }
+    Ok(Pointer { seq: ts, expires_at: expires, devices })
+}
+
+fn compact_envelope(s: &str) -> Option<crate::envelope::Envelope> {
+    let parts: Vec<&str> = s.split('.').collect();
+    let [p, b, g] = parts.as_slice() else { return None };
+    Some(crate::envelope::Envelope { protected: p.to_string(), payload: b.to_string(), signature: g.to_string() })
+}
+
+/// One listed device resolved: its hint's endpoints and the expiry of the earlier of hint and delegation, or the
+/// reason it does not count. `revocations` are compact `delegation-revocation` envelopes the reader holds.
+///
+/// Spec: DHT Hints Profile §9.1 (device hint, delegation record), §7.4 (the delegation verified).
+pub fn read_device(did: &str, device: &str, payload: &[u8], now: i64, revocations: &[String]) -> Result<(Vec<Value>, i64), String> {
+    let hint = read(device, payload, now).map_err(|r| r.0.to_string())?;
+    let (dkey, _, records) = open(device, payload, now).map_err(|r| r.0.to_string())?;
+    let owner: Vec<Vec<u8>> = vec![b"_dsip-delegation".to_vec(), z32_encode(&dkey).into_bytes()];
+    let found: Vec<Vec<u8>> = records.into_iter().filter(|(n, t, c, _, _)| *n == owner && *t == 16 && *c == 1).map(|r| r.4).collect();
+    let rdata = match found.as_slice() {
+        [] => return Err("delegation-missing".into()),
+        [one] => one,
+        _ => return Err("delegation-invalid".into()),
+    };
+    let joined: Vec<u8> = strings(rdata).map_err(|_| "delegation-invalid".to_string())?.concat();
+    let deleg = std::str::from_utf8(&joined).ok().and_then(compact_envelope).ok_or("delegation-invalid")?;
+    let resolver = crate::did::StaticResolver::default();
+    let mut ctx = crate::envelope::Context::new(now, &resolver);
+    ctx.revocations = revocations.iter().filter_map(|r| compact_envelope(r)).collect();
+    let v = crate::delegation::verify_delegation(&deleg, did, device, &ctx);
+    if let Some(code) = v.code {
+        return Err(serde_json::to_value(code).ok().and_then(|c| c.as_str().map(String::from)).unwrap_or_else(|| "delegation-invalid".into()));
+    }
+    let payload_json: Value = crate::b64::decode(&deleg.payload).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let dexp = payload_json["expires_at"].as_i64().unwrap_or(0);
+    Ok((hint.endpoints, hint.expires_at.min(dexp)))
+}
+
+/// `check: "devices"`: an identity's pointer, then each listed device in order.
+///
+/// Spec: DHT Hints Profile §9.1.
+pub fn devices(i: &Value) -> Value {
+    let did = i["did"].as_str().unwrap_or("");
+    let now = i["now"].as_i64().unwrap_or(0);
+    let ptr = match read_pointer(did, &hexv(&i["payload"]), now) {
+        Ok(p) => p,
+        Err(r) => return json!({"outcome": "rejected", "reason": r.0}),
+    };
+    let revocations: Vec<String> = i["revocations"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(String::from)).collect();
+    let out: Vec<Value> = ptr
+        .devices
+        .iter()
+        .map(|dev| match i["devices"].get(dev).filter(|p| !p.is_null()) {
+            None => json!({"device": dev, "outcome": "rejected", "reason": "unavailable"}),
+            Some(p) => match read_device(did, dev, &hexv(p), now, &revocations) {
+                Ok((eps, exp)) => json!({"device": dev, "outcome": "hint", "endpoints": eps, "expires_at": exp}),
+                Err(reason) => json!({"device": dev, "outcome": "rejected", "reason": reason}),
+            },
+        })
+        .collect();
+    json!({"outcome": "devices", "seq": ptr.seq, "expires_at": ptr.expires_at, "devices": out})
 }
 
 /// Whether a relay payload is signed by `key` (BEP 44, no salt); nothing else is checked.
@@ -359,11 +489,18 @@ pub fn carry(zone: &str, dns: &[u8]) -> Result<Vec<ForeignRecord>, Reject> {
     for _ in 0..qd {
         off = expand(dns, off, dns.len())?.1 + 4;
     }
-    let mut dsip_owner = vec![5u8];
-    dsip_owner.extend_from_slice(b"_dsip");
-    dsip_owner.push(zone.len() as u8);
-    dsip_owner.extend_from_slice(zone.as_bytes());
-    dsip_owner.push(0);
+    // §9.1: the publisher replaces its _dsip, _dsip-devices and _dsip-delegation records
+    let owners: Vec<Vec<u8>> = [&b"_dsip"[..], b"_dsip-devices", b"_dsip-delegation"]
+        .iter()
+        .map(|lb| {
+            let mut o = vec![lb.len() as u8];
+            o.extend_from_slice(lb);
+            o.push(zone.len() as u8);
+            o.extend_from_slice(zone.as_bytes());
+            o.push(0);
+            o
+        })
+        .collect();
     let mut keep = vec![];
     for i in 0..an + ns + ar {
         let (name, next) = expand(dns, off, dns.len())?;
@@ -378,7 +515,7 @@ pub fn carry(zone: &str, dns: &[u8]) -> Result<Vec<ForeignRecord>, Reject> {
             return Err(bad());
         }
         off = re;
-        if i >= an || rclass != 1 || name.eq_ignore_ascii_case(&dsip_owner) {
+        if i >= an || rclass != 1 || owners.iter().any(|o| name.eq_ignore_ascii_case(o)) {
             continue;
         }
         let rdata = match name_rdata(rtype) {
@@ -433,44 +570,35 @@ pub fn next_ts(clock: u64, previous: Option<u64>) -> Option<u64> {
     (ts < (1u64 << 53)).then_some(ts)
 }
 
-/// Build and sign a relay payload (`signature ‖ ts ‖ dns`) publishing `endpoints` as `_dsip` TXT records with `ttl`
-/// (≤ 3600), plus any `foreign` records kept from the previous packet. The DSIP owner name is written once and
-/// pointed to (RFC 1035 compression), and the DNS message must stay within 996 bytes.
-///
-/// Spec: DHT Hints Profile §9 (publishing): signed by the identity key over BEP 44's buffer, no salt.
-pub fn build_payload(
-    key: &crate::keys::KeyPair,
-    endpoints: &[PublishEndpoint],
-    ttl: u32,
-    ts: u64,
-    foreign: &[ForeignRecord],
-) -> Result<Vec<u8>, &'static str> {
-    if endpoints.is_empty() || ttl > MAX_TTL {
-        return Err("an endpoint and a TTL of at most 3600 s are required");
-    }
+/// One record this publisher writes in its own zone: the first label (`_dsip`, `_dsip-devices`, `_dsip-delegation`),
+/// the TXT character-strings, and the TTL.
+type OwnRecord = (&'static [u8], Vec<Vec<u8>>, u32);
+
+/// Build and sign a zone: `own` records under `<label>.<z32(key)>` (the zone label written once and pointed to, RFC
+/// 1035 compression), then the `foreign` records carried over. The DNS message must stay within 996 bytes.
+fn build_zone(key: &crate::keys::KeyPair, own: &[OwnRecord], ts: u64, foreign: &[ForeignRecord]) -> Result<Vec<u8>, &'static str> {
     let mut dns = vec![0, 0, 0x80, 0, 0, 0];
-    dns.extend_from_slice(&((endpoints.len() + foreign.len()) as u16).to_be_bytes());
+    dns.extend_from_slice(&((own.len() + foreign.len()) as u16).to_be_bytes());
     dns.extend_from_slice(&[0, 0, 0, 0]);
-    let owner = [b"_dsip".to_vec(), z32_encode(&key.public()).into_bytes()];
-    let owner_at = dns.len();
-    for (i, ep) in endpoints.iter().enumerate() {
-        if i == 0 {
-            push_name_labels(&mut dns, &owner);
-        } else {
-            dns.extend_from_slice(&(0xC000u16 | owner_at as u16).to_be_bytes());
+    let zone = z32_encode(&key.public()).into_bytes();
+    let mut zone_at: Option<usize> = None;
+    for (label, strings, ttl) in own {
+        dns.push(label.len() as u8);
+        dns.extend_from_slice(label);
+        match zone_at {
+            Some(at) => dns.extend_from_slice(&(0xC000u16 | at as u16).to_be_bytes()),
+            None => {
+                zone_at = Some(dns.len());
+                push_name_labels(&mut dns, std::slice::from_ref(&zone));
+            }
         }
         let mut rdata = vec![];
-        let mut strings = vec![format!("uri={}", ep.uri)];
-        strings.extend(ep.bindings.iter().map(|b| format!("b={b}")));
-        if let Some(s) = &ep.service {
-            strings.push(format!("svc={s}"));
-        }
-        for s in strings {
-            if s.len() > 255 {
+        for st in strings {
+            if st.len() > 255 {
                 return Err("a TXT string is longer than 255 bytes");
             }
-            rdata.push(s.len() as u8);
-            rdata.extend_from_slice(s.as_bytes());
+            rdata.push(st.len() as u8);
+            rdata.extend_from_slice(st);
         }
         dns.extend_from_slice(&16u16.to_be_bytes());
         dns.extend_from_slice(&1u16.to_be_bytes());
@@ -493,6 +621,62 @@ pub fn build_payload(
     out.extend_from_slice(&ts.to_be_bytes());
     out.extend_from_slice(&dns);
     Ok(out)
+}
+
+fn endpoint_records(endpoints: &[PublishEndpoint], ttl: u32) -> Vec<OwnRecord> {
+    endpoints
+        .iter()
+        .map(|ep| {
+            let mut strings = vec![format!("uri={}", ep.uri).into_bytes()];
+            strings.extend(ep.bindings.iter().map(|b| format!("b={b}").into_bytes()));
+            if let Some(svc) = &ep.service {
+                strings.push(format!("svc={svc}").into_bytes());
+            }
+            (&b"_dsip"[..], strings, ttl)
+        })
+        .collect()
+}
+
+/// Build and sign a relay payload (`signature ‖ ts ‖ dns`) publishing `endpoints` as `_dsip` TXT records with `ttl`
+/// (≤ 3600), plus any `foreign` records kept from the previous packet.
+///
+/// Spec: DHT Hints Profile §9 (publishing): signed by the identity key over BEP 44's buffer, no salt.
+pub fn build_payload(key: &crate::keys::KeyPair, endpoints: &[PublishEndpoint], ttl: u32, ts: u64, foreign: &[ForeignRecord]) -> Result<Vec<u8>, &'static str> {
+    if endpoints.is_empty() || ttl > MAX_TTL {
+        return Err("an endpoint and a TTL of at most 3600 s are required");
+    }
+    build_zone(key, &endpoint_records(endpoints, ttl), ts, foreign)
+}
+
+/// Build and sign an identity's pointer: one `_dsip-devices` record per device (`dev=<did:key>`), `ttl` ≤ 604,800.
+///
+/// Spec: DHT Hints Profile §9.1 (pointer), signed by the identity key.
+pub fn build_pointer_payload(identity: &crate::keys::KeyPair, devices: &[String], ttl: u32, ts: u64, foreign: &[ForeignRecord]) -> Result<Vec<u8>, &'static str> {
+    if devices.is_empty() || ttl > POINTER_MAX_TTL {
+        return Err("at least one device and a TTL of at most 604,800 s are required");
+    }
+    let own: Vec<OwnRecord> = devices.iter().map(|d| (&b"_dsip-devices"[..], vec![format!("dev={d}").into_bytes()], ttl)).collect();
+    build_zone(identity, &own, ts, foreign)
+}
+
+/// Build and sign a device's zone: its `_dsip` endpoint records and its `_dsip-delegation` record (the compact
+/// delegation split into 255-byte strings), all with `ttl` ≤ 3600.
+///
+/// Spec: DHT Hints Profile §9.1 (device hint), signed by the device key.
+pub fn build_device_payload(
+    device: &crate::keys::KeyPair,
+    endpoints: &[PublishEndpoint],
+    delegation: &str,
+    ttl: u32,
+    ts: u64,
+    foreign: &[ForeignRecord],
+) -> Result<Vec<u8>, &'static str> {
+    if endpoints.is_empty() || ttl > MAX_TTL {
+        return Err("an endpoint and a TTL of at most 3600 s are required");
+    }
+    let mut own = endpoint_records(endpoints, ttl);
+    own.push((&b"_dsip-delegation"[..], delegation.as_bytes().chunks(255).map(<[u8]>::to_vec).collect(), ttl));
+    build_zone(device, &own, ts, foreign)
 }
 
 fn hexv(v: &Value) -> Vec<u8> {
@@ -536,6 +720,7 @@ pub fn run_vector(v: &Value) -> Value {
             let msg = bep44_signable(i["seq"].as_u64().unwrap_or(0), &hexv(&i["value"]), &hexv(&i["salt"]));
             json!({"valid": key.is_some_and(|k| verify(&k, &msg, &hexv(&i["signature"])))})
         }
+        "devices" => devices(i),
         "carry" => match carry(i["zone"].as_str().unwrap_or(""), &hexv(&i["dns"])) {
             Ok(keep) => json!({"keep": keep.iter().map(|(labels, t, ttl, rdata)| {
                 let mut w = vec![];
@@ -583,5 +768,30 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].3, vec![5, b'h', b'e', b'l', b'l', b'o']);
         assert!(build_payload(&key, &eps, 7200, ts, &[]).is_err());
+    }
+
+    #[test]
+    fn multi_device_pointer_and_device_zone_round_trip() {
+        let identity = KeyPair::from_seed([1u8; 32]);
+        let phone = KeyPair::from_seed([2u8; 32]);
+        let (did, dev) = (identity.did(), phone.did());
+        let now = 1_790_000_000i64;
+        let ts = (now as u64 - 10) * 1_000_000;
+        let deleg = crate::envelope::sign(
+            &crate::delegation::delegation_payload(&did, &dev, now - 60, now + 7 * 86_400, &["dsip.signaling", "dsip.media.interactive", "dsip.messaging"]),
+            &identity,
+            &identity.kid(),
+        );
+        let compact = format!("{}.{}.{}", deleg.protected, deleg.payload, deleg.signature);
+        let ptr = build_pointer_payload(&identity, std::slice::from_ref(&dev), POINTER_MAX_TTL, ts, &[]).unwrap();
+        let ep = PublishEndpoint { uri: "wss://relay.example/dsip".into(), bindings: vec!["ws/1.0".into()], service: None };
+        let zone = build_device_payload(&phone, &[ep], &compact, 3600, ts, &[]).unwrap();
+        assert!(zone.len() <= 1072, "a real delegation fits: {} bytes", zone.len());
+        let out = devices(&json!({"did": did, "payload": hex(&ptr), "devices": {dev.clone(): hex(&zone)}, "now": now}));
+        assert_eq!(out["outcome"], "devices", "{out}");
+        assert_eq!(out["devices"][0]["outcome"], "hint", "{out}");
+        assert_eq!(out["devices"][0]["endpoints"][0]["uri"], "wss://relay.example/dsip");
+        // re-publishing carries nothing of its own records over
+        assert!(carry(&z32_encode(&phone.public()), &zone[72..]).unwrap().is_empty());
     }
 }

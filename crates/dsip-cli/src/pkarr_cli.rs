@@ -98,14 +98,17 @@ impl Pkarr {
         out
     }
 
-    /// Publish this identity's `_dsip` endpoint at `relay_uri` to every source, signed by the identity key.
+    /// Publish a zone signed by `key`: start from the newest packet of its own (one slot per key), keep the foreign
+    /// records, stay above its timestamp, then `build(ts, foreign)` and store it on every source. Returns the `ts`.
     ///
     /// Spec: DHT Hints Profile §9 (publishing).
-    pub async fn publish(&self, id: &Identity, relay_uri: &str, ttl: u32) -> Result<()> {
-        let key = &id.controller;
+    async fn publish_zone(
+        &self,
+        key: &dsip_core::keys::KeyPair,
+        build: impl Fn(u64, &[pkarr::ForeignRecord]) -> Result<Vec<u8>, &'static str>,
+    ) -> Result<(u64, Vec<String>)> {
         let public = key.public();
         let z32 = pkarr::z32_encode(&public);
-        // one slot per key: start from the newest packet of our own, keep its foreign records, stay above its ts
         let mut prev_ts = 0u64;
         let mut foreign = vec![];
         for c in self.candidates(&public).await {
@@ -121,8 +124,7 @@ impl Pkarr {
         }
         let ts = pkarr::next_ts(now_us(), (prev_ts > 0).then_some(prev_ts))
             .context("this key's timestamps are exhausted (above 2^53−1 µs): nothing can be signed")?;
-        let ep = PublishEndpoint { uri: relay_uri.to_string(), bindings: vec!["ws/1.0".into()], service: None };
-        let payload = pkarr::build_payload(key, &[ep], ttl, ts, &foreign).map_err(|e| anyhow::anyhow!(e))?;
+        let payload = build(ts, &foreign).map_err(|e| anyhow::anyhow!(e))?;
         let mut stored = vec![];
         for r in &self.relays {
             let resp = self.http.put(format!("{}/{z32}", r.trim_end_matches('/'))).body(payload.clone()).send().await;
@@ -140,9 +142,48 @@ impl Pkarr {
                 Err(e) => println!("hint       mainline DHT put failed: {e}"),
             }
         }
-        anyhow::ensure!(!stored.is_empty(), "no Pkarr relay or DHT stored the hint");
+        anyhow::ensure!(!stored.is_empty(), "no Pkarr relay or DHT stored the packet");
+        Ok((ts, stored))
+    }
+
+    /// Publish this identity's `_dsip` endpoint at `relay_uri` to every source, signed by the identity key.
+    ///
+    /// Spec: DHT Hints Profile §9 (publishing).
+    pub async fn publish(&self, id: &Identity, relay_uri: &str, ttl: u32) -> Result<()> {
+        let ep = PublishEndpoint { uri: relay_uri.to_string(), bindings: vec!["ws/1.0".into()], service: None };
+        let key = &id.controller;
+        let (ts, stored) = self.publish_zone(key, |ts, foreign| pkarr::build_payload(key, std::slice::from_ref(&ep), ttl, ts, foreign)).await?;
         println!("hint       pkarr published {relay_uri}  seq {ts}  ttl {ttl} s  to {}   §8.5 signed by the identity key",
                  stored.join(", "));
+        Ok(())
+    }
+
+    /// Publish this **device's** zone: its endpoint at `relay_uri` and its delegation, signed by the device key, so
+    /// the identity key can stay offline.
+    ///
+    /// Spec: DHT Hints Profile §9.1 (device hint).
+    pub async fn publish_device(&self, id: &Identity, relay_uri: &str, ttl: u32) -> Result<()> {
+        let ep = PublishEndpoint { uri: relay_uri.to_string(), bindings: vec!["ws/1.0".into()], service: None };
+        let d = &id.delegation;
+        let compact = format!("{}.{}.{}", d.protected, d.payload, d.signature);
+        let key = &id.device;
+        let (ts, stored) = self
+            .publish_zone(key, |ts, foreign| pkarr::build_device_payload(key, std::slice::from_ref(&ep), &compact, ttl, ts, foreign))
+            .await?;
+        println!("hint       pkarr published device zone {relay_uri}  seq {ts}  ttl {ttl} s  to {}   §9.1 signed by the device key, with its delegation",
+                 stored.join(", "));
+        Ok(())
+    }
+
+    /// Publish this identity's pointer to its devices, signed by the identity key (§9.1). Done rarely: it lives up
+    /// to 7 days.
+    ///
+    /// Spec: DHT Hints Profile §9.1 (pointer).
+    pub async fn publish_pointer(&self, id: &Identity, devices: &[String], ttl: u32) -> Result<()> {
+        let key = &id.controller;
+        let (ts, stored) = self.publish_zone(key, |ts, foreign| pkarr::build_pointer_payload(key, devices, ttl, ts, foreign)).await?;
+        println!("pointer    pkarr published {} device(s)  seq {ts}  ttl {ttl} s  to {}   §9.1 signed by the identity key",
+                 devices.len(), stored.join(", "));
         Ok(())
     }
 
@@ -160,6 +201,8 @@ impl Pkarr {
                         best = Some((h, c.source));
                     }
                 }
+                // a zone holding only a pointer (§9.1) has no `_dsip` endpoints: not a rejection, the next step reads it
+                Err(e) if e.0 == "no-endpoints" => {}
                 Err(e) => println!("hint       {}: rejected ({})", c.source, e.0),
             }
         }
@@ -167,8 +210,52 @@ impl Pkarr {
             let uri = h.endpoints.first().and_then(|e| e["uri"].as_str()).unwrap_or("-");
             println!("hint       pkarr {uri}  seq {}  expires in {} s  from {source}, signed by the identity key   §8.1 hint, not authority",
                      h.seq, h.expires_at - now_s());
+            return Ok(best.map(|(h, _)| h));
         }
-        Ok(best.map(|(h, _)| h))
+        self.discover_devices(did, &key).await
+    }
+
+    /// §9.1: the identity's pointer (newest valid one), then each listed device's own zone, in order; the first
+    /// device whose hint and delegation verify gives the hint.
+    ///
+    /// Spec: DHT Hints Profile §9.1 (reading).
+    async fn discover_devices(&self, did: &str, key: &[u8; 32]) -> Result<Option<Hint>> {
+        let now = now_s();
+        let mut pointer: Option<pkarr::Pointer> = None;
+        for c in self.candidates(key).await {
+            if let Ok(p) = pkarr::read_pointer(did, &c.payload, now) {
+                if pointer.as_ref().is_none_or(|b| p.seq > b.seq) {
+                    pointer = Some(p);
+                }
+            }
+        }
+        let Some(ptr) = pointer else { return Ok(None) };
+        println!("pointer    pkarr lists {} device(s), expires in {} s   §9.1 signed by the identity key", ptr.devices.len(), ptr.expires_at - now);
+        for dev in &ptr.devices {
+            let Some(dkey) = dsip_core::did::public_from_did_key(dev) else { continue };
+            let mut best: Option<(u64, Vec<serde_json::Value>, i64)> = None;
+            let mut last_err = String::from("unavailable");
+            for c in self.candidates(&dkey).await {
+                match pkarr::read_device(did, dev, &c.payload, now, &[]) {
+                    Ok((eps, exp)) => {
+                        let seq = u64::from_be_bytes(c.payload[64..72].try_into().unwrap_or_default());
+                        if best.as_ref().is_none_or(|(s, _, _)| seq > *s) {
+                            best = Some((seq, eps, exp));
+                        }
+                    }
+                    Err(e) => last_err = e,
+                }
+            }
+            match best {
+                Some((seq, eps, exp)) => {
+                    let uri = eps.first().and_then(|e| e["uri"].as_str()).unwrap_or("-").to_string();
+                    println!("hint       pkarr device {}…  {uri}  expires in {} s   §9.1 signed by the device, delegation verified", &dev[..20], exp - now);
+                    return Ok(Some(Hint { subject: did.to_string(), seq, issued_at: (seq / 1_000_000) as i64, expires_at: exp, endpoints: eps }));
+                }
+                None => println!("hint       pkarr device {}…: not usable ({last_err})", &dev[..20]),
+            }
+        }
+        Ok(None)
     }
 }
 
