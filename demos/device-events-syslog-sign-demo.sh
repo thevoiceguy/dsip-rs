@@ -9,7 +9,9 @@
 # - a Certificate Block in three fragments establishes the session; two linkDowns, then their Signature Block, reach
 #   Ann as syslog-signed with message numbers 1 and 2;
 # - a message claiming to be from the signer's host but never signed is deposited after the hold as syslog-udp;
-# - a Signature Block from another key is refused (bad-signature), and the message it lists stays unsigned.
+# - a Signature Block from another key is refused (bad-signature), and the message it lists stays unsigned;
+# - (v0.11) gaps: the refused block's number was never covered by a verified block, and a lost message is signed but
+#   never arrives — each raises dsip-syslog-gap, one alarm counted twice.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -42,7 +44,7 @@ for k in sw1 rogue; do openssl gendsa -out "$P/$k.key" "$P/params.pem" 2>/dev/nu
 openssl req -x509 -new -key "$P/sw1.key" -sha256 -days 2 -subj "/CN=sw1.example" -out "$P/sw1.pem" 2>/dev/null
 openssl req -x509 -new -key "$P/rogue.key" -sha256 -days 2 -subj "/CN=sw1.example" -out "$P/rogue.pem" 2>/dev/null
 KEY_SHA=$(openssl x509 -in "$P/sw1.pem" -outform DER | sha256sum | cut -c1-64)
-echo "[{\"hostname\": \"sw1.example\", \"certificate\": \"$P/sw1.pem\"}]" > "$DIR/signers.json"
+echo "[{\"hostname\": \"sw1.example\", \"certificate\": \"$P/sw1.pem\", \"gaps\": true}]" > "$DIR/signers.json"
 cat > "$DIR/rules.json" <<'EOF'
 [{"syslog": {"app_name": "linkd", "msgid": "LINKDOWN"}, "action": "raise", "type": "link-down", "severity": "major",
   "resource_sd": {"id": "if@32473", "param": "ifIndex"}}]
@@ -110,7 +112,22 @@ wait_for "$DIR/n.log" "^EVENT .*basis=syslog-udp .*port 8 down" 20
 ! grep -E "basis=syslog-signed.*port [78] down" "$DIR/n.log" || fail "an unsigned message was deposited as signed"
 [ "$(count "$DIR/n.log" "basis=syslog-signed")" = 2 ] || fail "expected exactly two signed events"
 
+echo "=== (v0.11) gaps: message 4 is lost on the way, 5 arrives; their Signature Block covers 4–5 (3 was never covered)"
+send msg linkd LINKDOWN "port 9 down" --sd '[if@32473 ifIndex="9"]' --lose
+send msg linkd LINKDOWN "port 10 down" --sd '[if@32473 ifIndex="10"]'
+send --key "$P/sw1.key" sign
+wait_for "$DIR/g.log" "^SYSLOG-SIGN gap sw1.example/syslogd/0/0 rsid 1: messages 3–3 lost" 10
+wait_for "$DIR/n.log" "^EVENT .*basis=syslog-signed .*#5 .*port 10 down" 20
+wait_for "$DIR/g.log" "^SYSLOG-SIGN gap sw1.example/syslogd/0/0 rsid 1: messages 4–4 lost" 15
+grep "^SYSLOG-SIGN gap" "$DIR/g.log" | sed 's/^/  gateway: /'
+wait_for "$DIR/n.log" "^EVENT .*basis=gateway .*syslog_gap=sw1.example/syslogd rsid=1 sg=0 spri=0 lost=4–4" 20
+grep "syslog_gap=" "$DIR/n.log" | cut -c1-170 | sed 's/^/  ann sees: /'
+wait_for "$DIR/n.log" "^ALARM raised sw1.example/dsip-syslog-gap severity=warning" 10
+[ "$(count "$DIR/n.log" "^ALARM raised sw1.example/dsip-syslog-gap")" = 1 ] || fail "the gaps were more than one alarm"
+echo "  one dsip-syslog-gap alarm for the signer, raised by the first gap and repeated by the second"
+
 echo
 echo "PASS: two messages held until their verified Signature Block became syslog-signed events with their signer,"
 echo "      session and message numbers; an unsigned message from the signer's host and one listed by a foreign"
-echo "      key were deposited as syslog-udp, after the hold — never as signed."
+echo "      key were deposited as syslog-udp, after the hold — never as signed; and the numbers that never arrived or"
+echo "      were never covered raised one dsip-syslog-gap alarm."

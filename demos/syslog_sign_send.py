@@ -36,6 +36,7 @@ a.add_argument("cmd", choices=["cert", "msg", "sign"])
 a.add_argument("rest", nargs="*")
 a.add_argument("--fragment", type=int, default=0)
 a.add_argument("--sd", default="-")
+a.add_argument("--lose", action="store_true", help="msg: record its hash but do not send it (a lost message)")
 args = a.parse_args()
 
 host, port = args.to.rsplit(":", 1)
@@ -76,9 +77,10 @@ if args.cmd == "cert":
 elif args.cmd == "msg":
     app, msgid, text = args.rest
     m = f"<187>1 {now} {args.hostname} {app} - {msgid} {args.sd} {text}".encode()
-    send(m)
+    if not args.lose:
+        send(m)
     st["pending"].append(base64.b64encode(hashlib.sha256(m).digest()).decode())
-    print(f"SENT message {st['next'] + len(st['pending']) - 1}: {text}")
+    print(f"{'LOST' if args.lose else 'SENT'} message {st['next'] + len(st['pending']) - 1}: {text}")
 else:
     hb = st["pending"]
     send(block("ssign", [("RSID", st["rsid"]), ("SG", 0), ("SPRI", 0), ("GBC", st["gbc"]), ("FMN", st["next"]),

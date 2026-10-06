@@ -175,7 +175,8 @@ struct Args {
     syslog_tls_names: Option<PathBuf>,
     /// Signed syslog (RFC 5848; E§3, v0.10): the signers whose messages are held until a verified Signature Block
     /// lists them. A JSON array of `{"hostname", "certificate": "<PEM path>"}` (key blob type C, a DSA certificate)
-    /// or `{"hostname", "key": "<base64 of the four MPIs p, q, g, y>"}` (type K).
+    /// or `{"hostname", "key": "<base64 of the four MPIs p, q, g, y>"}` (type K). Add `"gaps": true` when this
+    /// gateway receives all of the signer's messages, to raise `dsip-syslog-gap` for lost ones (E§3, v0.11).
     #[arg(long)]
     syslog_signers: Option<PathBuf>,
     /// How long a signer's message waits for its Signature Block before it is deposited unsigned (E§3).
@@ -389,6 +390,8 @@ struct Client {
     /// E§3 signed syslog: the collector, its clock, and each held message's transport (address, TLS certificate).
     syslog_sign: Option<(dsip_events::syslog_sign::Collector, i64)>,
     syslog_held: HashMap<String, std::collections::VecDeque<(std::net::SocketAddr, Option<String>)>>,
+    /// The address each signer HOSTNAME (lowercase) last sent from, for a gap found by the clock (E§5).
+    syslog_signer_at: HashMap<String, std::net::SocketAddr>,
     held_events: HashMap<(String, String, String), Value>,
     tls_names: Value,
     rec_accepted: BTreeMap<String, std::collections::BTreeSet<String>>,
@@ -2266,6 +2269,9 @@ impl Client {
     async fn syslog_in(&mut self, message: &[u8], from: std::net::SocketAddr, certificate: Option<String>) -> Result<()> {
         let Some((col, _)) = self.syslog_sign.as_mut() else { return self.syslog_event(message, from, certificate, None).await };
         let outs = col.receive(message);
+        if let Some(h) = dsip_events::syslog::parse_syslog(message)["syslog"]["hostname"].as_str() {
+            self.syslog_signer_at.insert(h.to_ascii_lowercase(), from);
+        }
         if outs.is_empty() {
             // E§3: held for its Signature Block; remember how it came, for an unsigned deposit later
             use sha2::Digest as _;
@@ -2297,6 +2303,20 @@ impl Client {
                                             s["hostname"].as_str().unwrap_or(""), s["app_name"].as_str().unwrap_or(""),
                                             s["procid"].as_str().unwrap_or(""), s["rsid"], &s["key_sha256"].as_str().unwrap_or("")[..16]),
                 Out::Refused(r) => println!("SYSLOG-SIGN {} refused: {}", r["block"].as_str().unwrap_or(""), r["reason"].as_str().unwrap_or("")),
+                Out::Gap(g) => {
+                    // E§3/E§5 (v0.11): a gateway event raising (signer, dsip-syslog-gap, "app/sg/spri")
+                    let host = g["hostname"].as_str().unwrap_or("").to_ascii_lowercase();
+                    let address = current.as_ref().map(|(a, _)| *a).or_else(|| self.syslog_signer_at.get(&host).copied())
+                        .map(|a| a.ip().to_string()).unwrap_or_default();
+                    let (from, to) = (g["from"].as_u64().unwrap_or(0), g["to"].as_u64().unwrap_or(0));
+                    let qualifier = format!("{}/{}/{}", g["app_name"].as_str().unwrap_or(""), g["sg"], g["spri"]);
+                    println!("SYSLOG-SIGN gap {}/{} rsid {}: messages {from}–{to} lost   E§3", g["hostname"].as_str().unwrap_or(""),
+                             qualifier, g["rsid"]);
+                    let event = json!({"source": {"address": address, "basis": "gateway"}, "syslog_gap": g,
+                                       "alarm": {"resource": g["hostname"], "type": "dsip-syslog-gap", "qualifier": qualifier,
+                                                 "severity": "warning", "cleared": false, "text": format!("messages {from}–{to} lost")}});
+                    self.deposit_event(event).await?;
+                }
             }
         }
         Ok(())
@@ -3272,6 +3292,7 @@ async fn main() -> Result<()> {
             None => None,
         },
         syslog_held: HashMap::new(),
+        syslog_signer_at: HashMap::new(),
         held_events: HashMap::new(),
         tls_names: match &args.syslog_tls_names {
             Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?).context("--syslog-tls-names")?,
@@ -3936,9 +3957,11 @@ fn syslog_signers(path: &Path) -> Result<Value> {
         if let Some(pem) = s["certificate"].as_str() {
             let der = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(pem)?)).next()
                 .context("--syslog-signers: no certificate in the PEM file")??;
-            out.push(json!({"hostname": host, "type": "C", "key": base64::engine::general_purpose::STANDARD.encode(der.as_ref())}));
+            out.push(json!({"hostname": host, "type": "C", "key": base64::engine::general_purpose::STANDARD.encode(der.as_ref()),
+                            "gaps": s["gaps"] == true}));
         } else {
-            out.push(json!({"hostname": host, "type": "K", "key": s["key"].as_str().context("--syslog-signers: certificate or key")?}));
+            out.push(json!({"hostname": host, "type": "K", "key": s["key"].as_str().context("--syslog-signers: certificate or key")?,
+                            "gaps": s["gaps"] == true}));
         }
     }
     println!("GATEWAY syslog-sign: {} signer(s)   RFC 5848", out.len());
@@ -4013,6 +4036,11 @@ fn render_event(ev: &Value) -> String {
     } else if let Some(sl) = raw.get("syslog") {
         out += &format!(" syslog={} severity={} app={} msg={:?}", sl["format"].as_str().unwrap_or(""), sl["severity"],
                         sl["app_name"].as_str().unwrap_or("-"), sl["msg"].as_str().unwrap_or(""));
+    }
+    // E§5 (v0.11): a signed-syslog gap, the gateway's own observation
+    if let Some(g) = ev.get("syslog_gap") {
+        out += &format!(" syslog_gap={}/{} rsid={} sg={} spri={} lost={}–{}", g["hostname"].as_str().unwrap_or(""),
+                        g["app_name"].as_str().unwrap_or(""), g["rsid"], g["sg"], g["spri"], g["from"], g["to"]);
     }
     out
 }
