@@ -430,7 +430,7 @@ pub fn foreign_records(key: &[u8; 32], payload: &[u8]) -> Vec<ForeignRecord> {
 pub fn next_ts(clock: u64, previous: Option<u64>) -> Option<u64> {
     let ts = previous.map_or(clock, |p| clock.max(p.saturating_add(1)));
     // above 2^53−1 every reader rejects it (`check: "hint"`): sign nothing
-    (ts <= (1u64 << 53) - 1).then_some(ts)
+    (ts < (1u64 << 53)).then_some(ts)
 }
 
 /// Build and sign a relay payload (`signature ‖ ts ‖ dns`) publishing `endpoints` as `_dsip` TXT records with `ttl`
