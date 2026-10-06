@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 const WINDOW: i64 = 150;
-const MAX31: i64 = (1 << 31) - 1;
+pub(crate) const MAX31: i64 = (1 << 31) - 1;
 /// `usmStatsNotInTimeWindows.0`.
 const NOT_IN_TIME_WINDOWS: &str = "1.3.6.1.6.3.15.1.1.2.0";
 /// `usmStatsUnknownEngineIDs.0`.
@@ -150,11 +150,11 @@ pub fn usm_key(i: &Value) -> Value {
     json!({"auth_key": hex(&k), "priv_key": hex(&k[..16])})
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }
@@ -163,22 +163,22 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 
 // --- BER, strictly as the README states it ---------------------------------------------------------
 
-struct Malformed;
-type R<T> = Result<T, Malformed>;
+pub(crate) struct Malformed;
+pub(crate) type R<T> = Result<T, Malformed>;
 
-struct Rd<'a> {
-    b: &'a [u8],
-    pos: usize,
-    end: usize,
+pub(crate) struct Rd<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) pos: usize,
+    pub(crate) end: usize,
 }
 
 impl<'a> Rd<'a> {
-    fn new(b: &'a [u8], start: usize, end: usize) -> Self {
+    pub(crate) fn new(b: &'a [u8], start: usize, end: usize) -> Self {
         Rd { b, pos: start, end }
     }
 
     /// (tag, content start, content end).
-    fn next(&mut self) -> R<(u8, usize, usize)> {
+    pub(crate) fn next(&mut self) -> R<(u8, usize, usize)> {
         if self.pos + 2 > self.end {
             return Err(Malformed);
         }
@@ -206,7 +206,7 @@ impl<'a> Rd<'a> {
         Ok((tag, off, off + n))
     }
 
-    fn expect(&mut self, tag: u8) -> R<(usize, usize)> {
+    pub(crate) fn expect(&mut self, tag: u8) -> R<(usize, usize)> {
         let (t, s, e) = self.next()?;
         if t != tag {
             return Err(Malformed);
@@ -214,21 +214,21 @@ impl<'a> Rd<'a> {
         Ok((s, e))
     }
 
-    fn int(&mut self) -> R<i64> {
+    pub(crate) fn int(&mut self) -> R<i64> {
         let (s, e) = self.expect(0x02)?;
         ber_int(&self.b[s..e])
     }
 
-    fn octets(&mut self) -> R<&'a [u8]> {
+    pub(crate) fn octets(&mut self) -> R<&'a [u8]> {
         let (s, e) = self.expect(0x04)?;
         Ok(&self.b[s..e])
     }
 
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.pos >= self.end
     }
 
-    fn finish(&self) -> R<()> {
+    pub(crate) fn finish(&self) -> R<()> {
         if self.done() {
             Ok(())
         } else {
@@ -264,7 +264,7 @@ fn u32_value(c: &[u8]) -> R<u64> {
     Ok(v)
 }
 
-fn ranged(v: i64, lo: i64, hi: i64) -> R<i64> {
+pub(crate) fn ranged(v: i64, lo: i64, hi: i64) -> R<i64> {
     if (lo..=hi).contains(&v) {
         Ok(v)
     } else {
@@ -325,15 +325,15 @@ fn ber_value(tag: u8, c: &[u8]) -> R<(&'static str, String)> {
 }
 
 /// A decoded PDU: its tag, request id, and varbinds (README shape).
-struct Pdu {
-    tag: u8,
-    request_id: i64,
-    varbinds: Vec<Value>,
+pub(crate) struct Pdu {
+    pub(crate) tag: u8,
+    pub(crate) request_id: i64,
+    pub(crate) varbinds: Vec<Value>,
     /// The raw varbind-list SEQUENCE (tag, length and content), echoed in a Response.
-    varbind_bytes: Vec<u8>,
+    pub(crate) varbind_bytes: Vec<u8>,
 }
 
-fn scoped_content(b: &[u8], s: usize, e: usize) -> R<Pdu> {
+pub(crate) fn scoped_content(b: &[u8], s: usize, e: usize) -> R<Pdu> {
     let mut q = Rd::new(b, s, e);
     q.octets()?;
     q.octets()?;
@@ -764,7 +764,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let n = body.len();
     if n < 0x80 {
@@ -778,7 +778,7 @@ fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn int(v: i64) -> Vec<u8> {
+pub(crate) fn int(v: i64) -> Vec<u8> {
     let bytes = v.to_be_bytes();
     let mut i = 0;
     while i < 7 && ((bytes[i] == 0 && bytes[i + 1] & 0x80 == 0) || (bytes[i] == 0xff && bytes[i + 1] & 0x80 != 0)) {
@@ -795,7 +795,7 @@ fn uint_body(v: u64) -> Vec<u8> {
     b
 }
 
-fn oid_tlv(oid: &str) -> Vec<u8> {
+pub(crate) fn oid_tlv(oid: &str) -> Vec<u8> {
     let p: Vec<u64> = oid.split('.').filter_map(|x| x.parse().ok()).collect();
     let mut subs = vec![p[0] * 40 + p[1]];
     subs.extend_from_slice(&p[2..]);

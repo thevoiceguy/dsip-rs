@@ -4,8 +4,8 @@
 //! Spec: sections owned by this crate — E§3 (a received notification becomes an event: RFC 3584 §3.1
 //! translation, the community never carried, the syslog severity table — [`normalize_trap`],
 //! [`syslog_severity`]), E§4 (the rule table — [`map_alarm`]), E§5 and E§6 (the alarm list and the
-//! escalation trigger — [`AlarmList`]), and the inputs beyond v1/v2c: SNMPv3 with USM ([`usm`]) and
-//! syslog ([`syslog`]).
+//! escalation trigger — [`AlarmList`]), and the inputs beyond v1/v2c: SNMPv3 with USM ([`usm`]), SNMPv3
+//! over TLS with TSM ([`tsm`]) and syslog ([`syslog`]).
 //!
 //! Impl (spec-gap 103): a re-raise reopens the same alarm and resets its operator state; the syslog
 //! default table; escalation is run by a member (the agent), never by a mailbox. Every rule is pinned
@@ -16,6 +16,7 @@
 
 pub mod ber;
 pub mod syslog;
+pub mod tsm;
 pub mod usm;
 
 use std::collections::BTreeMap;
@@ -466,6 +467,7 @@ pub fn run_vector(v: &Value) -> Value {
             syslog::parse_syslog(&b)
         }
         Some("usm-key") => usm::usm_key(i),
+        Some("tsm" | "tls-frames" | "tsm-name") => tsm::run_check(i),
         Some(_) => json!({"error": "unknown check"}),
         None if v["context"]["component"] == "snmpv3" => usm::run_trace(v),
         None if v["context"]["component"] == "holddown" => {
