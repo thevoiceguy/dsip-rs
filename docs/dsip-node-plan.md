@@ -23,7 +23,7 @@ tier and nothing more:
 | face | what | spec |
 |---|---|---|
 | **Overlay member** | libp2p Kademlia on `/dsip/hints/0.6`, verify-before-store; device-signed JOSE hints, `did:web` subjects | profile §2–§5 |
-| **Mainline participant** | a BEP 5/44 node on the BitTorrent Mainline DHT (`mainline` crate), in server mode when reachable; it stores and serves Pkarr packets, and refuses any `_dsip` packet that fails profile §9's reader | profile §9, §9.1 |
+| **Mainline participant** | a BEP 5/44 node on the BitTorrent Mainline DHT (`mainline` crate), in server mode when reachable. As a DHT server it stores other nodes' items by BEP 44's own rules, which the crate applies; what it accepts over HTTP passes `check: "store"` first (§3) | profile §9, §9.1 |
 | **HTTP hints API** | lookups and publishes for clients that cannot speak UDP or libp2p (browsers, light clients) | new profile §10 (v0.11) |
 
 The overlay and Mainline faces are the existing code (`dsip-dht::node`, `dsip_cli::pkarr_cli`), hardened and run
@@ -37,7 +37,7 @@ It is plain HTTP/1.1 and HTTP/2 over TLS, or behind a reverse proxy, with
 | method and path | body / answer | notes |
 |---|---|---|
 | `GET /<z32>` | 200 with the Pkarr relay payload (`sig ‖ seq ‖ packet`), or 404 | Pkarr relay compatible: existing Pkarr clients and DSIP's `--pkarr-relay` work unchanged |
-| `PUT /<z32>` | 204, 400 or 409 | Pkarr relay compatible; the payload is verified against the key **and** profile §9's reader before it is stored or put on Mainline. A `seq` not above the held one is 409 (§8.3) |
+| `PUT /<z32>` | 204, 400 or 409 | Pkarr relay compatible. A node serves every application's packets, so it checks what every packet must pass (canonical key, frame, signature, timestamp, DNS) and §8.3's `ts` rule (`check: "store"`), then puts it on Mainline. `_dsip` content is judged by readers |
 | `GET /dsip/v1/hints/<did>` | `{"hints": ["<frame>", …]}` | overlay hints for a DID; every frame verified, expired ones dropped |
 | `POST /dsip/v1/hints` | a frame; 202 or 400 | verified, stored, put on the overlay |
 | `GET /dsip/v1/node` | `{peer_id, overlay: {peers, records}, mainline: {routing, server_mode}, version}` | for operators and directories |
