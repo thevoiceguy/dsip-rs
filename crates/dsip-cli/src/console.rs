@@ -329,7 +329,10 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     republish.tick().await;
     if opts.publish_pkarr {
         let Some(p) = &pkarr else { anyhow::bail!("--publish-pkarr needs --pkarr-relay <https://…> or --mainline") };
-        p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await?;
+        // a hint is best-effort (§8.1): a failed publish is reported and tried again at the next re-sign
+        if let Err(e) = p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await {
+            println!("hint       pkarr publish failed, retrying at the next re-sign: {e}");
+        }
     }
 
     // command source: script or stdin
@@ -621,8 +624,11 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     crate::hints::publish(h, &Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl).await?;
                 }
                 if let (true, Some(p)) = (opts.publish_pkarr, &pkarr) {
-                    // DHT Hints Profile §9: the identity key re-signs before expires_at (re-announcing never extends it)
-                    p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await?;
+                    // DHT Hints Profile §9: the identity key re-signs before expires_at (re-announcing never extends it);
+                    // a failed publish is reported and tried again at the next re-sign, never fatal to the session
+                    if let Err(e) = p.publish(&Identity::load(&opts.identity)?, &relay_url, opts.hint_ttl as u32).await {
+                        println!("hint       pkarr publish failed, retrying at the next re-sign: {e}");
+                    }
                 }
             }
             cmd = crx.recv(), if !cmds_closed => {
