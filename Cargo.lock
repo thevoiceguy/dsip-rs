@@ -1346,6 +1346,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "x509-parser 0.17.0",
 ]
 
 [[package]]

@@ -150,6 +150,21 @@ struct Args {
     /// TEST ONLY: a recorder that sends anyway, to show members dropping its content (C§5).
     #[arg(long, hide = true)]
     recorder_misbehave: bool,
+    /// As a gateway, accept SNMPv3 over TLS (RFC 6353, TSM) here — the notification port is 10162 (E§3, v0.10).
+    #[arg(long, requires_all = ["snmp_tls_cert", "snmp_tls_key", "snmp_tls_ca", "snmp_tls_map"])]
+    snmp_tls_listen: Option<String>,
+    /// The gateway's TLS certificate for SNMP over TLS (PEM).
+    #[arg(long)]
+    snmp_tls_cert: Option<PathBuf>,
+    /// Its private key (PEM).
+    #[arg(long)]
+    snmp_tls_key: Option<PathBuf>,
+    /// The CA certificates that device certificates must chain to (PEM).
+    #[arg(long)]
+    snmp_tls_ca: Option<PathBuf>,
+    /// The certificate-to-security-name table (JSON array of `{id, fingerprint, map, data?}`, RFC 6353; E§3).
+    #[arg(long)]
+    snmp_tls_map: Option<PathBuf>,
     /// As a gateway, hold clears this many seconds (E§4 hold-down, v0.10): a re-raise within it cancels the clear, so a
     /// flapping link is one alarm. 0 (the default) turns it off. Events from informs are never held.
     #[arg(long, default_value_t = 0)]
@@ -371,7 +386,9 @@ struct Client {
     usm: Option<dsip_events::usm::UsmReceiver>,
     syslog_table: Value,
     informs: dsip_events::InformTracker,
-    inform_responses: HashMap<(String, i64), (Vec<u8>, std::net::SocketAddr)>,
+    inform_responses: HashMap<(String, i64), (Vec<u8>, ReplyTo)>,
+    /// The gateway's snmpEngineID, for RFC 5343 discovery over TLS (E§3).
+    snmp_engine: Vec<u8>,
     inform_items: HashMap<String, (String, i64)>,
     inform_clock: i64,
     heartbeat: Option<(i64, i64)>,
@@ -2150,6 +2167,44 @@ impl Client {
             let response = dsip_events::ber::inform_response(datagram);
             (trap, json!({"address": address, "basis": basis}), response)
         };
+        self.snmp_event(trap, source, response.map(|r| (r, ReplyTo::Udp(from))), from.to_string()).await
+    }
+
+    /// Gateway mode (E§3, v0.10): one SNMP message from a verified TLS connection. Discovery is answered at once;
+    /// a trap or inform becomes a `device-event` with basis `snmpv3-tls`.
+    async fn snmp_tls_in(&mut self, message: &[u8], from: std::net::SocketAddr, peer: TlsPeer) -> Result<()> {
+        let r = match dsip_events::tsm::receive(message) {
+            Ok(r) => r,
+            Err(reason) => {
+                println!("SNMP tls refused from {from} ({}): {reason}", peer.security_name);
+                return Ok(());
+            }
+        };
+        if r.kind == dsip_events::tsm::Kind::Discovery {
+            let _ = peer.reply.send(r.discovery_response(&self.snmp_engine));
+            println!("SNMP tls discovery from {from} ({}): answered with our engine ID   RFC 5343", peer.security_name);
+            return Ok(());
+        }
+        let mut trap = json!({"version": "v3", "varbinds": r.varbinds});
+        let response = if r.kind == dsip_events::tsm::Kind::Inform {
+            trap["inform"] = json!({"request_id": r.request_id});
+            Some((r.response(), ReplyTo::Tls(peer.reply.clone())))
+        } else {
+            None
+        };
+        // E§2: the authenticated identity is the certificate and the name it mapped to
+        let mut source = json!({"address": from.ip().to_string(), "basis": "snmpv3-tls",
+                                "certificate_sha256": peer.certificate_sha256, "tsm": {"security_name": peer.security_name}});
+        if let Some(name) = self.tls_names.get(&peer.certificate_sha256).and_then(Value::as_str) {
+            source["name"] = json!(name);
+        }
+        // informs are remembered by security name, so a retransmission on a new connection is not stored twice
+        self.snmp_event(trap, source, response, format!("tls:{}", peer.security_name)).await
+    }
+
+    /// A decoded notification → an event: map it, deposit a trap, or run an inform through E§3's memory.
+    async fn snmp_event(&mut self, trap: Value, source: Value, response: Option<(Vec<u8>, ReplyTo)>, from: String) -> Result<()> {
+        let address = source["address"].as_str().unwrap_or("").to_string();
         let raw = dsip_events::normalize_trap(&trap);
         if raw.get("error").is_some() {
             println!("SNMP dropped from {from}: malformed");
@@ -2163,10 +2218,10 @@ impl Client {
             println!("SNMP trap from {from}: {}", raw["snmp"]["trap_oid"].as_str().unwrap_or("-"));
             return self.gateway_deposit(event).await;
         };
-        let key = (from.to_string(), rid);
+        let key = (from.clone(), rid);
         // the response to the latest copy: a v3 retransmission may carry a new msgID, which its sender matches on
         if let Some(resp) = response {
-            self.inform_responses.insert(key.clone(), (resp, from));
+            self.inform_responses.insert(key.clone(), resp);
         }
         let emitted = self.informs.step(&json!({"inform": {"source": key.0, "request_id": rid}}));
         if emitted.is_empty() {
@@ -2241,10 +2296,19 @@ impl Client {
     }
 
     async fn inform_respond(&mut self, key: &(String, i64)) {
-        if let (Some(sock), Some((resp, to))) = (&self.snmp, self.inform_responses.get(key)) {
-            if let Err(e) = sock.send_to(resp, to).await {
-                println!("ERR SNMP response to {to}: {e}");
+        match self.inform_responses.get(key) {
+            Some((resp, ReplyTo::Udp(to))) => {
+                if let Some(sock) = &self.snmp {
+                    if let Err(e) = sock.send_to(resp, to).await {
+                        println!("ERR SNMP response to {to}: {e}");
+                    }
+                }
             }
+            // E§3: on the connection the inform came on
+            Some((resp, ReplyTo::Tls(tx))) if tx.send(resp.clone()).is_err() => {
+                println!("ERR SNMP response for {}: the TLS connection is gone", key.0);
+            }
+            _ => {}
         }
     }
 
@@ -3163,6 +3227,10 @@ async fn main() -> Result<()> {
         },
         informs: dsip_events::InformTracker::new(&json!({"now": now_s()})),
         inform_responses: HashMap::new(),
+        snmp_engine: match (&args.snmp_tls_listen, &args.snmp_users) {
+            (Some(_), _) | (_, Some(_)) => snmp_engine_id(&args.state, args.snmp_engine_id.as_deref())?.0,
+            _ => vec![],
+        },
         inform_items: HashMap::new(),
         inform_clock: now_s(),
         heartbeat: args.heartbeat.map(|n| (n, 0)),
@@ -3253,9 +3321,22 @@ async fn main() -> Result<()> {
     }
     if let Some(a) = &args.syslog_tls_listen {
         let l = tokio::net::TcpListener::bind(a).await.with_context(|| format!("binding {a}"))?;
-        let cfg = syslog_tls_config(args.syslog_tls_cert.as_deref(), args.syslog_tls_key.as_deref(), args.syslog_tls_ca.as_deref())?;
+        let cfg = tls_server_config("syslog-tls", args.syslog_tls_cert.as_deref(), args.syslog_tls_key.as_deref(), args.syslog_tls_ca.as_deref())?;
         println!("GATEWAY listening for syslog on tls {} (client certificates required)", l.local_addr()?);
         spawn_syslog_tls(l, cfg, gw_tx.clone());
+    }
+    if let Some(a) = &args.snmp_tls_listen {
+        let l = tokio::net::TcpListener::bind(a).await.with_context(|| format!("binding {a}"))?;
+        let cfg = tls_server_config("snmp-tls", args.snmp_tls_cert.as_deref(), args.snmp_tls_key.as_deref(), args.snmp_tls_ca.as_deref())?;
+        let ca_path = args.snmp_tls_ca.as_deref().context("--snmp-tls-ca")?;
+        let cas = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(ca_path)?))
+            .map(|c| c.map(|c| c.as_ref().to_vec())).collect::<Result<Vec<_>, _>>()?;
+        let map_path = args.snmp_tls_map.as_deref().context("--snmp-tls-map")?;
+        let table: Value = serde_json::from_str(&std::fs::read_to_string(map_path)?).context("--snmp-tls-map")?;
+        anyhow::ensure!(table.is_array(), "--snmp-tls-map: a JSON array of rows");
+        println!("GATEWAY listening for SNMP on tls {} (client certificates required, {} name row(s))   RFC 6353",
+                 l.local_addr()?, table.as_array().map_or(0, Vec::len));
+        spawn_snmp_tls(l, cfg, cas, table, gw_tx.clone());
     }
     drop(gw_tx);
     loop {
@@ -3276,6 +3357,7 @@ async fn main() -> Result<()> {
                 let r = match input {
                     GatewayInput::Snmp(d, from) => client.snmp_in(&d, from).await,
                     GatewayInput::Syslog(d, from, cert) => client.syslog_in(&d, from, cert).await,
+                    GatewayInput::SnmpTls(d, from, peer) => client.snmp_tls_in(&d, from, peer).await,
                 };
                 if let Err(e) = r {
                     println!("ERR {e}");
@@ -3579,6 +3661,22 @@ enum GatewayInput {
     Snmp(Vec<u8>, std::net::SocketAddr),
     /// A syslog message, with the SHA-256 of the device's verified TLS certificate when it came over TLS.
     Syslog(Vec<u8>, std::net::SocketAddr, Option<String>),
+    /// An SNMP message from a TLS connection (E§3, v0.10), with the connection's verified peer.
+    SnmpTls(Vec<u8>, std::net::SocketAddr, TlsPeer),
+}
+
+/// A verified SNMP-over-TLS connection: its certificate, the security name it mapped to, and the way back.
+#[derive(Clone)]
+struct TlsPeer {
+    certificate_sha256: String,
+    security_name: String,
+    reply: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+/// Where an inform's Response goes.
+enum ReplyTo {
+    Udp(std::net::SocketAddr),
+    Tls(tokio::sync::mpsc::UnboundedSender<Vec<u8>>),
 }
 
 fn spawn_udp(sock: std::sync::Arc<tokio::net::UdpSocket>, tx: tokio::sync::mpsc::UnboundedSender<GatewayInput>, syslog: bool) {
@@ -3598,9 +3696,10 @@ fn spawn_udp(sock: std::sync::Arc<tokio::net::UdpSocket>, tx: tokio::sync::mpsc:
 const SYSLOG_TLS_MAX: usize = 65536;
 
 /// TLS for syslog (RFC 5425): the gateway's certificate, and client certificates required, chaining to `ca`.
-fn syslog_tls_config(cert: Option<&Path>, key: Option<&Path>, ca: Option<&Path>) -> Result<std::sync::Arc<tokio_rustls::rustls::ServerConfig>> {
+fn tls_server_config(flag: &str, cert: Option<&Path>, key: Option<&Path>, ca: Option<&Path>) -> Result<std::sync::Arc<tokio_rustls::rustls::ServerConfig>> {
     use tokio_rustls::rustls;
-    let (cert, key, ca) = (cert.context("--syslog-tls-cert")?, key.context("--syslog-tls-key")?, ca.context("--syslog-tls-ca")?);
+    let (cert, key, ca) = (cert.with_context(|| format!("--{flag}-cert"))?, key.with_context(|| format!("--{flag}-key"))?,
+                           ca.with_context(|| format!("--{flag}-ca"))?);
     let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cert)?)).collect::<Result<Vec<_>, _>>()?;
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key)?))?.context("no private key")?;
     let mut roots = rustls::RootCertStore::empty();
@@ -3609,6 +3708,102 @@ fn syslog_tls_config(cert: Option<&Path>, key: Option<&Path>, ca: Option<&Path>)
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots)).build()?;
     Ok(std::sync::Arc::new(rustls::ServerConfig::builder().with_client_cert_verifier(verifier).with_single_cert(certs, key)?))
+}
+
+/// The certificate fields RFC 6353's name table reads (README `check: "tsm-name"`), from the presented chain.
+///
+/// Impl: the verified path's CAs are the certificates the client sent above its leaf, plus each configured CA whose
+/// subject is the issuer of the top one (rustls verified the path; it does not report it).
+fn tls_cert_fields(presented: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>], cas: &[Vec<u8>]) -> Option<Value> {
+    use sha2::Digest as _;
+    use x509_parser::prelude::*;
+    let sha = |d: &[u8]| -> String { sha2::Sha256::digest(d).iter().map(|b| format!("{b:02x}")).collect() };
+    let leaf_der = presented.first()?;
+    let (_, leaf) = X509Certificate::from_der(leaf_der.as_ref()).ok()?;
+    let mut chain: Vec<String> = presented[1..].iter().map(|c| sha(c.as_ref())).collect();
+    let top_der = presented.last()?;
+    let (_, top) = X509Certificate::from_der(top_der.as_ref()).ok()?;
+    for ca in cas {
+        if let Ok((_, c)) = X509Certificate::from_der(ca) {
+            if c.subject().as_raw() == top.issuer().as_raw() {
+                chain.push(sha(ca));
+            }
+        }
+    }
+    let mut san = vec![];
+    if let Ok(Some(ext)) = leaf.subject_alternative_name() {
+        for g in &ext.value.general_names {
+            san.push(match g {
+                GeneralName::RFC822Name(v) => json!({"type": "rfc822", "value": v}),
+                GeneralName::DNSName(v) => json!({"type": "dns", "value": v}),
+                GeneralName::IPAddress(v) => json!({"type": "ip", "value": v.iter().map(|b| format!("{b:02x}")).collect::<String>()}),
+                _ => json!({"type": "other", "value": ""}),
+            });
+        }
+    }
+    let cn: Vec<String> = leaf.subject().iter_common_name().filter_map(|a| a.as_str().ok().map(str::to_string)).collect();
+    Some(json!({"sha256": sha(leaf_der.as_ref()), "chain": chain, "san": san, "cn": cn}))
+}
+
+/// Accept SNMP-over-TLS connections (E§3, v0.10): each verified certificate maps to a security name through the
+/// table, or the connection is closed; its stream is split into whole messages; replies go back on it.
+fn spawn_snmp_tls(l: tokio::net::TcpListener, cfg: std::sync::Arc<tokio_rustls::rustls::ServerConfig>, cas: Vec<Vec<u8>>,
+                  table: Value, tx: tokio::sync::mpsc::UnboundedSender<GatewayInput>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+    tokio::spawn(async move {
+        while let Ok((tcp, from)) = l.accept().await {
+            let (acceptor, tx, cas, table) = (acceptor.clone(), tx.clone(), cas.clone(), table.clone());
+            tokio::spawn(async move {
+                let tls = match acceptor.accept(tcp).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        println!("SNMP tls refused from {from}: {e}");
+                        return;
+                    }
+                };
+                let Some(fields) = tls.get_ref().1.peer_certificates().and_then(|c| tls_cert_fields(c, &cas)) else { return };
+                let mapped = dsip_events::tsm::security_name(&fields, &table);
+                let Some(name) = mapped["security_name"].as_str() else {
+                    // RFC 6353 §5.3.2: no name, no messages
+                    println!("SNMP tls closed {from}: no-security-name for certificate {}", &fields["sha256"].as_str().unwrap_or("")[..16]);
+                    return;
+                };
+                println!("SNMP tls connection {from}: security name {name:?} (row {})", mapped["row"]);
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                let peer = TlsPeer { certificate_sha256: fields["sha256"].as_str().unwrap_or("").to_string(),
+                                     security_name: name.to_string(), reply: reply_tx };
+                let (mut rd, mut wr) = tokio::io::split(tls);
+                tokio::spawn(async move {
+                    while let Some(m) = reply_rx.recv().await {
+                        if wr.write_all(&m).await.is_err() || wr.flush().await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                let mut buf = vec![];
+                let mut chunk = vec![0u8; 16384];
+                loop {
+                    let Ok(n) = rd.read(&mut chunk).await else { return };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let f = dsip_events::tsm::split_frames(&buf);
+                    for m in f.messages {
+                        if tx.send(GatewayInput::SnmpTls(m, from, peer.clone())).is_err() {
+                            return;
+                        }
+                    }
+                    if f.close {
+                        println!("SNMP tls from {from}: unframeable stream, closing   E§3");
+                        return;
+                    }
+                    buf.drain(..f.consumed);
+                }
+            });
+        }
+    });
 }
 
 /// Accept syslog-over-TLS connections; each verified connection's octet-counted frames (RFC 5425 §4.3:
@@ -3663,7 +3858,8 @@ fn spawn_syslog_tls(l: tokio::net::TcpListener, cfg: std::sync::Arc<tokio_rustls
 
 /// The gateway's USM receiver (E§3): its engine ID (given, or generated once and kept in `state`), its boots (kept in
 /// `state`, one more at every start, RFC 3414 §2.2), and the users file.
-fn usm_receiver(state: &Path, engine: Option<&str>, users: &Path) -> Result<dsip_events::usm::UsmReceiver> {
+/// The gateway's snmpEngineID: given, or generated once and kept in `state`. USM and TSM (discovery) share it.
+fn snmp_engine_id(state: &Path, engine: Option<&str>) -> Result<(Vec<u8>, String)> {
     let unhex = |h: &str| -> Option<Vec<u8>> { (0..h.len() / 2).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect() };
     std::fs::create_dir_all(state)?;
     let id_file = state.join("snmp-engine-id");
@@ -3681,6 +3877,11 @@ fn usm_receiver(state: &Path, engine: Option<&str>, users: &Path) -> Result<dsip
         },
     };
     let engine = unhex(&engine_hex).filter(|e| (5..=32).contains(&e.len())).context("--snmp-engine-id: 5–32 bytes of hex")?;
+    Ok((engine, engine_hex))
+}
+
+fn usm_receiver(state: &Path, engine: Option<&str>, users: &Path) -> Result<dsip_events::usm::UsmReceiver> {
+    let (engine, engine_hex) = snmp_engine_id(state, engine)?;
     let boots_file = state.join("snmp-engine-boots");
     let boots = std::fs::read_to_string(&boots_file).ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0) + 1;
     std::fs::write(&boots_file, boots.to_string())?;
@@ -3699,11 +3900,14 @@ fn usm_receiver(state: &Path, engine: Option<&str>, users: &Path) -> Result<dsip
 fn render_event(ev: &Value) -> String {
     let src = &ev["source"];
     let basis = src["basis"].as_str().unwrap_or("");
-    let known = ["snmpv1", "snmpv2c", "snmpv3-auth", "snmpv3-authpriv", "syslog-tls", "syslog-udp", "gateway"];
+    let known = ["snmpv1", "snmpv2c", "snmpv3-auth", "snmpv3-authpriv", "snmpv3-tls", "syslog-tls", "syslog-udp", "gateway"];
     let mut out = format!("source={} basis={}", src["address"].as_str().unwrap_or(""),
                           if known.contains(&basis) { basis.to_string() } else { format!("{basis}(unauthenticated)") });
     if let Some(u) = src.get("usm") {
         out += &format!(" usm={}@{}", u["user"].as_str().unwrap_or(""), u["engine_id"].as_str().unwrap_or(""));
+    }
+    if let Some(t) = src["tsm"]["security_name"].as_str() {
+        out += &format!(" tsm={t:?}");
     }
     if let Some(c) = src["certificate_sha256"].as_str() {
         out += &format!(" cert={}…", c.get(..16).unwrap_or(c));

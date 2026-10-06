@@ -30,6 +30,7 @@ repository = "https://github.com/thevoiceguy/DSIP"
 rust-version = "1.85"
 
 [workspace.dependencies]
+x509-parser = "0.17"
 dsip-core = { path = "crates/dsip-core" }
 dsip-schema = { path = "crates/dsip-schema" }
 dsip-session = { path = "crates/dsip-session" }
