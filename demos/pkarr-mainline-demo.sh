@@ -44,6 +44,8 @@ print(z32_encode(bob.public), (evil.sign(bep44_signable(ts, d)).signature + stru
 PY
 )
 python3 demos/pkarr_relay.py "$HOSTILE" --hostile "$ZBOB=$FORGED" >"$D/pkarr-hostile.log" 2>&1 & PIDS+=($!)
+for _ in $(seq 100); do grep -q "^listening" "$D/pkarr-hostile.log" 2>/dev/null && break; sleep 0.2; done
+grep -q "^listening" "$D/pkarr-hostile.log" || fail "the hostile relay did not start"
 
 $B/dsip-relay --listen 127.0.0.1:$RELAY_PORT --state "$D/relay" >"$D/relay.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 50); do [ -s "$D/relay/cert.pem" ] && break; sleep 0.2; done; CA="$D/relay/cert.pem"

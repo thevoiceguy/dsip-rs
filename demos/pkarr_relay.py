@@ -78,4 +78,6 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
-http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
+print(f"listening on 127.0.0.1:{PORT}", flush=True)
+srv.serve_forever()

@@ -55,6 +55,10 @@ echo "════════ two Pkarr relays: an honest one already holding a
 echo "         hostile one serving a forged, newer _dsip packet for Bob (pointing at wss://127.0.0.1:9666/evil)"
 python3 demos/pkarr_relay.py "$HONEST" "$ZBOB=$IROH" >"$D/pkarr-honest.log" 2>&1 & PIDS+=($!)
 python3 demos/pkarr_relay.py "$HOSTILE" --hostile "$ZBOB=$FORGED" >"$D/pkarr-hostile.log" 2>&1 & PIDS+=($!)
+for f in pkarr-honest pkarr-hostile; do  # the relays must be listening before anyone publishes
+  for _ in $(seq 100); do grep -q "^listening" "$D/$f.log" 2>/dev/null && break; sleep 0.2; done
+  grep -q "^listening" "$D/$f.log" || fail "$f did not start"
+done
 PK=(--pkarr-relay "http://127.0.0.1:$HONEST" --pkarr-relay "http://127.0.0.1:$HOSTILE")
 
 $B/dsip-relay --listen 127.0.0.1:$RELAY_PORT --state "$D/relay" >"$D/relay.log" 2>&1 & PIDS+=($!)
