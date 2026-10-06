@@ -120,6 +120,7 @@ fn hex(b: &[u8]) -> String {
 
 /// A configured signer (README component `syslog-sign`, `signers`).
 struct Signer {
+    gaps: bool,
     kind: String,
     raw: Vec<u8>,
     sha256: String,
@@ -175,6 +176,7 @@ pub struct Collector {
     sessions: HashMap<Session, Vec<u8>>,
     highest: HashMap<(String, String), u64>,
     authed: HashSet<(Group, u64)>,
+    covered: HashMap<Group, u64>,
 }
 
 /// What a step releases or reports.
@@ -193,6 +195,8 @@ pub enum Out {
     Session(Value),
     /// A block was refused: `{block, reason}`.
     Refused(Value),
+    /// Lost message numbers (v0.11, signers with `gaps`): `{hostname, app_name, procid, rsid, sg, spri, from, to}`.
+    Gap(Value),
 }
 
 impl Out {
@@ -204,6 +208,7 @@ impl Out {
             }
             Out::Session(v) => json!({"session": v}),
             Out::Refused(v) => json!({"refused": v}),
+            Out::Gap(v) => json!({"gap": v}),
         }
     }
 }
@@ -224,7 +229,8 @@ impl Collector {
             let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s["key"].as_str().unwrap_or("")) else { continue };
             let Some(key) = verifying_key(&kind, &raw) else { continue };
             let sha256 = hex(&sha2::Sha256::digest(&raw));
-            map.insert(s["hostname"].as_str().unwrap_or("").to_ascii_lowercase(), Signer { kind, raw, sha256, key });
+            let gaps = s["gaps"] == true;
+            map.insert(s["hostname"].as_str().unwrap_or("").to_ascii_lowercase(), Signer { gaps, kind, raw, sha256, key });
         }
         Collector {
             now,
@@ -236,6 +242,7 @@ impl Collector {
             sessions: HashMap::new(),
             highest: HashMap::new(),
             authed: HashSet::new(),
+            covered: HashMap::new(),
         }
     }
 
@@ -289,8 +296,31 @@ impl Collector {
         let now = self.now;
         let (due, keep): (Vec<Held>, Vec<Held>) = std::mem::take(&mut self.held).into_iter().partition(|h| h.due <= now);
         self.held = keep;
-        self.waiting.retain(|w| w.due > now);
-        due.into_iter().map(|h| Out::Deposit { message: h.msg, signed: None }).collect()
+        let mut out: Emits = due.into_iter().map(|h| Out::Deposit { message: h.msg, signed: None }).collect();
+        let (expired, keep): (Vec<Waiting>, Vec<Waiting>) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.due <= now);
+        self.waiting = keep;
+        // gaps (v0.11): numbers signed but never arrived, by group (hostname, APP-NAME, PROCID, RSID, SG, SPRI) then number
+        let mut lost: Vec<Waiting> = expired.into_iter().filter(|w| self.signers.get(&w.group.0 .0).is_some_and(|s| s.gaps)).collect();
+        lost.sort_by(|a, b| (&a.group, a.number).cmp(&(&b.group, b.number)));
+        let mut run: Option<(Group, Value)> = None;
+        for w in lost {
+            if let Some((g, v)) = run.as_mut() {
+                if *g == w.group && v["to"] == w.number - 1 {
+                    v["to"] = json!(w.number);
+                    continue;
+                }
+            }
+            if let Some((_, v)) = run.take() {
+                out.push(Out::Gap(v));
+            }
+            let c = &w.claim;
+            run = Some((w.group.clone(), json!({"hostname": c["hostname"], "app_name": c["app_name"], "procid": c["procid"],
+                                               "rsid": c["rsid"], "sg": c["sg"], "spri": c["spri"], "from": w.number, "to": w.number})));
+        }
+        if let Some((_, v)) = run {
+            out.push(Out::Gap(v));
+        }
+        out
     }
 
     fn block(&mut self, msg: &[u8], sl: &Value, kind: &'static str) -> Emits {
@@ -385,6 +415,7 @@ impl Collector {
             self.sessions.remove(&session);
             self.authed.retain(|(g, _)| g.0 != session);
             self.waiting.retain(|w| w.group.0 != session);
+            self.covered.retain(|g, _| g.0 != session);
         }
         let st = self.frags.entry(session.clone()).or_insert_with(|| Frags { tpbl, bytes: BTreeMap::new() });
         if st.tpbl != tpbl || frag.iter().enumerate().any(|(i, c)| st.bytes.get(&(index - 1 + i as u64)).is_some_and(|x| x != c)) {
@@ -421,9 +452,18 @@ impl Collector {
         if !self.sessions.contains_key(&session) {
             return vec![Out::Refused(json!({"block": "ssign", "reason": "no-session"}))];
         }
-        let key_sha = self.signers[&session.0].sha256.clone();
+        let (key_sha, gaps) = (self.signers[&session.0].sha256.clone(), self.signers[&session.0].gaps);
         let group: Group = (session.clone(), sg, spri);
         let mut out = vec![];
+        if gaps {
+            // never covered (v0.11): a block starting past what the group's earlier blocks covered
+            let cov = self.covered.get(&group).copied().unwrap_or(0);
+            if cov > 0 && fmn > cov + 1 {
+                out.push(Out::Gap(json!({"hostname": sl["hostname"], "app_name": sl["app_name"], "procid": sl["procid"],
+                                         "rsid": session.3, "sg": sg, "spri": spri, "from": cov + 1, "to": fmn - 1})));
+            }
+            self.covered.insert(group.clone(), cov.max(fmn + hb.len() as u64 - 1));
+        }
         for (i, h) in hb.into_iter().enumerate() {
             let n = fmn + i as u64;
             if self.authed.contains(&(group.clone(), n)) {
