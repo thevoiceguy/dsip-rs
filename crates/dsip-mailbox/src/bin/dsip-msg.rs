@@ -150,6 +150,14 @@ struct Args {
     /// TEST ONLY: a recorder that sends anyway, to show members dropping its content (C§5).
     #[arg(long, hide = true)]
     recorder_misbehave: bool,
+    /// As a gateway, hold clears this many seconds (E§4 hold-down, v0.10): a re-raise within it cancels the clear, so a
+    /// flapping link is one alarm. 0 (the default) turns it off. Events from informs are never held.
+    #[arg(long, default_value_t = 0)]
+    hold_down: i64,
+    /// Names for syslog-TLS device certificates (JSON object `{"<sha256 hex>": "<name>"}`), carried as the gateway's
+    /// `source.name` claim (E§2, v0.10).
+    #[arg(long)]
+    syslog_tls_names: Option<PathBuf>,
     /// The gateway's syslog severity table overrides (JSON object, e.g. `{"5": "minor"}`; E§3).
     #[arg(long)]
     syslog_table: Option<PathBuf>,
@@ -353,6 +361,10 @@ struct Client {
     /// recorder devices last seen per conversation.
     recorder_mode: bool,
     recorder_misbehave: bool,
+    /// E§4 hold-down (v0.10) and the events whose clears it holds, by alarm key; E§2 certificate names.
+    hold_down: dsip_events::HoldDown,
+    held_events: HashMap<(String, String, String), Value>,
+    tls_names: Value,
     rec_accepted: BTreeMap<String, std::collections::BTreeSet<String>>,
     rec_seen: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// SNMPv3 (E§3): the USM receiver, when users are configured.
@@ -2063,6 +2075,25 @@ impl Client {
         self.deposit_event(event).await.map(|_| ())
     }
 
+    /// Deposit a gateway event through the E§4 hold-down: a clear may be held, a raise cancels its held clear.
+    async fn gateway_deposit(&mut self, event: Value) -> Result<()> {
+        let Some(alarm) = event.get("alarm").cloned() else { return self.deposit_event(event).await.map(|_| ()) };
+        let key = (
+            alarm["resource"].as_str().unwrap_or("").to_string(),
+            alarm["type"].as_str().unwrap_or("").to_string(),
+            alarm["qualifier"].as_str().unwrap_or("").to_string(),
+        );
+        if self.hold_down.report(&alarm).is_empty() {
+            println!("HELD clear of {}/{} for hold-down   E§4", key.0, key.1);
+            self.held_events.entry(key).or_insert(event);
+            return Ok(());
+        }
+        if self.held_events.remove(&key).is_some() {
+            println!("CANCELLED held clear of {}/{}: re-raised within the hold-down (a flap)   E§4", key.0, key.1);
+        }
+        self.deposit_event(event).await.map(|_| ())
+    }
+
     /// Deposit one `device-event`; the hub's answer (`accepted`, `pending` with the outbox id, or a refusal).
     async fn deposit_event(&mut self, event: Value) -> Result<Value> {
         let group = self.active()?;
@@ -2130,7 +2161,7 @@ impl Client {
         }
         let Some(rid) = trap["inform"]["request_id"].as_i64() else {
             println!("SNMP trap from {from}: {}", raw["snmp"]["trap_oid"].as_str().unwrap_or("-"));
-            return self.deposit_event(event).await.map(|_| ());
+            return self.gateway_deposit(event).await;
         };
         let key = (from.to_string(), rid);
         // the response to the latest copy: a v3 retransmission may carry a new msgID, which its sender matches on
@@ -2175,6 +2206,10 @@ impl Client {
         let address = from.ip().to_string();
         let mut source = json!({"address": address, "basis": if certificate.is_some() { "syslog-tls" } else { "syslog-udp" }});
         if let Some(c) = certificate {
+            // E§2 (v0.10): the gateway's configured name for this certificate, as its claim
+            if let Some(name) = self.tls_names.get(&c).and_then(Value::as_str) {
+                source["name"] = json!(name);
+            }
             source["certificate_sha256"] = json!(c);
         }
         let mut event = json!({"source": source, "raw": raw});
@@ -2184,7 +2219,7 @@ impl Client {
         let sl = &raw["syslog"];
         println!("SYSLOG from {from} ({}): severity {} {} {}", event["source"]["basis"].as_str().unwrap_or("-"),
                  sl["severity"], sl["app_name"].as_str().unwrap_or("-"), sl["msg"].as_str().unwrap_or(""));
-        self.deposit_event(event).await.map(|_| ())
+        self.gateway_deposit(event).await
     }
 
     /// The hub's verdict on an inform's event (E§3): answer it, or forget it so its next retransmission deposits anew.
@@ -2216,6 +2251,15 @@ impl Client {
     /// Gateway mode, from the ticker: the heartbeat (E§5) and the inform memory's clock (E§3).
     async fn gateway_tick(&mut self) -> Result<()> {
         let now = now_s();
+        // E§4 hold-down: the clears that held long enough are deposited now
+        for r in self.hold_down.advance_to(now) {
+            let key = (r["resource"].as_str().unwrap_or("").to_string(), r["type"].as_str().unwrap_or("").to_string(),
+                       r["qualifier"].as_str().unwrap_or("").to_string());
+            if let Some(event) = self.held_events.remove(&key) {
+                println!("RELEASED held clear of {}/{} after the hold-down   E§4", key.0, key.1);
+                self.deposit_event(event).await?;
+            }
+        }
         if now > self.inform_clock {
             self.informs.step(&json!({"advance": now - self.inform_clock}));
             self.inform_clock = now;
@@ -3095,6 +3139,12 @@ async fn main() -> Result<()> {
             Some(a) => Some(std::sync::Arc::new(tokio::net::UdpSocket::bind(a).await.with_context(|| format!("binding {a}"))?)),
             None => None,
         },
+        hold_down: dsip_events::HoldDown::new(now_s(), args.hold_down),
+        held_events: HashMap::new(),
+        tls_names: match &args.syslog_tls_names {
+            Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?).context("--syslog-tls-names")?,
+            None => json!({}),
+        },
         recorder_mode: args.recorder,
         recorder_misbehave: args.recorder_misbehave,
         rec_accepted: provider_state.unwrap_or_default(),
@@ -3261,7 +3311,7 @@ async fn main() -> Result<()> {
                 client.tick_alarms();
                 // Recording Profile C§5: render recorders arriving or leaving
                 client.check_recordings();
-                if client.snmp.is_some() || client.heartbeat.is_some() {
+                if client.snmp.is_some() || client.heartbeat.is_some() || !client.held_events.is_empty() {
                     if let Err(e) = client.gateway_tick().await {
                         println!("ERR {e}");
                     }
@@ -3657,6 +3707,10 @@ fn render_event(ev: &Value) -> String {
     }
     if let Some(c) = src["certificate_sha256"].as_str() {
         out += &format!(" cert={}…", c.get(..16).unwrap_or(c));
+    }
+    // E§2 (v0.10): the gateway's name for that identity, only beside the identity it names
+    if let Some(n) = src["name"].as_str().filter(|_| src.get("certificate_sha256").is_some() || src.get("usm").is_some()) {
+        out += &format!(" name={n:?} (gateway's claim)");
     }
     let raw = &ev["raw"];
     if let Some(t) = raw["snmp"]["trap_oid"].as_str() {
