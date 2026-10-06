@@ -1,5 +1,5 @@
 //! `dsip-kt` — the Alias Transparency Profile's building blocks (draft `alias-transparency/0.1`,
-//! `v0.10/dsip-alias-transparency-profile-v0.10-draft.md`, cited `T§n`): KEYTRANS (draft-ietf-keytrans-protocol)
+//! `v0.11/dsip-alias-transparency-profile-v0.11-draft.md`, cited `T§n`): KEYTRANS (draft-ietf-keytrans-protocol)
 //! structures for suite `KT_128_SHA256_Ed25519` and contact-monitoring mode.
 //!
 //! Spec: sections owned by this crate — T§2 (suite 0x0002, mode 1, `validate_key`), T§3 (alias normalization),

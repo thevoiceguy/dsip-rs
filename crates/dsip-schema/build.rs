@@ -11,7 +11,7 @@ use std::process::Command;
 
 fn schema_dir() -> PathBuf {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    manifest.join("../../../v0.10/dsip-schemas-v0.10-draft/dsip-schemas")
+    manifest.join("../../../v0.11/dsip-schemas-v0.11-draft/dsip-schemas")
 }
 
 fn main() {
@@ -47,7 +47,7 @@ fn compare(committed: &Path, regenerated: &Path) {
     if !drift.is_empty() {
         panic!(
             "schema drift: committed schemas differ from generate_schemas.py output for {:?}. \
-             Regenerate with `python3 v0.10/dsip-schemas-v0.10-draft/dsip-schemas/generate_schemas.py schemas`.",
+             Regenerate with `python3 v0.11/dsip-schemas-v0.11-draft/dsip-schemas/generate_schemas.py schemas`.",
             drift
         );
     }
