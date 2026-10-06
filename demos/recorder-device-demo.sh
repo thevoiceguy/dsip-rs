@@ -96,6 +96,30 @@ print(f"  recorder archive: {len(lines)} message(s), none from before it joined"
 PY
 ! grep -qE "^(ARCHIVE-KEY|HISTORY)" "$DIR/br.log" || fail "the recorder obtained Bob's archive"
 
+echo "=== conversations created after the recorder exists are recorded too, whoever creates them (C§5, M§7.2)"
+echo "kp 4" >&5; wait_for "$DIR/br.log" "OK uploaded" 10
+echo "kp 3" >&4; wait_for "$DIR/bp.log" "OK uploaded" 10
+echo "kp 3" >&3; wait_for "$DIR/a.log" "OK uploaded" 10
+NB=$(grep -c "^JOINED .* kind=group" "$DIR/br.log" || true)
+echo "  Alice creates a group with Bob: every Bob device is added — his phone AND his recorder"
+echo "grant $ALICE" >&4; sleep 2; grep "^GRANT " "$DIR/bp.log" | tail -1 | cut -d' ' -f2 > "$DIR/grant2.txt"
+echo "create group $BOB $DIR/grant2.txt" >&3
+wait_for "$DIR/a.log" "^OK added $BOB \(2 device\(s\)\)" 30
+wait_for "$DIR/bp.log" "^JOINED .* kind=group" 30
+for _ in $(seq 100); do [ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt "$NB" ] && break; sleep 0.2; done
+[ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt "$NB" ] || fail "A: the recorder did not join Alice's new conversation"
+[ "$(grep -c "^RECORDED group=" "$DIR/a.log")" -ge 2 ] || { sleep 3; [ "$(grep -c "^RECORDED group=" "$DIR/a.log")" -ge 2 ] || fail "A: Alice was not told her new conversation is recorded"; }
+NB=$(grep -c "^JOINED .* kind=group" "$DIR/br.log")
+echo "  Bob creates a group with Alice: his own other device (the recorder) is added with her (M§7.2)"
+echo "grant $BOB" >&3; sleep 2; grep "^GRANT " "$DIR/a.log" | tail -1 | cut -d' ' -f2 > "$DIR/grant3.txt"
+echo "create group $ALICE $DIR/grant3.txt" >&4
+wait_for "$DIR/bp.log" "^OWN-DEVICES 1 added with the peer's" 30
+for _ in $(seq 100); do [ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt "$NB" ] && break; sleep 0.2; done
+[ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt "$NB" ] || fail "B: the recorder did not join Bob's new conversation"
+sleep 3
+[ "$(grep -c "^RECORDED group=" "$DIR/a.log")" -ge 3 ] || fail "B: Alice was not told Bob's new conversation is recorded"
+echo "  both new conversations are recorded and disclosed to Alice: $(grep -c '^RECORDED group=' "$DIR/a.log") recorded conversation(s)"
+
 echo "=== a misbehaving recorder sends anyway: both members drop it (C§5: receive-only)"
 kill $BR; wait $BR 2>/dev/null || true
 start_recorder --recorder-misbehave
@@ -114,7 +138,8 @@ wait_for "$DIR/bp.log" "^RECORDING ENDED group=" 30
 echo "  alice: $(grep -m1 '^RECORDING ENDED' "$DIR/a.log")"
 
 echo
-echo "PASS: the recorder device was visible to every member, joined the conversation but never Bob's personal group"
+echo "PASS: the recorder device was visible to every member, joined every conversation — including ones created later by"
+echo "      either side — but never Bob's personal group"
 echo "      (so nothing from before it joined reached it), held Alice's sending until she accepted, never spoke —"
 echo "      a misbehaving one was dropped by both members — archived what was sent while disclosed, and its removal"
 echo "      ended the recording for everyone."

@@ -217,12 +217,39 @@ pub fn recording_session(i: &Value) -> Value {
     json!({"ok": true})
 }
 
+/// The devices to add for an identity from its KeyPackage directory's answer: `{"add": [device…]}` or
+/// `{"refused": "no-key-packages" | "recorder-only"}`.
+///
+/// Spec: C§5 (a recorder never stands in for the person; never the personal group), M§5.5, M§7.2 (every device).
+pub fn add_devices(i: &Value) -> Value {
+    let mut seen = BTreeSet::new();
+    let mut cands: Vec<&Value> = vec![];
+    for k in i["key_packages"].as_array().into_iter().flatten() {
+        let Some(device) = k["device"].as_str() else { continue };
+        if k["identity"] != i["target"] || Some(device) == i["self_device"].as_str() || !seen.insert(device.to_string()) {
+            continue;
+        }
+        cands.push(k);
+    }
+    if i["purpose"] == "personal" {
+        cands.retain(|k| !has_record(k));
+    }
+    if cands.is_empty() {
+        return json!({"refused": "no-key-packages"});
+    }
+    if cands.iter().all(|k| has_record(k)) && i["target"] != i["self_identity"] {
+        return json!({"refused": "recorder-only"});
+    }
+    json!({"add": cands.iter().map(|k| k["device"].clone()).collect::<Vec<_>>()})
+}
+
 /// Run one `recording` vector.
 pub fn run_vector(v: &Value) -> Value {
     let i = &v["input"];
     match i["check"].as_str() {
         Some("conversation") => conversation(i),
         Some("recording-session") => recording_session(i),
+        Some("add-devices") => add_devices(i),
         Some(_) => json!({"error": "unknown check"}),
         None => {
             let c = &v["context"];
