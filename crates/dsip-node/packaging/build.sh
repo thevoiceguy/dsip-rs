@@ -14,7 +14,10 @@ VERSION=$(cargo metadata --no-deps --format-version 1 --manifest-path "$CRATE/Ca
 rm -rf dist; mkdir -p dist
 for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do
   arch=${pair%%:*}; target=${pair#*:}
-  (cd "$IMPL" && cargo zigbuild -q --release --locked --target "$target" -p dsip-node 2>&1 | grep -vE 'linker stderr|deprecated|GETFUNCSYM|conflicting prototype|^\s*(\||[0-9]+ \|)|^\s*$|^\s*=|^\s*\^|In file included' || true)
+  # zig's libc headers warn loudly and harmlessly; keep the log, and show all of it if the build fails
+  if ! (cd "$IMPL" && cargo zigbuild --release --locked --target "$target" -p dsip-node) >"dist/build-$arch.log" 2>&1; then
+    tail -60 "dist/build-$arch.log"; echo "build for $target failed (full log: dist/build-$arch.log)"; exit 1
+  fi
   mkdir -p "dist/$arch"
   cp "$IMPL/target/$target/release/dsip-node" "dist/$arch/dsip-node"
   tar -czf "dist/dsip-node-$VERSION-linux-$arch.tar.gz" -C "dist/$arch" dsip-node -C "$CRATE" config.example.toml \
