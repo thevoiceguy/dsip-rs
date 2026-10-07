@@ -20,6 +20,7 @@ members = [
     "crates/dsip-dht",
     "crates/dsip-relay",
     "crates/dsip-cli",
+    "crates/dsip-node",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 x509-parser = "0.17"
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "json"] }
 dsa = "0.6"
 dsip-core = { path = "crates/dsip-core" }
 dsip-schema = { path = "crates/dsip-schema" }

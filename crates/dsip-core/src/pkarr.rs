@@ -237,6 +237,41 @@ fn open(did: &str, payload: &[u8], now: i64) -> Result<([u8; 32], u64, Vec<Answe
     Ok((key, ts, parse_dns(dns)?))
 }
 
+/// What a node does with a `PUT /<z32>`: store it, keep what it holds, or reject it.
+///
+/// Spec: DHT Hints Profile §10 (v0.11); README `pkarr`, `check: "store"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Store {
+    /// Verified, and newer than anything held: store it (HTTP 204).
+    Stored,
+    /// Verified, but the held packet stays: `same` (HTTP 204), `older` or `conflict` (HTTP 409).
+    Kept(&'static str),
+    /// Not a valid packet for that key (HTTP 400).
+    Rejected(&'static str),
+}
+
+/// A node's verify-before-store for one Pkarr packet: the canonical key, the steps every packet must pass (frame,
+/// signature, timestamp, DNS), then §8.3's seq rule against what it holds. A node serves every application's
+/// packets, so `_dsip` content is left to readers.
+///
+/// Spec: DHT Hints Profile §10 (v0.11), §8.3; README `pkarr`, `check: "store"`.
+pub fn store(key: &str, payload: &[u8], held: Option<&[u8]>, now: i64) -> Store {
+    let Ok(pk) = z32_decode(key) else { return Store::Rejected("bad-key") };
+    if let Err(r) = open(&crate::did::did_key_from_public(&pk), payload, now) {
+        return Store::Rejected(r.0);
+    }
+    let ts = |p: &[u8]| p.get(64..72).map(|b| u64::from_be_bytes(b.try_into().unwrap_or_default())).unwrap_or(0);
+    match held {
+        None => Store::Stored,
+        Some(h) => match ts(payload).cmp(&ts(h)) {
+            std::cmp::Ordering::Greater => Store::Stored,
+            std::cmp::Ordering::Less => Store::Kept("older"),
+            std::cmp::Ordering::Equal if payload == h => Store::Kept("same"),
+            std::cmp::Ordering::Equal => Store::Kept("conflict"),
+        },
+    }
+}
+
 fn finish_hint(did: &str, ts: u64, eps: Vec<Value>, ttls: Vec<u32>, now: i64) -> Result<Hint, Reject> {
     if eps.is_empty() {
         return Err(Reject("no-endpoints"));
@@ -721,6 +756,14 @@ pub fn run_vector(v: &Value) -> Value {
             json!({"valid": key.is_some_and(|k| verify(&k, &msg, &hexv(&i["signature"])))})
         }
         "devices" => devices(i),
+        "store" => {
+            let held = (!i["held"].is_null()).then(|| hexv(&i["held"]));
+            match store(i["key"].as_str().unwrap_or(""), &hexv(&i["payload"]), held.as_deref(), now) {
+                Store::Stored => json!({"outcome": "stored"}),
+                Store::Kept(r) => json!({"outcome": "kept", "reason": r}),
+                Store::Rejected(r) => json!({"outcome": "rejected", "reason": r}),
+            }
+        }
         "carry" => match carry(i["zone"].as_str().unwrap_or(""), &hexv(&i["dns"])) {
             Ok(keep) => json!({"keep": keep.iter().map(|(labels, t, ttl, rdata)| {
                 let mut w = vec![];
