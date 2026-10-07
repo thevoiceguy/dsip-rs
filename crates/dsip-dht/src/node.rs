@@ -78,6 +78,18 @@ pub struct NodeConfig {
     /// against what is already restored) and only what verifies is stored. `republish` marks the records this
     /// node publishes itself, which it keeps re-announcing; the others it only serves.
     pub records_file: Option<std::path::PathBuf>,
+    /// Ban a peer for this long once it spends its [`REJECTION_BUDGET`] (0: only the budget's own window): its PUTs
+    /// are dropped unverified for the whole ban and it leaves the routing table. Its connection is NOT closed.
+    ///
+    /// Spec: DHT profile §4 (rate limiting per remote peer).
+    /// Impl: measured (`demos/dsip-node-flood-demo.sh`): closing a flooder's connection and refusing its PeerId cost
+    /// 4× the CPU of keeping it, because the flooder redials and a PeerId is known only after the Noise handshake —
+    /// every refused redial is a TCP accept plus a key exchange. Dropping its PUTs on the open connection is cheaper.
+    pub ban_secs: u64,
+    /// Also refuse a banned peer's IP, **before** the handshake ([`IpGate`]), and then close its connection: its redials
+    /// cost a TCP accept and nothing more. A flooder can mint PeerIds for free, but not addresses; an IP ban also
+    /// refuses honest peers behind the same address (NAT), so it is the operator's choice.
+    pub ban_ip: bool,
 }
 
 impl Default for NodeConfig {
@@ -92,6 +104,8 @@ impl Default for NodeConfig {
             server: true,
             peers_file: None,
             records_file: None,
+            ban_secs: 0,
+            ban_ip: false,
         }
     }
 }
@@ -113,6 +127,12 @@ pub struct Stats {
     pub publishes: u64,
     /// GET queries issued.
     pub gets: u64,
+    /// Peers banned since start.
+    pub bans: u64,
+    /// Peers banned now.
+    pub banned: usize,
+    /// Connections refused because they came from a banned IP.
+    pub refused_connections: u64,
 }
 
 /// Result of a GET.
@@ -202,6 +222,7 @@ impl Handle {
 struct Behaviour {
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
+    gate: IpGate,
 }
 
 struct PendingGet {
@@ -243,7 +264,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
             let mut kad = kad::Behaviour::with_config(key.public().to_peer_id(), store, kcfg);
             kad.set_mode(Some(if cfg.server { kad::Mode::Server } else { kad::Mode::Client }));
             let identify = identify::Behaviour::new(identify::Config::new(PROTOCOL.into(), key.public()));
-            Behaviour { kad, identify }
+            Behaviour { kad, identify, gate: IpGate::default() }
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
@@ -290,6 +311,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
 
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let republish_interval = cfg.republish_interval;
+    let (ban_secs, ban_ip) = (cfg.ban_secs, cfg.ban_ip);
     tokio::spawn(async move {
         let mut listen_addrs: Vec<Multiaddr> = vec![];
         let mut gets: HashMap<QueryId, PendingGet> = HashMap::new();
@@ -298,18 +320,32 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
         let mut stats = Stats::default();
         // peer → (window start, verification failures in it)
         let mut rejections: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
+        // bans: peer → until; banned IPs (with `ban_ip`) → until; each connected peer's remote IP
+        let mut bans: HashMap<PeerId, std::time::Instant> = HashMap::new();
+        let mut peer_ips: HashMap<PeerId, std::net::IpAddr> = HashMap::new();
         let mut republish = tokio::time::interval(republish_interval);
         republish.tick().await;
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id: remote, endpoint, connection_id, .. } => {
+                        let ip = endpoint.get_remote_address().iter().find_map(|p| match p {
+                            libp2p::multiaddr::Protocol::Ip4(a) => Some(std::net::IpAddr::V4(a)),
+                            libp2p::multiaddr::Protocol::Ip6(a) => Some(std::net::IpAddr::V6(a)),
+                            _ => None,
+                        });
+                        let _ = connection_id;
+                        if let Some(ip) = ip {
+                            peer_ips.insert(remote, ip);
+                        }
+                    }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         let full = address.with(libp2p::multiaddr::Protocol::P2p(peer_id));
                         tracing::info!("listening on {full}");
                         listen_addrs.push(full);
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                        if info.protocols.iter().any(|p| p.as_ref() == PROTOCOL) {
+                        if info.protocols.iter().any(|p| p.as_ref() == PROTOCOL) && !bans.contains_key(&peer_id) {
                             for a in routable(info.listen_addrs) {
                                 swarm.behaviour_mut().kad.add_address(&peer_id, a);
                             }
@@ -318,9 +354,28 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                     SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::InboundRequest {
                         request: kad::InboundRequest::PutRecord { record: Some(record), source, .. } })) => {
                         let now = std::time::Instant::now();
+                        if bans.get(&source).is_some_and(|until| *until > now) {
+                            *stats.puts_rejected.entry("banned".into()).or_default() += 1;
+                            continue;
+                        }
                         if let Some((start, n)) = rejections.get(&source) {
                             if now.duration_since(*start) < REJECTION_WINDOW && *n >= REJECTION_BUDGET {
                                 *stats.puts_rejected.entry("rate-limited".into()).or_default() += 1;
+                                if ban_secs > 0 {
+                                    // the budget is spent: drop its PUTs for the whole ban, stop routing through it
+                                    let until = now + Duration::from_secs(ban_secs);
+                                    bans.insert(source, until);
+                                    swarm.behaviour_mut().kad.remove_peer(&source);
+                                    stats.bans += 1;
+                                    let ip = if ban_ip { peer_ips.get(&source).copied() } else { None };
+                                    if let Some(ip) = ip {
+                                        // its redials are now refused before the handshake: closing costs nothing more
+                                        swarm.behaviour_mut().gate.ban(ip, until);
+                                        let _ = swarm.disconnect_peer_id(source);
+                                    }
+                                    tracing::warn!("banned peer {source}{} for {ban_secs} s: {REJECTION_BUDGET} rejected PUTs in {} s",
+                                                   ip.map(|i| format!(" and {i}")).unwrap_or_default(), REJECTION_WINDOW.as_secs());
+                                }
                                 continue;
                             }
                         }
@@ -434,6 +489,8 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         let mut s = stats.clone();
                         s.stored = swarm.behaviour_mut().kad.store_mut().records().count();
                         s.routing_peers = swarm.behaviour_mut().kad.kbuckets().map(|b| b.num_entries()).sum();
+                        s.banned = bans.len();
+                        s.refused_connections = swarm.behaviour().gate.refused;
                         let _ = reply.send(s);
                     }
                     Some(Command::Shutdown) | None => break,
@@ -449,6 +506,13 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                     let now = now_s();
                     held.retain(|_, (_, exp)| *exp > now);
                     rejections.retain(|_, (start, _)| start.elapsed() < REJECTION_WINDOW);
+                    let t = std::time::Instant::now();
+                    let expired: Vec<PeerId> = bans.iter().filter(|(_, until)| **until <= t).map(|(p, _)| *p).collect();
+                    for p in expired {
+                        bans.remove(&p);
+                        tracing::info!("ban on {p} ended");
+                    }
+                    swarm.behaviour_mut().gate.expire(t);
                     for (key, (frame, _)) in &held {
                         let record = Record { key: RecordKey::new(key), value: frame.clone().into_bytes(), publisher: None, expires: None };
                         let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::All);
@@ -461,6 +525,90 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
         }
     });
     Ok((Handle { tx }, peer_id))
+}
+
+/// Refuses inbound connections from banned IPs **before** the transport upgrade: no Noise handshake, no streams.
+///
+/// Spec: DHT profile §4 (rate limiting per remote peer).
+#[derive(Default)]
+pub struct IpGate {
+    banned: HashMap<std::net::IpAddr, std::time::Instant>,
+    /// Inbound connections refused since start.
+    pub refused: u64,
+}
+
+impl IpGate {
+    fn ban(&mut self, ip: std::net::IpAddr, until: std::time::Instant) {
+        self.banned.insert(ip, until);
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        self.banned.retain(|_, until| *until > now);
+    }
+}
+
+impl libp2p::swarm::NetworkBehaviour for IpGate {
+    type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+    type ToSwarm = std::convert::Infallible;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        _: &Multiaddr,
+        remote: &Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let ip = remote.iter().find_map(|p| match p {
+            libp2p::multiaddr::Protocol::Ip4(a) => Some(std::net::IpAddr::V4(a)),
+            libp2p::multiaddr::Protocol::Ip6(a) => Some(std::net::IpAddr::V6(a)),
+            _ => None,
+        });
+        match ip.and_then(|ip| self.banned.get(&ip)) {
+            Some(until) if *until > std::time::Instant::now() => {
+                self.refused += 1;
+                Err(libp2p::swarm::ConnectionDenied::new(std::io::Error::other("banned address")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: &Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: libp2p::swarm::ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: libp2p::core::Endpoint,
+        _: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, _: libp2p::swarm::FromSwarm) {}
+
+    fn on_connection_handler_event(
+        &mut self,
+        _: PeerId,
+        _: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        match event {}
+    }
+
+    fn poll(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
+        std::task::Poll::Pending
+    }
 }
 
 /// Write every record the store holds as a JSON line, marking the ones this node re-announces itself.

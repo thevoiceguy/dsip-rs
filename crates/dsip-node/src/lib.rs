@@ -11,12 +11,13 @@
 
 pub mod config;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, MatchedPath, Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -41,9 +42,71 @@ pub struct Node {
     pub peer_id: String,
     /// Where held Pkarr packets are written as they are stored, so a restart serves them at once.
     pub state: Option<config::StateDir>,
+    /// HTTP limits.
+    pub limits: Limits,
+    /// Counters for `/metrics`.
+    pub metrics: Metrics,
+    buckets: std::sync::Mutex<HashMap<IpAddr, (f64, std::time::Instant)>>,
+}
+
+/// HTTP limits (profile §10: a node MAY limit request rates, answering 429).
+///
+/// Spec: DHT Reachability Hints Profile §10.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// Requests per client IP per minute (a token bucket of this size, refilled evenly); 0 turns it off.
+    pub http_per_ip_per_min: u32,
+    /// Take the client IP from the first `X-Forwarded-For` entry: only behind a reverse proxy that sets it.
+    pub trust_forwarded_for: bool,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { http_per_ip_per_min: 120, trust_forwarded_for: false }
+    }
+}
+
+/// Counters exposed at `/metrics`.
+///
+/// Spec: none (infrastructure).
+#[derive(Debug, Default)]
+pub struct Metrics {
+    /// HTTP requests by (route, status).
+    pub http: std::sync::Mutex<BTreeMap<(String, u16), u64>>,
+    /// `PUT /<z32>` outcomes by (outcome, reason).
+    pub pkarr_puts: std::sync::Mutex<BTreeMap<(String, String), u64>>,
 }
 
 impl Node {
+    /// A node with default limits and empty counters.
+    pub fn new(overlay: Option<dsip_dht::node::Handle>, mainline: Option<AsyncDht>, peer_id: String,
+               state: Option<config::StateDir>) -> Node {
+        Node { overlay, mainline, held: Default::default(), peer_id, state, limits: Limits::default(),
+               metrics: Metrics::default(), buckets: Default::default() }
+    }
+
+    /// Take one token from `ip`'s bucket; `false` when it is empty.
+    fn admit(&self, ip: IpAddr) -> bool {
+        let per_min = self.limits.http_per_ip_per_min as f64;
+        if per_min == 0.0 {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let mut b = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if b.len() > 100_000 {
+            // full buckets carry no information: drop them before the map grows without bound
+            b.retain(|_, (tokens, at)| *tokens + now.duration_since(*at).as_secs_f64() * per_min / 60.0 < per_min);
+        }
+        let (tokens, at) = b.entry(ip).or_insert((per_min, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * per_min / 60.0).min(per_min);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
     /// Hold a packet that passed the store check, on disk too when there is a state directory.
     async fn hold(&self, z32: &str, payload: Vec<u8>) {
         if let Some(st) = &self.state {
@@ -89,12 +152,77 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/dsip/v1/node", get(node_info))
         .route("/dsip/v1/hints/{did}", get(overlay_get))
         .route("/dsip/v1/hints", post(overlay_post))
+        .route("/metrics", get(metrics))
         .route("/{z32}", get(pkarr_get).put(pkarr_put))
+        .layer(axum::middleware::from_fn_with_state(node.clone(), limit_and_count))
         .layer(axum::middleware::map_response(|mut r: Response| async move {
             r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
             r
         }))
         .with_state(node)
+}
+
+/// The per-IP rate limit (429) and the request counters, around every route.
+///
+/// Spec: DHT Reachability Hints Profile §10 (a node MAY limit request rates, answering 429).
+async fn limit_and_count(State(node): State<Arc<Node>>, req: Request, next: axum::middleware::Next) -> Response {
+    let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str().to_string()).unwrap_or_else(|| "other".into());
+    let forwarded = if node.limits.trust_forwarded_for {
+        req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+    } else {
+        None
+    };
+    let ip = forwarded.or_else(|| req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()));
+    let resp = if route != "/metrics" && ip.is_some_and(|ip| !node.admit(ip)) {
+        (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "60")], "rate-limited").into_response()
+    } else {
+        next.run(req).await
+    };
+    *node.metrics.http.lock().unwrap_or_else(|e| e.into_inner()).entry((route, resp.status().as_u16())).or_default() += 1;
+    resp
+}
+
+/// `GET /metrics`: Prometheus text exposition.
+///
+/// Spec: none (infrastructure).
+async fn metrics(State(node): State<Arc<Node>>) -> Response {
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, kind: &str, lines: Vec<(String, f64)>| {
+        out += &format!("# HELP {name} {help}\n# TYPE {name} {kind}\n");
+        for (labels, v) in lines {
+            out += &format!("{name}{labels} {v}\n");
+        }
+    };
+    if let Some(h) = &node.overlay {
+        if let Ok(s) = h.stats().await {
+            gauge("dsip_node_overlay_peers", "Peers in the overlay routing table.", "gauge", vec![(String::new(), s.routing_peers as f64)]);
+            gauge("dsip_node_overlay_records", "Overlay records held.", "gauge", vec![(String::new(), s.stored as f64)]);
+            gauge("dsip_node_overlay_puts_accepted_total", "Inbound overlay PUTs stored.", "counter", vec![(String::new(), s.puts_accepted as f64)]);
+            gauge("dsip_node_overlay_puts_rejected_total", "Inbound overlay PUTs refused, by reason.", "counter",
+                  s.puts_rejected.iter().map(|(r, n)| (format!("{{reason=\"{r}\"}}"), *n as f64)).collect());
+            gauge("dsip_node_overlay_bans_total", "Peers banned after spending their rejection budget.", "counter", vec![(String::new(), s.bans as f64)]);
+            gauge("dsip_node_overlay_banned", "Peers banned now.", "gauge", vec![(String::new(), s.banned as f64)]);
+            gauge("dsip_node_overlay_refused_connections_total", "Connections refused from banned IPs.", "counter",
+                  vec![(String::new(), s.refused_connections as f64)]);
+        }
+    }
+    if let Some(d) = &node.mainline {
+        let i = d.info().await;
+        gauge("dsip_node_mainline_server_mode", "1 when this node serves the Mainline DHT.", "gauge",
+              vec![(String::new(), if i.server_mode() { 1.0 } else { 0.0 })]);
+        gauge("dsip_node_mainline_dht_size_estimate", "The Mainline DHT's estimated size.", "gauge",
+              vec![(String::new(), i.dht_size_estimate().0 as f64)]);
+    }
+    let held = node.held.lock().await.len();
+    gauge("dsip_node_pkarr_held", "Pkarr packets held.", "gauge", vec![(String::new(), held as f64)]);
+    let puts = node.metrics.pkarr_puts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    gauge("dsip_node_pkarr_puts_total", "PUT /<z32> by outcome and reason.", "counter",
+          puts.iter().map(|((o, r), n)| (format!("{{outcome=\"{o}\",reason=\"{r}\"}}"), *n as f64)).collect());
+    let http = node.metrics.http.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    gauge("dsip_node_http_requests_total", "HTTP requests by route and status.", "counter",
+          http.iter().map(|((r, c), n)| (format!("{{route=\"{r}\",status=\"{c}\"}}"), *n as f64)).collect());
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
 }
 
 /// `GET /<z32>`: the held packet, or one fetched from Mainline that passes the store check; else 404.
@@ -132,7 +260,14 @@ fn pkarr_payload(p: Vec<u8>) -> Response {
 async fn pkarr_put(State(node): State<Arc<Node>>, Path(z32): Path<String>, body: Bytes) -> Response {
     // one store decision at a time, so two racing PUTs cannot both pass the ts rule against the same held packet
     let mut held = node.held.lock().await;
-    match pkarr::store(&z32, &body, held.get(&z32).map(Vec::as_slice), now_s()) {
+    let verdict = pkarr::store(&z32, &body, held.get(&z32).map(Vec::as_slice), now_s());
+    let (o, r) = match &verdict {
+        Store::Stored => ("stored", ""),
+        Store::Kept(r) => ("kept", *r),
+        Store::Rejected(r) => ("rejected", *r),
+    };
+    *node.metrics.pkarr_puts.lock().unwrap_or_else(|e| e.into_inner()).entry((o.into(), r.into())).or_default() += 1;
+    match verdict {
         Store::Stored => {
             if let Some(st) = &node.state {
                 if let Err(e) = config::write_atomic(&st.pkarr(&z32), &body) {

@@ -24,3 +24,16 @@ bootstrap = []
 [http]
 # The hints API (profile §10). Plain HTTP: put a TLS reverse proxy in front for public service.
 listen = "0.0.0.0:8080"
+
+[limits]
+# Ban an overlay peer for this long once it spends its rejection budget (20 failed verifications in 60 s): its PUTs
+# are dropped unverified for the whole ban and it leaves the routing table. Its connection stays open — closing it
+# costs more, since a flooder redials and a PeerId is known only after the handshake. 0: only the budget's window.
+ban_secs = 600
+# Also refuse the banned peer's IP before the handshake, and close its connection: its redials then cost a TCP accept.
+# PeerIds are free to mint, addresses are not — but honest peers behind the same NAT are refused too.
+ban_ip = false
+# HTTP requests per client IP per minute, answered 429 beyond (0: no limit).
+http_requests_per_ip_per_min = 120
+# Behind a reverse proxy that sets X-Forwarded-For, rate-limit by the client's address instead of the proxy's.
+trust_x_forwarded_for = false

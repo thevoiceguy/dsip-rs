@@ -43,6 +43,15 @@ struct Args {
     /// Serve Mainline as a server node (store and answer for others), not only as a client.
     #[arg(long)]
     mainline_server: bool,
+    /// Ban an overlay peer for this long once it spends its rejection budget [default: 600; 0: never].
+    #[arg(long)]
+    ban_secs: Option<u64>,
+    /// Also refuse a banned peer's IP before the handshake (honest peers behind the same NAT are refused too).
+    #[arg(long)]
+    ban_ip: bool,
+    /// HTTP requests per client IP per minute [default: 120; 0: no limit].
+    #[arg(long)]
+    http_requests_per_ip_per_min: Option<u32>,
 }
 
 fn parse_addrs(v: &[String], what: &str) -> Result<Vec<Multiaddr>> {
@@ -93,6 +102,8 @@ async fn main() -> Result<()> {
             bootstrap: overlay_bootstrap,
             peers_file: state.as_ref().map(StateDir::overlay_peers),
             records_file: state.as_ref().map(StateDir::overlay_records),
+            ban_secs: a.ban_secs.or(cfg.limits.ban_secs).unwrap_or(600),
+            ban_ip: a.ban_ip || cfg.limits.ban_ip.unwrap_or(false),
             republish_interval: Duration::from_secs(60),
             ..Default::default()
         };
@@ -146,13 +157,18 @@ async fn main() -> Result<()> {
         None
     };
 
-    let node = Arc::new(dsip_node::Node { overlay, mainline, held: Default::default(), peer_id, state });
+    let mut node = dsip_node::Node::new(overlay, mainline, peer_id, state);
+    node.limits = dsip_node::Limits {
+        http_per_ip_per_min: a.http_requests_per_ip_per_min.or(cfg.limits.http_requests_per_ip_per_min).unwrap_or(120),
+        trust_forwarded_for: cfg.limits.trust_x_forwarded_for.unwrap_or(false),
+    };
+    let node = Arc::new(node);
     let (kept, dropped) = node.restore().await;
     if kept + dropped > 0 {
         println!("pkarr: restored {kept} packet(s), dropped {dropped} that no longer pass the store check");
     }
     let listener = tokio::net::TcpListener::bind(&http).await.with_context(|| format!("binding {http}"))?;
     println!("http: {}", listener.local_addr()?);
-    axum::serve(listener, dsip_node::router(node)).await?;
+    axum::serve(listener, dsip_node::router(node).into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
 }
