@@ -1,0 +1,27 @@
+# dsip-node, as packaged. Every key is optional; a command-line flag of the same name overrides it, and unknown keys
+# are an error. The template with every key explained: /usr/share/doc/dsip-node/config.example.toml.
+# A hints node is never authoritative (DSIP core §8.1): it verifies before storing or serving; clients verify again.
+
+[node]
+state_dir = "/var/lib/dsip-node"
+
+[overlay]
+listen = ["/ip4/0.0.0.0/tcp/4610"]
+# Add the overlay's bootstrap nodes: /dns4/<name>/tcp/4610/p2p/<PeerId> (or /ip4/…). Alone until then.
+bootstrap = []
+
+[mainline]
+enabled = true
+port = 6881
+server = true
+bootstrap = []
+
+[http]
+# The hints API, for a TLS reverse proxy on this host. To serve it directly, listen on 0.0.0.0 instead.
+listen = "127.0.0.1:8080"
+
+[limits]
+ban_secs = 600
+ban_ip = false
+http_requests_per_ip_per_min = 120
+trust_x_forwarded_for = false

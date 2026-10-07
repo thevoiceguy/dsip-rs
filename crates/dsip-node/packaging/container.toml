@@ -1,0 +1,23 @@
+# dsip-node in a container (the image's /etc/dsip-node/config.toml). Mount your own over it, or pass flags after the
+# image name (they override these keys). State lives in the /var/lib/dsip-node volume.
+[node]
+state_dir = "/var/lib/dsip-node"
+
+[overlay]
+listen = ["/ip4/0.0.0.0/tcp/4610"]
+bootstrap = []
+
+[mainline]
+enabled = true
+port = 6881
+server = true
+bootstrap = []
+
+[http]
+listen = "0.0.0.0:8080"
+
+[limits]
+ban_secs = 600
+ban_ip = false
+http_requests_per_ip_per_min = 120
+trust_x_forwarded_for = false

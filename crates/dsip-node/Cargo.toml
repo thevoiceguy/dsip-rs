@@ -23,3 +23,25 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 serde_json.workspace = true
+
+# `cargo deb -p dsip-node --target <musl target> --no-build` after `packaging/build.sh` built the static binary.
+[package.metadata.deb]
+name = "dsip-node"
+maintainer = "DSIP PoC <thevoiceguy@users.noreply.github.com>"
+copyright = "the DSIP authors; MIT OR Apache-2.0"
+section = "net"
+priority = "optional"
+extended-description = """\
+A DSIP reachability-hints node: a member of the DSIP overlay (libp2p Kademlia), a participant in the BitTorrent \
+Mainline DHT for Pkarr packets, and an HTTP hints API for clients that join neither. It is a hints tier only: it \
+verifies every record before storing or serving it, and never answers with authority."""
+depends = ""
+conf-files = ["/etc/dsip-node/config.toml"]
+maintainer-scripts = "packaging/debian/"
+systemd-units = { unit-name = "dsip-node", enable = true, start = true, restart-after-upgrade = true }
+assets = [
+    ["target/release/dsip-node", "usr/bin/", "755"],
+    ["packaging/config.toml", "etc/dsip-node/config.toml", "644"],
+    ["config.example.toml", "usr/share/doc/dsip-node/config.example.toml", "644"],
+    ["packaging/compose.yaml", "usr/share/doc/dsip-node/compose.yaml", "644"],
+]
