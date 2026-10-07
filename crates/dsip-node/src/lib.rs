@@ -9,6 +9,8 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod config;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +39,39 @@ pub struct Node {
     pub held: Mutex<HashMap<String, Vec<u8>>>,
     /// This node's overlay PeerId, for `/dsip/v1/node`.
     pub peer_id: String,
+    /// Where held Pkarr packets are written as they are stored, so a restart serves them at once.
+    pub state: Option<config::StateDir>,
+}
+
+impl Node {
+    /// Hold a packet that passed the store check, on disk too when there is a state directory.
+    async fn hold(&self, z32: &str, payload: Vec<u8>) {
+        if let Some(st) = &self.state {
+            if let Err(e) = config::write_atomic(&st.pkarr(z32), &payload) {
+                tracing::warn!("could not write the packet for {z32}: {e}");
+            }
+        }
+        self.held.lock().await.insert(z32.to_string(), payload);
+    }
+
+    /// Restore the packets kept in the state directory, each checked again as a fresh `PUT` would be.
+    ///
+    /// Spec: DHT Reachability Hints Profile §10 (`check: "store"`): a node's own disk is no exception.
+    pub async fn restore(&self) -> (usize, usize) {
+        let Some(st) = &self.state else { return (0, 0) };
+        let (mut kept, mut dropped) = (0, 0);
+        let mut held = self.held.lock().await;
+        for (z32, payload) in st.pkarr_all() {
+            if pkarr::store(&z32, &payload, held.get(&z32).map(Vec::as_slice), now_s()) == Store::Stored {
+                held.insert(z32, payload);
+                kept += 1;
+            } else {
+                let _ = std::fs::remove_file(st.pkarr(&z32));
+                dropped += 1;
+            }
+        }
+        (kept, dropped)
+    }
 }
 
 fn now_s() -> i64 {
@@ -77,10 +112,10 @@ async fn pkarr_get(State(node): State<Arc<Node>>, Path(z32): Path<String>) -> Re
     payload.extend_from_slice(&(item.seq() as u64).to_be_bytes());
     payload.extend_from_slice(item.value());
     // what Mainline returns is verified like any PUT before it is cached or served
-    let mut held = node.held.lock().await;
-    match pkarr::store(&z32, &payload, held.get(&z32).map(Vec::as_slice), now_s()) {
+    let verdict = pkarr::store(&z32, &payload, node.held.lock().await.get(&z32).map(Vec::as_slice), now_s());
+    match verdict {
         Store::Stored => {
-            held.insert(z32, payload.clone());
+            node.hold(&z32, payload.clone()).await;
             pkarr_payload(payload)
         }
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -95,9 +130,15 @@ fn pkarr_payload(p: Vec<u8>) -> Response {
 ///
 /// Spec: DHT Reachability Hints Profile §10; README `pkarr`, `check: "store"` (204 / 409 / 400).
 async fn pkarr_put(State(node): State<Arc<Node>>, Path(z32): Path<String>, body: Bytes) -> Response {
+    // one store decision at a time, so two racing PUTs cannot both pass the ts rule against the same held packet
     let mut held = node.held.lock().await;
     match pkarr::store(&z32, &body, held.get(&z32).map(Vec::as_slice), now_s()) {
         Store::Stored => {
+            if let Some(st) = &node.state {
+                if let Err(e) = config::write_atomic(&st.pkarr(&z32), &body) {
+                    tracing::warn!("could not write the packet for {z32}: {e}");
+                }
+            }
             held.insert(z32.clone(), body.to_vec());
             drop(held);
             if let (Some(dht), Ok(key)) = (&node.mainline, pkarr::z32_decode(&z32)) {
