@@ -1,0 +1,19 @@
+# dsip-node: a distroless image around the static (musl) binary. Build context: crates/dsip-node, with the binaries
+# staged at dist/<amd64|arm64>/dsip-node (see packaging/build.sh). Multi-arch with `docker buildx --platform`.
+# only makes a directory: it runs on the build machine, so a multi-arch build needs no emulation
+FROM --platform=$BUILDPLATFORM busybox:1.37 AS dirs
+RUN mkdir -p /out/var/lib/dsip-node && chown -R 65532:65532 /out/var/lib/dsip-node && chmod 0700 /out/var/lib/dsip-node
+
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.title="dsip-node" \
+      org.opencontainers.image.description="DSIP hints node: overlay member, Mainline DHT participant, HTTP hints API" \
+      org.opencontainers.image.source="https://github.com/thevoiceguy/DSIP" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+COPY --chmod=0755 dist/${TARGETARCH}/dsip-node /usr/bin/dsip-node
+COPY packaging/container.toml /etc/dsip-node/config.toml
+COPY --from=dirs --chown=65532:65532 /out/var/lib/dsip-node /var/lib/dsip-node
+USER 65532:65532
+VOLUME ["/var/lib/dsip-node"]
+EXPOSE 8080/tcp 4610/tcp 6881/udp
+ENTRYPOINT ["/usr/bin/dsip-node", "--config", "/etc/dsip-node/config.toml"]

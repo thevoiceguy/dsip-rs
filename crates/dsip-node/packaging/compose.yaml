@@ -1,0 +1,19 @@
+# One dsip-node: the hints API on 8080 (put a TLS proxy in front for public service), the overlay on 4610/tcp,
+# the Mainline DHT on 6881/udp. Its identity, peers and held records live in the `dsip-node` volume.
+services:
+  dsip-node:
+    image: ghcr.io/thevoiceguy/dsip-node:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080/tcp"
+      - "4610:4610/tcp"
+      - "6881:6881/udp"
+    volumes:
+      - dsip-node:/var/lib/dsip-node
+    # flags after the image override the config, e.g. the overlay's bootstrap nodes:
+    # command: ["--overlay-bootstrap", "/dns4/boot1.example/tcp/4610/p2p/12D3Koo…"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+volumes:
+  dsip-node:
