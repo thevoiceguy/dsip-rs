@@ -91,8 +91,26 @@ is assumed.
 ## 6. Limits and observability (the WAN findings)
 
 - **Per-peer verification budget** (exists): 20 failures in 60 s drops a peer's PUTs unverified.
-- **Connection-level penalty** (new): when the budget is spent, the node disconnects the peer and bans its PeerId
-  and IP for `ban_secs`. This answers the finding that CPU stayed high because the cost is transport, not Ed25519.
+- **Bans** (stage 3, measured; `demos/dsip-node-flood-demo.sh`):
+  - **What was planned, and failed:** disconnect the peer and refuse its PeerId. That cost **4×** the CPU of the
+    budget alone. The flooder redials, and libp2p learns a PeerId only after the Noise handshake, so every refused
+    redial is a TCP accept plus a key exchange.
+  - **What shipped:**
+    - a banned peer's PUTs are dropped unverified for the whole ban;
+    - it leaves the routing table;
+    - its connection stays open (the default).
+  - **With `ban_ip`:** its address is refused before the handshake (`IpGate`, `handle_pending_inbound_connection`)
+    and the connection is closed. Its redials then cost a TCP accept.
+  - **Measured over 30 s at ~50 PUTs/s,** victim CPU, three runs:
+
+    | victim | CPU |
+    |---|---|
+    | budget only | 2.4–2.5 s |
+    | ban in place | 2.4–2.8 s |
+    | `ban_ip` | 0.66–0.93 s |
+
+  - **`ban_ip` is the operator's choice:** PeerIds are free to mint, addresses are not, but honest peers behind the
+    same NAT are refused too.
 - **HTTP rate limit** per client IP, answered with 429.
 - **Prometheus metrics:** peers, records held, puts accepted and refused by reason, verification failures, bans,
   HTTP requests by route and status, Mainline routing size.

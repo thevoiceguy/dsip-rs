@@ -11,7 +11,7 @@ fn now_s() -> i64 {
 }
 
 fn node(state: &StateDir) -> dsip_node::Node {
-    dsip_node::Node { overlay: None, mainline: None, held: Default::default(), peer_id: "-".into(), state: Some(state.clone()) }
+    dsip_node::Node::new(None, None, "-".into(), Some(state.clone()))
 }
 
 async fn serve(n: Arc<dsip_node::Node>) -> String {

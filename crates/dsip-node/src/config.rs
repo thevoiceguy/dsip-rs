@@ -24,6 +24,23 @@ pub struct Config {
     /// `[http]`.
     #[serde(default)]
     pub http: HttpSection,
+    /// `[limits]`.
+    #[serde(default)]
+    pub limits: LimitsSection,
+}
+
+/// `[limits]`: what a misbehaving peer or client costs before it is cut off.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Ban an overlay peer for this long once it spends its rejection budget (default 600; 0: never ban).
+    pub ban_secs: Option<u64>,
+    /// Also refuse a banned peer's IP (default false: honest peers behind the same NAT would be refused too).
+    pub ban_ip: Option<bool>,
+    /// HTTP requests per client IP per minute (default 120; 0: no limit).
+    pub http_requests_per_ip_per_min: Option<u32>,
+    /// Take the client IP from `X-Forwarded-For` (default false; only behind a proxy that sets it).
+    pub trust_x_forwarded_for: Option<bool>,
 }
 
 /// `[node]`.
