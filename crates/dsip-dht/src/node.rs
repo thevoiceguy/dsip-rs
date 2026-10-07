@@ -71,6 +71,13 @@ pub struct NodeConfig {
     /// On the WAN testbed a restarted bootstrap node with nothing to dial sat with an empty
     /// routing table for minutes, until another node happened to dial it.
     pub peers_file: Option<std::path::PathBuf>,
+    /// Where held records are kept across restarts: one JSON line `{"frame", "republish"}` per record.
+    ///
+    /// Spec: DHT profile §4 — a record is verified at every hop, a node's own disk included.
+    /// Impl: rewritten every republish tick; at start every line is evaluated again (signature, expiry, §8.3
+    /// against what is already restored) and only what verifies is stored. `republish` marks the records this
+    /// node publishes itself, which it keeps re-announcing; the others it only serves.
+    pub records_file: Option<std::path::PathBuf>,
 }
 
 impl Default for NodeConfig {
@@ -84,6 +91,7 @@ impl Default for NodeConfig {
             query_timeout: Duration::from_secs(10),
             server: true,
             peers_file: None,
+            records_file: None,
         }
     }
 }
@@ -250,6 +258,35 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
     }
     dial_known(&mut swarm, &known);
     let peers_file = cfg.peers_file.clone();
+    let records_file = cfg.records_file.clone();
+    // records kept before a restart, verified again before they are served or re-announced
+    let mut restored_held: HashMap<Vec<u8>, (String, i64)> = HashMap::new();
+    if let Some(f) = &records_file {
+        let ctx = Context::new(now_s(), &cfg.resolver);
+        let (mut kept, mut dropped) = (0usize, 0usize);
+        for line in std::fs::read_to_string(f).unwrap_or_default().lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { dropped += 1; continue };
+            let frame = v["frame"].as_str().unwrap_or("").to_string();
+            let Some(h) = evaluate(&frame, &ctx, None).hint else { dropped += 1; continue };
+            let key = key_for(&h.subject);
+            let existing = swarm.behaviour_mut().kad.store_mut().get(&RecordKey::new(&key))
+                .and_then(|r| Envelope::from_frame(&String::from_utf8_lossy(&r.value)).ok());
+            let ev = evaluate(&frame, &ctx, existing.as_ref());
+            if !(ev.verdict.ok() && ev.winner == "input") {
+                dropped += 1;
+                continue;
+            }
+            let record = Record { key: RecordKey::new(&key), value: frame.clone().into_bytes(), publisher: None, expires: None };
+            let _ = swarm.behaviour_mut().kad.store_mut().put(record);
+            if v["republish"] == true {
+                restored_held.insert(key, (frame, h.expires_at));
+            }
+            kept += 1;
+        }
+        if kept + dropped > 0 {
+            tracing::info!("restored {kept} record(s) from {}, dropped {dropped} that no longer verify", f.display());
+        }
+    }
 
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let republish_interval = cfg.republish_interval;
@@ -257,7 +294,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
         let mut listen_addrs: Vec<Multiaddr> = vec![];
         let mut gets: HashMap<QueryId, PendingGet> = HashMap::new();
         let mut puts: HashMap<QueryId, PendingPut> = HashMap::new();
-        let mut held: HashMap<Vec<u8>, (String, i64)> = HashMap::new(); // key → (frame, expires_at)
+        let mut held: HashMap<Vec<u8>, (String, i64)> = restored_held; // key → (frame, expires_at)
         let mut stats = Stats::default();
         // peer → (window start, verification failures in it)
         let mut rejections: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
@@ -416,11 +453,27 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         let record = Record { key: RecordKey::new(key), value: frame.clone().into_bytes(), publisher: None, expires: None };
                         let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::All);
                     }
+                    if let Some(f) = &records_file {
+                        save_records(f, &mut swarm, &held);
+                    }
                 }
             }
         }
     });
     Ok((Handle { tx }, peer_id))
+}
+
+/// Write every record the store holds as a JSON line, marking the ones this node re-announces itself.
+fn save_records(path: &std::path::Path, swarm: &mut libp2p::Swarm<Behaviour>, held: &HashMap<Vec<u8>, (String, i64)>) {
+    let mut lines = vec![];
+    for r in swarm.behaviour_mut().kad.store_mut().records() {
+        let frame = String::from_utf8_lossy(&r.value).into_owned();
+        lines.push(serde_json::json!({"frame": frame, "republish": held.contains_key(r.key.as_ref())}).to_string());
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        tracing::warn!("could not save records to {}", path.display());
+    }
 }
 
 /// Dial `addrs` (each `/…/p2p/<PeerId>`) and start a Kademlia bootstrap.

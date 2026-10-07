@@ -1,0 +1,26 @@
+# dsip-node configuration (/etc/dsip-node/config.toml). Every key is optional and a command-line flag of the same
+# name overrides it (e.g. --state-dir, --http, --overlay-listen, --mainline-port). Unknown keys are an error.
+# A hints node is never authoritative (DSIP core §8.1): it verifies before storing or serving, clients verify again.
+
+[node]
+# Identity, learned peers, held records and Mainline routing nodes. Without it, nothing survives a restart.
+state_dir = "/var/lib/dsip-node"
+
+[overlay]
+# The DSIP overlay (libp2p Kademlia, /dsip/hints/0.6). Leave `listen` empty to stay out of it.
+listen = ["/ip4/0.0.0.0/tcp/4610"]
+# Multiaddrs with /p2p/<PeerId>; /dns4/ names let an operator rotate nodes behind a name.
+bootstrap = []
+
+[mainline]
+# The BitTorrent Mainline DHT, for Pkarr packets (DHT Hints Profile §9).
+enabled = true
+port = 6881
+# Store and answer for others (needs a reachable UDP port), not only query.
+server = true
+# Empty: the public bootstrap nodes.
+bootstrap = []
+
+[http]
+# The hints API (profile §10). Plain HTTP: put a TLS reverse proxy in front for public service.
+listen = "0.0.0.0:8080"

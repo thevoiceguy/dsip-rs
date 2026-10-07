@@ -26,7 +26,7 @@ fn packet(key: &KeyPair, uri: &str, ts: u64) -> Vec<u8> {
 
 #[tokio::test]
 async fn pkarr_routes_store_serve_and_refuse() {
-    let base = serve(dsip_node::Node { overlay: None, mainline: None, held: Default::default(), peer_id: "-".into() }).await;
+    let base = serve(dsip_node::Node { overlay: None, mainline: None, held: Default::default(), peer_id: "-".into(), state: None }).await;
     let http = reqwest::Client::new();
     let (k, other) = (KeyPair::from_seed([7; 32]), KeyPair::from_seed([8; 32]));
     let z = z32_encode(&k.public());
@@ -55,7 +55,7 @@ async fn pkarr_routes_store_serve_and_refuse() {
 #[tokio::test]
 async fn overlay_routes_verify_before_store() {
     let (h, id) = dsip_dht::node::start(Default::default()).await.unwrap();
-    let base = serve(dsip_node::Node { overlay: Some(h), mainline: None, held: Default::default(), peer_id: id.to_string() }).await;
+    let base = serve(dsip_node::Node { overlay: Some(h), mainline: None, held: Default::default(), peer_id: id.to_string(), state: None }).await;
     let http = reqwest::Client::new();
     let k = KeyPair::from_seed([9; 32]);
     let did = k.did();
