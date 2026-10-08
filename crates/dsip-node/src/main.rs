@@ -129,6 +129,16 @@ async fn main() -> Result<()> {
         if !saved.is_empty() {
             b.extra_bootstrap(&saved);
         }
+        // Without a known public IP the node starts on a random id, learns its address from the first replies,
+        // then rotates to a BEP 42 id and resets its routing table — discarding the saved nodes above (measured on
+        // the WAN). Starting from the address seen last time gives a valid id at once; a changed address rotates once.
+        let public_ip: Option<std::net::Ipv4Addr> = state
+            .as_ref()
+            .and_then(|st| std::fs::read_to_string(st.mainline_public_ip()).ok())
+            .and_then(|t| t.trim().parse().ok());
+        if let Some(ip) = public_ip {
+            b.public_ip(ip);
+        }
         if mainline_port != 0 {
             b.port(mainline_port);
         }
@@ -148,6 +158,9 @@ async fn main() -> Result<()> {
                     let nodes = d.to_bootstrap().await;
                     if !nodes.is_empty() {
                         let _ = dsip_node::config::write_atomic(&st.mainline_nodes(), (nodes.join("\n") + "\n").as_bytes());
+                    }
+                    if let Some(addr) = d.info().await.public_address() {
+                        let _ = dsip_node::config::write_atomic(&st.mainline_public_ip(), format!("{}\n", addr.ip()).as_bytes());
                     }
                 }
             });

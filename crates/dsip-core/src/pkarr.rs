@@ -237,6 +237,17 @@ fn open(did: &str, payload: &[u8], now: i64) -> Result<([u8; 32], u64, Vec<Answe
     Ok((key, ts, parse_dns(dns)?))
 }
 
+/// When a relay payload (`signature ‖ ts ‖ dns`) stops being fresh: its `ts` in seconds plus its shortest answer
+/// TTL. `None` when the frame or the DNS message does not parse. A node serving every application's packets uses it
+/// to decide when to look for a newer one; readers still judge expiry themselves.
+///
+/// Spec: DHT Hints Profile §9 (a packet's records live for their TTLs).
+pub fn fresh_until(payload: &[u8]) -> Option<i64> {
+    let ts = u64::from_be_bytes(payload.get(64..72)?.try_into().ok()?);
+    let ttl = parse_dns(payload.get(72..)?).ok()?.iter().map(|a| a.3).min().unwrap_or(0);
+    Some((ts / 1_000_000) as i64 + ttl as i64)
+}
+
 /// What a node does with a `PUT /<z32>`: store it, keep what it holds, or reject it.
 ///
 /// Spec: DHT Hints Profile §10 (v0.11); README `pkarr`, `check: "store"`.

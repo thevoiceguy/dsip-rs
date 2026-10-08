@@ -139,6 +139,11 @@ impl StateDir {
         self.0.join("mainline-nodes")
     }
 
+    /// This node's public IPv4 address as the Mainline DHT last saw it, for a BEP 42 node id at the next start.
+    pub fn mainline_public_ip(&self) -> PathBuf {
+        self.0.join("mainline-public-ip")
+    }
+
     /// The file holding the Pkarr packet for `z32`.
     pub fn pkarr(&self, z32: &str) -> PathBuf {
         self.0.join("pkarr").join(z32)

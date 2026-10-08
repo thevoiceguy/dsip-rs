@@ -47,6 +47,8 @@ pub struct Node {
     /// Counters for `/metrics`.
     pub metrics: Metrics,
     buckets: std::sync::Mutex<HashMap<IpAddr, (f64, std::time::Instant)>>,
+    /// When each held packet was last looked for on Mainline.
+    checked: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// HTTP limits (profile §10: a node MAY limit request rates, answering 429).
@@ -82,7 +84,34 @@ impl Node {
     pub fn new(overlay: Option<dsip_dht::node::Handle>, mainline: Option<AsyncDht>, peer_id: String,
                state: Option<config::StateDir>) -> Node {
         Node { overlay, mainline, held: Default::default(), peer_id, state, limits: Limits::default(),
-               metrics: Metrics::default(), buckets: Default::default() }
+               metrics: Metrics::default(), buckets: Default::default(), checked: Default::default() }
+    }
+
+    /// Whether `z32` was last looked for on Mainline more than [`MAINLINE_RECHECK`] ago; if so, it is now.
+    fn recheck_due(&self, z32: &str) -> bool {
+        let mut checked = self.checked.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if checked.get(z32).is_some_and(|t| now.duration_since(*t) < MAINLINE_RECHECK) {
+            return false;
+        }
+        checked.insert(z32.to_string(), now);
+        true
+    }
+
+    /// The most recent packet for `key` on Mainline, when it passes the store check against what is held: it is
+    /// then held, and returned.
+    async fn fetch_mainline(&self, dht: &AsyncDht, z32: &str, key: &[u8; 32]) -> Option<Vec<u8>> {
+        let item = tokio::time::timeout(MAINLINE_QUERY, dht.get_mutable_most_recent(key, None)).await.ok().flatten()?;
+        let mut payload = item.signature().to_vec();
+        payload.extend_from_slice(&(item.seq() as u64).to_be_bytes());
+        payload.extend_from_slice(item.value());
+        // what Mainline returns is verified like any PUT before it is cached or served
+        let verdict = pkarr::store(z32, &payload, self.held.lock().await.get(z32).map(Vec::as_slice), now_s());
+        if verdict != Store::Stored {
+            return None;
+        }
+        self.hold(z32, payload.clone()).await;
+        Some(payload)
     }
 
     /// Take one token from `ip`'s bucket; `false` when it is empty.
@@ -143,6 +172,8 @@ fn now_s() -> i64 {
 
 /// How long a Mainline lookup may take on behalf of an HTTP client.
 const MAINLINE_QUERY: Duration = Duration::from_secs(5);
+/// How often a held packet is looked for again on Mainline while it is fresh, in the background of a `GET`.
+const MAINLINE_RECHECK: Duration = Duration::from_secs(60);
 
 /// The HTTP hints API (profile §10), with `Access-Control-Allow-Origin: *` on every answer.
 ///
@@ -227,26 +258,33 @@ async fn metrics(State(node): State<Arc<Node>>) -> Response {
 
 /// `GET /<z32>`: the held packet, or one fetched from Mainline that passes the store check; else 404.
 ///
-/// Spec: DHT Reachability Hints Profile §10 (Pkarr's relay interface).
+/// A fresh held packet is served at once and looked for again on Mainline in the background, at most once a
+/// minute; one past its TTL is looked for first, so a publisher's re-signed packet replaces it. Without that, a node
+/// keeps serving the first packet it fetched long after it expired — measured on the WAN.
+///
+/// Spec: DHT Reachability Hints Profile §10 (Pkarr's relay interface; a held packet is a cache: SHOULD look again
+/// once it is past its TTL, MAY while it is fresh).
+/// Impl: while it is fresh, at most once a minute per key, in the background.
 async fn pkarr_get(State(node): State<Arc<Node>>, Path(z32): Path<String>) -> Response {
     let Ok(key) = pkarr::z32_decode(&z32) else { return (StatusCode::BAD_REQUEST, "bad-key").into_response() };
-    if let Some(p) = node.held.lock().await.get(&z32) {
-        return pkarr_payload(p.clone());
-    }
-    let Some(dht) = &node.mainline else { return StatusCode::NOT_FOUND.into_response() };
-    let item = tokio::time::timeout(MAINLINE_QUERY, dht.get_mutable_most_recent(&key, None)).await.ok().flatten();
-    let Some(item) = item else { return StatusCode::NOT_FOUND.into_response() };
-    let mut payload = item.signature().to_vec();
-    payload.extend_from_slice(&(item.seq() as u64).to_be_bytes());
-    payload.extend_from_slice(item.value());
-    // what Mainline returns is verified like any PUT before it is cached or served
-    let verdict = pkarr::store(&z32, &payload, node.held.lock().await.get(&z32).map(Vec::as_slice), now_s());
-    match verdict {
-        Store::Stored => {
-            node.hold(&z32, payload.clone()).await;
-            pkarr_payload(payload)
+    let held = node.held.lock().await.get(&z32).cloned();
+    let Some(dht) = node.mainline.clone() else {
+        return held.map_or_else(|| StatusCode::NOT_FOUND.into_response(), pkarr_payload);
+    };
+    if let Some(p) = &held {
+        if pkarr::fresh_until(p).is_some_and(|t| now_s() < t) {
+            if node.recheck_due(&z32) {
+                let (n, z) = (node.clone(), z32.clone());
+                tokio::spawn(async move { n.fetch_mainline(&dht, &z, &key).await });
+            }
+            return pkarr_payload(p.clone());
         }
-        _ => StatusCode::NOT_FOUND.into_response(),
+        node.recheck_due(&z32);
+    }
+    match node.fetch_mainline(&dht, &z32, &key).await {
+        Some(p) => pkarr_payload(p),
+        // nothing newer: what is held is still served, and readers judge it
+        None => held.map_or_else(|| StatusCode::NOT_FOUND.into_response(), pkarr_payload),
     }
 }
 

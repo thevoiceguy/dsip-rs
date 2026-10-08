@@ -139,7 +139,9 @@ is assumed.
 4. **Packaging.** musl binaries, the systemd unit, the container and the `.deb`, built in CI. The demo runs inside
    the container.
 5. **WAN** (needs the user's Linodes). Deploy the `.deb` on the four hosts; a browser on a laptop looks up a hint
-   through the HTTP API of a node across the Atlantic; results go into `dht-findings.md`.
+   through the HTTP API of a node across the Atlantic; results go into `dht-findings.md`. **Done 2026-10-08:** the
+   lookup worked laptop → Milan, using curl, with CORS checked. It found two node fixes: a BEP 42 id kept across
+   restarts, and held Pkarr packets looked up again on Mainline. See `dht-findings.md`, "dsip-node on the WAN".
 
 ## 9. Spec impact
 
