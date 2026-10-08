@@ -20,6 +20,9 @@ messages, media or presence. Design and measurements: `impl/docs/dsip-node-plan.
 | **Any Linux** | Unpack `dsip-node-<version>-linux-<arch>.tar.gz` (a static binary, no dependencies). Install `dsip-node.service` and `config.example.toml` from the tarball by hand. |
 | **Container** | `docker run -d -p 8080:8080 -p 4610:4610 -p 6881:6881/udp -v dsip-node:/var/lib/dsip-node ghcr.io/thevoiceguy/dsip-node`, or `compose.yaml`. |
 
+The package starts at once with its default config. To start with your own instead (another HTTP port, bootstrap
+nodes), put `/etc/dsip-node/config.toml` in place first and install with `-o Dpkg::Options::=--force-confold`.
+
 Releases carry `SHA256SUMS`. To build everything yourself, run `packaging/build.sh --image`; to test it as an
 operator would, run `packaging/test.sh`.
 
@@ -47,8 +50,10 @@ a key (`dsip-node --help`), and a misspelt key is an error.
   dsip-node` rates it 1.1, "OK".
 - **Container:** distroless, non-root (65532); it runs with a read-only root and `cap_drop: [ALL]`.
 - **The identity key** (`overlay.key`) is created with mode 0600. Keep the state directory: it holds the node's
-  PeerId, learned peers and held records, so a restart rejoins in seconds. Every record read back from it is
-  verified again.
+  PeerId, learned peers, held records, and its Mainline routing nodes and public address, so a restart rejoins in
+  seconds on both DHTs. Every record read back from it is verified again.
+- **Held Pkarr packets** are served at once, and looked for again on Mainline at most once a minute; one past its
+  TTL is looked for before it is served, so a publisher's re-signed packet replaces it.
 - **Flooding peers:** a peer that fails 20 verifications in 60 s is banned for `ban_secs`. Its PUTs are dropped
   unverified and it leaves the routing table.
   - `ban_ip = true` also refuses its address **before** the handshake. Measured, this cuts a flood's CPU by about
