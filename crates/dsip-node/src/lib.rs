@@ -262,8 +262,9 @@ async fn metrics(State(node): State<Arc<Node>>) -> Response {
 /// minute; one past its TTL is looked for first, so a publisher's re-signed packet replaces it. Without that, a node
 /// keeps serving the first packet it fetched long after it expired — measured on the WAN.
 ///
-/// Spec: DHT Reachability Hints Profile §10 (Pkarr's relay interface).
-/// Impl: §10 does not say when a holding node looks again; spec-gap 109.
+/// Spec: DHT Reachability Hints Profile §10 (Pkarr's relay interface; a held packet is a cache: SHOULD look again
+/// once it is past its TTL, MAY while it is fresh).
+/// Impl: while it is fresh, at most once a minute per key, in the background.
 async fn pkarr_get(State(node): State<Arc<Node>>, Path(z32): Path<String>) -> Response {
     let Ok(key) = pkarr::z32_decode(&z32) else { return (StatusCode::BAD_REQUEST, "bad-key").into_response() };
     let held = node.held.lock().await.get(&z32).cloned();
