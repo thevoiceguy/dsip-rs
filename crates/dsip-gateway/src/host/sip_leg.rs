@@ -207,8 +207,23 @@ impl SipLeg {
 
     /// Send an INVITE; returns the Call-ID.
     pub async fn invite(&self, target: &str, sdp: &str) -> Result<String> {
+        self.invite_from(target, sdp, None, None).await
+    }
+
+    /// Send an INVITE presenting `from_user` as the `From` user (the caller's attested number, N§4.1) and, when
+    /// given, an RFC 8224 `Identity` header; returns the Call-ID.
+    ///
+    /// Spec: N§4.1, G§11 (path b presents the number only; path c adds the PASSporT).
+    pub async fn invite_from(&self, target: &str, sdp: &str, from_user: Option<&str>, identity: Option<&str>) -> Result<String> {
         let uri = SipUri::parse(target).map_err(|e| anyhow!("target uri: {e}"))?;
-        let req = self.uac.create_invite(&uri, Some(sdp));
+        let port = self.socket.local_addr().map(|a| a.port()).unwrap_or(5060);
+        let from = from_user
+            .map(|u| SipUri::parse(&format!("sip:{u}@{}:{port}", self.local_ip)).map_err(|e| anyhow!("from uri: {e}")))
+            .transpose()?;
+        let mut req = self.uac.create_invite_with_from(&uri, Some(sdp), from.as_ref());
+        if let Some(v) = identity {
+            req.headers_mut().push("Identity", v).map_err(|e| anyhow!("Identity header: {e}"))?;
+        }
         let call_id = header(&req, "Call-ID").unwrap_or_default();
         let addr = resolve_uri_addr(&uri)?;
         self.calls.lock().await.insert(call_id.clone(), SipCall { invite: req.clone(), remote_addr: addr, dialog: None, outbound: true });

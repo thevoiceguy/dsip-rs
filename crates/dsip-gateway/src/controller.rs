@@ -16,6 +16,8 @@ use crate::{map_inbound, map_outbound, tel_claim, GATEWAY_DID};
 pub struct GatewayCall {
     direction: String,
     early_media: String,
+    /// The gateway's own DID: the `verifier` of every `tel` claim it makes (G§5).
+    verifier: String,
     dsip: &'static str,
     sip: &'static str,
     answered: bool,
@@ -23,11 +25,13 @@ pub struct GatewayCall {
 }
 
 impl GatewayCall {
-    /// From a vector `context` (`direction`, `early_media`).
+    /// From a vector `context` (`direction`, `early_media`; `gateway` is the host's own DID, and the suite's
+    /// fixed `did:web:gw.example` when absent).
     pub fn new(ctx: &Value) -> Self {
         GatewayCall {
             direction: ctx.get("direction").and_then(Value::as_str).unwrap_or("outbound").to_string(),
             early_media: ctx.get("early_media").and_then(Value::as_str).unwrap_or("auto").to_string(),
+            verifier: ctx.get("gateway").and_then(Value::as_str).unwrap_or(GATEWAY_DID).to_string(),
             dsip: "idle",
             sip: "idle",
             answered: false,
@@ -170,7 +174,7 @@ impl GatewayCall {
                     (Some("INVITE"), false) => {
                         self.dsip = "offered";
                         self.sip = "early";
-                        let tc = tel_claim(s.get("from_tn").and_then(Value::as_str).unwrap_or(""), s.get("identity"), s.get("cnam").and_then(Value::as_str), GATEWAY_DID);
+                        let tc = tel_claim(s.get("from_tn").and_then(Value::as_str).unwrap_or(""), s.get("identity"), s.get("cnam").and_then(Value::as_str), &self.verifier);
                         out.push(json!({"dsip": {"local": "place_call", "claims": [tc["claim"]], "trust_basis": tc["trust_basis"]}}));
                         out.push(json!({"sip": {"response": 100}}));
                     }

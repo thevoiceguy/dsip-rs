@@ -135,7 +135,8 @@ pub struct Core {
     pending_sdp: Option<String>,
     /// This side's recording declaration (Recording Profile C§3), carried on every invite, answer and update.
     recording: Option<serde_json::Value>,
-    /// A patch for the next invite only: `{direction?, recording_session?}` (C§6: a recording session's offer).
+    /// A patch for the next invite only: `{direction?, recording_session?, destination?}` (C§6: a recording session's
+    /// offer; N§4.1: the PSTN number asked of a gateway).
     invite_patch: Option<serde_json::Value>,
     /// `identity.claims` to put on the next invite (a gateway's PSTN caller claim, §18.1).
     pending_claims: Vec<Value>,
@@ -556,6 +557,9 @@ impl Core {
                     }
                     if let Some(rs) = patch.get("recording_session") {
                         p["recording_session"] = rs.clone(); // C§6
+                    }
+                    if let Some(d) = patch.get("destination") {
+                        p["destination"] = d.clone(); // N§4.1: a tel URI for the gateway named by `to`
                     }
                     self.offers.insert(session.clone(), json!({"media": p["media"], "transports": p["transports"]}));
                 }

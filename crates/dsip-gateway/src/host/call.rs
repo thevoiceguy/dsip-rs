@@ -3,12 +3,16 @@
 //!
 //! Spec: none (infrastructure) — the normative decisions are all in [`crate::controller`]; this
 //! is the plumbing that turns `{sip: …}` / `{dsip: …}` emissions into method calls on the legs
-//! and media bridges. Round one: one outbound and one inbound call shape, audio only.
+//! and media bridges. Round one: one outbound and one inbound call shape, audio only. Stage 4 of the
+//! Number Attestation Profile wires the DSIP leg (an `Agent`) so the `{dsip: …}` emissions act: the
+//! gateway places, alerts, answers, declines and hangs up DSIP sessions as the controller says.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use dsip_session::LocalEvent;
+use dsip_transport::agent::Agent;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -21,8 +25,14 @@ use super::sip_leg::{RemoteRtp, SipEvent, SipLeg};
 /// A live call: its controller, DSIP session id, SIP Call-ID, and media handles.
 pub struct Call {
     ctrl: GatewayCall,
-    #[allow(dead_code)]
-    dsip_session: Option<String>,
+    /// The DSIP session id, once the DSIP leg has one.
+    pub dsip_session: Option<String>,
+    /// Inbound (PSTN → DSIP): the DID the controller's `place_call` invites (N§6.1).
+    pub dsip_target: Option<String>,
+    /// Outbound (DSIP → PSTN): the `From` user to present, when the caller's number was attested (N§4.1).
+    pub from_tn: Option<String>,
+    /// Outbound: the RFC 8224 `Identity` header value, when the gateway signed a PASSporT (N§4.1).
+    pub identity_header: Option<String>,
     sip_call_id: Option<String>,
     media: Option<DsipMedia>,
     rtp: Option<Arc<RtpLeg>>,
@@ -43,10 +53,12 @@ pub struct Calls(pub HashMap<String, Call>);
 pub struct Legs<'a> {
     /// The SIP leg.
     pub sip: &'a Arc<SipLeg>,
+    /// The DSIP leg, when the host runs one (the daemon does; the round-trip test drives the DSIP side itself).
+    pub dsip: Option<&'a mut Agent>,
 }
 
 /// Apply one controller emission list to the real legs. `key` is the call table key.
-pub async fn apply(call: &mut Call, emits: Vec<Value>, legs: &Legs<'_>) -> Result<()> {
+pub async fn apply(call: &mut Call, emits: Vec<Value>, legs: &mut Legs<'_>) -> Result<()> {
     for e in emits {
         if let Some(sip) = e.get("sip") {
             apply_sip(call, sip, legs).await?;
@@ -55,23 +67,66 @@ pub async fn apply(call: &mut Call, emits: Vec<Value>, legs: &Legs<'_>) -> Resul
             // harness / daemon); the controller's `media` emission only marks readiness.
             call.media_ready = true;
         } else if let Some(dsip) = e.get("dsip") {
-            // Inbound direction: the controller tells the DSIP side to place a call / answer /
-            // reject. In a full host these become `Agent` local events; round one logs them so the
-            // trace is visible and the SIP side (the exercised half of G2) drives to completion.
-            info!("dsip emit: {dsip}");
+            match legs.dsip.as_deref_mut() {
+                Some(agent) => apply_dsip(call, dsip, agent).await?,
+                // No DSIP leg (the round-trip harness): log the emission so the trace is visible.
+                None => info!("dsip emit: {dsip}"),
+            }
         }
     }
     Ok(())
 }
 
-async fn apply_sip(call: &mut Call, s: &Value, legs: &Legs<'_>) -> Result<()> {
+/// The controller's `{dsip: {local: …}}` emission as an `Agent` local event (§12 engine vocabulary).
+///
+/// Spec: G§3.1–G§3.2 (the DSIP leg actions per crossing event), §14.1 (`answered_by: gateway`).
+async fn apply_dsip(call: &mut Call, d: &Value, agent: &mut Agent) -> Result<()> {
+    let local = d.get("local").and_then(Value::as_str).unwrap_or("");
+    if local == "place_call" {
+        let Some(target) = call.dsip_target.clone() else { return Ok(()) };
+        let claims = d.get("claims").and_then(Value::as_array).cloned().unwrap_or_default();
+        agent.set_claims(claims);
+        let sid = agent.place_call(&target).await?;
+        println!("→ invite   to {target}  session …{}  (G§5 claim: {})", &sid[sid.len().saturating_sub(8)..], d.get("trust_basis").and_then(Value::as_str).unwrap_or(""));
+        call.dsip_session = Some(sid);
+        return Ok(());
+    }
+    let Some(session) = call.dsip_session.clone() else { return Ok(()) };
+    let reason = d.get("reason").and_then(Value::as_str).map(String::from);
+    let offered = agent.endpoint().session(&session).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
+    println!("→ dsip     {local}{}", reason.as_deref().map(|r| format!(" {r}")).unwrap_or_default());
+    let ev = match local {
+        "alert" => LocalEvent::Alert { session, ring_timeout: Some(60) },
+        "accept" => {
+            if offered {
+                // the SIP side answered without ringing first: the §12 engine alerts before it answers
+                agent.local(LocalEvent::Alert { session: session.clone(), ring_timeout: Some(60) }).await?;
+            }
+            LocalEvent::Accept { session, answered_by: Some("gateway".into()) } // §14.1
+        }
+        // a pre-answer refusal with the G§4 reason: `auto_reject` is the engine's own event for an offered session
+        "auto_reject" if offered => LocalEvent::AutoReject { session, reason: reason.unwrap_or_else(|| "session.failed".into()) },
+        "auto_reject" => LocalEvent::Decline { session, reason },
+        "cancel" => LocalEvent::Cancel { session },
+        "hangup" => LocalEvent::Hangup { session, reason },
+        _ => {
+            info!("dsip emit not carried by this host: {d}");
+            return Ok(());
+        }
+    };
+    agent.local(ev).await
+}
+
+async fn apply_sip(call: &mut Call, s: &Value, legs: &mut Legs<'_>) -> Result<()> {
     let Some(cid) = &call.sip_call_id else {
         // An outbound INVITE has no Call-ID yet: the string form "INVITE" triggers the dial.
         if s == "INVITE" {
             let rtp = call.rtp.as_ref().expect("rtp allocated before invite");
             let sdp = super::sip_leg::local_sdp(legs.sip.local_ip(), rtp.port(), "sendrecv");
             let target = call.dial_target.clone().unwrap_or_default();
-            let cid = legs.sip.invite(&target, &sdp).await?;
+            let cid = legs.sip.invite_from(&target, &sdp, call.from_tn.as_deref(), call.identity_header.as_deref()).await?;
+            println!("→ INVITE   {target}  From {}  Identity: {}", call.from_tn.as_deref().unwrap_or("(the gateway's own)"),
+                     if call.identity_header.is_some() { "SHAKEN PASSporT" } else { "none" });
             call.sip_call_id = Some(cid);
         }
         return Ok(());
@@ -146,7 +201,7 @@ pub async fn on_rtp_dtmf(calls: &Arc<Mutex<Calls>>, sip: &Arc<SipLeg>, key: &str
     let event = json!({"sip": {"event": "dtmf", "dtmf": ev.digits, "duration_ms": ev.duration_ms}});
     let emits = guard.0.get_mut(key).map(|c| c.step(&event)).unwrap_or_default();
     if let Some(call) = guard.0.get_mut(key) {
-        apply(call, emits, &Legs { sip }).await?;
+        apply(call, emits, &mut Legs { sip, dsip: None }).await?;
     }
     Ok(())
 }
@@ -164,13 +219,22 @@ impl Call {
             media_ready: false,
             dial_target: Some(dial_target),
             last_sip_request: None,
+            dsip_target: None,
+            from_tn: None,
+            identity_header: None,
         }
     }
 
     /// A fresh inbound (PSTN→DSIP) call.
     pub fn inbound(sip_call_id: String, rtp: Arc<RtpLeg>, remote: Option<RemoteRtp>) -> Call {
+        Self::inbound_via(&json!({"direction": "inbound"}), sip_call_id, rtp, remote)
+    }
+
+    /// A fresh inbound call with the controller's context given: `{"direction": "inbound", "gateway": <our DID>}`
+    /// names this gateway as the `verifier` of the G§5 claim.
+    pub fn inbound_via(ctx: &Value, sip_call_id: String, rtp: Arc<RtpLeg>, remote: Option<RemoteRtp>) -> Call {
         Call {
-            ctrl: GatewayCall::new(&json!({"direction": "inbound"})),
+            ctrl: GatewayCall::new(ctx),
             dsip_session: None,
             sip_call_id: Some(sip_call_id),
             media: None,
@@ -179,6 +243,9 @@ impl Call {
             media_ready: false,
             dial_target: None,
             last_sip_request: None,
+            dsip_target: None,
+            from_tn: None,
+            identity_header: None,
         }
     }
 
@@ -204,8 +271,10 @@ impl Call {
     }
 }
 
-/// A helper the SIP receive loop uses: find the call whose SIP Call-ID matches and step it.
-pub async fn on_sip_event(calls: &Arc<Mutex<Calls>>, sip: &Arc<SipLeg>, ev: SipEvent) -> Result<()> {
+/// A helper the SIP receive loop uses: find the call whose SIP Call-ID matches and step it. `dsip` is the DSIP
+/// leg, when the host runs one. An INVITE for a call the table does not hold is left alone: the daemon admits
+/// inbound calls itself (N§6.1 routing) before stepping them.
+pub async fn on_sip_event(calls: &Arc<Mutex<Calls>>, sip: &Arc<SipLeg>, ev: SipEvent, dsip: Option<&mut Agent>) -> Result<()> {
     let mut guard = calls.lock().await;
     let (key, event): (Option<String>, Value) = match &ev {
         SipEvent::Response { call_id, status, remote } => {
@@ -236,11 +305,27 @@ pub async fn on_sip_event(calls: &Arc<Mutex<Calls>>, sip: &Arc<SipLeg>, ev: SipE
     }
     let emits = guard.0.get_mut(&key).map(|c| c.step(&event)).unwrap_or_default();
     if let Some(call) = guard.0.get_mut(&key) {
-        apply(call, emits, &Legs { sip }).await?;
+        apply(call, emits, &mut Legs { sip, dsip }).await?;
+    }
+    Ok(())
+}
+
+/// Step the call that owns DSIP session `sid` with a `{dsip: …}` event and apply the emissions to both legs.
+pub async fn on_dsip_event(calls: &Arc<Mutex<Calls>>, sip: &Arc<SipLeg>, sid: &str, event: Value, dsip: &mut Agent) -> Result<()> {
+    let mut guard = calls.lock().await;
+    let Some(key) = find_by_session(&guard, sid) else { return Ok(()) };
+    let emits = guard.0.get_mut(&key).map(|c| c.step(&event)).unwrap_or_default();
+    if let Some(call) = guard.0.get_mut(&key) {
+        apply(call, emits, &mut Legs { sip, dsip: Some(dsip) }).await?;
     }
     Ok(())
 }
 
 fn find_by_sip(calls: &Calls, sip_call_id: &str) -> Option<String> {
     calls.0.iter().find(|(_, c)| c.sip_call_id() == Some(sip_call_id)).map(|(k, _)| k.clone())
+}
+
+/// The table key of the call whose DSIP session is `sid`.
+pub fn find_by_session(calls: &Calls, sid: &str) -> Option<String> {
+    calls.0.iter().find(|(_, c)| c.dsip_session.as_deref() == Some(sid)).map(|(k, _)| k.clone())
 }

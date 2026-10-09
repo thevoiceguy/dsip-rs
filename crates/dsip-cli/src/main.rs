@@ -373,6 +373,10 @@ struct ConnOpts {
     /// A dsip-node (http://host:port, repeatable) to look numbers up on when calling `--to tel:+…` (N§6 route 1).
     #[arg(long = "tn-node")]
     tn_nodes: Vec<String>,
+    /// A DSIP↔PSTN gateway's DID: a `--to tel:+…` that no binding resolves is placed to the gateway, with the number
+    /// as the invite's `destination` (Number Attestation N§4.1).
+    #[arg(long)]
+    gateway: Option<String>,
     /// With --recorded-by: open the recorder leg (C§6) from this second device of our identity, forwarding both
     /// voices to the recorder once the call's media flows.
     #[arg(long)]
@@ -461,6 +465,7 @@ impl ConnOpts {
             pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr, pkarr_device: self.pkarr_device,
             mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
             tn_binding: self.tn_binding, tn_policy: self.tn_policy, contacts: self.contacts, tn_nodes: self.tn_nodes,
+            gateway: self.gateway, destination: None,
             recorded_by: self.recorded_by, record_later: self.record_later, record_device: self.record_device, fork_taps: None, record_purpose: self.record_purpose, recording_accept: self.recording_accept,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
