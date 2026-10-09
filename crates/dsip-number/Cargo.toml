@@ -12,4 +12,4 @@ dsip-core.workspace = true
 serde_json.workspace = true
 base64.workspace = true
 x509-parser.workspace = true
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "pem"] }

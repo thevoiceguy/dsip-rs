@@ -5,9 +5,15 @@ Two carriers under one test STI-CA, with certificates valid around the real cloc
   A  "Carrier Example"  x5u https://cr.carrier-a.example/sti.pem  TNAuthList: one 15551234567, range 15552000000+1000
   B  "Carrier B"        x5u https://cr.carrier-b.example/sti.pem  TNAuthList: one 15551234567 (the number, ported)
 
-  tn_issuer.py policy OUT.json                 the relying party's policy: the STI-CA anchor and both x5u chains
+  tn_issuer.py policy OUT.json                 the relying party's policy: the STI-CA anchor, both x5u chains and
+                                               the gateway's delegate chain
   tn_issuer.py bind A|B TN DID OUT.jws [AGE]   a binding of TN to DID, signed by that carrier, valid for one day,
                                                issued AGE seconds ago (default 60)
+  tn_issuer.py gateway-key OUT.pem             the gateway's delegate-certificate key (PKCS#8 PEM), for `assert`
+                                               (N§4.1); its chain is served at https://gw.example/sti.pem
+
+The gateway's certificate is an RFC 9060 delegate: Carrier Example's delegation CA (a range of 100 numbers from
+15551234500) issues "Enterprise Example" a leaf for 15551234567 only.
 
 Keys are the vector generator's deterministic test keys: never use them for anything real.
 """
@@ -33,6 +39,13 @@ CARRIERS = {
 }
 
 
+SPCA = G.cert(G.name((G.O, "Carrier Example"), (G.CN, "Carrier Example Delegation CA")), G.key("sp-ca"), INTER,
+              [G.bc(True, 0), G.CA_KU, G.tnauth(G.tn_range("15551234500", 100))], 11, nb=NOW - 86400 * 30, na=NOW + 86400 * 90)
+DELEGATE = G.cert(G.name((G.O, "Enterprise Example"), (G.CN, "Delegate")), G.key("delegate"), SPCA,
+                  [G.LEAF_KU, G.tnauth(G.tn_one("15551234567"))], 12, nb=NOW - 86400 * 30, na=NOW + 86400 * 90)
+GW_X5U = "https://gw.example/sti.pem"
+
+
 def leaf(c: str) -> G.Cert:
     name, _, k, tn = CARRIERS[c]
     return G.cert(G.name((G.C, "US"), (G.O, name), (G.CN, f"SHAKEN {name}")), G.key(k), INTER, [G.LEAF_KU, tn],
@@ -41,10 +54,14 @@ def leaf(c: str) -> G.Cert:
 
 def main(argv: list[str]) -> int:
     if argv[:1] == ["policy"] and len(argv) == 2:
-        policy = {"trust_anchors": [ROOT.b64()],
-                  "certificates": {CARRIERS[c][1]: G.pem(leaf(c), INTER) for c in CARRIERS},
+        certificates = {CARRIERS[c][1]: G.pem(leaf(c), INTER) for c in CARRIERS}
+        certificates[GW_X5U] = G.pem(DELEGATE, SPCA, INTER)
+        policy = {"trust_anchors": [ROOT.b64()], "certificates": certificates,
                   "spc_numbers": {}, "require_status": False, "status": {}}
         Path(argv[1]).write_text(json.dumps(policy, indent=1))
+        return 0
+    if argv[:1] == ["gateway-key"] and len(argv) == 2:
+        Path(argv[1]).write_text(G.key_pem(DELEGATE.key))
         return 0
     if argv[:1] == ["bind"] and len(argv) in (5, 6):
         c, tn, did, out = argv[1:5]

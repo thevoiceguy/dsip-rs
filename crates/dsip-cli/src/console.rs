@@ -60,6 +60,10 @@ pub struct ConsoleOpts {
     pub contacts: Option<PathBuf>,
     /// dsip-nodes to look numbers up on, for `--to tel:+…` (N§6 route 1).
     pub tn_nodes: Vec<String>,
+    /// A gateway's DID for numbers no binding resolves (N§4.1).
+    pub gateway: Option<String>,
+    /// The tel URI to put on the invite as `destination` when calling through a gateway (set by `run`).
+    pub destination: Option<String>,
     /// Declare this side recorded by this recorder identity (Recording Profile C§3).
     pub recorded_by: Option<String>,
     /// Declare nothing until `record on`.
@@ -193,6 +197,9 @@ async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(
         let number = b.payload["tn"].as_str().unwrap_or_default().to_string();
         println!("claims    tel {number} with a binding (x5u {}) → invite identity.claims   N§4", b.header["x5u"].as_str().unwrap_or_default());
         agent.set_claims(vec![serde_json::json!({"type": "tel", "number": number, "binding": binding})]);
+    }
+    if let Some(d) = &opts.destination {
+        agent.set_invite_patch(Some(serde_json::json!({"destination": d}))); // N§4.1
     }
     let mut media = None;
     if media_enabled(opts) {
@@ -362,7 +369,24 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     let tn = TnContext::load(&opts)?;
     // Number Attestation N§6–N§7: `--to tel:+…` is looked up on the hints tier, verified, and becomes a DID
     let mode = match mode {
-        Mode::Call { to } if to.starts_with("tel:") => Mode::Call { to: tn.lookup(&to[4..], &opts.tn_nodes).await? },
+        Mode::Call { to } if to.starts_with("tel:") => {
+            let number = to[4..].to_string();
+            let looked = if opts.tn_nodes.is_empty() && opts.gateway.is_some() {
+                Err(anyhow::anyhow!("no --tn-node to look it up on"))
+            } else {
+                tn.lookup(&number, &opts.tn_nodes).await
+            };
+            match (looked, &opts.gateway) {
+                (Ok(did), _) => Mode::Call { to: did },
+                // N§4.1: a number no binding resolves is a PSTN number; the gateway named by `to` dials it
+                (Err(e), Some(gw)) => {
+                    println!("number    {number}: {e}\nnumber    {number} → PSTN through gateway {}, as the invite's destination   N§4.1", short(gw));
+                    opts.destination = Some(format!("tel:{number}"));
+                    Mode::Call { to: gw.clone() }
+                }
+                (Err(e), None) => return Err(e),
+            }
+        }
         m => m,
     };
     // a document given with --did-document is used as it is; only a callee without one is fetched

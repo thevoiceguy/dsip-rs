@@ -3,7 +3,10 @@
 //!
 //! Spec: sections owned by this crate — N§3.1 (the binding's format — [`parse_binding`]), N§3.2 (the STIR
 //! certificate path and TNAuthList coverage — [`parse_tnauth`], [`covers`]), N§3.4 (the order of the checks —
-//! [`verify`]).
+//! [`verify`]), N§4 ([`check_claim`]), N§5 ([`identity_change`]), N§6–N§7 ([`store`], [`select`]), and the
+//! gateway's side — N§4.1 ([`assert_number`]: a bound number carried to the PSTN under the gateway's STIR
+//! certificate), N§6.1 ([`route`]: a dialled number to the DSIP identity it reaches), G§5 ([`verify_passport`]: a
+//! PSTN caller's SHAKEN PASSporT, RFC 8224 §6.2).
 //!
 //! Impl (spec-gap 110): certificates are checked at the verification time, not at `iat`; every TNAuthList on the
 //! path must cover the number; `iat` may be up to 300 s ahead of the clock; E.164 only. Every rule is pinned by
@@ -16,8 +19,11 @@ use std::collections::HashSet;
 
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine as _;
-use p256::ecdsa::signature::Verifier as _;
-use p256::ecdsa::{Signature, VerifyingKey};
+use std::collections::BTreeMap;
+
+use p256::ecdsa::signature::{Signer as _, Verifier as _};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::pkcs8::DecodePrivateKey as _;
 use serde_json::{json, Map, Value};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::{FromDer as _, X509Version};
@@ -463,6 +469,37 @@ fn check_path(path: &[Cert], now: i64) -> Result<(), Reject> {
     }
 }
 
+/// Step 2: the path from what `x5u` serves to a trust anchor, checked at `now`.
+fn cert_path(x5u: Option<&str>, now: i64, policy: &Policy) -> Result<Vec<Cert>, Reject> {
+    let text = x5u.and_then(|u| policy.certificates.get(u)).and_then(Value::as_str).ok_or(UNTRUSTED)?;
+    let chain = load_chain(text)?;
+    // An anchor that does not parse is ignored (README `trust_anchors`).
+    let anchors: Vec<Cert> = policy.trust_anchors.iter().filter_map(|d| Cert::parse(d)).collect();
+    find_path(chain, &anchors, now)
+}
+
+/// Step 3: the leaf key verifies the raw r‖s signature (0 < r, s < n: `Signature::from_slice` refuses the rest)
+/// over the signing input.
+fn check_signature(path: &[Cert], signing_input: &[u8], signature: &[u8]) -> Result<(), Reject> {
+    let sig = (signature.len() == 64).then(|| Signature::from_slice(signature).ok()).flatten();
+    let key = path[0].key.as_ref().ok_or(UNTRUSTED)?;
+    if sig.is_some_and(|s| key.verify(signing_input, &s).is_ok()) {
+        Ok(())
+    } else {
+        Err(Reject("signature"))
+    }
+}
+
+/// Step 4: the leaf has a TNAuthList, and every TNAuthList on the path covers `d` (the number without its `+`;
+/// N§3.2 "Nested coverage").
+fn check_coverage(path: &[Cert], d: &str, policy: &Policy) -> Result<(), Reject> {
+    let covered = |c: &Cert| c.tnauth.as_ref().is_none_or(|l| covers(l, d, &policy.spc_numbers));
+    if path[0].tnauth.is_none() || !path.iter().all(covered) {
+        return Err(Reject("not-authorized-for-tn"));
+    }
+    Ok(())
+}
+
 /// Steps 1–5: everything a party can check without resolving the DID — what a `dsip-node` checks before it stores
 /// (README `check: "store"`). Returns the parsed binding and who attested it.
 ///
@@ -472,25 +509,12 @@ pub fn verify_offline(binding: &str, now: i64, policy: &Policy) -> Result<(Bindi
     let b = parse_binding(binding)?;
     let p = &b.payload;
     // 2. untrusted-certificate
-    let x5u = b.header["x5u"].as_str().unwrap_or_default();
-    let text = policy.certificates.get(x5u).and_then(Value::as_str).ok_or(UNTRUSTED)?;
-    let chain = load_chain(text)?;
-    // An anchor that does not parse is ignored (README `trust_anchors`).
-    let anchors: Vec<Cert> = policy.trust_anchors.iter().filter_map(|d| Cert::parse(d)).collect();
-    let path = find_path(chain, &anchors, now)?;
-    // 3. signature: raw r‖s, 0 < r, s < n (Signature::from_slice refuses the rest)
-    let sig = (b.signature.len() == 64).then(|| Signature::from_slice(&b.signature).ok()).flatten();
-    let key = path[0].key.as_ref().ok_or(UNTRUSTED)?;
-    if !sig.is_some_and(|s| key.verify(&b.signing_input, &s).is_ok()) {
-        return Err(Reject("signature"));
-    }
-    // 4. not-authorized-for-tn: the leaf's list, and every other list on the path (N§3.2 "Nested coverage")
+    let path = cert_path(b.header["x5u"].as_str(), now, policy)?;
+    // 3. signature
+    check_signature(&path, &b.signing_input, &b.signature)?;
+    // 4. not-authorized-for-tn
     let tn = p["tn"].as_str().unwrap_or_default();
-    let d = &tn[1..];
-    let covered = |c: &Cert| c.tnauth.as_ref().is_none_or(|l| covers(l, d, &policy.spc_numbers));
-    if path[0].tnauth.is_none() || !path.iter().all(covered) {
-        return Err(Reject("not-authorized-for-tn"));
-    }
+    check_coverage(&path, &tn[1..], policy)?;
     // 5. time (spec-gap 110: 7 days; the §12.9 300 s tolerance)
     let (iat, exp) = (p["iat"].as_i64().unwrap_or_default(), p["exp"].as_i64().unwrap_or_default());
     if exp - iat > LIFETIME_MAX {
@@ -756,6 +780,269 @@ fn utc_date(t: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+// --- gateways: a PSTN caller's PASSporT, a dialled number's identity, a bound number toward the PSTN ----------
+
+/// RFC 8224 §6.2.1's freshness window for a PASSporT's `iat`, seconds (README `check: "passport"` rule 7).
+pub const PASSPORT_FRESH: i64 = 60;
+
+/// A number's canonical form (RFC 8224 §8.3 as the README pins it): a leading `+` and the visual separators `-`,
+/// `.`, `(`, `)` and SP removed, leaving 1 to 15 digits. `None` when nothing matchable remains.
+///
+/// Spec: G§5 (`orig` must match the SIP `From`), RFC 8224 §8.3.
+pub fn canonical_number(s: &str) -> Option<String> {
+    let t: String = s.strip_prefix('+').unwrap_or(s).chars().filter(|c| !matches!(c, '-' | '.' | '(' | ')' | ' ')).collect();
+    ((1..=15).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_digit())).then_some(t)
+}
+
+/// What a gateway learned from an inbound INVITE's `Identity` header: the facts the G§5 `tel` claim carries.
+///
+/// Spec: G§5 (`attestation` is the level of a verified header, `none` when absent; `verified` only when the
+/// signature and chain verified and `orig` matches the `From`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassportOutcome {
+    /// `A`, `B` or `C`, or `none` when no PASSporT was accepted.
+    pub attest: String,
+    /// Whether it verified in full.
+    pub verified: bool,
+    /// Why not, when it did not (README `check: "passport"`; local, never on the wire).
+    pub reason: Option<&'static str>,
+}
+
+/// An `Identity` header value split into its token, its parameters (names lower-cased) and the `info` URI.
+fn parse_identity_header(value: &str) -> Result<(String, BTreeMap<String, String>, String), Reject> {
+    let mut parts = value.split(';');
+    let token = parts.next().unwrap_or_default().trim_matches([' ', '\t']).to_string();
+    let mut params = BTreeMap::new();
+    for part in parts {
+        let (n, v) = part.split_once('=').ok_or(MALFORMED)?;
+        let (n, v) = (n.trim_matches([' ', '\t']).to_ascii_lowercase(), v.trim_matches([' ', '\t']).to_string());
+        if n.is_empty() || v.is_empty() || params.insert(n, v).is_some() {
+            return Err(MALFORMED);
+        }
+    }
+    let info = params.get("info").ok_or(MALFORMED)?;
+    let uri = info.strip_prefix('<').and_then(|i| i.strip_suffix('>')).ok_or(MALFORMED)?.to_string();
+    Ok((token, params, uri))
+}
+
+/// A SHAKEN PASSporT token (README `check: "passport"` rule 4): three segments, I-JSON objects, the header and
+/// payload members RFC 8225 and RFC 8588 require.
+fn parse_passport(token: &str) -> Result<Binding, Reject> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 || parts[2].is_empty() {
+        return Err(MALFORMED);
+    }
+    let header = json_object(&b64u(parts[0])?)?;
+    let payload = json_object(&b64u(parts[1])?)?;
+    let signature = b64u(parts[2])?;
+    let x5u_ok = header.get("x5u").and_then(Value::as_str).is_some_and(|u| u.starts_with("https://"));
+    if header.get("alg") != Some(&json!("ES256")) || header.get("typ") != Some(&json!("passport"))
+        || header.get("ppt") != Some(&json!("shaken")) || !x5u_ok
+    {
+        return Err(MALFORMED);
+    }
+    let number = |v: Option<&Value>| v.and_then(Value::as_str).and_then(canonical_number).is_some();
+    let attest_ok = matches!(payload.get("attest").and_then(Value::as_str), Some("A" | "B" | "C"));
+    let orig_ok = payload.get("orig").is_some_and(|o| o.is_object() && number(o.get("tn")));
+    let dest_ok = payload.get("dest").is_some_and(|d| {
+        d.is_object() && d.get("tn").and_then(Value::as_array).is_some_and(|a| !a.is_empty() && a.iter().all(|t| number(Some(t))))
+    });
+    if !attest_ok || !orig_ok || !dest_ok || !int(payload.get("iat")).is_some_and(|i| i >= 0) {
+        return Err(MALFORMED);
+    }
+    Ok(Binding { header, payload, signing_input: format!("{}.{}", parts[0], parts[1]).into_bytes(), signature })
+}
+
+/// Verify the `Identity` header of an inbound SIP INVITE: the facts behind the gateway's G§5 `tel` claim.
+///
+/// Spec: G§5, N§4.1 (inbound), RFC 8224 §6.2, RFC 8588. Impl (spec-gap 110 I): the README `check: "passport"`
+/// order — absent, malformed parameters, unsupported `alg`/`ppt`, malformed token, `orig` against the `From`
+/// (discarded whole, G§5), then with the level kept: `dest`, freshness (60 s), `x5u` against `info`, the certificate
+/// path, the signature, and TNAuthList coverage for `A` only (`B` and `C` attest no authority over the number).
+pub fn verify_passport(identity: Option<&str>, from_tn: &str, to_tn: &str, now: i64, policy: &Policy) -> PassportOutcome {
+    let none = |reason| PassportOutcome { attest: "none".into(), verified: false, reason: Some(reason) };
+    let Some(value) = identity else { return none("no-identity-header") };
+    let Ok((token, params, info)) = parse_identity_header(value) else { return none("malformed") };
+    if params.get("alg").is_some_and(|a| a != "ES256") || params.get("ppt").is_some_and(|p| p != "shaken") {
+        return none("unsupported"); // RFC 8224 §6.2.3: a header the verifier cannot process is ignored
+    }
+    let Ok(pp) = parse_passport(&token) else { return none("malformed") };
+    let orig = canonical_number(pp.payload["orig"]["tn"].as_str().unwrap_or_default()).unwrap_or_default();
+    if canonical_number(from_tn).as_deref() != Some(orig.as_str()) {
+        return none("orig-mismatch"); // G§5: it attests some other call
+    }
+    let attest = pp.payload["attest"].as_str().unwrap_or_default().to_string();
+    let un = |reason| PassportOutcome { attest: attest.clone(), verified: false, reason: Some(reason) };
+    let to = canonical_number(to_tn);
+    let dests = pp.payload["dest"]["tn"].as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(canonical_number);
+    if !dests.into_iter().any(|d| Some(d) == to) {
+        return un("dest-mismatch");
+    }
+    if (now - int(pp.payload.get("iat")).unwrap_or_default()).abs() > PASSPORT_FRESH {
+        return un("stale");
+    }
+    if pp.header["x5u"].as_str() != Some(info.as_str()) {
+        return un("x5u-mismatch");
+    }
+    let checks = || -> Result<(), Reject> {
+        let path = cert_path(pp.header["x5u"].as_str(), now, policy)?;
+        check_signature(&path, &pp.signing_input, &pp.signature)?;
+        if attest == "A" {
+            check_coverage(&path, &orig, policy)?;
+        }
+        Ok(())
+    };
+    match checks() {
+        Ok(()) => PassportOutcome { attest, verified: true, reason: None },
+        Err(Reject(r)) => un(r),
+    }
+}
+
+/// Where an inbound PSTN call to a number goes (N§6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// The operator's own table named it.
+    Configured(String),
+    /// The N§6 lookup found a verified binding (N§7 chose among several).
+    Binding(Selected),
+    /// Nowhere: the gateway refuses `identity.unknown` (404, Q.850 cause 1; G§4.2).
+    None,
+}
+
+/// Resolve a dialled number to the DSIP identity to invite: the operator's table first, then the bindings an N§6
+/// route 1 lookup returned (`select`), else nothing.
+///
+/// Spec: N§6.1, G§3.2. Impl (spec-gap 110 I): the table is the operator's statement about its own trunk, and a
+/// verified binding never overrides it; `to_tn` must be E.164 for the lookup.
+pub fn route(to_tn: &str, configured: &Value, bindings: &[Value], documents: &Map<String, Value>, now: i64, policy: &Policy) -> Route {
+    if let Some(did) = configured.get(to_tn).and_then(Value::as_str) {
+        return Route::Configured(did.to_string());
+    }
+    if is_tn(to_tn) {
+        if let Some(s) = select(to_tn, bindings, documents, now, policy) {
+            return Route::Binding(s);
+        }
+    }
+    Route::None
+}
+
+/// The gateway's own STIR certificate: the `x5u` its chain is served at, and the leaf's private key (PKCS#8 PEM).
+///
+/// Spec: N§4.1 (an RFC 9060 delegate certificate normally, G§11 path c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayCert {
+    /// Where the chain is served; the PASSporT's `x5u` and the `Identity` header's `info`.
+    pub x5u: String,
+    /// The leaf's private key, a PKCS#8 PEM.
+    pub key_pem: String,
+}
+
+impl GatewayCert {
+    /// From a `tn-binding` context's `gateway` member: `None` unless it is an object with string `x5u` and `key`.
+    ///
+    /// Spec: none (infrastructure) — the README `check: "assert"` context.
+    pub fn from_json(v: &Value) -> Option<GatewayCert> {
+        let (x5u, key) = (v.get("x5u")?.as_str()?, v.get("key")?.as_str()?);
+        Some(GatewayCert { x5u: x5u.to_string(), key_pem: key.to_string() })
+    }
+}
+
+/// A signed SHAKEN PASSporT: the decoded header and claims, and the compact JWS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Passport {
+    /// The protected header.
+    pub header: Map<String, Value>,
+    /// The claims.
+    pub claims: Map<String, Value>,
+    /// The compact JWS.
+    pub token: String,
+}
+
+impl Passport {
+    /// The RFC 8224 `Identity` header value: `<token>;info=<x5u>;alg=ES256;ppt=shaken`.
+    pub fn identity_header(&self) -> String {
+        format!("{};info=<{}>;alg=ES256;ppt=shaken", self.token, self.header["x5u"].as_str().unwrap_or_default())
+    }
+}
+
+/// What a gateway presents toward the PSTN for a DSIP caller (N§4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assertion {
+    /// The SIP `From` user: the caller's attested number, or `None` for the gateway's own identity.
+    pub from: Option<String>,
+    /// The PASSporT, when the gateway may sign one.
+    pub passport: Option<Passport>,
+    /// Why there is no PASSporT (README `check: "assert"`): G§7's `identity-not-assertable`.
+    pub reason: Option<&'static str>,
+}
+
+fn sorted_json(m: &Map<String, Value>) -> Vec<u8> {
+    // RFC 8225 §9: members in lexicographic order, no whitespace (nested objects here have one member each)
+    let b: BTreeMap<&String, &Value> = m.iter().collect();
+    serde_json::to_vec(&b).unwrap_or_default()
+}
+
+/// Carry a DSIP caller's bound number to the PSTN: the first attested `tel` claim gives the `From`, and the gateway
+/// signs a SHAKEN PASSporT (`attest: A`) when its own certificate chains, covers the number, and matches its key.
+///
+/// Spec: N§4 ("a gateway … may assert the `From` number only under a STIR certificate that covers it"), N§4.1,
+/// G§7 (`identity-not-assertable` otherwise), G§11 path (c). Impl (spec-gap 110 A and I): the README
+/// `check: "assert"` order — the claim, `bad-destination`, `no-certificate`, `untrusted-certificate`,
+/// `not-authorized-for-tn`, `key-mismatch`; an attested number is presented unsigned (path b) when the gateway cannot
+/// sign; the level is `A` only, never `B`.
+#[allow(clippy::too_many_arguments)]
+pub fn assert_number(
+    claims: &[Value],
+    identity: &str,
+    did_document: &Value,
+    to_tn: &str,
+    now: i64,
+    origid: &str,
+    policy: &Policy,
+    gateway: Option<&GatewayCert>,
+) -> Assertion {
+    let (mut number, mut dropped) = (None, None);
+    for c in claims {
+        match check_claim(c, identity, did_document, now, policy) {
+            ClaimOutcome::Attested { .. } => {
+                number = c["number"].as_str().map(String::from);
+                break;
+            }
+            ClaimOutcome::Dropped { reason, .. } => dropped = dropped.or(Some(reason)),
+            ClaimOutcome::Ignored => {}
+        }
+    }
+    let Some(number) = number else {
+        return Assertion { from: None, passport: None, reason: Some(dropped.unwrap_or("no-binding")) };
+    };
+    let no = |reason| Assertion { from: Some(number.clone()), passport: None, reason: Some(reason) };
+    if !is_tn(to_tn) {
+        return no("bad-destination");
+    }
+    let Some(gw) = gateway else { return no("no-certificate") };
+    let Ok(secret) = p256::SecretKey::from_pkcs8_pem(&gw.key_pem) else { return no("no-certificate") };
+    let path = match cert_path(Some(&gw.x5u), now, policy) {
+        Ok(p) => p,
+        Err(Reject(r)) => return no(r),
+    };
+    if let Err(Reject(r)) = check_coverage(&path, &number[1..], policy) {
+        return no(r);
+    }
+    let signing = SigningKey::from(&secret);
+    if path[0].key.as_ref() != Some(signing.verifying_key()) {
+        return no("key-mismatch");
+    }
+    let header = json!({"alg": "ES256", "ppt": "shaken", "typ": "passport", "x5u": gw.x5u});
+    let claims = json!({"attest": "A", "dest": {"tn": [&to_tn[1..]]}, "iat": now, "orig": {"tn": &number[1..]}, "origid": origid});
+    let (header, claims) = (header.as_object().cloned().unwrap_or_default(), claims.as_object().cloned().unwrap_or_default());
+    let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let si = format!("{}.{}", enc(&sorted_json(&header)), enc(&sorted_json(&claims)));
+    let sig: Signature = signing.sign(si.as_bytes()); // RFC 6979 nonces: the same input signs the same way
+    let token = format!("{si}.{}", enc(&sig.to_bytes()));
+    Assertion { from: Some(number), passport: Some(Passport { header, claims, token }), reason: None }
+}
+
+
 /// Run one `tn-binding` vector: `{outcome: verified, …}` or `{outcome: rejected, reason}`.
 ///
 /// Spec: none (infrastructure) — the README `tn-binding` vector contract around [`verify`].
@@ -811,6 +1098,43 @@ pub fn run_vector(v: &Value) -> Value {
             ClaimOutcome::Dropped { reason, line } => json!({"outcome": "dropped", "reason": reason, "line": line}),
         };
     }
+    if i["check"] == "passport" {
+        let (from, to) = (i["from_tn"].as_str().unwrap_or_default(), i["to_tn"].as_str().unwrap_or_default());
+        let o = verify_passport(i["identity"].as_str(), from, to, i["now"].as_i64().unwrap_or_default(), &policy);
+        return match o.reason {
+            None => json!({"attest": o.attest, "verified": true}),
+            Some(r) => json!({"attest": o.attest, "verified": false, "reason": r}),
+        };
+    }
+    if i["check"] == "route" {
+        let bindings = i["bindings"].as_array().cloned().unwrap_or_default();
+        let docs = i["documents"].as_object().cloned().unwrap_or_default();
+        let to = i["to_tn"].as_str().unwrap_or_default();
+        return match route(to, &i["configured"], &bindings, &docs, i["now"].as_i64().unwrap_or_default(), &policy) {
+            Route::Configured(did) => json!({"outcome": "configured", "did": did}),
+            Route::Binding(s) => json!({"outcome": "binding", "did": s.did, "attested_by": s.attested_by, "issued": s.issued, "others": s.others}),
+            Route::None => json!({"outcome": "none"}),
+        };
+    }
+    if i["check"] == "assert" {
+        let claims = i["claims"].as_array().cloned().unwrap_or_default();
+        let gw = GatewayCert::from_json(&c["gateway"]);
+        let a = assert_number(
+            &claims,
+            i["identity"].as_str().unwrap_or_default(),
+            &i["did_document"],
+            i["to_tn"].as_str().unwrap_or_default(),
+            i["now"].as_i64().unwrap_or_default(),
+            i["origid"].as_str().unwrap_or_default(),
+            &policy,
+            gw.as_ref(),
+        );
+        let passport = a.passport.map(|p| json!({"header": p.header, "claims": p.claims}));
+        return match a.reason {
+            None => json!({"from": a.from, "passport": passport, "assertable": true}),
+            Some(r) => json!({"from": a.from, "passport": passport, "assertable": false, "reason": r}),
+        };
+    }
     let r = verify(
         i["binding"].as_str().unwrap_or_default(),
         i["did"].as_str().unwrap_or_default(),
@@ -821,5 +1145,31 @@ pub fn run_vector(v: &Value) -> Value {
     match r {
         Ok(ok) => json!({"outcome": "verified", "tn": ok.tn, "did": ok.did, "expires": ok.expires, "attested_by": ok.attested_by}),
         Err(Reject(reason)) => json!({"outcome": "rejected", "reason": reason}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The suite pins the signing input, not the signature; this pins that what `assert_number` signs is what
+    /// `verify_passport` accepts (the far end of `demos/number-gateway-demo.sh`).
+    #[test]
+    fn asserted_passport_verifies_at_the_far_end() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../vectors/tn-binding/");
+        let v: Value = serde_json::from_slice(&std::fs::read(format!("{dir}assert-signed.json")).unwrap()).unwrap();
+        let (c, i) = (&v["context"], &v["input"]);
+        let policy = Policy::from_json(c);
+        let gw = GatewayCert::from_json(&c["gateway"]).unwrap();
+        let claims = i["claims"].as_array().cloned().unwrap();
+        let now = i["now"].as_i64().unwrap();
+        let a = assert_number(&claims, i["identity"].as_str().unwrap(), &i["did_document"], i["to_tn"].as_str().unwrap(), now, "x", &policy, Some(&gw));
+        let p = a.passport.expect("signed");
+        assert_eq!(a.from.as_deref(), Some("+15551234567"));
+        let o = verify_passport(Some(&p.identity_header()), "+15551234567", i["to_tn"].as_str().unwrap(), now, &policy);
+        assert_eq!(o, PassportOutcome { attest: "A".into(), verified: true, reason: None });
+        // and the same input signs the same way (RFC 6979), so the token is reproducible
+        let again = assert_number(&claims, i["identity"].as_str().unwrap(), &i["did_document"], i["to_tn"].as_str().unwrap(), now, "x", &policy, Some(&gw));
+        assert_eq!(again.passport.unwrap().token, p.token);
     }
 }
