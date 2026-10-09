@@ -58,6 +58,8 @@ pub struct ConsoleOpts {
     pub tn_policy: Option<PathBuf>,
     /// The address book for the identity-change warning (N§5).
     pub contacts: Option<PathBuf>,
+    /// dsip-nodes to look numbers up on, for `--to tel:+…` (N§6 route 1).
+    pub tn_nodes: Vec<String>,
     /// Declare this side recorded by this recorder identity (Recording Profile C§3).
     pub recorded_by: Option<String>,
     /// Declare nothing until `record on`.
@@ -124,6 +126,36 @@ impl TnContext {
             None => vec![],
         };
         Ok(TnContext { policy, documents, contacts })
+    }
+
+    /// Number → DID (N§6 route 1, N§7): every binding the nodes return, verified in full against its own DID's
+    /// document, the newest winning. The DHT is a hints tier: a node can withhold, never forge (§8.1).
+    async fn lookup(&self, tn: &str, nodes: &[String]) -> Result<String> {
+        anyhow::ensure!(!nodes.is_empty(), "calling a number needs --tn-node (a dsip-node serving /dsip/v1/tn/)");
+        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+        let mut bindings: Vec<serde_json::Value> = vec![];
+        for n in nodes {
+            let url = format!("{}/dsip/v1/tn/{}", n.trim_end_matches('/'), tn.replace('+', "%2B"));
+            match http.get(&url).send().await.and_then(|r| r.error_for_status()) {
+                Ok(r) => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let got = v["bindings"].as_array().cloned().unwrap_or_default();
+                    println!("number    {tn}: {} binding(s) from {n}   N§6 (hints tier)", got.len());
+                    bindings.extend(got.into_iter().filter(|b| !bindings.contains(b)).collect::<Vec<_>>());
+                }
+                Err(e) => println!("number    {tn}: {n} did not answer ({e})"),
+            }
+        }
+        let docs: serde_json::Map<String, serde_json::Value> = self.documents.clone().into_iter().collect();
+        let Some(s) = dsip_number::select(tn, &bindings, &docs, dsip_transport::now_s(), &self.policy) else {
+            anyhow::bail!("{tn}: no binding verified (none found, or none whose DID claims the number back)   N§3.4");
+        };
+        let by = s.attested_by.as_deref().map(|b| format!(" by {b}")).unwrap_or_default();
+        println!("number    {tn} → {}  (attested{by}; the DID claims it back)   N§3.4, N§6", s.did);
+        if !s.others.is_empty() {
+            println!("  ⚠  {tn} is also bound to {} — the newer binding is used   N§7", s.others.join(", "));
+        }
+        Ok(s.did)
     }
 }
 
@@ -327,12 +359,18 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     let my_identity = id.meta.identity.clone();
     println!("identity  {}  (\"{}\")", id.meta.identity, id.meta.display_name);
     println!("device    {}", id.meta.device);
+    let tn = TnContext::load(&opts)?;
+    // Number Attestation N§6–N§7: `--to tel:+…` is looked up on the hints tier, verified, and becomes a DID
+    let mode = match mode {
+        Mode::Call { to } if to.starts_with("tel:") => Mode::Call { to: tn.lookup(&to[4..], &opts.tn_nodes).await? },
+        m => m,
+    };
+    // a document given with --did-document is used as it is; only a callee without one is fetched
     let fetch: Vec<String> = match &mode {
-        Mode::Call { to } | Mode::Introduce { to, .. } => vec![to.clone()],
+        Mode::Call { to } | Mode::Introduce { to, .. } if !tn.documents.contains_key(to) => vec![to.clone()],
         _ => vec![],
     };
     let resolver = build_resolver(&opts.did_documents, &fetch).await?;
-    let tn = TnContext::load(&opts)?;
 
     // Discovery (§8.1): DID document first; did:key has none, so the hints tier may name the peer's relay.
     let dht = if opts.dht.is_empty() { None } else { Some(crate::hints::join(&opts.dht).await?) };

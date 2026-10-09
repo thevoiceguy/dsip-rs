@@ -3,7 +3,8 @@
 //!
 //! Spec: sections owned by this crate — DHT Reachability Hints Profile §10 (HTTP access, v0.11): the routes, their
 //! answers, and verify-before-store on each ([`dsip_core::pkarr::store`] for Pkarr packets, the overlay's own
-//! evaluation for §2 records). It is a hints tier only (§8.1): it never answers with authority, and every client
+//! evaluation for §2 records), and Number Attestation Profile N§6 route 1 (number bindings at `/dsip/v1/tn/<tn>`,
+//! checked by [`dsip_number::store`]). It is a hints tier only (§8.1): it never answers with authority, and every client
 //! verifies what it receives, so withholding is its only power. Plan: `impl/docs/dsip-node-plan.md`.
 
 #![deny(missing_docs)]
@@ -49,6 +50,19 @@ pub struct Node {
     buckets: std::sync::Mutex<HashMap<IpAddr, (f64, std::time::Instant)>>,
     /// When each held packet was last looked for on Mainline.
     checked: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Number bindings (N§6 route 1), when this node serves them.
+    pub numbers: Option<Numbers>,
+}
+
+/// Number bindings held, and the policy they are verified against before they are stored.
+///
+/// Spec: Number Attestation Profile N§6 (route 1); README `tn-binding` `check: "store"`.
+/// Impl: held in memory only; publishers re-`PUT` as they renew, which a binding's ≤ 7-day life requires anyway.
+pub struct Numbers {
+    /// The STI-CA trust list and the x5u chains this node can fetch.
+    pub policy: dsip_number::Policy,
+    /// Bindings held, by E.164 number.
+    pub held: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// HTTP limits (profile §10: a node MAY limit request rates, answering 429).
@@ -84,7 +98,7 @@ impl Node {
     pub fn new(overlay: Option<dsip_dht::node::Handle>, mainline: Option<AsyncDht>, peer_id: String,
                state: Option<config::StateDir>) -> Node {
         Node { overlay, mainline, held: Default::default(), peer_id, state, limits: Limits::default(),
-               metrics: Metrics::default(), buckets: Default::default(), checked: Default::default() }
+               metrics: Metrics::default(), buckets: Default::default(), checked: Default::default(), numbers: None }
     }
 
     /// Whether `z32` was last looked for on Mainline more than [`MAINLINE_RECHECK`] ago; if so, it is now.
@@ -183,6 +197,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/dsip/v1/node", get(node_info))
         .route("/dsip/v1/hints/{did}", get(overlay_get))
         .route("/dsip/v1/hints", post(overlay_post))
+        .route("/dsip/v1/tn/{tn}", get(tn_get).put(tn_put))
         .route("/metrics", get(metrics))
         .route("/{z32}", get(pkarr_get).put(pkarr_put))
         .layer(axum::middleware::from_fn_with_state(node.clone(), limit_and_count))
@@ -212,6 +227,36 @@ async fn limit_and_count(State(node): State<Arc<Node>>, req: Request, next: axum
     };
     *node.metrics.http.lock().unwrap_or_else(|e| e.into_inner()).entry((route, resp.status().as_u16())).or_default() += 1;
     resp
+}
+
+/// `GET /dsip/v1/tn/<tn>`: `{"bindings": [...]}`, the unexpired bindings held for the number, newest first; 404 when
+/// this node serves no numbers. Readers verify every one and choose (N§7).
+///
+/// Spec: Number Attestation Profile N§6 (route 1).
+async fn tn_get(State(node): State<Arc<Node>>, Path(tn): Path<String>) -> Response {
+    let Some(n) = &node.numbers else { return (StatusCode::NOT_FOUND, "numbers not served").into_response() };
+    let held = n.held.lock().await.get(&tn).cloned().unwrap_or_default();
+    Json(json!({"bindings": dsip_number::live(&held, now_s())})).into_response()
+}
+
+/// `PUT /dsip/v1/tn/<tn>`: steps 1–5, the path's number, then the held-set rules: 204 stored or the same binding,
+/// 409 older or full, 400 rejected.
+///
+/// Spec: Number Attestation Profile N§6 (route 1); README `tn-binding` `check: "store"`.
+async fn tn_put(State(node): State<Arc<Node>>, Path(tn): Path<String>, body: Bytes) -> Response {
+    let Some(n) = &node.numbers else { return (StatusCode::NOT_FOUND, "numbers not served").into_response() };
+    let Ok(binding) = std::str::from_utf8(&body) else { return (StatusCode::BAD_REQUEST, "malformed").into_response() };
+    let mut held = n.held.lock().await;
+    let current = held.get(&tn).cloned().unwrap_or_default();
+    match dsip_number::store(&tn, binding.trim(), &current, now_s(), &n.policy) {
+        dsip_number::StoreOutcome::Stored(set) => {
+            held.insert(tn, set);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        dsip_number::StoreOutcome::Kept("same") => StatusCode::NO_CONTENT.into_response(),
+        dsip_number::StoreOutcome::Kept(r) => (StatusCode::CONFLICT, r).into_response(),
+        dsip_number::StoreOutcome::Rejected(r) => (StatusCode::BAD_REQUEST, r).into_response(),
+    }
 }
 
 /// `GET /metrics`: Prometheus text exposition.

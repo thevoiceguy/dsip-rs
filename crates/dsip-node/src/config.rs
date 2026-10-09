@@ -27,6 +27,18 @@ pub struct Config {
     /// `[limits]`.
     #[serde(default)]
     pub limits: LimitsSection,
+    /// `[numbers]`.
+    #[serde(default)]
+    pub numbers: NumbersSection,
+}
+
+/// `[numbers]`: number bindings (Number Attestation Profile N§6, route 1), served only with a trust policy.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NumbersSection {
+    /// The binding policy (JSON: trust_anchors, certificates, …) that bindings are verified against before they are
+    /// stored. Without it the `/dsip/v1/tn/` routes answer 404.
+    pub policy: Option<PathBuf>,
 }
 
 /// `[limits]`: what a misbehaving peer or client costs before it is cut off.

@@ -463,10 +463,11 @@ fn check_path(path: &[Cert], now: i64) -> Result<(), Reject> {
     }
 }
 
-/// Verify a binding for `did`, in the N§3.4 order: the first failing step gives the reason.
+/// Steps 1–5: everything a party can check without resolving the DID — what a `dsip-node` checks before it stores
+/// (README `check: "store"`). Returns the parsed binding and who attested it.
 ///
-/// Spec: N§3.4 (steps 1–8), N§3.1, N§3.2, N§3.3.
-pub fn verify(binding: &str, did: &str, did_document: &Value, now: i64, policy: &Policy) -> Result<Verified, Reject> {
+/// Spec: N§3.4 steps 1–5, N§6 (route 1).
+pub fn verify_offline(binding: &str, now: i64, policy: &Policy) -> Result<(Binding, Option<String>), Reject> {
     // 1. malformed
     let b = parse_binding(binding)?;
     let p = &b.payload;
@@ -501,6 +502,18 @@ pub fn verify(binding: &str, did: &str, did_document: &Value, now: i64, policy: 
     if now >= exp {
         return Err(Reject("expired"));
     }
+    let attested_by = path[0].attested_by.clone();
+    Ok((b, attested_by))
+}
+
+/// Verify a binding for `did`, in the N§3.4 order: the first failing step gives the reason.
+///
+/// Spec: N§3.4 (steps 1–8), N§3.1, N§3.2, N§3.3.
+pub fn verify(binding: &str, did: &str, did_document: &Value, now: i64, policy: &Policy) -> Result<Verified, Reject> {
+    let (b, attested_by) = verify_offline(binding, now, policy)?;
+    let p = &b.payload;
+    let tn = p["tn"].as_str().unwrap_or_default();
+    let exp = p["exp"].as_i64().unwrap_or_default();
     // 6. did-mismatch
     let bound = p["did"].as_str().unwrap_or_default();
     if bound != did {
@@ -522,7 +535,128 @@ pub fn verify(binding: &str, did: &str, did_document: &Value, now: i64, policy: 
             _ => return Err(Reject("status-unavailable")), // no answer, or one that is neither: fail closed
         }
     }
-    Ok(Verified { tn: tn.to_string(), did: bound.to_string(), expires: exp, attested_by: path[0].attested_by.clone() })
+    Ok(Verified { tn: tn.to_string(), did: bound.to_string(), expires: exp, attested_by })
+}
+
+/// How many bindings a node holds per number (README `check: "store"`).
+pub const HELD_MAX: usize = 4;
+
+/// A node's answer to `PUT /dsip/v1/tn/<tn>` (N§6 route 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreOutcome {
+    /// Stored: the new held set, newest `iat` first, then by binding text.
+    Stored(Vec<String>),
+    /// Not stored: `same`, `older` or `full`.
+    Kept(&'static str),
+    /// Refused: `bad-number`, a step 1–5 reason, or `tn-mismatch`.
+    Rejected(&'static str),
+}
+
+fn payload_of(binding: &str) -> Value {
+    binding.split('.').nth(1).and_then(|p| B64U.decode(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn iat_of(binding: &str) -> i64 {
+    payload_of(binding)["iat"].as_i64().unwrap_or_default()
+}
+
+fn held_order(mut held: Vec<String>) -> Vec<String> {
+    held.sort_by(|a, b| iat_of(b).cmp(&iat_of(a)).then_with(|| a.as_bytes().cmp(b.as_bytes())));
+    held
+}
+
+/// The held bindings still live at `now` (`now < exp`), in their order.
+///
+/// Spec: N§6 (route 1: a node serves the unexpired held set).
+pub fn live(held: &[String], now: i64) -> Vec<String> {
+    held.iter().filter(|h| held_payload(h).is_some_and(|p| p["exp"].as_i64().is_some_and(|e| now < e))).cloned().collect()
+}
+
+/// A held entry's payload, when it reads: three segments, the second an I-JSON object with a string `did` and integer
+/// `iat` and `exp`. The header and signature are not looked at; an entry that does not read is dropped.
+fn held_payload(h: &str) -> Option<Value> {
+    let parts: Vec<&str> = h.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let p = json_object(&b64u(parts[1]).ok()?).ok()?;
+    let ok = p.get("did").is_some_and(Value::is_string) && p.get("iat").is_some_and(Value::is_i64) && p.get("exp").is_some_and(Value::is_i64);
+    ok.then_some(Value::Object(p))
+}
+
+/// A node's verify-before-store for a number binding: steps 1–5 (a node resolves no DIDs), the path's number, then
+/// at most [`HELD_MAX`] live bindings per number, one per DID, the newest kept.
+///
+/// Spec: N§6 (route 1); Impl (spec-gap 110 H): the set rules are the README's `check: "store"`.
+pub fn store(tn: &str, binding: &str, held: &[String], now: i64, policy: &Policy) -> StoreOutcome {
+    if !is_tn(tn) {
+        return StoreOutcome::Rejected("bad-number");
+    }
+    let (b, _) = match verify_offline(binding, now, policy) {
+        Ok(v) => v,
+        Err(Reject(r)) => return StoreOutcome::Rejected(r),
+    };
+    if b.payload["tn"].as_str() != Some(tn) {
+        return StoreOutcome::Rejected("tn-mismatch");
+    }
+    let (did, iat) = (b.payload["did"].as_str().unwrap_or_default(), b.payload["iat"].as_i64().unwrap_or_default());
+    let live = live(held, now);
+    let without = |x: &str| live.iter().filter(|h| h.as_str() != x).cloned().chain([binding.to_string()]).collect();
+    if let Some(h) = live.iter().find(|h| payload_of(h)["did"].as_str() == Some(did)) {
+        return if h == binding {
+            StoreOutcome::Kept("same")
+        } else if iat > iat_of(h) {
+            StoreOutcome::Stored(held_order(without(h)))
+        } else {
+            StoreOutcome::Kept("older")
+        };
+    }
+    if live.len() < HELD_MAX {
+        return StoreOutcome::Stored(held_order(without("")));
+    }
+    let low = live.iter().map(|h| iat_of(h)).min().unwrap_or_default();
+    let victim = live.iter().filter(|h| iat_of(h) == low).max_by(|a, b| a.as_bytes().cmp(b.as_bytes())).cloned().unwrap_or_default();
+    if iat > low {
+        StoreOutcome::Stored(held_order(without(&victim)))
+    } else {
+        StoreOutcome::Kept("full")
+    }
+}
+
+/// The number's DID, chosen from the bindings a lookup returned (N§6, N§7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selected {
+    /// The winner's DID.
+    pub did: String,
+    /// Who attested the winner.
+    pub attested_by: Option<String>,
+    /// The winner's `iat`.
+    pub issued: i64,
+    /// Other DIDs that also hold verified bindings for the number, sorted: a port in progress, or a hijack.
+    pub others: Vec<String>,
+}
+
+/// Verify every returned binding fully, each against its own DID and that DID's document, and pick the winner:
+/// the greatest `iat`, then the smallest binding text.
+///
+/// Spec: N§6, N§7 (two verified bindings: the newer `iat` wins, and the client says so).
+pub fn select(tn: &str, bindings: &[Value], documents: &Map<String, Value>, now: i64, policy: &Policy) -> Option<Selected> {
+    let mut verified: Vec<(i64, &str, Verified)> = vec![];
+    for b in bindings.iter().filter_map(Value::as_str) {
+        let p = payload_of(b);
+        let Some(did) = p["did"].as_str() else { continue };
+        let doc = documents.get(did).cloned().unwrap_or(Value::Null);
+        if let Ok(v) = verify(b, did, &doc, now, policy) {
+            if v.tn == tn {
+                verified.push((p["iat"].as_i64().unwrap_or_default(), b, v));
+            }
+        }
+    }
+    let (issued, _, win) = verified.iter().min_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.as_bytes().cmp(y.1.as_bytes())))?.clone();
+    let mut others: Vec<String> = verified.iter().map(|v| v.2.did.clone()).filter(|d| *d != win.did).collect();
+    others.sort();
+    others.dedup();
+    Some(Selected { did: win.did, attested_by: win.attested_by, issued, others })
 }
 
 /// What a client does with a `tel` claim carrying a binding (N§4).
@@ -649,6 +783,24 @@ pub fn run_vector(v: &Value) -> Value {
         return json!(w);
     }
     let policy = Policy::from_json(c);
+    if i["check"] == "store" {
+        let held: Vec<String> = i["held"].as_array().into_iter().flatten().filter_map(|h| h.as_str().map(String::from)).collect();
+        let tn = i["tn"].as_str().unwrap_or_default();
+        return match store(tn, i["binding"].as_str().unwrap_or_default(), &held, i["now"].as_i64().unwrap_or_default(), &policy) {
+            StoreOutcome::Stored(h) => json!({"outcome": "stored", "held": h}),
+            StoreOutcome::Kept(r) => json!({"outcome": "kept", "reason": r}),
+            StoreOutcome::Rejected(r) => json!({"outcome": "rejected", "reason": r}),
+        };
+    }
+    if i["check"] == "select" {
+        let bindings = i["bindings"].as_array().cloned().unwrap_or_default();
+        let docs = i["documents"].as_object().cloned().unwrap_or_default();
+        let tn = i["tn"].as_str().unwrap_or_default();
+        return match select(tn, &bindings, &docs, i["now"].as_i64().unwrap_or_default(), &policy) {
+            None => json!({"outcome": "none"}),
+            Some(s) => json!({"outcome": "found", "did": s.did, "attested_by": s.attested_by, "issued": s.issued, "others": s.others}),
+        };
+    }
     if i["check"] == "claim" {
         let ident = i["identity"].as_str().unwrap_or_default();
         return match check_claim(&i["claim"], ident, &i["did_document"], i["now"].as_i64().unwrap_or_default(), &policy) {

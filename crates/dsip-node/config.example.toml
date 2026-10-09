@@ -37,3 +37,9 @@ ban_ip = false
 http_requests_per_ip_per_min = 120
 # Behind a reverse proxy that sets X-Forwarded-For, rate-limit by the client's address instead of the proxy's.
 trust_x_forwarded_for = false
+
+[numbers]
+# Serve number bindings (Number Attestation Profile N§6, draft): GET/PUT /dsip/v1/tn/<E.164>. A binding is checked
+# against this policy (JSON: trust_anchors = the STI-CA list as base64 DER, certificates = {x5u URL: PEM chain}, …)
+# before it is stored. Unset: the routes answer 404.
+# policy = "/etc/dsip-node/tn-policy.json"
