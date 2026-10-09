@@ -1,5 +1,5 @@
 //! `dsip-number` — the DSIP Number Attestation Profile (draft `tn-binding/0.1`,
-//! `v0.11/dsip-number-attestation-profile-v0.11-draft.md`, cited `N§n`). Pure: no network.
+//! `v0.12/dsip-number-attestation-profile-v0.12-draft.md`, cited `N§n`). Pure: no network.
 //!
 //! Spec: sections owned by this crate — N§3.1 (the binding's format — [`parse_binding`]), N§3.2 (the STIR
 //! certificate path and TNAuthList coverage — [`parse_tnauth`], [`covers`]), N§3.4 (the order of the checks —

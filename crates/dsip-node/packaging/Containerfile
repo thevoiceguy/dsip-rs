@@ -1,9 +1,8 @@
 # dsip-node: a distroless image around the static (musl) binary. Build context: crates/dsip-node, with the binaries
-# staged at dist/<amd64|arm64>/dsip-node (see packaging/build.sh). Multi-arch with `docker buildx --platform`.
-# only makes a directory: it runs on the build machine, so a multi-arch build needs no emulation
-FROM --platform=$BUILDPLATFORM busybox:1.37 AS dirs
-RUN mkdir -p /out/var/lib/dsip-node && chown -R 65532:65532 /out/var/lib/dsip-node && chmod 0700 /out/var/lib/dsip-node
-
+# staged at dist/<amd64|arm64>/dsip-node and the empty state directory at dist/state (see packaging/build.sh).
+# Multi-arch with `docker buildx --platform`. Nothing is pulled from Docker Hub: its anonymous rate limit (HTTP 429)
+# trips on CI runners' shared addresses, so the state directory comes from the build context instead of a busybox
+# stage, and the base is distroless on gcr.io.
 FROM gcr.io/distroless/static-debian12:nonroot
 ARG TARGETARCH
 LABEL org.opencontainers.image.title="dsip-node" \
@@ -12,7 +11,7 @@ LABEL org.opencontainers.image.title="dsip-node" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --chmod=0755 dist/${TARGETARCH}/dsip-node /usr/bin/dsip-node
 COPY packaging/container.toml /etc/dsip-node/config.toml
-COPY --from=dirs --chown=65532:65532 /out/var/lib/dsip-node /var/lib/dsip-node
+COPY --chown=65532:65532 --chmod=0700 dist/state /var/lib/dsip-node
 USER 65532:65532
 VOLUME ["/var/lib/dsip-node"]
 EXPOSE 8080/tcp 4610/tcp 6881/udp
