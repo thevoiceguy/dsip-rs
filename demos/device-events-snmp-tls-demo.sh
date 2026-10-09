@@ -23,6 +23,7 @@ MBX=$B/dsip-mailbox
 MSG=$B/dsip-msg
 RESOLVER=(--resolver-file "$DIR/docs/gw.json" --resolver-file "$DIR/docs/ann.json")
 TLS_PORT=${SNMP_TLS_PORT:-16162}
+DTLS_PORT=${SNMP_DTLS_PORT:-16163}
 source demos/netsnmp_tls.sh
 echo "=== net-snmp: $(env "${NETSNMP_ENV[@]}" "$SNMPTRAP" --version 2>&1 | head -1)"
 
@@ -61,7 +62,7 @@ netsnmp() { # device tool args...
   local who=$1 tool=$2; shift 2
   env "${NETSNMP_ENV[@]}" HOME="$DIR/$who" SNMPCONFPATH="$DIR/$who/.snmp" SNMP_PERSISTENT_DIR="$DIR/$who/persist" MIBS= \
     "$tool" -t 5 -r 2 -v 3 --defSecurityModel=tsm -l authPriv -T localCert="$who" -T trustCert=ca -T their_hostname=localhost \
-    "tls:localhost:$TLS_PORT" "$@"
+    "${TRANSPORT:-tls:localhost:$TLS_PORT}" "$@"
 }
 
 echo "=== the gateway's certificate-to-name table (RFC 6353): sw1 by its own fingerprint, then anything under the CA by dNSName"
@@ -89,7 +90,7 @@ done
 
 for x in g n; do mkfifo "$DIR/$x.in"; done
 $MSG --state "$DIR/dev-g" --identity "$GW" "${RESOLVER[@]}" --ca "$DIR/ca.pem" --event-rules "$DIR/rules.json" \
-  --snmp-tls-listen 127.0.0.1:$TLS_PORT --snmp-tls-cert "$P/gateway.pem" --snmp-tls-key "$P/gateway.key" \
+  --snmp-tls-listen 127.0.0.1:$TLS_PORT --snmp-dtls-listen 127.0.0.1:$DTLS_PORT --snmp-tls-cert "$P/gateway.pem" --snmp-tls-key "$P/gateway.key" \
   --snmp-tls-ca "$P/ca.pem" --snmp-tls-map "$DIR/tsm-map.json" <"$DIR/g.in" >"$DIR/g.log" 2>&1 &
 $MSG --state "$DIR/dev-n" --identity "$ANN" "${RESOLVER[@]}" --ca "$DIR/ca.pem" <"$DIR/n.in" >"$DIR/n.log" 2>&1 &
 exec 3>"$DIR/g.in"; exec 4>"$DIR/n.in"
@@ -139,7 +140,21 @@ grep -m1 "^SNMP tls refused" "$DIR/g.log" | cut -c1-120 | sed 's/^/  gateway: /'
 sleep 2
 [ "$(count "$DIR/n.log" "^EVENT ")" = "$N" ] || fail "an unnamed or uncertified device's message reached the group"
 
+echo "=== sw1 again, over DTLS (RFC 6353 over UDP, v0.11): the session's certificate names it, each record one message"
+TRANSPORT="dtlsudp:localhost:$DTLS_PORT" netsnmp sw1 "$SNMPTRAP" 1234 1.3.6.1.6.3.1.1.5.3 1.3.6.1.2.1.2.2.1.1.3 i 4
+wait_for "$DIR/g.log" "^SNMP dtls session .*security name \"core-switch\" \(row 10\)" 10
+wait_for "$DIR/n.log" "^EVENT .*basis=snmpv3-tls tsm=\"core-switch\" dtls cert=${SW1_SHA:0:16}" 20
+wait_for "$DIR/n.log" "^ALARM raised 127.0.0.1/4/link-down severity=major" 20
+grep -m1 "^SNMP dtls session" "$DIR/g.log" | sed 's/^/  gateway: /'
+grep -m1 "tsm=\"core-switch\" dtls" "$DIR/n.log" | cut -c1-200 | sed 's/^/  ann sees: /'
+echo "=== sw3 over DTLS: its certificate maps to no row, so the session is closed"
+TRANSPORT="dtlsudp:localhost:$DTLS_PORT" netsnmp sw3 "$SNMPTRAP" 1234 1.3.6.1.6.3.1.1.5.3 1.3.6.1.2.1.2.2.1.1.3 i 14 > "$DIR/sw3-dtls.log" 2>&1 || true
+wait_for "$DIR/g.log" "^SNMP dtls closed .*no-security-name" 10
+grep -m1 "^SNMP dtls closed" "$DIR/g.log" | sed 's/^/  gateway: /'
+[ "$(count "$DIR/n.log" "/14/link-down")" = 0 ] || fail "a DTLS session without a name delivered an event"
+
 echo
 echo "PASS: net-snmp traps and informs over TLS became signed device events with basis snmpv3-tls, each with its"
 echo "      certificate and the security name RFC 6353's table gave it; the inform's RFC 5343 discovery was answered"
-echo "      and the inform answered once stored; an unnamed certificate and an uncertified client were refused."
+echo "      and the inform answered once stored; an unnamed certificate and an uncertified client were refused; the"
+echo "      same trap over DTLS was named by its session's certificate, and a nameless DTLS session was closed."

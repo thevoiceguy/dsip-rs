@@ -165,6 +165,10 @@ struct Args {
     /// The certificate-to-security-name table (JSON array of `{id, fingerprint, map, data?}`, RFC 6353; E§3).
     #[arg(long)]
     snmp_tls_map: Option<PathBuf>,
+    /// As a gateway, accept SNMPv3 over DTLS (RFC 6353 over UDP, TSM) here (E§3, v0.11), with the same certificate,
+    /// key, CA and name table as --snmp-tls-listen.
+    #[arg(long, requires_all = ["snmp_tls_cert", "snmp_tls_key", "snmp_tls_ca", "snmp_tls_map"])]
+    snmp_dtls_listen: Option<String>,
     /// As a gateway, hold clears this many seconds (E§4 hold-down, v0.10): a re-raise within it cancels the clear, so a
     /// flapping link is one alarm. 0 (the default) turns it off. Events from informs are never held.
     #[arg(long, default_value_t = 0)]
@@ -2208,8 +2212,8 @@ impl Client {
             None
         };
         // E§2: the authenticated identity is the certificate and the name it mapped to
-        let mut source = json!({"address": from.ip().to_string(), "basis": "snmpv3-tls",
-                                "certificate_sha256": peer.certificate_sha256, "tsm": {"security_name": peer.security_name}});
+        let mut source = json!({"address": from.ip().to_string(), "basis": "snmpv3-tls", "certificate_sha256": peer.certificate_sha256,
+                                "tsm": {"security_name": peer.security_name, "transport": peer.transport}});
         if let Some(name) = self.tls_names.get(&peer.certificate_sha256).and_then(Value::as_str) {
             source["name"] = json!(name);
         }
@@ -3428,6 +3432,19 @@ async fn main() -> Result<()> {
                  l.local_addr()?, table.as_array().map_or(0, Vec::len));
         spawn_snmp_tls(l, cfg, cas, table, gw_tx.clone());
     }
+    if let Some(a) = &args.snmp_dtls_listen {
+        let sock = std::net::UdpSocket::bind(a).with_context(|| format!("binding {a}"))?;
+        let ca_path = args.snmp_tls_ca.as_deref().context("--snmp-tls-ca")?;
+        let cas = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(ca_path)?))
+            .map(|c| c.map(|c| c.as_ref().to_vec())).collect::<Result<Vec<_>, _>>()?;
+        let map_path = args.snmp_tls_map.as_deref().context("--snmp-tls-map")?;
+        let table: Value = serde_json::from_str(&std::fs::read_to_string(map_path)?).context("--snmp-tls-map")?;
+        anyhow::ensure!(table.is_array(), "--snmp-tls-map: a JSON array of rows");
+        println!("GATEWAY listening for SNMP on dtls {} (client certificates required, {} name row(s))   RFC 6353",
+                 sock.local_addr()?, table.as_array().map_or(0, Vec::len));
+        spawn_snmp_dtls(sock, args.snmp_tls_cert.as_deref().context("--snmp-tls-cert")?, args.snmp_tls_key.as_deref().context("--snmp-tls-key")?,
+                        ca_path, cas, table, gw_tx.clone())?;
+    }
     drop(gw_tx);
     loop {
         let gw = async {
@@ -3755,11 +3772,13 @@ enum GatewayInput {
     SnmpTls(Vec<u8>, std::net::SocketAddr, TlsPeer),
 }
 
-/// A verified SNMP-over-TLS connection: its certificate, the security name it mapped to, and the way back.
+/// A verified SNMP-over-TLS connection or DTLS session: its certificate, the security name it mapped to, the
+/// transport (`tls` or `dtls`, E§2) and the way back.
 #[derive(Clone)]
 struct TlsPeer {
     certificate_sha256: String,
     security_name: String,
+    transport: &'static str,
     reply: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 }
 
@@ -3862,7 +3881,7 @@ fn spawn_snmp_tls(l: tokio::net::TcpListener, cfg: std::sync::Arc<tokio_rustls::
                 println!("SNMP tls connection {from}: security name {name:?} (row {})", mapped["row"]);
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                 let peer = TlsPeer { certificate_sha256: fields["sha256"].as_str().unwrap_or("").to_string(),
-                                     security_name: name.to_string(), reply: reply_tx };
+                                     security_name: name.to_string(), transport: "tls", reply: reply_tx };
                 let (mut rd, mut wr) = tokio::io::split(tls);
                 tokio::spawn(async move {
                     while let Some(m) = reply_rx.recv().await {
@@ -3894,6 +3913,146 @@ fn spawn_snmp_tls(l: tokio::net::TcpListener, cfg: std::sync::Arc<tokio_rustls::
             });
         }
     });
+}
+
+/// One DTLS peer's datagrams as a blocking stream for OpenSSL: reads pop the demultiplexer's queue (a short wait
+/// gives `WouldBlock`, so the session loop can send replies), writes go to the peer.
+struct DtlsPeerIo {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    sock: std::sync::Arc<std::net::UdpSocket>,
+    peer: std::net::SocketAddr,
+}
+
+impl std::io::Read for DtlsPeerIo {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        match self.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(d) => {
+                let n = d.len().min(out.len());
+                out[..n].copy_from_slice(&d[..n]);
+                Ok(n)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::ErrorKind::WouldBlock.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(0),
+        }
+    }
+}
+
+impl std::io::Write for DtlsPeerIo {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.sock.send_to(b, self.peer)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Accept SNMP over DTLS (RFC 6353 over UDP; E§3, v0.11): one UDP socket, OpenSSL's DTLS server with the cookie
+/// exchange (RFC 6347 §4.2.1), a session per peer address, the client certificate verified against the CA and
+/// named by the table, and each DTLS record exactly one message (`dsip_events::tsm::dtls_record`).
+///
+/// Impl: a blocking thread per session over a demultiplexed queue (OpenSSL's DTLS needs a datagram at a time);
+/// handshake retransmission is OpenSSL's over that stream, so a lost handshake flight is not retried in this
+/// round; idle sessions are kept until the peer closes.
+fn spawn_snmp_dtls(sock: std::net::UdpSocket, cert: &Path, key: &Path, ca: &Path, cas: Vec<Vec<u8>>, table: Value,
+                   tx: tokio::sync::mpsc::UnboundedSender<GatewayInput>) -> Result<()> {
+    use openssl::ssl::{Ssl, SslContext, SslFiletype, SslMethod, SslOptions, SslRef, SslVerifyMode};
+    use sha2::Digest as _;
+    let mut b = SslContext::builder(SslMethod::dtls_server())?;
+    b.set_certificate_chain_file(cert)?;
+    b.set_private_key_file(key, SslFiletype::PEM)?;
+    b.set_ca_file(ca)?;
+    b.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    b.set_options(SslOptions::COOKIE_EXCHANGE | SslOptions::NO_QUERY_MTU); // the MTU below is ours to set: the stream is not a datagram BIO
+    let idx = Ssl::new_ex_index::<std::net::SocketAddr>()?;
+    let secret: [u8; 32] = rand::random();
+    let cookie = move |ssl: &SslRef| -> Vec<u8> {
+        let addr = ssl.ex_data(idx).map(|a| a.to_string()).unwrap_or_default();
+        sha2::Sha256::digest([&secret[..], addr.as_bytes()].concat()).to_vec()
+    };
+    b.set_cookie_generate_cb(move |ssl, buf| {
+        let c = cookie(ssl);
+        buf[..c.len()].copy_from_slice(&c);
+        Ok(c.len())
+    });
+    b.set_cookie_verify_cb(move |ssl, given| given == cookie(ssl).as_slice());
+    let ctx = b.build();
+    let sock = std::sync::Arc::new(sock);
+    std::thread::spawn(move || {
+        let mut peers: std::collections::HashMap<std::net::SocketAddr, std::sync::mpsc::Sender<Vec<u8>>> = std::collections::HashMap::new();
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let d = buf[..n].to_vec();
+            let fresh = peers.get(&from).is_none_or(|p| p.send(d.clone()).is_err());
+            if fresh {
+                let (ptx, prx) = std::sync::mpsc::channel();
+                let _ = ptx.send(d);
+                peers.insert(from, ptx);
+                let (ctx, sock, cas, table, tx) = (ctx.clone(), sock.clone(), cas.clone(), table.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    let mut ssl = match Ssl::new(&ctx) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("SNMP dtls {from}: {e}");
+                            return;
+                        }
+                    };
+                    ssl.set_ex_data(idx, from);
+                    let _ = ssl.set_mtu(1400);
+                    let io = DtlsPeerIo { rx: prx, sock, peer: from };
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                    let mut hs = ssl.accept(io);
+                    let mut stream = loop {
+                        match hs {
+                            Ok(s) => break s,
+                            Err(openssl::ssl::HandshakeError::WouldBlock(mid)) if std::time::Instant::now() < deadline => hs = mid.handshake(),
+                            Err(e) => {
+                                println!("SNMP dtls refused from {from}: {}", match &e { openssl::ssl::HandshakeError::Failure(m) => m.error().to_string(), _ => "handshake timed out".into() });
+                                return;
+                            }
+                        }
+                    };
+                    let leaf = stream.ssl().peer_certificate().and_then(|c| c.to_der().ok());
+                    let chain: Vec<Vec<u8>> = stream.ssl().peer_cert_chain().into_iter().flatten().filter_map(|c| c.to_der().ok()).collect();
+                    let presented: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> =
+                        leaf.into_iter().chain(chain).map(tokio_rustls::rustls::pki_types::CertificateDer::from).collect();
+                    let Some(fields) = (!presented.is_empty()).then(|| tls_cert_fields(&presented, &cas)).flatten() else { return };
+                    let mapped = dsip_events::tsm::security_name(&fields, &table);
+                    let Some(name) = mapped["security_name"].as_str() else {
+                        // RFC 6353 §5.3.2: no name, no messages; the session is shut down
+                        println!("SNMP dtls closed {from}: no-security-name for certificate {}", &fields["sha256"].as_str().unwrap_or("")[..16]);
+                        let _ = stream.shutdown();
+                        return;
+                    };
+                    println!("SNMP dtls session {from}: security name {name:?} (row {})", mapped["row"]);
+                    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                    let peer = TlsPeer { certificate_sha256: fields["sha256"].as_str().unwrap_or("").to_string(),
+                                         security_name: name.to_string(), transport: "dtls", reply: reply_tx };
+                    let mut rec = vec![0u8; 65536];
+                    loop {
+                        while let Ok(m) = reply_rx.try_recv() {
+                            if stream.ssl_write(&m).is_err() {
+                                return;
+                            }
+                        }
+                        match stream.ssl_read(&mut rec) {
+                            Ok(0) => return,
+                            Ok(n) => match dsip_events::tsm::dtls_record(&rec[..n]) {
+                                Some(m) => {
+                                    if tx.send(GatewayInput::SnmpTls(m, from, peer.clone())).is_err() {
+                                        return;
+                                    }
+                                }
+                                None => println!("SNMP dtls from {from}: a record that is not one message, dropped   E§3"),
+                            },
+                            Err(e) if e.code() == openssl::ssl::ErrorCode::WANT_READ => continue,
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Accept syslog-over-TLS connections; each verified connection's octet-counted frames (RFC 5425 §4.3:
@@ -4027,6 +4186,9 @@ fn render_event(ev: &Value) -> String {
     }
     if let Some(t) = src["tsm"]["security_name"].as_str() {
         out += &format!(" tsm={t:?}");
+        if src.pointer("/tsm/transport").and_then(Value::as_str) == Some("dtls") {
+            out += " dtls";
+        }
     }
     if let Some(c) = src["certificate_sha256"].as_str() {
         out += &format!(" cert={}…", c.get(..16).unwrap_or(c));
