@@ -43,6 +43,9 @@ struct Args {
     /// Serve Mainline as a server node (store and answer for others), not only as a client.
     #[arg(long)]
     mainline_server: bool,
+    /// Serve number bindings (`/dsip/v1/tn/<tn>`, Number Attestation N§6), verified against this policy file.
+    #[arg(long)]
+    tn_policy: Option<PathBuf>,
     /// Ban an overlay peer for this long once it spends its rejection budget [default: 600; 0: never].
     #[arg(long)]
     ban_secs: Option<u64>,
@@ -175,6 +178,12 @@ async fn main() -> Result<()> {
         http_per_ip_per_min: a.http_requests_per_ip_per_min.or(cfg.limits.http_requests_per_ip_per_min).unwrap_or(120),
         trust_forwarded_for: cfg.limits.trust_x_forwarded_for.unwrap_or(false),
     };
+    if let Some(p) = a.tn_policy.clone().or(cfg.numbers.policy.clone()) {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?)?;
+        let policy = dsip_number::Policy::from_json(&v);
+        println!("numbers: serving /dsip/v1/tn/<tn>, {} STI-CA anchor(s)   N§6", policy.trust_anchors.len());
+        node.numbers = Some(dsip_node::Numbers { policy, held: Default::default() });
+    }
     let node = Arc::new(node);
     let (kept, dropped) = node.restore().await;
     if kept + dropped > 0 {

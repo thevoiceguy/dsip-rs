@@ -7,6 +7,7 @@ description = "A deployable DSIP hints node: the DSIP overlay, the Mainline DHT 
 
 [dependencies]
 dsip-core.workspace = true
+dsip-number.workspace = true
 dsip-dht.workspace = true
 anyhow.workspace = true
 axum.workspace = true

@@ -1483,6 +1483,7 @@ dependencies = [
  "clap",
  "dsip-core",
  "dsip-dht",
+ "dsip-number",
  "libp2p",
  "mainline",
  "reqwest",

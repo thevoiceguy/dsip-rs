@@ -142,9 +142,19 @@ enum Cmd {
     Call {
         #[command(flatten)]
         opts: ConnOpts,
-        /// Callee identity or device DID.
+        /// Callee identity or device DID, or `tel:+<E.164>` to look the number up (--tn-node, N§6).
         #[arg(long)]
         to: String,
+    },
+    /// Publish a number binding to dsip-nodes (`PUT /dsip/v1/tn/<tn>`; Number Attestation N§6 route 1). Opt-in: a
+    /// published number can be looked up by anyone, and number keys can be enumerated.
+    TnPublish {
+        /// The binding (compact JWS) file.
+        #[arg(long)]
+        binding: PathBuf,
+        /// dsip-node base URLs (http://host:port), repeatable.
+        #[arg(long = "node", required = true)]
+        nodes: Vec<String>,
     },
     /// Send an introduction (§19.4 first contact) and wait for a grant, a rejection, or silence.
     Introduce {
@@ -360,6 +370,9 @@ struct ConnOpts {
     /// The address book (JSON array of {name, did, numbers}) for the identity-change warning (N§5).
     #[arg(long)]
     contacts: Option<PathBuf>,
+    /// A dsip-node (http://host:port, repeatable) to look numbers up on when calling `--to tel:+…` (N§6 route 1).
+    #[arg(long = "tn-node")]
+    tn_nodes: Vec<String>,
     /// With --recorded-by: open the recorder leg (C§6) from this second device of our identity, forwarding both
     /// voices to the recorder once the call's media flows.
     #[arg(long)]
@@ -447,7 +460,7 @@ impl ConnOpts {
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
             pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr, pkarr_device: self.pkarr_device,
             mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
-            tn_binding: self.tn_binding, tn_policy: self.tn_policy, contacts: self.contacts,
+            tn_binding: self.tn_binding, tn_policy: self.tn_policy, contacts: self.contacts, tn_nodes: self.tn_nodes,
             recorded_by: self.recorded_by, record_later: self.record_later, record_device: self.record_device, fork_taps: None, record_purpose: self.record_purpose, recording_accept: self.recording_accept,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
@@ -600,6 +613,21 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Call { opts, to } => finish(console::run(opts.into_console(), console::Mode::Call { to }).await),
+        Cmd::TnPublish { binding, nodes } => {
+            let text = std::fs::read_to_string(&binding)?.trim().to_string();
+            let b = dsip_number::parse_binding(&text).map_err(|r| anyhow::anyhow!("{}: {}", binding.display(), r.0))?;
+            let tn = b.payload["tn"].as_str().unwrap_or_default().to_string();
+            let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+            let mut stored = 0;
+            for n in &nodes {
+                let url = format!("{}/dsip/v1/tn/{}", n.trim_end_matches('/'), tn.replace('+', "%2B"));
+                let r = http.put(&url).body(text.clone()).send().await?;
+                let status = r.status();
+                println!("tn-publish {tn} → {n}: {} {}   N§6", status.as_u16(), r.text().await.unwrap_or_default());
+                stored += usize::from(status == reqwest::StatusCode::NO_CONTENT);
+            }
+            anyhow::ensure!(stored > 0, "no node stored the binding");
+        }
         Cmd::Introduce { opts, to, purpose, token, wait } => {
             finish(console::run(opts.into_console(), console::Mode::Introduce { to, purpose, token, wait }).await)
         }

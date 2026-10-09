@@ -6,7 +6,8 @@ Two carriers under one test STI-CA, with certificates valid around the real cloc
   B  "Carrier B"        x5u https://cr.carrier-b.example/sti.pem  TNAuthList: one 15551234567 (the number, ported)
 
   tn_issuer.py policy OUT.json                 the relying party's policy: the STI-CA anchor and both x5u chains
-  tn_issuer.py bind A|B TN DID OUT.jws         a binding of TN to DID, signed by that carrier, valid for one day
+  tn_issuer.py bind A|B TN DID OUT.jws [AGE]   a binding of TN to DID, signed by that carrier, valid for one day,
+                                               issued AGE seconds ago (default 60)
 
 Keys are the vector generator's deterministic test keys: never use them for anything real.
 """
@@ -45,10 +46,11 @@ def main(argv: list[str]) -> int:
                   "spc_numbers": {}, "require_status": False, "status": {}}
         Path(argv[1]).write_text(json.dumps(policy, indent=1))
         return 0
-    if argv[:1] == ["bind"] and len(argv) == 5:
-        c, tn, did, out = argv[1:]
-        ulid = G.JTI[:-3] + f"{NOW % 1000:03d}"
-        payload = {"tn": tn, "did": did, "iat": NOW - 60, "exp": NOW - 60 + 86400, "jti": ulid}
+    if argv[:1] == ["bind"] and len(argv) in (5, 6):
+        c, tn, did, out = argv[1:5]
+        age = int(argv[5]) if len(argv) == 6 else 60
+        ulid = G.JTI[:-3] + f"{(NOW - age) % 1000:03d}"
+        payload = {"tn": tn, "did": did, "iat": NOW - age, "exp": NOW - age + 86400, "jti": ulid}
         binding = G.jws(G.header(x5u=CARRIERS[c][1]), payload, leaf(c).key)
         Path(out).write_text(binding + "\n")
         return 0
