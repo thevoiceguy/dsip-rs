@@ -164,8 +164,13 @@ pub async fn bridge(
         };
         let mut out = vec![0u8; 4000];
         let mut reported_event_ts: Option<u32> = None;
+        let mut packets = 0u64;
         loop {
             let Ok((n, from)) = rtp_in.socket.recv_from(&mut buf).await else { break };
+            packets += 1;
+            if packets == 1 || packets % 200 == 0 {
+                debug!("sip→dsip: {packets} RTP packet(s) from the trunk at {from}");
+            }
             rtp_in.set_remote(from).await;
             let Ok(pkt) = RtpPacket::parse(Bytes::copy_from_slice(&buf[..n])) else { continue };
             if event_pt.is_some_and(|pt| pkt.header.payload_type() == pt) {
@@ -197,7 +202,12 @@ pub async fn bridge(
             Err(e) => { debug!("opus dec: {e}"); return; }
         };
         let mut pcm48 = vec![0i16; 5760];
+        let mut frames = 0u64;
         while let Some(opus) = dsip_rx.recv().await {
+            frames += 1;
+            if frames == 1 || frames % 200 == 0 {
+                debug!("dsip→sip: {frames} Opus frame(s) from the DSIP leg");
+            }
             let sig = audiopus::packet::Packet::try_from(opus.as_ref());
             let Ok(sig) = sig else { continue };
             let out = audiopus::MutSignals::try_from(&mut pcm48[..]);

@@ -12,7 +12,9 @@
 //!   against its identity, and the gateway asserts the attested number under its own STIR certificate when it
 //!   may (N§4.1), crossing downgraded otherwise (G§7).
 //!
-//! Media is signalling-only on the DSIP side in this daemon (the in-process `round_trip` test proves the bridge).
+//! Media crosses too: the DSIP leg is a forge-webrtc peer connection per call (SDP in `transports[].sdp`,
+//! candidates in signed `info`, §12.12), bridged to the SIP leg's RTP by `host::media::bridge` once both sides are
+//! up (§14.1); a caller without media gets a signalling-only crossing.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,8 +27,10 @@ use dsip_transport::identity::Identity;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use dsip_gateway::host::call::{apply, on_dsip_event, on_sip_event, Call, Calls, Legs};
-use dsip_gateway::host::media::RtpLeg;
+use dsip_gateway::host::call::{apply, on_dsip_event, on_rtp_dtmf, on_sip_event, Call, Calls, Legs};
+use dsip_gateway::host::dsip_leg::DsipMedia;
+use dsip_gateway::host::media::{bridge, RtpLeg};
+use dsip_session::LocalEvent;
 use dsip_gateway::host::numbers::{e164, origid_for, Numbers};
 use dsip_gateway::host::sip_leg::{SipEvent, SipLeg};
 
@@ -116,16 +120,25 @@ async fn main() -> Result<()> {
     let my_did = agent.identity_did().to_string();
     println!("DSIP leg  on {}  relay {}   §13.2 hello bound", opts.relay, agent.relay().did);
     let trunk = opts.sip_peer.clone();
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(200)); // timers, candidate flushes, bridges
+    let mut media = MediaTable::default();
+    let (dtmf_tx, mut dtmf_rx) = tokio::sync::mpsc::unbounded_channel::<(String, dsip_gateway::host::media::DtmfEvent)>();
 
     loop {
         tokio::select! {
             Some(ev) = rx.recv() => {
                 let r = match ev {
                     SipEvent::Invite { call_id, from_tn, to_user, remote, identity_header } => {
-                        inbound_invite(&calls, &sip, &mut agent, &numbers, &opts.local_ip, &my_did, call_id, from_tn, to_user, remote, identity_header).await
+                        inbound_invite(&calls, &sip, &mut agent, &mut media, &numbers, &opts.local_ip, &my_did, call_id, from_tn, to_user, remote, identity_header).await
                     }
-                    ev => on_sip_event(&calls, &sip, ev, Some(&mut agent)).await,
+                    ev => {
+                        if let SipEvent::Response { call_id, status, remote: Some(r) } = &ev {
+                            if (200..300).contains(status) {
+                                media.sip_remote(&calls, call_id, r.clone()).await;
+                            }
+                        }
+                        on_sip_event(&calls, &sip, ev, Some(&mut agent)).await
+                    }
                 };
                 if let Err(e) = r {
                     tracing::warn!("sip event: {e}");
@@ -133,13 +146,146 @@ async fn main() -> Result<()> {
             }
             events = agent.next() => {
                 for ev in events? {
-                    if let Err(e) = dsip_event(&calls, &sip, &mut agent, &numbers, &opts.local_ip, trunk.as_deref(), ev).await {
+                    if let Err(e) = dsip_event(&calls, &sip, &mut agent, &mut media, &numbers, &opts.local_ip, trunk.as_deref(), ev).await {
                         tracing::warn!("dsip event: {e}");
                     }
                 }
             }
+            Some((key, ev)) = dtmf_rx.recv() => {
+                if let Err(e) = on_rtp_dtmf(&calls, &sip, &key, ev).await {
+                    tracing::warn!("dtmf: {e}");
+                }
+            }
             _ = tick.tick() => {
                 agent.tick_and_handle().await?;
+                media.flush_candidates(&mut agent).await;
+                media.start_bridges(&calls, &dtmf_tx).await;
+                media.drop_ended(&calls).await;
+            }
+        }
+    }
+}
+
+/// One call's media on the DSIP side (§12.12, §14.1): the peer connection, the candidates it gathered before the
+/// session was ACTIVE, the Opus it receives (fed to the bridge), and whether the bridge has started.
+struct CallMedia {
+    pc: DsipMedia,
+    pending: Vec<Value>,
+    gathered: std::sync::Arc<std::sync::Mutex<Vec<forge_webrtc::IceCandidate>>>,
+    rtp_tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    rtp_in: Option<tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>>,
+    sip_remote: Option<dsip_gateway::host::sip_leg::RemoteRtp>,
+    bridged: bool,
+    end_sent: bool,
+}
+
+impl CallMedia {
+    /// Start the event pump (candidates to `gathered`, inbound Opus to the bridge). Call once the SDP exchange has
+    /// begun; before that forge has no event stream to take.
+    fn pump(&mut self) {
+        let Some(mut events) = self.pc.take_events() else { return };
+        let (g, rtp_tx) = (self.gathered.clone(), self.rtp_tx.clone());
+        tokio::spawn(async move {
+            let mut n = 0u64;
+            while let Some(e) = events.recv().await {
+                match e {
+                    forge_webrtc::PeerEvent::LocalCandidate(c) => g.lock().unwrap().push(c),
+                    forge_webrtc::PeerEvent::Rtp(p) => {
+                        n += 1;
+                        if n == 1 || n % 200 == 0 {
+                            tracing::debug!("peer connection: {n} RTP event(s) from the DSIP leg");
+                        }
+                        let _ = rtp_tx.send(p.payload.clone());
+                    }
+                    other => tracing::debug!("peer connection event: {other:?}"),
+                }
+            }
+        });
+    }
+}
+
+/// Media per DSIP session id.
+#[derive(Default)]
+struct MediaTable(std::collections::HashMap<String, CallMedia>);
+
+impl MediaTable {
+    /// A peer connection for a session. Its event pump starts with [`CallMedia::pump`], after the offer or answer:
+    /// forge creates the transport, and with it the event stream, when the SDP exchange begins.
+    async fn open(&mut self, sid: &str) -> anyhow::Result<&mut CallMedia> {
+        let pc = DsipMedia::new().await?;
+        let (rtp_tx, rtp_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        self.0.insert(sid.to_string(), CallMedia { pc, pending: vec![], gathered: Default::default(), rtp_tx, rtp_in: Some(rtp_rx),
+                                                  sip_remote: None, bridged: false, end_sent: false });
+        Ok(self.0.get_mut(sid).expect("inserted"))
+    }
+
+    /// The SIP side answered with its RTP endpoint: remember it for the bridge.
+    async fn sip_remote(&mut self, calls: &Arc<Mutex<Calls>>, sip_call_id: &str, r: dsip_gateway::host::sip_leg::RemoteRtp) {
+        let guard = calls.lock().await;
+        let sid = guard.0.values().find(|c| c.sip_call_id() == Some(sip_call_id)).and_then(|c| c.dsip_session.clone());
+        drop(guard);
+        if let Some(m) = sid.and_then(|s| self.0.get_mut(&s)) {
+            if let Some(rtp) = m.sip_remote.replace(r) {
+                let _ = rtp;
+            }
+        }
+    }
+
+    /// §12.12: candidates gathered so far go out in a signed `info` once the session is ACTIVE.
+    async fn flush_candidates(&mut self, agent: &mut Agent) {
+        for (sid, m) in self.0.iter_mut() {
+            if m.end_sent || agent.endpoint().session(sid).map(|s| s.state) != Some(dsip_session::SessionState::Active) {
+                continue;
+            }
+            let fresh: Vec<Value> = std::mem::take(&mut *m.gathered.lock().unwrap()).into_iter()
+                .map(|c| json!({"candidate": c.to_sdp_attribute(), "sdp_mid": "0", "sdp_m_line_index": 0})).collect();
+            m.pending.extend(fresh);
+            if m.pending.is_empty() {
+                continue;
+            }
+            let batch = std::mem::take(&mut m.pending);
+            let n = batch.len();
+            agent.set_info_data(json!({"candidates": batch, "end_of_candidates": false}));
+            if agent.local(LocalEvent::Info { session: sid.clone() }).await.is_ok() {
+                println!("media     {n} ICE candidate(s) sent in a signed info   §12.12");
+            }
+        }
+    }
+
+    /// §14.1: once the DSIP media is connected and the SIP side's RTP endpoint is known, bridge the two.
+    async fn start_bridges(&mut self, calls: &Arc<Mutex<Calls>>, dtmf: &tokio::sync::mpsc::UnboundedSender<(String, dsip_gateway::host::media::DtmfEvent)>) {
+        for (sid, m) in self.0.iter_mut() {
+            if m.bridged || !m.pc.connected() {
+                continue;
+            }
+            let guard = calls.lock().await;
+            let Some((key, call)) = guard.0.iter().find(|(_, c)| c.dsip_session.as_deref() == Some(sid)) else { continue };
+            let Some(rtp) = call.rtp_handle() else { continue };
+            let Some(remote) = m.sip_remote.clone().or_else(|| call.remote_rtp_handle()) else { continue };
+            let key = key.clone();
+            drop(guard);
+            let (Some(rtp_in), Ok(sender)) = (m.rtp_in.take(), m.pc.sender()) else { continue };
+            rtp.set_remote(remote.addr).await;
+            let pcma = remote.payload_types.first() == Some(&8);
+            let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
+            let (dtmf, key2) = (dtmf.clone(), key.clone());
+            tokio::spawn(async move { while let Some(e) = drx.recv().await { let _ = dtmf.send((key2.clone(), e)); } });
+            let te = remote.telephone_event;
+            tokio::spawn(async move { let _ = bridge(rtp_in, sender, rtp, pcma, te, Some(dtx)).await; });
+            m.bridged = true;
+            println!("media     bridged: DSIP Opus ⇄ trunk G.711 ({}), RTP to {}   §14.1, G§6", if pcma { "PCMA" } else { "PCMU" }, remote.addr);
+        }
+    }
+
+    /// Close the media of sessions whose call has ended.
+    async fn drop_ended(&mut self, calls: &Arc<Mutex<Calls>>) {
+        let guard = calls.lock().await;
+        let live: std::collections::HashSet<String> = guard.0.values().filter(|c| !c.ended()).filter_map(|c| c.dsip_session.clone()).collect();
+        drop(guard);
+        let gone: Vec<String> = self.0.keys().filter(|k| !live.contains(*k)).cloned().collect();
+        for k in gone {
+            if let Some(mut m) = self.0.remove(&k) {
+                m.pc.close();
             }
         }
     }
@@ -151,6 +297,7 @@ async fn inbound_invite(
     calls: &Arc<Mutex<Calls>>,
     sip: &Arc<SipLeg>,
     agent: &mut Agent,
+    media: &mut MediaTable,
     numbers: &Numbers,
     local_ip: &str,
     my_did: &str,
@@ -192,8 +339,23 @@ async fn inbound_invite(
     let mut call = Call::inbound_via(&json!({"direction": "inbound", "gateway": my_did}), call_id.clone(), rtp, remote);
     call.dsip_target = Some(target);
     let identity = json!({"attest": pp.attest, "verified": pp.verified});
+    // the gateway offers media toward the DSIP callee (§16.3): a peer connection per call, its SDP in the invite
+    let sid_placeholder = format!("sip:{call_id}");
+    match media.open(&sid_placeholder).await {
+        Ok(m) => match m.pc.offer().await {
+            Ok(offer) => {
+                m.pump();
+                agent.set_sdp(Some(offer));
+            }
+            Err(e) => tracing::warn!("media offer: {e}"),
+        },
+        Err(e) => tracing::warn!("media: {e}"),
+    }
     let emits = call.step(&json!({"sip": {"request": "INVITE", "from_tn": from_tn, "identity": identity}}));
     apply(&mut call, emits, &mut Legs { sip, dsip: Some(agent) }).await?;
+    if let (Some(sid), Some(m)) = (call.dsip_session.clone(), media.0.remove(&sid_placeholder)) {
+        media.0.insert(sid, m); // now keyed by the session the invite got
+    }
     calls.lock().await.0.insert(call_id, call);
     Ok(())
 }
@@ -204,6 +366,7 @@ async fn dsip_event(
     calls: &Arc<Mutex<Calls>>,
     sip: &Arc<SipLeg>,
     agent: &mut Agent,
+    media: &mut MediaTable,
     numbers: &Numbers,
     local_ip: &str,
     trunk: Option<&str>,
@@ -220,7 +383,29 @@ async fn dsip_event(
     let sid = message.session_id().to_string();
     let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
     if message.msg_type == "invite" && offered {
-        return outbound_invite(calls, sip, agent, numbers, local_ip, trunk, &sid, &identity, &payload).await;
+        return outbound_invite(calls, sip, agent, media, numbers, local_ip, trunk, &sid, &identity, &payload).await;
+    }
+    // §16.3 / §12.12: the callee's SDP answer, and candidates in signed info, reach our peer connection
+    if let Some(m) = media.0.get_mut(&sid) {
+        if message.msg_type == "answer" {
+            if let Some(sdp) = payload.pointer("/transports/0/sdp").and_then(Value::as_str) {
+                if let Err(e) = m.pc.set_answer(sdp).await {
+                    tracing::warn!("media answer: {e}");
+                } else {
+                    println!("media     remote WebRTC answer applied   §16.3");
+                }
+            }
+        }
+        if message.msg_type == "info" && payload["about"] == "transport:webrtc" {
+            let cands = payload["data"]["candidates"].as_array().cloned().unwrap_or_default();
+            for c in &cands {
+                if let Some(s) = c["candidate"].as_str() {
+                    m.pc.add_candidate(s).await.ok();
+                }
+            }
+            println!("media     {} remote ICE candidate(s) applied from signed info   §12.12", cands.len());
+            return Ok(());
+        }
     }
     let event = match message.msg_type.as_str() {
         "progress" => json!({"dsip": {"type": "progress"}}),
@@ -245,6 +430,7 @@ async fn outbound_invite(
     calls: &Arc<Mutex<Calls>>,
     sip: &Arc<SipLeg>,
     agent: &mut Agent,
+    media: &mut MediaTable,
     numbers: &Numbers,
     local_ip: &str,
     trunk: Option<&str>,
@@ -277,6 +463,20 @@ async fn outbound_invite(
         });
         agent.send_payload(err, 30).await?;
         println!("→ error    gateway.downgraded {}   G§7", detail["losses"]);
+    }
+    // the caller's SDP offer (§16.3): answer it with a peer connection of our own, the SDP riding in our answer
+    if let Some(offer) = payload.pointer("/transports/0/sdp").and_then(Value::as_str) {
+        match media.open(sid).await {
+            Ok(m) => match m.pc.answer(offer).await {
+                Ok(answer) => {
+                    m.pump();
+                    agent.set_sdp(Some(answer));
+                    println!("media     WebRTC answer prepared for the caller's offer   §16.3");
+                }
+                Err(e) => tracing::warn!("media answer: {e}"),
+            },
+            Err(e) => tracing::warn!("media: {e}"),
+        }
     }
     let rtp = RtpLeg::bind(local_ip, 0, rand_ssrc(sid)).await?;
     let mut call = Call::outbound(format!("sip:{to_tn}@{trunk}"), rtp);

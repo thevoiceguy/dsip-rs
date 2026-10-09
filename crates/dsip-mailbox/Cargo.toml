@@ -23,6 +23,8 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 # SNMP over DTLS (RFC 6353 over UDP, E§3 v0.11): OpenSSL's DTLS server with the cookie exchange; rustls has no DTLS.
 openssl.workspace = true
+openssl-sys.workspace = true   # DTLS timeout handling: SSL_ctrl(DTLS_CTRL_HANDLE_TIMEOUT), which the openssl crate does not wrap
+foreign-types.workspace = true
 futures-util.workspace = true
 anyhow.workspace = true
 clap.workspace = true
