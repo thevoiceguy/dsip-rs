@@ -24,6 +24,7 @@ dsip-gateway.workspace = true
 dsip-messaging.workspace = true
 dsip-events.workspace = true
 dsip-recording.workspace = true
+dsip-number.workspace = true
 dsip-kt.workspace = true
 libp2p.workspace = true
 serde_json.workspace = true

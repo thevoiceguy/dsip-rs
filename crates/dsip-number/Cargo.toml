@@ -1,0 +1,15 @@
+[package]
+name = "dsip-number"
+description = "DSIP Number Attestation Profile (draft): verifying a STIR-signed number → DID binding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+x509-parser.workspace = true
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

@@ -13,6 +13,7 @@ members = [
     "crates/dsip-messaging",
     "crates/dsip-events",
     "crates/dsip-recording",
+    "crates/dsip-number",
     "crates/dsip-kt",
     "crates/dsip-mls",
     "crates/dsip-mailbox",
@@ -47,6 +48,7 @@ dsip-gateway = { path = "crates/dsip-gateway" }
 dsip-messaging = { path = "crates/dsip-messaging" }
 dsip-events = { path = "crates/dsip-events" }
 dsip-recording = { path = "crates/dsip-recording" }
+dsip-number = { path = "crates/dsip-number" }
 dsip-kt = { path = "crates/dsip-kt" }
 dsip-mls = { path = "crates/dsip-mls" }
 dsip-mailbox = { path = "crates/dsip-mailbox" }
