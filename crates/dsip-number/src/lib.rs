@@ -60,6 +60,24 @@ pub struct Policy {
     pub status: Map<String, Value>,
 }
 
+impl Policy {
+    /// Read a policy from its JSON form, the shape of a `tn-binding` vector's context: `trust_anchors` (padded base64
+    /// DER; an entry that is not is ignored), `certificates`, `spc_numbers`, `require_status`, `status`.
+    ///
+    /// Spec: none (infrastructure) — the README `tn-binding` context.
+    pub fn from_json(c: &Value) -> Policy {
+        let map = |k: &str| c[k].as_object().cloned().unwrap_or_default();
+        let anchors = c["trust_anchors"].as_array().into_iter().flatten().filter_map(|x| PADDED.decode(x.as_str()?).ok());
+        Policy {
+            trust_anchors: anchors.collect(),
+            certificates: map("certificates"),
+            spc_numbers: map("spc_numbers"),
+            require_status: c["require_status"].as_bool().unwrap_or(false),
+            status: map("status"),
+        }
+    }
+}
+
 /// A verified binding: what a client may render (N§3.4, N§4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
@@ -507,20 +525,140 @@ pub fn verify(binding: &str, did: &str, did_document: &Value, now: i64, policy: 
     Ok(Verified { tn: tn.to_string(), did: bound.to_string(), expires: exp, attested_by: path[0].attested_by.clone() })
 }
 
+/// What a client does with a `tel` claim carrying a binding (N§4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// Not a `tel` claim with a `binding`: not this rule's (a gateway's G§5 claim renders through `dsip_core::trust`).
+    Ignored,
+    /// Verified: the line to show (§18.1), the binding's `iat` and `exp`.
+    Attested {
+        /// `<tn> · number attested by <issuer> for this identity`.
+        line: String,
+        /// The binding's `iat`.
+        issued: i64,
+        /// The binding's `exp`.
+        expires: i64,
+        /// Who attested it (the N§3.4 `attested_by`), for the N§5 warning.
+        attested_by: Option<String>,
+    },
+    /// Dropped: the reason, and `<number> (unverified)` when the claimed number is E.164 (§18.2).
+    Dropped {
+        /// The first failing step's reason, `malformed` for a non-string binding, or `number-mismatch`.
+        reason: &'static str,
+        /// What may still be shown, marked.
+        line: Option<String>,
+    },
+}
+
+/// Check a `tel` claim from an invite's `identity.claims` against the envelope's verified signing identity.
+///
+/// Spec: N§4 (the claim, its rendering, a failed claim dropped), §18.1, §18.2.
+pub fn check_claim(claim: &Value, identity: &str, did_document: &Value, now: i64, policy: &Policy) -> ClaimOutcome {
+    // A string `verifier` makes it a gateway's claim (G§5), rendered by dsip_core::trust, even with a `binding`.
+    let is_binding_claim = claim.get("type").and_then(Value::as_str) == Some("tel")
+        && claim.get("binding").is_some()
+        && !claim.get("verifier").is_some_and(Value::is_string);
+    if !is_binding_claim {
+        return ClaimOutcome::Ignored;
+    }
+    let number = claim.get("number").and_then(Value::as_str);
+    let line = number.filter(|n| is_tn(n)).map(|n| format!("{n} (unverified)"));
+    let Some(binding) = claim["binding"].as_str() else {
+        return ClaimOutcome::Dropped { reason: "malformed", line };
+    };
+    match verify(binding, identity, did_document, now, policy) {
+        Err(Reject(reason)) => ClaimOutcome::Dropped { reason, line },
+        Ok(v) if number != Some(v.tn.as_str()) => ClaimOutcome::Dropped { reason: "number-mismatch", line },
+        Ok(v) => {
+            let by = v.attested_by.as_ref().map(|b| format!(" by {b}")).unwrap_or_default();
+            let issued = parse_binding(binding).ok().and_then(|b| b.payload["iat"].as_i64()).unwrap_or_default();
+            let line = format!("{} · number attested{by} for this identity", v.tn);
+            ClaimOutcome::Attested { line, issued, expires: v.expires, attested_by: v.attested_by }
+        }
+    }
+}
+
+/// A stored contact: a name, the DID the user knows them by, and their numbers (E.164).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contact {
+    /// The name the user gave them.
+    pub name: String,
+    /// Their DID.
+    pub did: String,
+    /// Their numbers.
+    pub numbers: Vec<String>,
+}
+
+/// N§5: when a verified number now belongs to another identity than the stored contact listing it, the warning to
+/// show; `None` when no contact lists it or one listing it has the attested DID.
+///
+/// Spec: N§5.
+pub fn identity_change(contacts: &[Contact], tn: &str, did: &str, attested_by: Option<&str>, issued: i64) -> Option<String> {
+    let listing: Vec<&Contact> = contacts.iter().filter(|c| c.numbers.iter().any(|n| n == tn)).collect();
+    if listing.iter().any(|c| c.did == did) {
+        return None;
+    }
+    let c = listing.first()?;
+    let by = attested_by.map(|b| format!(" by {b}")).unwrap_or_default();
+    Some(format!(
+        "{tn} now belongs to a different identity (number attested{by} since {}). Your contact \"{}\" is {}.",
+        utc_date(issued),
+        c.name,
+        c.did
+    ))
+}
+
+/// `YYYY-MM-DD` for Unix seconds, UTC (proleptic Gregorian; Howard Hinnant's civil-from-days).
+fn utc_date(t: i64) -> String {
+    let z = t.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Run one `tn-binding` vector: `{outcome: verified, …}` or `{outcome: rejected, reason}`.
 ///
 /// Spec: none (infrastructure) — the README `tn-binding` vector contract around [`verify`].
 pub fn run_vector(v: &Value) -> Value {
     let (c, i) = (&v["context"], &v["input"]);
-    let map = |k: &str| c[k].as_object().cloned().unwrap_or_default();
-    let anchors = c["trust_anchors"].as_array().map(|a| a.iter().filter_map(|x| PADDED.decode(x.as_str()?).ok()).collect());
-    let policy = Policy {
-        trust_anchors: anchors.unwrap_or_default(),
-        certificates: map("certificates"),
-        spc_numbers: map("spc_numbers"),
-        require_status: c["require_status"].as_bool().unwrap_or(false),
-        status: map("status"),
-    };
+    if i["check"] == "contact" {
+        let contacts: Vec<Contact> = i["contacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| Contact {
+                name: c["name"].as_str().unwrap_or_default().to_string(),
+                did: c["did"].as_str().unwrap_or_default().to_string(),
+                numbers: c["numbers"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect(),
+            })
+            .collect();
+        let a = &i["attested"];
+        let w = identity_change(
+            &contacts,
+            a["tn"].as_str().unwrap_or_default(),
+            a["did"].as_str().unwrap_or_default(),
+            a["attested_by"].as_str(),
+            a["issued"].as_i64().unwrap_or_default(),
+        );
+        return json!(w);
+    }
+    let policy = Policy::from_json(c);
+    if i["check"] == "claim" {
+        let ident = i["identity"].as_str().unwrap_or_default();
+        return match check_claim(&i["claim"], ident, &i["did_document"], i["now"].as_i64().unwrap_or_default(), &policy) {
+            ClaimOutcome::Ignored => json!({"outcome": "ignored"}),
+            ClaimOutcome::Attested { line, issued, expires, .. } => {
+                json!({"outcome": "attested", "line": line, "issued": issued, "expires": expires})
+            }
+            ClaimOutcome::Dropped { reason, line } => json!({"outcome": "dropped", "reason": reason, "line": line}),
+        };
+    }
     let r = verify(
         i["binding"].as_str().unwrap_or_default(),
         i["did"].as_str().unwrap_or_default(),

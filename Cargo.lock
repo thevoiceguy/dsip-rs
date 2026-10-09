@@ -1556,6 +1556,7 @@ name = "dsip-transport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dsip-core",
  "dsip-endpoint",
  "dsip-schema",

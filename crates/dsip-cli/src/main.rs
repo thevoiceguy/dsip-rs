@@ -306,6 +306,12 @@ enum IdentityCmd {
         /// Delegate this capability too (repeatable), e.g. `dsip.record` for a recorder (Recording Profile C§1).
         #[arg(long = "capability")]
         capabilities: Vec<String>,
+        /// Make the identity this `did:web` DID (the controller key is its `#key-1`) and write `did.json` to serve.
+        #[arg(long)]
+        did_web: Option<String>,
+        /// An alias the `did:web` document claims (repeatable), e.g. `tel:+15551234567` (Number Attestation N§3.3).
+        #[arg(long = "also-known-as", requires = "did_web")]
+        also_known_as: Vec<String>,
     },
     /// Show an identity directory.
     Show {
@@ -344,6 +350,16 @@ struct ConnOpts {
     /// With --recorded-by: declare nothing until `record on` (recording begun mid-call, C§3).
     #[arg(long)]
     record_later: bool,
+    /// A number binding (compact JWS) to present as a `tel` claim on our invites (Number Attestation N§4).
+    #[arg(long)]
+    tn_binding: Option<PathBuf>,
+    /// The relying party's binding policy (JSON: trust_anchors, certificates, spc_numbers, require_status, status) for
+    /// verifying callers' bound numbers (N§3.4). Without it nothing is trusted and every binding is dropped.
+    #[arg(long)]
+    tn_policy: Option<PathBuf>,
+    /// The address book (JSON array of {name, did, numbers}) for the identity-change warning (N§5).
+    #[arg(long)]
+    contacts: Option<PathBuf>,
     /// With --recorded-by: open the recorder leg (C§6) from this second device of our identity, forwarding both
     /// voices to the recorder once the call's media flows.
     #[arg(long)]
@@ -431,6 +447,7 @@ impl ConnOpts {
             dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
             pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr, pkarr_device: self.pkarr_device,
             mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
+            tn_binding: self.tn_binding, tn_policy: self.tn_policy, contacts: self.contacts,
             recorded_by: self.recorded_by, record_later: self.record_later, record_device: self.record_device, fork_taps: None, record_purpose: self.record_purpose, recording_accept: self.recording_accept,
             media: self.media, record: self.record, stun: self.stun,
             turn: self.turn.iter().map(|uri| dsip_media::TurnConfig {
@@ -529,8 +546,12 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Cmd::Identity { cmd: IdentityCmd::Init { dir, name, fixture, controller_from, capabilities } } => {
-            let id = dsip_transport::identity::Identity::init_with(&dir, &name, fixture.as_deref(), controller_from.as_deref(), &capabilities)?;
+        Cmd::Identity { cmd: IdentityCmd::Init { dir, name, fixture, controller_from, capabilities, did_web, also_known_as } } => {
+            let mut id = dsip_transport::identity::Identity::init_with(&dir, &name, fixture.as_deref(), controller_from.as_deref(), &capabilities)?;
+            if let Some(did) = did_web {
+                id.rehome_did_web(&did, &also_known_as)?;
+                println!("document   {}/did.json (serve it at the did:web URL, or pass it to --did-document)   §7.2", dir.display());
+            }
             println!("identity   {}", id.meta.identity);
             println!("device     {}", id.meta.device);
             println!("delegation {}/delegation.json (controller→device, dsip.signaling, 1 year)   §7.4", dir.display());

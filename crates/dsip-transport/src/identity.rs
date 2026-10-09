@@ -88,6 +88,44 @@ impl Identity {
         Ok(Identity { dir: dir.to_path_buf(), controller, device, delegation, meta })
     }
 
+    /// Re-home this identity on `did:web` `did`: its controller key becomes the document's `#key-1`, the delegation is
+    /// re-signed with that subject and kid, and `did.json` is written for the domain to serve. `also_known_as` lists
+    /// aliases the document claims, e.g. `tel:+15551234567` for a bound number (Number Attestation N§3.3).
+    ///
+    /// Spec: §7.2 (did:web), §7.4 (the delegation names the identity), §8.1 (the document is authoritative).
+    pub fn rehome_did_web(&mut self, did: &str, also_known_as: &[String]) -> Result<()> {
+        anyhow::ensure!(did.starts_with("did:web:"), "not a did:web DID: {did}");
+        let kid = format!("{did}#key-1");
+        // Keep the capabilities the current delegation grants (its payload is our own, already trusted).
+        use base64::Engine as _;
+        let payload: serde_json::Value = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&self.delegation.payload)
+            .ok()
+            .and_then(|b: Vec<u8>| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let caps: Vec<String> = payload["capabilities"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+        let now = crate::now_s();
+        let caps_ref: Vec<&str> = caps.iter().map(String::as_str).collect();
+        let payload = delegation_payload(did, &self.device.did(), now - 60, now + 365 * 86_400, &caps_ref);
+        self.delegation = sign(&payload, &self.controller, &kid);
+        self.meta.identity = did.to_string();
+        let multibase = self.controller.did().trim_start_matches("did:key:").to_string();
+        let mut doc = serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+            "id": did,
+            "verificationMethod": [{"id": kid, "type": "Multikey", "controller": did, "publicKeyMultibase": multibase}],
+            "authentication": [kid],
+            "assertionMethod": [kid],
+        });
+        if !also_known_as.is_empty() {
+            doc["alsoKnownAs"] = serde_json::json!(also_known_as);
+        }
+        std::fs::write(self.dir.join("delegation.json"), self.delegation.frame())?;
+        std::fs::write(self.dir.join("identity.json"), serde_json::to_string_pretty(&self.meta)?)?;
+        std::fs::write(self.dir.join("did.json"), serde_json::to_string_pretty(&doc)?)?;
+        Ok(())
+    }
+
     /// Load an identity directory.
     pub fn load(dir: &Path) -> Result<Identity> {
         let read = |n: &str| std::fs::read_to_string(dir.join(n)).with_context(|| format!("reading {}/{n}", dir.display()));
