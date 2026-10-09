@@ -47,6 +47,10 @@ mod www;
 #[derive(Parser)]
 #[command(name = "dsip-relay", version, about = "DSIP relay (ws/1.0, forking with leg tracking, store-and-forward within the §13.3 boundary)")]
 struct Args {
+    /// DID document JSON files (repeatable) for verifying `did:web` identities that bind here (§8.1: the document is
+    /// authoritative). Without them only `did:key` identities can bind.
+    #[arg(long)]
+    did_document: Vec<PathBuf>,
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
@@ -450,7 +454,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(Mutex::new(State {
         key,
         supported: Supported::all_known(),
-        resolver: StaticResolver::default(),
+        resolver: dsip_transport::resolver::build_resolver(&args.did_document, &[]).await?,
         seen: SeenIds::default(),
         devices: HashMap::new(),
         identities: HashMap::new(),

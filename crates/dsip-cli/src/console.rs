@@ -52,6 +52,12 @@ pub struct ConsoleOpts {
     pub pkarr_device: bool,
     /// Use the Mainline DHT directly for Pkarr.
     pub mainline: bool,
+    /// A number binding to present as a `tel` claim on our invites (Number Attestation N§4).
+    pub tn_binding: Option<PathBuf>,
+    /// The binding policy file for verifying callers' bound numbers (N§3.4).
+    pub tn_policy: Option<PathBuf>,
+    /// The address book for the identity-change warning (N§5).
+    pub contacts: Option<PathBuf>,
     /// Declare this side recorded by this recorder identity (Recording Profile C§3).
     pub recorded_by: Option<String>,
     /// Declare nothing until `record on`.
@@ -82,6 +88,45 @@ pub struct ConsoleOpts {
     pub media_backend: String,
 }
 
+/// What a callee needs to check callers' bound numbers (Number Attestation N§3.4–N§5).
+struct TnContext {
+    policy: dsip_number::Policy,
+    /// DID documents as JSON, for `alsoKnownAs` (the typed resolver keeps only keys and services).
+    documents: std::collections::HashMap<String, serde_json::Value>,
+    contacts: Vec<dsip_number::Contact>,
+}
+
+impl TnContext {
+    fn load(opts: &ConsoleOpts) -> Result<TnContext> {
+        let read = |p: &PathBuf| -> Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
+        let mut policy = dsip_number::Policy::default();
+        if let Some(p) = &opts.tn_policy {
+            policy = dsip_number::Policy::from_json(&read(p)?);
+            println!("numbers   {} STI-CA anchor(s), {} x5u chain(s) — callers' bound numbers are verified   N§3.4",
+                     policy.trust_anchors.len(), policy.certificates.len());
+        }
+        let mut documents = std::collections::HashMap::new();
+        for f in &opts.did_documents {
+            let v = read(f)?;
+            let docs: Vec<serde_json::Value> = if v.get("id").is_some() { vec![v] } else { v.as_object().into_iter().flatten().map(|(_, d)| d.clone()).collect() };
+            for d in docs {
+                if let Some(id) = d["id"].as_str() {
+                    documents.insert(id.to_string(), d.clone());
+                }
+            }
+        }
+        let contacts = match &opts.contacts {
+            Some(p) => read(p)?.as_array().into_iter().flatten().map(|c| dsip_number::Contact {
+                name: c["name"].as_str().unwrap_or_default().into(),
+                did: c["did"].as_str().unwrap_or_default().into(),
+                numbers: c["numbers"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect(),
+            }).collect(),
+            None => vec![],
+        };
+        Ok(TnContext { policy, documents, contacts })
+    }
+}
+
 /// Media state for the current session.
 struct Media {
     leg: MediaLeg,
@@ -108,6 +153,14 @@ fn media_enabled(opts: &ConsoleOpts) -> bool {
 async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(String, Option<Media>)> {
     if let Some(g) = agent.endpoint().contacts.held_from(to, dsip_transport::now_s()) {
         println!("contacts  holding grant …{} from {} — attached to the invite   §19.4", sid8(&g), short(to));
+    }
+    // Number Attestation N§4: our bound number rides as a `tel` claim; the callee verifies it against our identity
+    if let Some(path) = &opts.tn_binding {
+        let binding = std::fs::read_to_string(path)?.trim().to_string();
+        let b = dsip_number::parse_binding(&binding).map_err(|r| anyhow::anyhow!("--tn-binding: {}", r.0))?;
+        let number = b.payload["tn"].as_str().unwrap_or_default().to_string();
+        println!("claims    tel {number} with a binding (x5u {}) → invite identity.claims   N§4", b.header["x5u"].as_str().unwrap_or_default());
+        agent.set_claims(vec![serde_json::json!({"type": "tel", "number": number, "binding": binding})]);
     }
     let mut media = None;
     if media_enabled(opts) {
@@ -279,6 +332,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         _ => vec![],
     };
     let resolver = build_resolver(&opts.did_documents, &fetch).await?;
+    let tn = TnContext::load(&opts)?;
 
     // Discovery (§8.1): DID document first; did:key has none, so the hints tier may name the peer's relay.
     let dht = if opts.dht.is_empty() { None } else { Some(crate::hints::join(&opts.dht).await?) };
@@ -428,9 +482,26 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             // caller (a `tel` claim) shows the caller headline and the attestation.
                             let claims: Vec<serde_json::Value> = payload.pointer("/identity/claims").and_then(|c| c.as_array()).cloned().unwrap_or_default();
                             if matches!(message.msg_type.as_str(), "invite" | "introduction") {
-                                if let Some(tel) = claims.iter().find(|c| c["type"] == "tel") {
-                                    if let Some(line) = dsip_core::trust::tel_caller_line(tel) {
-                                        println!("  ☎  {line}   (via gateway {})", short(&identity));
+                                if let Some(line) = claims.iter().find_map(dsip_core::trust::tel_caller_line) {
+                                    println!("  ☎  {line}   (via gateway {})", short(&identity));
+                                }
+                                // Number Attestation N§4–N§5: the caller's own bound numbers, verified against the
+                                // identity that signed this invite; a number now on another identity is said out loud
+                                for c in &claims {
+                                    let doc = tn.documents.get(&identity).cloned().unwrap_or(serde_json::Value::Null);
+                                    match dsip_number::check_claim(c, &identity, &doc, dsip_transport::now_s(), &tn.policy) {
+                                        dsip_number::ClaimOutcome::Ignored => {}
+                                        dsip_number::ClaimOutcome::Attested { line, issued, attested_by, .. } => {
+                                            println!("  ☎  {line}   N§4");
+                                            let tel = c["number"].as_str().unwrap_or_default();
+                                            if let Some(w) = dsip_number::identity_change(&tn.contacts, tel, &identity, attested_by.as_deref(), issued) {
+                                                println!("  ⚠  {w}   N§5");
+                                            }
+                                        }
+                                        dsip_number::ClaimOutcome::Dropped { reason, line } => {
+                                            let shown = line.unwrap_or_else(|| "a number".into());
+                                            println!("  ☎  {shown} — number binding refused: {reason}   N§4, §18.2");
+                                        }
                                     }
                                 }
                                 println!("  🔎 trust: {}   §18.1", dsip_core::trust::verification_basis(&identity, &claims));
