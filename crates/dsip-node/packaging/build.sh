@@ -28,6 +28,7 @@ done
 (cd dist && sha256sum -- *.tar.gz *.deb > SHA256SUMS)
 if [ "${1:-}" = "--image" ]; then
   arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+  mkdir -p dist/state  # the image's empty, owned state directory (Containerfile), so no busybox stage is pulled
   docker build -q --build-arg TARGETARCH="$arch" -f packaging/Containerfile -t "dsip-node:$VERSION" -t dsip-node:dev . >/dev/null
   echo "image dsip-node:$VERSION ($arch), $(docker image inspect dsip-node:dev --format '{{.Size}}' | awk '{printf "%.1f MB", $1/1e6}')"
 fi
