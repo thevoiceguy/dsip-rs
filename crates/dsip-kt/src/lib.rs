@@ -284,10 +284,20 @@ pub fn tree_head_valid(config: &[u8], tree_size: u64, root: &[u8], signature: &[
     Ok(key.verify(&tbs, &sig).is_ok())
 }
 
-/// Normalize an alias (`local@domain`), or `None` when it is not one.
+/// Normalize an alias (`local@domain`), or a `tel:` global number (v0.12), or `None` when it is not one.
 ///
-/// Spec: T§3. Impl (spec-gap 104): ASCII only; split at the last `@`; the domain lowercased.
+/// Spec: T§3. Impl (spec-gap 104): ASCII only; split at the last `@`; the domain lowercased. A `tel:` alias is a
+/// global tel URI with no parameters: visual separators removed, E.164 digits, lowercase scheme.
 pub fn normalize_alias(a: &str) -> Option<String> {
+    if a.len() >= 4 && a[..4].eq_ignore_ascii_case("tel:") {
+        let rest = a[4..].strip_prefix('+')?;
+        if !rest.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'(' | b')')) {
+            return None;
+        }
+        let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+        let ok = (2..=15).contains(&digits.len()) && !digits.starts_with('0');
+        return ok.then(|| format!("tel:+{digits}"));
+    }
     let (local, domain) = a.rsplit_once('@')?;
     if local.is_empty() || !local.chars().all(|c| ('\u{21}'..='\u{7e}').contains(&c) && c != '@') {
         return None;
