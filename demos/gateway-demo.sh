@@ -9,9 +9,9 @@
 # This script is the human-facing "vs siphond" version. It needs siphon-rs's siphond on PATH
 # (build it from ~/siphon-rs: `cargo build -p siphond`). It starts siphond as a call-server that
 # answers with G.711, starts the gateway, and places a SIP call at the gateway to show the SIP leg
-# and transcoding live. The DSIP leg (relay + native CLI caller) is the same code the round_trip
-# test drives in-process; wiring the relay end to end here is left as the operator step the plan
-# calls out (a running relay + a DSIP identity for the gateway).
+# and transcoding live. The full DSIP leg (a relay, DSIP identities, media bridged end to end) runs
+# in `number-gateway-demo.sh`, which is the CI proof of the daemon; here the gateway runs its SIP
+# half alone (no --identity).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SIPHOND=${SIPHOND:-$(command -v siphond || echo "$HOME/siphon-rs/target/debug/siphond")}

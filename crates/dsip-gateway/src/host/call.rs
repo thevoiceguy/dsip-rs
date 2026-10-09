@@ -269,6 +269,19 @@ impl Call {
     pub fn sip_call_id(&self) -> Option<&str> {
         self.sip_call_id.as_deref()
     }
+    /// The SIP-side RTP leg, for the daemon's bridge.
+    pub fn rtp_handle(&self) -> Option<Arc<RtpLeg>> {
+        self.rtp.clone()
+    }
+    /// The trunk's RTP endpoint, when its SDP has been seen.
+    pub fn remote_rtp_handle(&self) -> Option<RemoteRtp> {
+        self.remote_rtp.clone()
+    }
+    /// Whether the controller has ended both legs.
+    pub fn ended(&self) -> bool {
+        let s = self.ctrl.snapshot();
+        s["dsip"] == "ended" && matches!(s["sip"].as_str(), Some("terminated") | Some("idle"))
+    }
 }
 
 /// A helper the SIP receive loop uses: find the call whose SIP Call-ID matches and step it. `dsip` is the DSIP

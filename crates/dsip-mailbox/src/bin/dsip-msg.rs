@@ -3923,6 +3923,19 @@ struct DtlsPeerIo {
     peer: std::net::SocketAddr,
 }
 
+/// How long a DTLS session may stay silent before the gateway shuts it down (RFC 6353 §5.1.2 leaves the policy to
+/// the implementation; net-snmp's own default is 5 minutes).
+const DTLS_IDLE_S: u64 = 300;
+
+/// Run OpenSSL's DTLS retransmission timer for a session: `DTLSv1_handle_timeout`, which the `openssl` crate does not
+/// wrap. It resends the last handshake flight when its timer has expired and does nothing otherwise.
+fn dtls_handle_timeout(ssl: &openssl::ssl::SslRef) {
+    use foreign_types::ForeignTypeRef as _;
+    const DTLS_CTRL_HANDLE_TIMEOUT: std::os::raw::c_int = 74; // ssl.h; a macro over SSL_ctrl
+    // SAFETY: `ssl` is a live SSL object this thread owns; the control takes no pointer argument.
+    unsafe { openssl_sys::SSL_ctrl(ssl.as_ptr(), DTLS_CTRL_HANDLE_TIMEOUT, 0, std::ptr::null_mut()) };
+}
+
 impl std::io::Read for DtlsPeerIo {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self.rx.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -3950,9 +3963,10 @@ impl std::io::Write for DtlsPeerIo {
 /// exchange (RFC 6347 §4.2.1), a session per peer address, the client certificate verified against the CA and
 /// named by the table, and each DTLS record exactly one message (`dsip_events::tsm::dtls_record`).
 ///
-/// Impl: a blocking thread per session over a demultiplexed queue (OpenSSL's DTLS needs a datagram at a time);
-/// handshake retransmission is OpenSSL's over that stream, so a lost handshake flight is not retried in this
-/// round; idle sessions are kept until the peer closes.
+/// Impl: a blocking thread per session over a demultiplexed queue (OpenSSL's DTLS needs a datagram at a time). A
+/// lost handshake flight is retransmitted by OpenSSL's own DTLS timer, run from the session thread whenever a read
+/// times out (`DTLSv1_handle_timeout`); a session idle for [`DTLS_IDLE_S`] is shut down, and the peer's next
+/// datagram starts a new one.
 fn spawn_snmp_dtls(sock: std::net::UdpSocket, cert: &Path, key: &Path, ca: &Path, cas: Vec<Vec<u8>>, table: Value,
                    tx: tokio::sync::mpsc::UnboundedSender<GatewayInput>) -> Result<()> {
     use openssl::ssl::{Ssl, SslContext, SslFiletype, SslMethod, SslOptions, SslRef, SslVerifyMode};
@@ -4004,7 +4018,10 @@ fn spawn_snmp_dtls(sock: std::net::UdpSocket, cert: &Path, key: &Path, ca: &Path
                     let mut stream = loop {
                         match hs {
                             Ok(s) => break s,
-                            Err(openssl::ssl::HandshakeError::WouldBlock(mid)) if std::time::Instant::now() < deadline => hs = mid.handshake(),
+                            Err(openssl::ssl::HandshakeError::WouldBlock(mid)) if std::time::Instant::now() < deadline => {
+                                dtls_handle_timeout(mid.ssl()); // a read timed out: resend the flight if OpenSSL's timer says so
+                                hs = mid.handshake();
+                            }
                             Err(e) => {
                                 println!("SNMP dtls refused from {from}: {}", match &e { openssl::ssl::HandshakeError::Failure(m) => m.error().to_string(), _ => "handshake timed out".into() });
                                 return;
@@ -4028,6 +4045,7 @@ fn spawn_snmp_dtls(sock: std::net::UdpSocket, cert: &Path, key: &Path, ca: &Path
                     let peer = TlsPeer { certificate_sha256: fields["sha256"].as_str().unwrap_or("").to_string(),
                                          security_name: name.to_string(), transport: "dtls", reply: reply_tx };
                     let mut rec = vec![0u8; 65536];
+                    let mut last = std::time::Instant::now();
                     loop {
                         while let Ok(m) = reply_rx.try_recv() {
                             if stream.ssl_write(&m).is_err() {
@@ -4036,15 +4054,25 @@ fn spawn_snmp_dtls(sock: std::net::UdpSocket, cert: &Path, key: &Path, ca: &Path
                         }
                         match stream.ssl_read(&mut rec) {
                             Ok(0) => return,
-                            Ok(n) => match dsip_events::tsm::dtls_record(&rec[..n]) {
-                                Some(m) => {
-                                    if tx.send(GatewayInput::SnmpTls(m, from, peer.clone())).is_err() {
-                                        return;
+                            Ok(n) => {
+                                last = std::time::Instant::now();
+                                match dsip_events::tsm::dtls_record(&rec[..n]) {
+                                    Some(m) => {
+                                        if tx.send(GatewayInput::SnmpTls(m, from, peer.clone())).is_err() {
+                                            return;
+                                        }
                                     }
+                                    None => println!("SNMP dtls from {from}: a record that is not one message, dropped   E§3"),
                                 }
-                                None => println!("SNMP dtls from {from}: a record that is not one message, dropped   E§3"),
-                            },
-                            Err(e) if e.code() == openssl::ssl::ErrorCode::WANT_READ => continue,
+                            }
+                            Err(e) if e.code() == openssl::ssl::ErrorCode::WANT_READ => {
+                                if last.elapsed() > std::time::Duration::from_secs(DTLS_IDLE_S) {
+                                    println!("SNMP dtls session {from}: idle for {DTLS_IDLE_S} s, closed");
+                                    let _ = stream.shutdown();
+                                    return;
+                                }
+                                continue;
+                            }
                             Err(_) => return,
                         }
                     }

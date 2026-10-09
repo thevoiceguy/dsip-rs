@@ -13,6 +13,8 @@
 #      identity-not-assertable (G§7); Bob sees "no attestation".
 #   3. Alice dials a number nobody published: gw-b finds no route and refuses identity.unknown (404); Alice's call is
 #      rejected identity.unknown.
+# Media crosses both gateways: Alice's 440 Hz Opus becomes G.711 on the trunk and Opus again for Bob, and Bob's
+# 660 Hz comes back the same way; both ends count the RTP they received.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build -q -p dsip-cli -p dsip-relay -p dsip-node
@@ -56,13 +58,14 @@ grep -h "^gateway\|^numbers\|^sti " "$D/gw-a.log" "$D/gw-b.log" | sed 's/^/  /' 
 
 call() { # n caller number [extra caller args]
   local n=$1 who=$2 number=$3; shift 3
-  $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --auto accept --media none "${DOCS[@]}" \
-    --script "sleep 8; quit" >"$D/$n-bob.log" 2>&1 & BP=$!
+  $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --auto accept --media tone:660 "${DOCS[@]}" \
+    --script "sleep 18; quit" >"$D/$n-bob.log" 2>&1 & BP=$!
   for _ in $(seq 50); do grep -q "capabilities" "$D/$n-bob.log" && break; sleep 0.2; done
-  $B/dsip call --identity "$D/$who" --relay $R --ca "$CA" --to "tel:$number" --gateway $GWA --media none "${DOCS[@]}" \
-    "$@" --script "sleep 4; hangup; sleep 1; quit" >"$D/$n-$who.log" 2>&1 || true
+  $B/dsip call --identity "$D/$who" --relay $R --ca "$CA" --to "tel:$number" --gateway $GWA --media tone:440 "${DOCS[@]}" \
+    "$@" --script "sleep 14; hangup; sleep 1; quit" >"$D/$n-$who.log" 2>&1 || true
   kill $BP 2>/dev/null || true; wait $BP 2>/dev/null || true
-  grep -E "^number|^claims|^← (answer|reject)|⚠" "$D/$n-$who.log" | sed "s/^/  $who: /" || true
+  grep -E "^number|^claims|^← (answer|reject)|⚠|media   closed" "$D/$n-$who.log" | sed "s/^/  $who: /" || true
+  grep -E "media     bridged" "$D/gw-a.log" | tail -1 | sed 's/^/  gw-a: /' || true
   grep -E "^(assert|route|passport|← |→ )" "$D/gw-a.log" | tail -4 | sed 's/^/  gw-a: /' || true
   grep -E "^(assert|route|passport|← |→ )" "$D/gw-b.log" | tail -4 | sed 's/^/  gw-b: /' || true
   grep -E "^← invite|☎|🔎|⚠" "$D/$n-bob.log" | sed 's/^/  bob: /' || true
@@ -76,6 +79,11 @@ grep -q "route     $BOB_TN → $BOB  (binding" "$D/gw-b.log" || fail "1: gateway
 grep -q "☎  PSTN caller $ALICE_TN" "$D/1-bob.log" || fail "1: Bob saw no PSTN caller"
 grep -q "🔎 trust: Gateway attested by gw-b.example · STIR attestation A (verified)" "$D/1-bob.log" || fail "1: Bob's basis is not the verified attestation"
 grep -q "← answer" "$D/1-alice.log" || fail "1: Alice's call was not answered"
+grep -q "media     bridged" "$D/gw-a.log" || fail "1: gateway A did not bridge media"
+grep -q "media     bridged" "$D/gw-b.log" || fail "1: gateway B did not bridge media"
+heard() { grep -o "received [0-9]* RTP packets" "$1" | grep -o "[0-9]*" | head -1; }
+[ "${heard_a:=$(heard "$D/1-alice.log")}" -gt 20 ] 2>/dev/null || fail "1: Alice heard nothing through two gateways (got '${heard_a}' packets)"
+grep -o "received [0-9]* RTP packets" "$D/1-bob.log" | head -1 | sed 's/^/  bob heard Alice: /'
 
 echo "════════ 2. Mallory has no binding: the gateway presents its own identity, and the crossing is downgraded"
 call 2 mallory $BOB_TN
@@ -92,5 +100,5 @@ grep -q "← reject .* reason=identity.unknown" "$D/3-alice.log" || fail "3: Ali
 echo
 echo "PASS: a DSIP caller's bound number crossed to the PSTN with a SHAKEN PASSporT (attestation A) signed under the"
 echo "      gateway's RFC 9060 delegate certificate; the far gateway verified it and reached the callee through the"
-echo "      binding he published; a caller without a binding crossed downgraded with no attestation; a number nobody"
-echo "      published was refused identity.unknown."
+echo "      binding he published, and audio crossed both gateways; a caller without a binding crossed downgraded with"
+echo "      no attestation; a number nobody published was refused identity.unknown."
