@@ -231,9 +231,22 @@ pub fn security_name(cert: &Value, table: &Value) -> Value {
     json!({"error": "no-security-name"})
 }
 
-/// Run a `check: "tsm"`, `"tls-frames"` or `"tsm-name"` vector.
+/// A DTLS record as exactly one message (RFC 6353 over UDP): split as a stream, it must give one message, nothing
+/// left and no close. `None` means the record is dropped and the session continues.
+///
+/// Spec: E§3 (DTLS, v0.11); README `check: "dtls-record"`.
+pub fn dtls_record(record: &[u8]) -> Option<Vec<u8>> {
+    let mut f = split_frames(record);
+    (f.messages.len() == 1 && f.consumed == record.len() && !f.close).then(|| f.messages.remove(0))
+}
+
+/// Run a `check: "tsm"`, `"tls-frames"`, `"dtls-record"` or `"tsm-name"` vector.
 pub fn run_check(i: &Value) -> Value {
     match i["check"].as_str() {
+        Some("dtls-record") => match dtls_record(&unhex(i["record"].as_str().unwrap_or("")).unwrap_or_default()) {
+            Some(m) => json!({"message": hex(&m)}),
+            None => json!({"error": "not-one-message"}),
+        },
         Some("tsm") => match receive(&unhex(i["message"].as_str().unwrap_or("")).unwrap_or_default()) {
             Err(reason) => json!({"refused": {"reason": reason}}),
             Ok(r) => match r.kind {

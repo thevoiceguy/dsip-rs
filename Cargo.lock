@@ -1407,6 +1407,7 @@ dependencies = [
  "dsip-transport",
  "futures-util",
  "openmls",
+ "openssl",
  "rand 0.8.7",
  "reqwest",
  "rustls-pemfile",

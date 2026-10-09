@@ -468,7 +468,7 @@ pub fn run_vector(v: &Value) -> Value {
             syslog::parse_syslog(&b)
         }
         Some("usm-key") => usm::usm_key(i),
-        Some("tsm" | "tls-frames" | "tsm-name") => tsm::run_check(i),
+        Some("tsm" | "tls-frames" | "dtls-record" | "tsm-name") => tsm::run_check(i),
         Some(_) => json!({"error": "unknown check"}),
         None if v["context"]["component"] == "snmpv3" => usm::run_trace(v),
         None if v["context"]["component"] == "syslog-sign" => syslog_sign::run_trace(v),
