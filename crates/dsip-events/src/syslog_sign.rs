@@ -124,10 +124,13 @@ struct Signer {
     kind: String,
     raw: Vec<u8>,
     sha256: String,
-    key: VerifyingKey,
+    /// `None` when the configured blob does not read (a `P` key, README): every block then fails `bad-signature`.
+    key: Option<VerifyingKey>,
 }
 
-/// A signer's DSA key from its configured blob: a certificate's SubjectPublicKeyInfo (`C`) or four MPIs (`K`).
+/// A signer's DSA key from its configured blob: a certificate's SubjectPublicKeyInfo (`C`), four MPIs (`K`), or an
+/// OpenPGP KeyID and certificate (`P`, v0.11). A blob that does not read gives no key: the signer's blocks fail
+/// `bad-signature` (README `syslog-sign` context).
 fn verifying_key(kind: &str, raw: &[u8]) -> Option<VerifyingKey> {
     if kind == "C" {
         use dsa::pkcs8::DecodePublicKey as _;
@@ -135,9 +138,85 @@ fn verifying_key(kind: &str, raw: &[u8]) -> Option<VerifyingKey> {
         let (_, c) = x509_parser::certificate::X509Certificate::from_der(raw).ok()?;
         return VerifyingKey::from_public_key_der(c.public_key().raw).ok();
     }
-    let m = mpis(raw).ok()?;
+    let m = if kind == "P" { pgp_dsa_mpis(raw)? } else { mpis(raw).ok()? };
     let [p, q, g, y] = <[BigUint; 4]>::try_from(m).ok()?;
     VerifyingKey::from_components(Components::from_components(p, q, g).ok()?, y).ok()
+}
+
+/// OpenPGP packets (RFC 4880 §4.2) as `(tag, body)`: old and new format headers, definite lengths only (an
+/// indeterminate old-format length or a new-format partial body length does not read), each packet fitting the bytes.
+fn pgp_packets(b: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let (mut out, mut i) = (vec![], 0usize);
+    while i < b.len() {
+        let h = b[i];
+        if h & 0x80 == 0 {
+            return None;
+        }
+        let (tag, n) = if h & 0x40 != 0 {
+            let tag = h & 0x3F;
+            i += 1;
+            let f = *b.get(i)?;
+            let n = match f {
+                0..=191 => {
+                    i += 1;
+                    f as usize
+                }
+                192..=223 => {
+                    let second = *b.get(i + 1)?;
+                    i += 2;
+                    ((f as usize - 192) << 8) + second as usize + 192
+                }
+                255 => {
+                    let n = u32::from_be_bytes(b.get(i + 1..i + 5)?.try_into().ok()?) as usize;
+                    i += 5;
+                    n
+                }
+                _ => return None, // a partial body length
+            };
+            (tag, n)
+        } else {
+            let (tag, lt) = ((h >> 2) & 0x0F, (h & 3) as usize);
+            if lt == 3 {
+                return None; // indeterminate length
+            }
+            let w = 1usize << lt;
+            let len_bytes = b.get(i + 1..i + 1 + w)?;
+            i += 1 + w;
+            (tag, len_bytes.iter().fold(0usize, |acc, x| (acc << 8) | *x as usize))
+        };
+        let body = b.get(i..i + n)?;
+        out.push((tag, body));
+        i += n;
+    }
+    Some(out)
+}
+
+/// The DSA MPIs p, q, g, y of a `P` key blob: the 8-byte KeyID, then a certificate whose first packet is a version 4
+/// DSA (algorithm 17) public key filling its body exactly; the KeyID is the last 8 bytes of the V4 fingerprint (SHA-1
+/// over `0x99`, the body length as 2 bytes, and the body; RFC 4880 §12.2).
+fn pgp_dsa_mpis(blob: &[u8]) -> Option<Vec<BigUint>> {
+    let kid = blob.get(..8)?;
+    let packets = pgp_packets(&blob[8..])?;
+    let (tag, body) = *packets.first()?;
+    if tag != 6 || body.len() < 6 || body[0] != 4 || body[5] != 17 {
+        return None;
+    }
+    let (mut m, mut i) = (vec![], 6usize);
+    while i < body.len() && m.len() < 4 {
+        let bits = u16::from_be_bytes(body.get(i..i + 2)?.try_into().ok()?) as usize;
+        let n = bits.div_ceil(8);
+        m.push(BigUint::from_bytes_be(body.get(i + 2..i + 2 + n)?));
+        i += 2 + n;
+    }
+    if m.len() != 4 || i != body.len() {
+        return None;
+    }
+    let mut h = sha1::Sha1::new();
+    h.update([0x99]);
+    h.update((body.len() as u16).to_be_bytes());
+    h.update(body);
+    let fp = h.finalize();
+    (&fp[12..] == kid).then_some(m)
 }
 
 type Session = (String, String, String, u64); // hostname (lowercase), APP-NAME, PROCID, RSID
@@ -227,7 +306,7 @@ impl Collector {
         for s in signers.as_array().into_iter().flatten() {
             let kind = s["type"].as_str().unwrap_or("").to_string();
             let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s["key"].as_str().unwrap_or("")) else { continue };
-            let Some(key) = verifying_key(&kind, &raw) else { continue };
+            let key = verifying_key(&kind, &raw);
             let sha256 = hex(&sha2::Sha256::digest(&raw));
             let gaps = s["gaps"] == true;
             map.insert(s["hostname"].as_str().unwrap_or("").to_ascii_lowercase(), Signer { gaps, kind, raw, sha256, key });
@@ -389,7 +468,7 @@ impl Collector {
         }
         let signed = [&msg[..close - cut.len()], &msg[close..]].concat();
         let [r, s] = <[BigUint; 2]>::try_from(rs).unwrap_or_else(|_| unreachable!());
-        let ok = Signature::from_components(r, s).ok().is_some_and(|sig| signer.key.verify_prehash(&alg.digest(&signed), &sig).is_ok());
+        let ok = Signature::from_components(r, s).ok().zip(signer.key.as_ref()).is_some_and(|(sig, key)| key.verify_prehash(&alg.digest(&signed), &sig).is_ok());
         if !ok {
             return refused("bad-signature");
         }
@@ -430,11 +509,22 @@ impl Collector {
         let payload: Vec<u8> = st.bytes.values().copied().collect();
         self.frags.remove(&session);
         let signer = &self.signers[&session.0];
+        // the key blob type (RFC 5848 §5.2.1; README): C, K, P carry the configured blob; N is the configured key;
+        // U has no interoperable reading
         let parts: Vec<&[u8]> = payload.split(|c| *c == b' ').collect();
-        let ok = parts.len() == 3
-            && !parts[0].is_empty()
-            && parts[1] == signer.kind.as_bytes()
-            && std::str::from_utf8(parts[2]).ok().and_then(|t| b64(t).ok()).as_deref() == Some(&signer.raw[..]);
+        if !(2..=3).contains(&parts.len()) || parts[0].is_empty() || !matches!(parts[1], b"C" | b"K" | b"P" | b"N" | b"U") {
+            return refused("payload-mismatch");
+        }
+        if parts[1] == b"U" {
+            return refused("unsupported-key-blob");
+        }
+        let ok = if parts[1] == b"N" {
+            parts.len() == 2
+        } else {
+            parts.len() == 3
+                && parts[1] == signer.kind.as_bytes()
+                && std::str::from_utf8(parts[2]).ok().and_then(|t| b64(t).ok()).as_deref() == Some(&signer.raw[..])
+        };
         if !ok {
             return refused("payload-mismatch");
         }

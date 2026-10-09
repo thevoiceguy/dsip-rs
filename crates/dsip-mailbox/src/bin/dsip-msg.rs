@@ -174,7 +174,8 @@ struct Args {
     #[arg(long)]
     syslog_tls_names: Option<PathBuf>,
     /// Signed syslog (RFC 5848; E§3, v0.10): the signers whose messages are held until a verified Signature Block
-    /// lists them. A JSON array of `{"hostname", "certificate": "<PEM path>"}` (key blob type C, a DSA certificate)
+    /// lists them. A JSON array of `{"hostname", "certificate": "<PEM path>"}` (key blob type C, a DSA certificate),
+    /// `{"hostname", "openpgp": "<path to the base64 P key blob>"}` (type P, v0.11)
     /// or `{"hostname", "key": "<base64 of the four MPIs p, q, g, y>"}` (type K). Add `"gaps": true` when this
     /// gateway receives all of the signer's messages, to raise `dsip-syslog-gap` for lost ones (E§3, v0.11).
     #[arg(long)]
@@ -3947,7 +3948,8 @@ fn spawn_syslog_tls(l: tokio::net::TcpListener, cfg: std::sync::Arc<tokio_rustls
 
 /// The gateway's USM receiver (E§3): its engine ID (given, or generated once and kept in `state`), its boots (kept in
 /// `state`, one more at every start, RFC 3414 §2.2), and the users file.
-/// `--syslog-signers` → the collector's signers (`{hostname, type, key}`, key base64): a certificate's DER for `C`.
+/// `--syslog-signers` → the collector's signers (`{hostname, type, key}`, key base64): a certificate's DER for `C`,
+/// the KeyID and OpenPGP certificate for `P` (E§3, v0.11).
 fn syslog_signers(path: &Path) -> Result<Value> {
     use base64::Engine as _;
     let list: Value = serde_json::from_str(&std::fs::read_to_string(path)?).context("--syslog-signers")?;
@@ -3959,6 +3961,9 @@ fn syslog_signers(path: &Path) -> Result<Value> {
                 .context("--syslog-signers: no certificate in the PEM file")??;
             out.push(json!({"hostname": host, "type": "C", "key": base64::engine::general_purpose::STANDARD.encode(der.as_ref()),
                             "gaps": s["gaps"] == true}));
+        } else if let Some(path) = s["openpgp"].as_str() {
+            let blob = std::fs::read_to_string(path).with_context(|| format!("--syslog-signers: {path}"))?;
+            out.push(json!({"hostname": host, "type": "P", "key": blob.trim(), "gaps": s["gaps"] == true}));
         } else {
             out.push(json!({"hostname": host, "type": "K", "key": s["key"].as_str().context("--syslog-signers: certificate or key")?,
                             "gaps": s["gaps"] == true}));
