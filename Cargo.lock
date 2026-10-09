@@ -1268,6 +1268,7 @@ dependencies = [
  "dsip-kt",
  "dsip-media",
  "dsip-messaging",
+ "dsip-number",
  "dsip-recording",
  "dsip-schema",
  "dsip-session",
@@ -1491,6 +1492,17 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dsip-number"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "dsip-core",
+ "p256",
+ "serde_json",
+ "x509-parser 0.17.0",
 ]
 
 [[package]]
