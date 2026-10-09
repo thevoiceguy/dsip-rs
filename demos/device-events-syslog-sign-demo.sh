@@ -44,7 +44,12 @@ for k in sw1 rogue; do openssl gendsa -out "$P/$k.key" "$P/params.pem" 2>/dev/nu
 openssl req -x509 -new -key "$P/sw1.key" -sha256 -days 2 -subj "/CN=sw1.example" -out "$P/sw1.pem" 2>/dev/null
 openssl req -x509 -new -key "$P/rogue.key" -sha256 -days 2 -subj "/CN=sw1.example" -out "$P/rogue.pem" 2>/dev/null
 KEY_SHA=$(openssl x509 -in "$P/sw1.pem" -outform DER | sha256sum | cut -c1-64)
-echo "[{\"hostname\": \"sw1.example\", \"certificate\": \"$P/sw1.pem\", \"gaps\": true}]" > "$DIR/signers.json"
+# a second signer whose key blob is an OpenPGP certificate (type P, v0.11)
+openssl gendsa -out "$P/sw2.key" "$P/params.pem" 2>/dev/null
+python3 demos/syslog_sign_send.py 127.0.0.1:$SYSLOG_PORT "$DIR/sw2.json" --key "$P/sw2.key" --hostname sw2.example blob > "$P/sw2.blob"
+KEY2_SHA=$(base64 -d "$P/sw2.blob" | sha256sum | cut -c1-64)
+echo "[{\"hostname\": \"sw1.example\", \"certificate\": \"$P/sw1.pem\", \"gaps\": true},
+      {\"hostname\": \"sw2.example\", \"openpgp\": \"$P/sw2.blob\"}]" > "$DIR/signers.json"
 cat > "$DIR/rules.json" <<'EOF'
 [{"syslog": {"app_name": "linkd", "msgid": "LINKDOWN"}, "action": "raise", "type": "link-down", "severity": "major",
   "resource_sd": {"id": "if@32473", "param": "ifIndex"}}]
@@ -126,8 +131,28 @@ wait_for "$DIR/n.log" "^ALARM raised sw1.example/dsip-syslog-gap severity=warnin
 [ "$(count "$DIR/n.log" "^ALARM raised sw1.example/dsip-syslog-gap")" = 1 ] || fail "the gaps were more than one alarm"
 echo "  one dsip-syslog-gap alarm for the signer, raised by the first gap and repeated by the second"
 
+echo "=== sw2's key blob is an OpenPGP certificate (type P): its session is established and its message signed"
+send2() { python3 demos/syslog_sign_send.py 127.0.0.1:$SYSLOG_PORT "$DIR/sw2.json" --hostname sw2.example "$@" | sed 's/^/  sw2: /'; }
+send2 --key "$P/sw2.key" cert --blob P
+wait_for "$DIR/g.log" "^SYSLOG-SIGN session sw2.example/syslogd/.* rsid 1 established, key ${KEY2_SHA:0:16}" 10
+send2 msg linkd LINKDOWN "port 2 down" --sd '[if@32473 ifIndex="2"]'
+send2 --key "$P/sw2.key" sign
+wait_for "$DIR/n.log" "^EVENT .*basis=syslog-signed signed=sw2.example/syslogd rsid=1 #1 key=${KEY2_SHA:0:16}" 20
+grep "signed=sw2.example" "$DIR/n.log" | head -1 | cut -c1-190 | sed 's/^/  ann sees: /'
+
+echo "=== sw1 reboots: a new session (RSID 2) announced with key blob type N, the key being pre-distributed"
+rm -f "$DIR/signer.json"
+send --key "$P/sw1.key" --rsid 2 cert --blob N
+wait_for "$DIR/g.log" "^SYSLOG-SIGN session sw1.example/syslogd/.* rsid 2 established, key ${KEY_SHA:0:16}" 10
+grep "rsid 2 established" "$DIR/g.log" | head -1 | sed 's/^/  gateway: /'
+send msg linkd LINKDOWN "port 9 down" --sd '[if@32473 ifIndex="9"]'
+send --key "$P/sw1.key" sign
+wait_for "$DIR/n.log" "^EVENT .*basis=syslog-signed signed=sw1.example/syslogd rsid=2 #1 key=${KEY_SHA:0:16}" 20
+grep "rsid=2" "$DIR/n.log" | head -1 | cut -c1-190 | sed 's/^/  ann sees: /'
+
 echo
 echo "PASS: two messages held until their verified Signature Block became syslog-signed events with their signer,"
 echo "      session and message numbers; an unsigned message from the signer's host and one listed by a foreign"
-echo "      key were deposited as syslog-udp, after the hold — never as signed; and the numbers that never arrived or"
-echo "      were never covered raised one dsip-syslog-gap alarm."
+echo "      key were deposited as syslog-udp, after the hold — never as signed; the numbers that never arrived or"
+echo "      were never covered raised one dsip-syslog-gap alarm; a signer with an OpenPGP key blob (P) and a rebooted"
+echo "      signer announcing its session with no key blob (N) were both signed."
