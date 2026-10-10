@@ -497,7 +497,12 @@ async function hangup() {
   if (st === 'ACTIVE') await engine.local({ local: 'hangup', session: call.sid });
   else if (st === 'ENDED' || !st) endCall();
   else if (call.role === 'responder') await engine.local({ local: 'decline', session: call.sid });
-  else await engine.local({ local: 'cancel', session: call.sid });
+  else {
+    // §12.5: our cancel ends the session for us at once; a late answer that crosses it is answered by the engine
+    // with a bye on its own, and neither is a `ui ended` (the person ended it), so the screen is cleared here.
+    await engine.local({ local: 'cancel', session: call.sid });
+    endCall();
+  }
 }
 
 async function sendUpdate(escalate) {

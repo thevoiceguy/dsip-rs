@@ -68,9 +68,10 @@ try {
   await mallory.page.click('#call-number button[type=submit]');
   await incomingAt(bob);
   check('Bob: the crossing carried no attestation', (await bob.page.textContent('#in-basis')) === 'Gateway attested by gw-b.example · no attestation', await bob.page.textContent('#in-basis'));
-  await bob.page.click('#btn-accept');
   await until(mallory.page, () => /could not be asserted/.test(window.dsip.downgrade()), null, 30000);
   check('Mallory: told what the crossing lost (G§7)', /not encrypted on the PSTN trunk/.test(await mallory.page.evaluate(() => window.dsip.downgrade())), await mallory.page.evaluate(() => window.dsip.downgrade()));
+  await bob.page.click('#btn-accept');
+  await until(mallory.page, () => window.dsip.state() === 'ACTIVE', null, 30000);
   await mallory.page.click('#btn-hangup');
   await ended(mallory, bob);
 
