@@ -47,8 +47,13 @@
     <button type="submit">Add</button>
   </form>
   <ul id="contact-list" class="list"></ul>
-  <p class="muted small">Calling someone who has not granted you contact may be refused until you introduce yourself (§19.4).
-  Introductions never ring; they wait for the other person.</p>
+  <form id="introduce-form" class="notice hidden">
+    <div><strong>Introduce yourself</strong> to <span id="introduce-name" class="name"></span> <code id="introduce-did" class="did"></code></div>
+    <div class="row"><input id="introduce-purpose" maxlength="280" size="60" placeholder="why you are getting in touch (shown to them as a claim)"></div>
+    <div class="row"><button type="submit" class="primary">Send introduction</button> <button type="button" id="introduce-cancel" class="ghost">Cancel</button></div>
+    <p class="muted small">An introduction never rings. They see it under Requests and may grant you contact, decline, or say nothing; silence is a valid answer (§19.4).</p>
+  </form>
+  <p class="muted small">Someone who requires first contact refuses calls from identities they have not granted; introduce yourself first (§19.4).</p>
   <h3>Requests <span class="muted small">introductions received; silence is a valid answer</span></h3>
   <ul id="request-list" class="list"><li class="muted small">none</li></ul>
 </section>
@@ -65,6 +70,7 @@
   </div>
   <div class="row">
     <button id="btn-hangup" class="danger">Hang up</button>
+    <button id="btn-introduce-after" class="hidden">Introduce yourself</button>
     <button id="btn-add-video" class="hidden">Add video</button>
     <button id="btn-escalate" class="hidden">Answer for real (§14.4)</button>
     <button id="btn-answer-update" class="hidden">Accept their video</button>
@@ -105,6 +111,11 @@
   browser makes that browser a second device of the same identity (stage 3) or restores this one.</p>
   <h3>Policy</h3>
   <div class="row"><label class="small"><input type="checkbox" id="set-first-contact"> require first contact: refuse calls from identities that hold no grant (§19.4)</label></div>
+  <h3>Contact link</h3>
+  <p class="muted small">A link you hand to one person out of band (a message, a card). Opening it introduces them to you with a
+  single-use token, and the introduction is granted at once without a request (§19.4). Each link works once.</p>
+  <div class="row"><button id="btn-contact-link">New contact link</button></div>
+  <ul id="contact-links" class="list"></ul>
   <h3>Network</h3>
   <div class="row"><label>relay</label><input id="set-relay" size="40" placeholder="wss://host:8443/dsip"> <span class="muted small">default: the origin that served this page</span></div>
   <div class="row"><label>ICE servers</label><input id="set-ice" size="60" placeholder='[{"urls":"stun:stun.example:3478"}]'></div>

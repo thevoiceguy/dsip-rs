@@ -209,6 +209,18 @@ impl Endpoint {
         self.core.set_sdp(sdp);
     }
 
+    /// Whether the next `invite`/`update` offers video (its descriptors must match the SDP set with `set_sdp`, B§2.1).
+    pub fn set_video(&mut self, video: bool) {
+        self.core.set_video(video);
+    }
+
+    /// Video codec registry ids (JSON array) the next offer lists; they must appear as `rtpmap`s in the SDP (B§3.4).
+    pub fn set_video_codecs(&mut self, ids_json: &str) {
+        if let Ok(ids) = serde_json::from_str::<Vec<String>>(ids_json) {
+            self.core.set_video_codecs(ids);
+        }
+    }
+
     /// `data` for the next `info` (ICE candidates).
     pub fn set_info_data(&mut self, data_json: &str) {
         if let Ok(v) = serde_json::from_str(data_json) {

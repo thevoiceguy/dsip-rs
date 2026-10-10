@@ -16,6 +16,8 @@ grep -q 'listening on' "$D/relay.log" || { echo "relay did not start"; cat "$D/r
 rc=0
 for b in $(echo "$BROWSERS" | sed 's/all/firefox chromium/; s/,/ /g'); do
   echo "== $b"
-  (cd web && BROWSER=$b URL="https://$LISTEN/" node test/call.mjs) || rc=1
+  for t in call first-contact; do
+    (cd web && BROWSER=$b URL="https://$LISTEN/" node test/$t.mjs) || rc=1
+  done
 done
 exit $rc

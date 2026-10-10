@@ -24,6 +24,10 @@ const short = (d) => (d && d.length > 32 ? d.slice(0, 20) + '…' + d.slice(-8) 
 let identity = null, engine = null, relay = null, settings = {}, contacts = [];
 let call = null;      // {sid, role, peer, media, offer, pendingUpdate, screening}
 let relayInfo = null;
+let purposes = {};    // introduction id → {purpose, basis}: what a request shows (the engine keeps only the ids)
+let links = [];       // contact links issued here: {token, url, created}
+let onBound = null;   // one action deferred until the relay is bound (a contact link opened before connecting)
+const payloadOf = (frame) => { try { return JSON.parse(atob(JSON.parse(frame).payload.replace(/-/g, '+').replace(/_/g, '/'))); } catch { return {}; } };
 
 // ---------------------------------------------------------------- log
 
@@ -55,7 +59,10 @@ function renderContacts() {
     const li = document.createElement('li');
     const held = Object.values(file.grants_held || {}).some((g) => g.identity === c.did);
     const issued = Object.values(file.grants_issued || {}).some((g) => g.identity === c.did);
-    const status = held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them' : 'no grant';
+    const pending = Object.values(file.pending_sent || {}).includes(c.did);
+    const asked = Object.values(file.requests || {}).some(([who]) => who === c.did);
+    const status = held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them'
+      : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant';
     li.innerHTML = `<span class="name"></span><code class="did"></code><span class="status">${status}</span>`;
     li.querySelector('.name').textContent = c.name || '(unnamed)';
     li.querySelector('.did').textContent = c.did;
@@ -69,9 +76,11 @@ function renderContacts() {
   rl.innerHTML = reqs.length ? '' : '<li class="muted small">none</li>';
   for (const [id, who] of reqs) {
     const li = document.createElement('li');
-    li.innerHTML = `<span class="name"></span><code class="did"></code>`;
+    li.innerHTML = `<div class="request"><span class="name"></span> <code class="did"></code><div class="small purpose"></div><div class="small basis"></div></div>`;
     li.querySelector('.name').textContent = nameOf(who) || 'someone';
     li.querySelector('.did').textContent = who;
+    li.querySelector('.purpose').textContent = purposes[id]?.purpose ? `“${purposes[id].purpose}”  (a claim, §18.2)` : '(no purpose given)';
+    li.querySelector('.basis').textContent = purposes[id]?.basis || '';
     const g = document.createElement('button'); g.textContent = 'Grant'; g.className = 'primary';
     g.onclick = () => engine.local({ local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite'], valid_until: Math.floor(now()) + 31536000 });
     const r = document.createElement('button'); r.textContent = 'Ignore';
@@ -112,6 +121,31 @@ async function persist() {
   await store.set(key('engine.contacts'), engine.contactsFile());
 }
 
+function renderLinks() {
+  const ul = $('contact-links');
+  ul.innerHTML = links.length ? '' : '<li class="muted small">none yet</li>';
+  const file = JSON.parse(engine.contactsFile());
+  for (const l of links) {
+    const li = document.createElement('li');
+    li.innerHTML = '<code class="did link"></code><span class="status"></span>';
+    li.querySelector('.link').textContent = l.url;
+    li.querySelector('.status').textContent = Object.prototype.hasOwnProperty.call(file.tokens || {}, l.token) ? 'unused' : 'used';
+    ul.append(li);
+  }
+}
+
+async function newContactLink() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const token = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  await engine.local({ local: 'issue_token', token, grant_id: engine.newId() });   // §19.4: single-use, auto-granted
+  const url = `${location.origin}${location.pathname}?contact=${encodeURIComponent(identity.identity)}&token=${token}&name=${encodeURIComponent(identity.display_name || '')}`;
+  links.push({ token, url, created: Math.floor(now()) });
+  await store.set(key('links'), links);
+  renderLinks();
+  navigator.clipboard?.writeText(url).catch(() => {});
+  notify('contact link made (and copied): hand it to one person');
+}
+
 async function saveContacts() { await store.set(key('contacts'), contacts); renderContacts(); }
 
 // ---------------------------------------------------------------- engine events
@@ -119,6 +153,17 @@ async function saveContacts() { await store.set(key('contacts'), contacts); rend
 async function onReceived(r) {
   const m = r.message, p = r.payload;
   log(`← ${m.type.padEnd(12)} from ${short(r.identity)}${r.display_name ? ` "${r.display_name}"` : ''}  ✓ signature · delegation · replay · schema`, '§10.2');
+  if (m.type === 'introduction') {
+    // what the request will show: the stated purpose (a claim) and the introducer's §18.1 basis
+    purposes[m.id] = { purpose: p.purpose || '', basis: verification_basis(r.identity, JSON.stringify((p.identity && p.identity.claims) || [])) };
+    await store.set(key('purposes'), purposes);
+    return;
+  }
+  if (m.type === 'error') log(`   error ${m.reason || ''}${p.detail ? ': ' + (typeof p.detail === 'string' ? p.detail : JSON.stringify(p.detail)) : ''}`, '§15');
+  if (m.type === 'error' && m.reason === 'policy.rate-limited') {
+    notify(`the relay limits introductions (§19.4): try again in ${p.retry_after ?? '?'} s`);
+    return;
+  }
   if (m.type === 'invite') {
     if (engine.state(m.id) !== 'OFFERED') return;   // policy refused it (first contact): no ring, no screen
     if (call && engine.state(call.sid) !== 'ENDED') {
@@ -179,8 +224,16 @@ async function onEmission(e) {
     if (e.ui === 'progress') $('call-note').textContent = e.status === 'ringing' ? 'ringing at the other end' : e.status || '';
     if (e.ui === 'answered') { $('call-note').textContent = e.answered_by === 'screening' ? 'answered in screening mode: they hear you, you do not hear them (§14.4)' : ''; }
     if (e.ui === 'missed_call') notify(`Missed call from ${nameOf(call?.peer) || short(call?.peer)}`);
-    if (e.ui === 'ended') { $('call-note').textContent = e.reason ? `ended: ${e.reason}` : 'ended'; endCall(); }
-    if (e.ui === 'introduction_received') notify(`Introduction from ${nameOf(e.from) || short(e.from)}: see Requests`);
+    if (e.ui === 'ended') {
+      const peer = call?.peer;
+      const refused = e.reason === 'policy.first-contact-required' && peer;
+      $('call-note').textContent = refused ? 'They require an introduction before calls (§19.4). Introduce yourself; once they grant you, call again.' : e.reason ? `ended: ${e.reason}` : 'ended';
+      endCall(refused);
+      if (refused) { $('btn-introduce-after').classList.remove('hidden'); $('btn-introduce-after').onclick = () => introduce(peer); }
+    }
+    if (e.ui === 'introduction_received' && e.token) { notify(`${short(e.from)} used your contact link: granted`); if (!contacts.some((c) => c.did === e.from)) await addContact('', e.from); }
+    else if (e.ui === 'introduction_received') notify(`Introduction from ${nameOf(e.from) || short(e.from)}: see Requests`);
+    if (e.ui === 'introduction_rejected') notify(`an introduction of yours was declined${e.reason ? ` (${e.reason})` : ''}`);
     if (e.ui === 'granted') notify(`${nameOf(e.by) || short(e.by)} granted you contact`);
     return;
   }
@@ -218,12 +271,16 @@ async function placeCall(to, video) {
   $('call-basis').textContent = verification_basis(to, '[]');
   $('call-note').textContent = '';
   $('call-downgrade').classList.add('hidden');
+  $('btn-introduce-after').classList.add('hidden');
   show('call');
   try {
     call.media = newMedia();
     await call.media.capture(video);
     $('local').srcObject = call.media.localStream;
-    engine.setSdp(await call.media.offer());               // B§: SDP as the transport binding object
+    const sdp = await call.media.offer();
+    engine.setVideo(video);
+    if (video) engine.setVideoCodecsFromSdp(sdp);
+    engine.setSdp(sdp);                                     // B§: SDP as the transport binding object
     await engine.local({ local: 'place_call', session: call.sid, to });
   } catch (err) { notify(`cannot call: ${err.message || err}`); endCall(); }
   renderCall();
@@ -236,6 +293,7 @@ async function accept(screening) {
   $('call-peer-did').textContent = call.peer;
   $('call-basis').textContent = $('in-basis').textContent;
   $('call-note').textContent = screening ? 'screening: nothing of yours is sent (§14.4)' : '';
+  $('btn-introduce-after').classList.add('hidden');
   show('call');
   try {
     call.pendingLocal = []; call.screening = screening;
@@ -266,9 +324,14 @@ async function hangup() {
 
 async function sendUpdate(escalate) {
   if (!call?.media) return;
-  await call.media.addVideo();
+  const offeredVideo = !!call.offer?.media?.some((m) => m.type === 'video');
+  if (escalate) await call.media.unscreen(offeredVideo);
+  else await call.media.addVideo();
   $('local').srcObject = call.media.localStream;
-  engine.setSdp(await call.media.offer());
+  const sdp = await call.media.offer();
+  engine.setVideo(escalate ? offeredVideo : true);
+  engine.setVideoCodecsFromSdp(sdp);
+  engine.setSdp(sdp);
   const ev = { local: 'update', session: call.sid, id: engine.newId() };
   if (escalate) { ev.answered_by = 'user'; call.screening = false; }   // §14.4 step 3
   await engine.local(ev);
@@ -292,7 +355,7 @@ async function rejectUpdate() {
   renderCall();
 }
 
-function endCall() {
+function endCall(stay = false) {
   if (!call) return;
   call.media?.close();
   $('local').srcObject = null; $('remote').srcObject = null;
@@ -302,15 +365,26 @@ function endCall() {
   if (!$('view-call').classList.contains('hidden')) {
     $('call-state').textContent = 'ENDED';
     $('call-title').textContent = 'Call ended';
-    setTimeout(() => { if (!call && !$('view-call').classList.contains('hidden')) show('contacts'); }, 1500);
+    if (!stay) setTimeout(() => { if (!call && !$('view-call').classList.contains('hidden')) show('contacts'); }, 1500);
   }
   return ended;
 }
 
-async function introduce(to) {
-  const purpose = prompt('Why are you introducing yourself? (shown to them as a claim, up to 280 characters)', `Hello from ${identity.display_name || 'a DSIP user'}`);
-  if (purpose === null) return;
-  await engine.local({ local: 'introduce', id: engine.newId(), to, purpose });
+function introduce(to) {
+  show('contacts');
+  $('introduce-name').textContent = nameOf(to) || '';
+  $('introduce-did').textContent = to;
+  $('introduce-form').dataset.to = to;
+  $('introduce-purpose').value = '';
+  $('introduce-form').classList.remove('hidden');
+  $('introduce-purpose').focus();
+}
+
+async function sendIntroduction(to, purpose, token) {
+  const ev = { local: 'introduce', id: engine.newId(), to, purpose };
+  if (token) ev.contact_token = token;
+  await engine.local(ev);
+  $('introduce-form').classList.add('hidden');
   notify('introduction sent; it never rings, and silence is a valid answer');
 }
 
@@ -366,6 +440,7 @@ function connect() {
   relay = new Relay(relayUrl(), engine.ep, {
     bound: (r) => {
       relayInfo = r;
+      if (onBound) { const f = onBound; onBound = null; f(); }
       renderRelay(`relay ${short(r.did)}`, 'ok');
       $('relay-caps').textContent = `relay ${r.did}: ${JSON.stringify(r.capabilities)}`;
       log(`← hello        relay ${short(r.did)} bound (in_reply_to matched)`, '§13.2 · §20.5');
@@ -384,11 +459,14 @@ async function startEngine() {
   engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required }, now);
   engine.loadContactsFile(await store.get(key('engine.contacts')));
   engine.on = {
-    send: (frame, meta) => { relay.send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}`, '§12.4'); },
+    send: (frame, meta) => {
+      relay.send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}`, '§12.4');
+      if (meta.type === 'reject' && payloadOf(frame).reason === 'policy.first-contact-required') log(`refused a call from ${short(meta.to)} without ringing: first contact required`, '§19.4');
+    },
     received: onReceived,
     emission: onEmission,
     rejected: (code, detail) => log(`✗ inbound rejected: ${code} ${detail || ''}`, '§10.2'),
-    changed: () => { persist(); renderContacts(); renderCall(); },
+    changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); },
   };
   engine.startTimers();
   connect();
@@ -398,6 +476,8 @@ async function startEngine() {
   await init();
   settings = (await store.get(key('settings'))) || {};
   contacts = (await store.get(key('contacts'))) || [];
+  purposes = (await store.get(key('purposes'))) || {};
+  links = (await store.get(key('links'))) || [];
   identity = await store.get(key('identity'));
 
   const fresh = !identity;
@@ -415,8 +495,16 @@ async function startEngine() {
 
   renderHeader();
   renderSettings();
+  const params = new URLSearchParams(location.search);
+  if (params.get('contact') && params.get('token')) {
+    // a contact link: add them, and introduce ourselves with the single-use token once the relay is bound
+    const to = params.get('contact'), token = params.get('token'), name = params.get('name') || '';
+    history.replaceState(null, '', location.pathname + (slot ? `?as=${slot}` : ''));
+    onBound = async () => { await addContact(name, to); await sendIntroduction(to, `opened your contact link`, token); };
+  }
   await startEngine();
   renderContacts();
+  renderLinks();
   show('contacts');
   log(`identity ${identity.identity}`, '§7.3');
   log(`device   ${identity.device} (delegated, §7.4)`);
@@ -425,6 +513,9 @@ async function startEngine() {
   $('btn-log-toggle').onclick = () => $('log-panel').classList.toggle('hidden');
   $('me-did').onclick = () => navigator.clipboard?.writeText(identity.identity).then(() => notify('your DID is on the clipboard'));
   $('contact-add').onsubmit = async (e) => { e.preventDefault(); await addContact($('contact-name').value, $('contact-did').value); $('contact-name').value = ''; $('contact-did').value = ''; };
+  $('introduce-form').onsubmit = (e) => { e.preventDefault(); sendIntroduction($('introduce-form').dataset.to, $('introduce-purpose').value.trim()); };
+  $('introduce-cancel').onclick = () => $('introduce-form').classList.add('hidden');
+  $('btn-contact-link').onclick = newContactLink;
   $('btn-accept').onclick = () => accept(false);
   $('btn-screen').onclick = () => accept(true);
   $('btn-decline').onclick = decline;
@@ -447,12 +538,17 @@ async function startEngine() {
   // Test and automation surface (the headless test drives the screens through the DOM; this exposes state only).
   window.dsip = {
     identity: () => identity.identity,
-    state: () => (call ? engine.state(call.sid) : null),
+    state: () => (call ? engine.state(call.sid) || 'PREPARING' : null),   // null = no call; PREPARING = media being set up, no session yet
     session: () => call?.sid || null,
     relay: () => relayInfo?.did || null,
     inboundPackets: () => (call?.media ? call.media.inboundPackets() : Promise.resolve(0)),
+    remoteKinds: () => ($('remote').srcObject ? $('remote').srcObject.getTracks().map((t) => t.kind).sort() : []),
     exportIdentity: (pass) => exportIdentity(identity, pass),
     importIdentity: async (text, pass) => { const id = await importIdentity(text, pass); await store.set(key('identity'), id); await store.del(key('engine.contacts')); return id.identity; },
     contacts: () => contacts.map((c) => c.did),
+    contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
+    requests: () => engine.requests(),
+    links: () => links.map((l) => l.url),
+    note: () => $('call-note').textContent,
   };
 })();

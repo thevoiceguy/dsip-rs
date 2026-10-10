@@ -82,6 +82,16 @@ pub struct ContactFile {
     /// Learned device → identity mapping.
     #[serde(default)]
     pub identities: std::collections::BTreeMap<String, String>,
+    /// Pending introductions received, id → `[identity, device]` (§19.4 requests surface); a grant after a restart
+    /// needs them.
+    #[serde(default)]
+    pub requests: std::collections::BTreeMap<String, (String, String)>,
+    /// Introductions sent and not yet answered, id → recipient identity; a grant arriving after a restart needs them.
+    #[serde(default)]
+    pub pending_sent: std::collections::BTreeMap<String, String>,
+    /// Out-of-band contact tokens issued and unused, token → grant id (single use; §19.4).
+    #[serde(default)]
+    pub tokens: std::collections::BTreeMap<String, String>,
 }
 
 /// What the core hands back to its host.
@@ -133,6 +143,8 @@ pub struct Core {
     offers: HashMap<String, Value>,
     peer_delegations: Vec<Envelope>,
     pending_sdp: Option<String>,
+    /// Video codec ids the next offer lists (B§3.4 registry ids); a host sets them from the SDP it will supply.
+    video_codecs: Vec<String>,
     /// This side's recording declaration (Recording Profile C§3), carried on every invite, answer and update.
     recording: Option<serde_json::Value>,
     /// A patch for the next invite only: `{direction?, recording_session?, destination?}` (C§6: a recording session's
@@ -171,6 +183,7 @@ impl Core {
             offers: HashMap::new(),
             peer_delegations: vec![],
             pending_sdp: None,
+            video_codecs: vec!["codec:video/h264".into()],
             recording: None,
             invite_patch: None,
             pending_claims: vec![],
@@ -281,6 +294,20 @@ impl Core {
         self.pending_sdp = sdp;
     }
 
+    /// Whether the next `invite`/`update` offers video (B§2.1: the descriptors must match the SDP the host
+    /// supplies, and a host decides that per call).
+    pub fn set_video(&mut self, video: bool) {
+        self.cfg.video = video;
+    }
+
+    /// The video codecs the next offer lists, as registry ids (`codec:video/vp8`, …): they must have an `rtpmap`
+    /// in the SDP the host supplies (B§3.4), so a host sets them from that SDP. Empty keeps the default (H.264).
+    pub fn set_video_codecs(&mut self, ids: Vec<String>) {
+        if !ids.is_empty() {
+            self.video_codecs = ids;
+        }
+    }
+
     /// Claims for the next invite's `identity.claims` (§18.1: claims, never badges — e.g. a
     /// gateway's `tel` claim about a PSTN caller).
     pub fn set_claims(&mut self, claims: Vec<Value>) {
@@ -309,6 +336,9 @@ impl Core {
         for (d, i) in &file.identities {
             self.ep.learn_identity(d, i);
         }
+        self.ep.contacts.requests = file.requests.clone();
+        self.ep.contacts.pending_sent = file.pending_sent.clone();
+        self.ep.contacts.tokens = file.tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     }
 
     /// Export first-contact state.
@@ -318,6 +348,9 @@ impl Core {
             grants_issued: self.ep.contacts.grants_issued.clone(),
             grants_held: self.ep.contacts.grants_held.clone(),
             identities: self.ep.identities().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            requests: self.ep.contacts.requests.clone(),
+            pending_sent: self.ep.contacts.pending_sent.clone(),
+            tokens: self.ep.contacts.tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 
@@ -480,7 +513,12 @@ impl Core {
         let mut media = vec![json!({"type": "audio", "direction": "sendrecv",
             "codecs": [{"id": "codec:audio/opus", "sample_rates": [48000], "channels": [1, 2]}]})];
         if with_video {
-            media.push(json!({"type": "video", "direction": "sendrecv", "codecs": [{"id": "codec:video/h264", "profiles": ["baseline"]}]}));
+            let codecs: Vec<Value> = self
+                .video_codecs
+                .iter()
+                .map(|id| if id == "codec:video/h264" { json!({"id": id, "profiles": ["baseline"]}) } else { json!({"id": id}) })
+                .collect();
+            media.push(json!({"type": "video", "direction": "sendrecv", "codecs": codecs}));
         }
         json!({"media": media, "transports": [self.transport()]})
     }
