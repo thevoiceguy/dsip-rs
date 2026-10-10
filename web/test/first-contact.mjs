@@ -11,7 +11,8 @@ try {
 
   // Bob requires first contact (the setting reloads the page)
   await bob.page.click('nav button[data-view=settings]');
-  await bob.page.check('#set-first-contact');
+  // the change handler reloads the page, so click without waiting for the post-click state and wait for the load
+  await Promise.all([bob.page.waitForNavigation({ waitUntil: 'load' }), bob.page.click('#set-first-contact', { noWaitAfter: true })]);
   await ready(bob.page);
   await bob.page.click('nav button[data-view=settings]');
   check('Bob: first contact required is on after the reload', await bob.page.isChecked('#set-first-contact'));
