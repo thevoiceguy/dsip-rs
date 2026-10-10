@@ -39,7 +39,7 @@ use dsip_broadcast::Authority;
 use dsip_session::fork::{RelayAction, RelayEvent};
 use dsip_session::{Emission, Message, Relay};
 use dsip_transport::conn::ws_config;
-use dsip_transport::verify::{verify_frame, Inbound, SeenIds};
+use dsip_transport::verify::{verify_frame_with, Inbound, SeenIds};
 use dsip_transport::{now_s, tls, HELLO_TIMEOUT_S};
 
 mod www;
@@ -121,6 +121,9 @@ struct State {
     records: HashMap<String, String>,
     /// Provenance statement frames by publication id (statements reference a specific record, §22.3).
     statements: HashMap<String, Vec<String>>,
+    /// `delegation-revocation` records handed to this relay (§7.4, v0.8; spec-gap 57): applied to every later
+    /// `hello` and frame. A `did:key` identity has no document, so this is where its revocations reach the relay.
+    revocations: Vec<Envelope>,
 }
 
 impl State {
@@ -215,6 +218,31 @@ impl State {
                     None
                 }
             }
+        }
+    }
+
+    /// A `delegation-revocation` handed to this relay (§7.4, v0.8; spec-gap 57). The frame passed verification like
+    /// any other; here its signer must be the subject itself (the semantic signer rule needs the kid, which the
+    /// pipeline does not supply). Held for every later verification; the named device's binding ends at once (its
+    /// connection loop ends when its channel is dropped) and its next `hello` is refused (`transport.hello-rejected`,
+    /// `delegation-revoked`). Impl (spec-gap 113): the record itself is the carriage, on any bound connection, not
+    /// only the subject's own: a validly signed record can only remove authority, "so its source does not matter"
+    /// (§7.4); nothing acknowledges it.
+    fn revoke(&mut self, sender: &str, inb: &Inbound) {
+        let p = &inb.verified.payload;
+        let subject = p["subject"].as_str().unwrap_or("").to_string();
+        let revoked = p["device"].as_str().unwrap_or("").to_string();
+        if subject.is_empty() || revoked.is_empty() || inb.verified.signer_did != subject {
+            let f = self.error_frame(sender, "transport.routing-refused", p["id"].as_str(), None, Some("revocation-signer-not-subject"));
+            self.deliver(sender, &f);
+            return;
+        }
+        tracing::info!("delegation of {revoked} revoked by {subject} ({})", p["reason"].as_str().unwrap_or(""));
+        if !self.revocations.contains(&inb.envelope) {
+            self.revocations.push(inb.envelope.clone());
+        }
+        if self.devices.remove(&revoked).is_some() {
+            tracing::info!("closed the binding of revoked device {revoked}");
         }
     }
 
@@ -472,6 +500,7 @@ async fn main() -> Result<()> {
         authority: Authority::new(now_s(), HashMap::new()),
         records: HashMap::new(),
         statements: HashMap::new(),
+        revocations: vec![],
     }));
 
     if let Some(w) = &args.www {
@@ -521,8 +550,8 @@ async fn serve(
     let (device, identity, hello_id) = {
         let mut st = state.lock().await;
         let sem = dsip_schema::SemanticContext { supported: st.supported.clone(), ..Default::default() };
-        let State { resolver, seen, .. } = &mut *st;
-        match verify_frame(&first, now_s(), resolver, &[], seen, &sem) {
+        let State { resolver, seen, revocations, .. } = &mut *st;
+        match verify_frame_with(&first, now_s(), resolver, &[], revocations, seen, &sem) {
             Ok(inb) if inb.verified.msg_type() == "hello" && inb.verified.payload.get("in_reply_to").is_none() => {
                 let p = &inb.verified.payload;
                 (inb.verified.signer_did.clone(), inb.verified.identity.clone(), p["id"].as_str().unwrap_or("").to_string())
@@ -535,11 +564,13 @@ async fn serve(
                 anyhow::bail!("first envelope was {} not a client hello", inb.verified.msg_type());
             }
             Err(v) => {
-                // We cannot address the sender before verification; close with the reason in the close frame.
+                // We cannot address the sender before verification; close with the reason in the close frame: the
+                // reason token and the verdict's code token as the vectors spell it (`delegation-revoked`, …).
+                let code = v.to_expect()["code"].as_str().unwrap_or("rejected").to_string();
                 let _ = ws
                     .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
                         code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                        reason: format!("transport.hello-rejected: {:?}", v.code).into(),
+                        reason: format!("transport.hello-rejected: {code}").into(),
                     }))
                     .await;
                 anyhow::bail!("hello rejected: {:?} {}", v.code, v.detail.unwrap_or_default());
@@ -586,13 +617,16 @@ async fn serve(
                         let mut st = state.lock().await;
                         let sem = dsip_schema::SemanticContext { supported: st.supported.clone(), ..Default::default() };
                         let verdict = {
-                            let State { resolver, seen, .. } = &mut *st;
-                            verify_frame(&t, now_s(), resolver, &[], seen, &sem)
+                            let State { resolver, seen, revocations, .. } = &mut *st;
+                            verify_frame_with(&t, now_s(), resolver, &[], revocations, seen, &sem)
                         };
                         match verdict {
                             Ok(inb) => {
                                 if inb.verified.msg_type() == "hello" {
                                     tracing::info!("{peer}: re-hello ignored (binding unchanged)");
+                                } else if inb.verified.msg_type() == "delegation-revocation" {
+                                    // signed by the identity key, not the bound device: handled before the signer check
+                                    st.revoke(&device, &inb);
                                 } else if inb.verified.signer_did != device {
                                     let f = st.error_frame(&device, "transport.routing-refused", Some(inb.verified.payload["id"].as_str().unwrap_or("")), None, Some("signer is not the bound device"));
                                     st.deliver(&device, &f);

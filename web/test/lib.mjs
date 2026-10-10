@@ -25,16 +25,33 @@ export async function launch() {
   } });
 }
 
-/** A fresh browser context at `url` (default: the client's root), through the welcome screen, bound to the relay. */
-export async function person(browser, name, url = URL) {
+/** A fresh browser context (fresh storage, so a fresh identity) with a page at `url`, on the welcome screen. */
+export async function openPage(browser, name, url = URL) {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, permissions: which === 'chromium' ? ['camera', 'microphone'] : [] });
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.log(`  [${name}] page error: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') console.log(`  [${name}] console: ${m.text()}`); });
   await page.goto(url);
   await page.waitForSelector('#view-welcome:not(.hidden)');
+  return { ctx, page };
+}
+
+/** A fresh browser context at `url` (default: the client's root), through the welcome screen, bound to the relay. */
+export async function person(browser, name, url = URL) {
+  const { ctx, page } = await openPage(browser, name, url);
   await page.fill('#welcome-name', name);
   await page.click('#welcome-continue');
+  await ready(page);
+  const did = await page.evaluate(() => window.dsip.identity());
+  return { ctx, page, did, name };
+}
+
+/** A fresh browser context enrolled as a device of the identity in `file` (the welcome screen's import, passphrase
+ *  answered through the dialog), bound to the relay. The dialog handler stays: later prompts get `pass` too. */
+export async function enrolled(browser, name, file, pass, url = URL) {
+  const { ctx, page } = await openPage(browser, name, url);
+  page.on('dialog', (d) => d.accept(pass));
+  await page.setInputFiles('#import-file', { name: 'identity.dsip-identity', mimeType: 'application/json', buffer: Buffer.from(file) });
   await ready(page);
   const did = await page.evaluate(() => window.dsip.identity());
   return { ctx, page, did, name };

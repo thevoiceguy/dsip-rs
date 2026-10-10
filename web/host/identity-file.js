@@ -1,11 +1,13 @@
-// The identity file: the person's identity key (and this browser's device key), encrypted with a passphrase. The
-// export is the only copy of the identity key outside the browser; the import restores it, or makes another
-// browser a device of the same identity (stage 3 uses the identity seed to delegate a fresh device key).
+// The identity file: the person's identity key, encrypted with a passphrase. The export is the only copy of the
+// identity key outside the browser; importing it on another browser enrols that browser as a device of the same
+// identity: the app makes a fresh device key there and the identity key signs its delegation (§7.4), no server
+// involved. The exporting device's own key travels in the file but is never reused by an importer.
 //
 // Format (version 1): JSON `{"dsip-identity": 1, "identity": <did>, "kdf": {"name": "PBKDF2", "hash": "SHA-256",
 // "iterations", "salt"}, "cipher": {"name": "AES-GCM", "iv"}, "ciphertext"}`, binary fields base64; the plaintext
-// is the identity JSON `create_identity` returned (seeds included). Spec: none (infrastructure); the client plan §5
-// and spec-gap "identity export" propose whether this becomes a specified format.
+// is the identity JSON `create_identity` returned (seeds included), plus `devices` (the exporter's device list, what
+// it knows) and `revoked` (the revocations it issued). Spec: none (infrastructure); the client plan §5 and spec-gap
+// "identity export" propose whether this becomes a specified format.
 
 const ITERATIONS = 600_000;
 const enc = new TextEncoder(), dec = new TextDecoder();

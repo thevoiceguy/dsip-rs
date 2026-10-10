@@ -7,7 +7,7 @@
 // media before a signed answer), §14.4 (screening), §18.1 (the verification basis, never a badge), §18.2 (display
 // names are claims), §19.4 (first contact), B§ (SDP in `transports[].sdp`), G§5/G§7 (PSTN caller line, downgrade).
 
-import init, { create_identity, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
+import init, { create_identity, revocation_frame, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
 import { store } from './host/store.js';
 import { Engine } from './host/engine.js';
 import { Relay } from './host/relay.js';
@@ -27,6 +27,8 @@ let relayInfo = null;
 let purposes = {};    // introduction id → {purpose, basis}: what a request shows (the engine keeps only the ids)
 let links = [];       // contact links issued here: {token, url, created}
 let onBound = null;   // one action deferred until the relay is bound (a contact link opened before connecting)
+let devices = [];     // {device, enrolled?}: this identity's devices as this browser knows them (no registry for did:key)
+let revoked = [];     // {device, reason, at, frame}: revocations this identity issued here (§7.4)
 const payloadOf = (frame) => { try { return JSON.parse(atob(JSON.parse(frame).payload.replace(/-/g, '+').replace(/_/g, '/'))); } catch { return {}; } };
 
 // ---------------------------------------------------------------- log
@@ -108,6 +110,30 @@ function renderSettings() {
   $('set-first-contact').checked = !!settings.first_contact_required;
   $('set-relay').value = settings.relay || '';
   $('set-ice').value = settings.ice ? JSON.stringify(settings.ice) : '';
+  renderDevices();
+}
+
+function renderDevices() {
+  const ul = $('device-list');
+  ul.innerHTML = '';
+  for (const d of devices) {
+    const li = document.createElement('li');
+    const mine = d.device === identity.device;
+    li.innerHTML = '<code class="did"></code><span class="status"></span>';
+    li.querySelector('.did').textContent = d.device;
+    li.querySelector('.status').textContent = mine ? 'this browser' : d.enrolled ? `enrolled ${new Date(d.enrolled * 1000).toLocaleString()}` : 'added by DID';
+    if (!mine) { const b = document.createElement('button'); b.textContent = 'Revoke'; b.className = 'ghost'; b.onclick = () => revoke(d.device); li.append(b); }
+    ul.append(li);
+  }
+  const rl = $('revoked-list');
+  rl.innerHTML = '';
+  for (const r of revoked) {
+    const li = document.createElement('li');
+    li.innerHTML = '<code class="did"></code><span class="status"></span>';
+    li.querySelector('.did').textContent = r.device;
+    li.querySelector('.status').textContent = `revoked (${r.reason}) ${new Date(r.at * 1000).toLocaleString()}`;
+    rl.append(li);
+  }
 }
 
 function renderRelay(text, state) {
@@ -227,7 +253,10 @@ async function onEmission(e) {
     if (e.ui === 'ended') {
       const peer = call?.peer;
       const refused = e.reason === 'policy.first-contact-required' && peer;
-      $('call-note').textContent = refused ? 'They require an introduction before calls (§19.4). Introduce yourself; once they grant you, call again.' : e.reason ? `ended: ${e.reason}` : 'ended';
+      // §12.7: a forked invite answered on another device ends this leg; §12.11: never a missed call
+      const elsewhere = e.reason === 'session.answered-elsewhere';
+      $('call-note').textContent = refused ? 'They require an introduction before calls (§19.4). Introduce yourself; once they grant you, call again.'
+        : elsewhere ? 'answered on another of your devices (§12.7); not a missed call' : e.reason ? `ended: ${e.reason}` : 'ended';
       endCall(refused);
       if (refused) { $('btn-introduce-after').classList.remove('hidden'); $('btn-introduce-after').onclick = () => introduce(peer); }
     }
@@ -408,7 +437,7 @@ async function exportToFile() {
   const pass = prompt('Choose a passphrase for the identity file (at least 8 characters). Without it the file is useless; without the file the identity is unrecoverable.');
   if (pass === null) return;
   try {
-    const text = await exportIdentity(identity, pass);
+    const text = await exportIdentity({ ...identity, devices, revoked }, pass);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
     a.download = `${(identity.display_name || 'dsip').replace(/[^\w.-]+/g, '_')}.dsip-identity`;
@@ -422,11 +451,45 @@ async function importFromText(text) {
   const pass = prompt('Passphrase of the identity file:');
   if (pass === null) return;
   try {
-    const id = await importIdentity(text, pass);
-    await store.set(key('identity'), id);
-    await store.del(key('engine.contacts'));
+    await enrol(await importIdentity(text, pass));
     location.reload();
   } catch (err) { alert(err.message); }
+}
+
+/** Enrol this browser as a device of the identity in a file: a fresh device key, its delegation signed by the
+ *  identity key (§7.4), all locally. The file's own device key stays with the device that exported it; the file's
+ *  device list and revocations come along. Impl: every import makes a new device (a restore too): a key that was in
+ *  a file is not known to be only here. */
+async function enrol(file) {
+  const fresh = JSON.parse(create_identity(file.controller_seed_hex, null, file.display_name || '', now()));
+  const known = (file.devices || []).filter((d) => d.device !== fresh.device);
+  if (file.device && !known.some((d) => d.device === file.device)) known.push({ device: file.device });
+  known.push({ device: fresh.device, enrolled: Math.floor(now()) });
+  await store.set(key('identity'), fresh);
+  await store.set(key('devices'), known);
+  await store.set(key('revoked'), file.revoked || []);
+  await store.del(key('engine.contacts'));
+  return fresh;
+}
+
+/** Revoke another device of this identity (§7.4, v0.8): the record is signed by the identity key, not this device's,
+ *  and covers delegations issued at or before now, so the device can be enrolled again later with a fresh delegation.
+ *  It goes to the relay (the only distribution a did:key identity has here) and is held by this engine. */
+async function revoke(device) {
+  const reason = (prompt('Why? lost, compromised, retired or policy (the §7.4 registry)', 'lost') || '').trim();
+  if (!reason) return;
+  if (!['lost', 'compromised', 'retired', 'policy'].includes(reason)) return alert('the reason must be lost, compromised, retired or policy');
+  const at = Math.floor(now());
+  const frame = revocation_frame(JSON.stringify(identity), engine.newId(), device, reason, now());
+  engine.ep.hold_revocation(frame);
+  relay.send(frame);
+  revoked.push({ device, reason, at, frame });
+  devices = devices.filter((d) => d.device !== device);
+  await store.set(key('devices'), devices);
+  await store.set(key('revoked'), revoked);
+  renderDevices();
+  log(`→ delegation-revocation of ${short(device)} (${reason}) to the relay; held here`, '§7.4');
+  notify(`device ${short(device)} revoked: the relay ends its binding and refuses its next hello`);
 }
 
 async function saveSettings() { await store.set(key('settings'), settings); }
@@ -447,8 +510,14 @@ function connect() {
       log(`← hello        relay ${short(r.did)} bound (in_reply_to matched)`, '§13.2 · §20.5');
     },
     refused: (r) => { renderRelay(`relay hello refused: ${r.code}`, 'bad'); log(`✗ relay hello rejected: ${r.code} (anti-splicing)`, '§20.5'); },
+    rejected: (code) => {
+      const revokedHere = code === 'delegation-revoked';
+      renderRelay(revokedHere ? 'this device was revoked: its delegation no longer verifies (§7.4)' : `relay refused our hello: ${code}`, 'bad');
+      log(`✗ relay refused our hello: ${code}${revokedHere ? '; this device is revoked, not reconnecting' : ''}`, '§13.2 · §7.4');
+      if (revokedHere) notify('This device was revoked by your identity. If that was a mistake, enrol it again from the identity file (a new delegation).');
+    },
     frame: (text) => engine.inbound(text),
-    closed: () => { renderRelay('disconnected, reconnecting…', 'bad'); },
+    closed: () => { if (!relay.closedByUs) renderRelay('disconnected, reconnecting…', 'bad'); },
     dropped: (f) => log(`✗ not connected: a ${JSON.parse(f).type || 'frame'} was not sent`),
   }, now);
   relay.connect();
@@ -459,6 +528,7 @@ function connect() {
 async function startEngine() {
   engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required }, now);
   engine.loadContactsFile(await store.get(key('engine.contacts')));
+  for (const r of revoked) engine.ep.hold_revocation(r.frame);   // §7.4: revocations this identity issued apply here too
   engine.on = {
     send: (frame, meta) => {
       relay.send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}`, '§12.4');
@@ -480,6 +550,8 @@ async function startEngine() {
   purposes = (await store.get(key('purposes'))) || {};
   links = (await store.get(key('links'))) || [];
   identity = await store.get(key('identity'));
+  devices = (await store.get(key('devices'))) || [];
+  revoked = (await store.get(key('revoked'))) || [];
 
   const fresh = !identity;
   if (fresh) {
@@ -494,6 +566,7 @@ async function startEngine() {
     });
   }
 
+  if (!devices.some((d) => d.device === identity.device)) { devices.unshift({ device: identity.device, enrolled: Math.floor(now()) }); await store.set(key('devices'), devices); }
   renderHeader();
   renderSettings();
   const params = new URLSearchParams(location.search);
@@ -533,6 +606,15 @@ async function startEngine() {
     await saveSettings(); connect();
   };
   $('btn-export').onclick = exportToFile;
+  $('device-add').onsubmit = async (e) => {
+    e.preventDefault();
+    const did = $('device-did').value.trim();
+    if (!/^did:key:/.test(did)) return alert('a device DID starts with did:key:');
+    if (!devices.some((d) => d.device === did)) devices.push({ device: did });
+    await store.set(key('devices'), devices);
+    $('device-did').value = '';
+    renderDevices();
+  };
   $('btn-import').onclick = () => $('import-file').click();
   $('import-file').onchange = async (e) => { const f = e.target.files[0]; if (f) await importFromText(await f.text()); };
 
@@ -545,7 +627,11 @@ async function startEngine() {
     inboundPackets: () => (call?.media ? call.media.inboundPackets() : Promise.resolve(0)),
     remoteKinds: () => ($('remote').srcObject ? $('remote').srcObject.getTracks().map((t) => t.kind).sort() : []),
     exportIdentity: (pass) => exportIdentity(identity, pass),
-    importIdentity: async (text, pass) => { const id = await importIdentity(text, pass); await store.set(key('identity'), id); await store.del(key('engine.contacts')); return id.identity; },
+    importIdentity: async (text, pass) => (await enrol(await importIdentity(text, pass))).identity,
+    device: () => identity.device,
+    devices: () => devices.map((d) => d.device),
+    revoked: () => revoked.map((r) => r.device),
+    relayText: () => $('relay-status').textContent,
     contacts: () => contacts.map((c) => c.did),
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
     requests: () => engine.requests(),

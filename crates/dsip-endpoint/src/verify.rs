@@ -80,10 +80,25 @@ pub fn verify_frame(
     seen: &mut SeenIds,
     sem: &SemanticContext,
 ) -> Result<Inbound, Verdict> {
+    verify_frame_with(frame, now, resolver, delegations, &[], seen, sem)
+}
+
+/// [`verify_frame`] with the `delegation-revocation` records this receiver holds (§7.4, v0.8): a presented
+/// delegation they cover fails `delegation-revoked`, after signature, capability and validity.
+pub fn verify_frame_with(
+    frame: &str,
+    now: i64,
+    resolver: &dyn Resolver,
+    delegations: &[Envelope],
+    revocations: &[Envelope],
+    seen: &mut SeenIds,
+    sem: &SemanticContext,
+) -> Result<Inbound, Verdict> {
     let envelope = Envelope::from_frame(frame)?;
     seen.sweep(now);
     let mut ctx = Context::new(now, resolver);
     ctx.delegations = delegations.to_vec();
+    ctx.revocations = revocations.to_vec();
     ctx.seen_ids = seen.set();
     ctx.supported = sem.supported.clone();
     let mut verified = envelope::verify(&envelope, &ctx, Some(frame))?;

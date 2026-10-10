@@ -85,6 +85,19 @@ pub fn create_identity(controller_seed_hex: Option<String>, device_seed_hex: Opt
     .to_string())
 }
 
+/// Sign a `delegation-revocation` for `device` with the identity key in `identity_json` (§7.4, v0.8; spec-gap 57):
+/// `id` a fresh ULID, `reason` a `dsip-revocation-reason` token. Returns the frame: hand it to the relay (which ends
+/// the device's binding and refuses its next `hello`) and hold it ([`Endpoint::hold_revocation`]).
+#[wasm_bindgen]
+pub fn revocation_frame(identity_json: &str, id: &str, device: &str, reason: &str, now: f64) -> Result<String, JsValue> {
+    let idj: Value = serde_json::from_str(identity_json).map_err(js)?;
+    let controller = KeyPair::from_seed(unhex(idj["controller_seed_hex"].as_str().unwrap_or(""))?);
+    let now = now as i64;
+    let dsip = dsip_core::version::version_block(&dsip_core::version::Supported::all_known(), &[]);
+    let p = dsip_core::delegation::revocation_payload(dsip, id, &controller.did(), device, now, reason, now);
+    Ok(sign(&p, &controller, &controller.kid()).frame())
+}
+
 /// Verify a frame standalone (stages 1–14) with a vector-style context JSON. Returns the `expect` projection.
 #[wasm_bindgen]
 pub fn verify_frame(frame: &str, context_json: &str) -> String {
@@ -276,6 +289,18 @@ impl Endpoint {
     pub fn load_contacts(&mut self, json_text: &str) {
         if let Ok(f) = serde_json::from_str::<ContactFile>(json_text) {
             self.core.load_contacts(&f);
+        }
+    }
+
+    /// Hold a `delegation-revocation` frame (one we signed, or one handed to us): every later verification applies
+    /// it (§7.4, v0.8: "any store they hold"). Returns false for text that is not a frame.
+    pub fn hold_revocation(&mut self, frame: &str) -> bool {
+        match Envelope::from_frame(frame) {
+            Ok(e) => {
+                self.core.hold_revocation(e);
+                true
+            }
+            Err(_) => false,
         }
     }
 }
