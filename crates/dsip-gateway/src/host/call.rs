@@ -33,6 +33,10 @@ pub struct Call {
     pub from_tn: Option<String>,
     /// Outbound: the RFC 8224 `Identity` header value, when the gateway signed a PASSporT (N§4.1).
     pub identity_header: Option<String>,
+    /// Outbound: our SDP answer to the caller's offer, given to the engine right before `accept` (§16.3).
+    pub answer_sdp: Option<String>,
+    /// Inbound: our SDP offer toward the DSIP callee, given to the engine right before `place_call` (§16.3).
+    pub offer_sdp: Option<String>,
     sip_call_id: Option<String>,
     media: Option<DsipMedia>,
     rtp: Option<Arc<RtpLeg>>,
@@ -86,6 +90,7 @@ async fn apply_dsip(call: &mut Call, d: &Value, agent: &mut Agent) -> Result<()>
         let Some(target) = call.dsip_target.clone() else { return Ok(()) };
         let claims = d.get("claims").and_then(Value::as_array).cloned().unwrap_or_default();
         agent.set_claims(claims);
+        agent.set_sdp(call.offer_sdp.take()); // the engine holds one pending SDP: ours goes in just before it is used
         let sid = agent.place_call(&target).await?;
         println!("→ invite   to {target}  session …{}  (G§5 claim: {})", &sid[sid.len().saturating_sub(8)..], d.get("trust_basis").and_then(Value::as_str).unwrap_or(""));
         call.dsip_session = Some(sid);
@@ -102,6 +107,7 @@ async fn apply_dsip(call: &mut Call, d: &Value, agent: &mut Agent) -> Result<()>
                 // the SIP side answered without ringing first: the §12 engine alerts before it answers
                 agent.local(LocalEvent::Alert { session: session.clone(), ring_timeout: Some(60) }).await?;
             }
+            agent.set_sdp(call.answer_sdp.take()); // one pending SDP slot in the engine: set just before the answer
             LocalEvent::Accept { session, answered_by: Some("gateway".into()) } // §14.1
         }
         // a pre-answer refusal with the G§4 reason: `auto_reject` is the engine's own event for an offered session
@@ -132,7 +138,7 @@ async fn apply_sip(call: &mut Call, s: &Value, legs: &mut Legs<'_>) -> Result<()
         return Ok(());
     };
     match s {
-        Value::String(k) if k == "ACK" => legs.sip.ack(cid, 200).await?,
+        Value::String(k) if k == "ACK" => {} // the leg ACKs every 2xx on receipt, with the UAS's To-tag; not again here
         Value::String(k) if k == "CANCEL" => legs.sip.cancel(cid).await?,
         Value::String(k) if k == "INVITE" => {}
         Value::Object(o) => {
@@ -222,6 +228,8 @@ impl Call {
             dsip_target: None,
             from_tn: None,
             identity_header: None,
+            answer_sdp: None,
+            offer_sdp: None,
         }
     }
 
@@ -246,6 +254,8 @@ impl Call {
             dsip_target: None,
             from_tn: None,
             identity_header: None,
+            answer_sdp: None,
+            offer_sdp: None,
         }
     }
 

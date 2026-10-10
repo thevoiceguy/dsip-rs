@@ -3926,6 +3926,12 @@ struct DtlsPeerIo {
 /// How long a DTLS session may stay silent before the gateway shuts it down (RFC 6353 §5.1.2 leaves the policy to
 /// the implementation; net-snmp's own default is 5 minutes).
 const DTLS_IDLE_S: u64 = 300;
+/// How many DTLS sessions may be in their handshake at once. Each unseen source address costs a thread until the
+/// cookie exchange and the certificate check are done, so a flood of spoofed addresses is bounded here: beyond it,
+/// datagrams from new addresses are dropped until a handshake ends.
+const DTLS_HANDSHAKES_MAX: usize = 64;
+/// How long a handshake may take before its session is dropped.
+const DTLS_HANDSHAKE_S: u64 = 10;
 
 /// Run OpenSSL's DTLS retransmission timer for a session: `DTLSv1_handle_timeout`, which the `openssl` crate does not
 /// wrap. It resends the last handshake flight when its timer has expired and does nothing otherwise.
@@ -3991,93 +3997,118 @@ fn spawn_snmp_dtls(sock: std::net::UdpSocket, cert: &Path, key: &Path, ca: &Path
     b.set_cookie_verify_cb(move |ssl, given| given == cookie(ssl).as_slice());
     let ctx = b.build();
     let sock = std::sync::Arc::new(sock);
+    let handshakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
         let mut peers: std::collections::HashMap<std::net::SocketAddr, std::sync::mpsc::Sender<Vec<u8>>> = std::collections::HashMap::new();
         let mut buf = vec![0u8; 65536];
+        let mut refused_at_cap = 0u64;
         while let Ok((n, from)) = sock.recv_from(&mut buf) {
             let d = buf[..n].to_vec();
-            let fresh = peers.get(&from).is_none_or(|p| p.send(d.clone()).is_err());
-            if fresh {
-                let (ptx, prx) = std::sync::mpsc::channel();
-                let _ = ptx.send(d);
-                peers.insert(from, ptx);
-                let (ctx, sock, cas, table, tx) = (ctx.clone(), sock.clone(), cas.clone(), table.clone(), tx.clone());
-                std::thread::spawn(move || {
-                    let mut ssl = match Ssl::new(&ctx) {
-                        Ok(s) => s,
+            if let Some(p) = peers.get(&from) {
+                if p.send(d.clone()).is_ok() {
+                    continue;
+                }
+                peers.remove(&from); // its session ended: this datagram starts a new one
+            }
+            if handshakes.load(Ordering::SeqCst) >= DTLS_HANDSHAKES_MAX {
+                refused_at_cap += 1;
+                if refused_at_cap.is_power_of_two() {
+                    println!("SNMP dtls: {DTLS_HANDSHAKES_MAX} handshakes in flight, dropping datagrams from new addresses ({refused_at_cap} so far)");
+                }
+                continue;
+            }
+            let (ptx, prx) = std::sync::mpsc::channel();
+            let _ = ptx.send(d);
+            peers.insert(from, ptx);
+            handshakes.fetch_add(1, Ordering::SeqCst);
+            let (ctx, sock, cas, table, tx, handshakes) = (ctx.clone(), sock.clone(), cas.clone(), table.clone(), tx.clone(), handshakes.clone());
+            std::thread::spawn(move || {
+                // the handshake slot is given back when the handshake ends, however it ends
+                struct Slot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for Slot {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                let slot = Slot(handshakes);
+                let mut ssl = match Ssl::new(&ctx) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("SNMP dtls {from}: {e}");
+                        return;
+                    }
+                };
+                ssl.set_ex_data(idx, from);
+                let _ = ssl.set_mtu(1400);
+                let io = DtlsPeerIo { rx: prx, sock, peer: from };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(DTLS_HANDSHAKE_S);
+                let mut hs = ssl.accept(io);
+                let mut stream = loop {
+                    match hs {
+                        Ok(s) => {
+                            drop(slot);
+                            break s;
+                        }
+                        Err(openssl::ssl::HandshakeError::WouldBlock(mid)) if std::time::Instant::now() < deadline => {
+                            dtls_handle_timeout(mid.ssl()); // a read timed out: resend the flight if OpenSSL's timer says so
+                            hs = mid.handshake();
+                        }
                         Err(e) => {
-                            println!("SNMP dtls {from}: {e}");
+                            println!("SNMP dtls refused from {from}: {}", match &e { openssl::ssl::HandshakeError::Failure(m) => m.error().to_string(), _ => "handshake timed out".into() });
                             return;
                         }
-                    };
-                    ssl.set_ex_data(idx, from);
-                    let _ = ssl.set_mtu(1400);
-                    let io = DtlsPeerIo { rx: prx, sock, peer: from };
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-                    let mut hs = ssl.accept(io);
-                    let mut stream = loop {
-                        match hs {
-                            Ok(s) => break s,
-                            Err(openssl::ssl::HandshakeError::WouldBlock(mid)) if std::time::Instant::now() < deadline => {
-                                dtls_handle_timeout(mid.ssl()); // a read timed out: resend the flight if OpenSSL's timer says so
-                                hs = mid.handshake();
-                            }
-                            Err(e) => {
-                                println!("SNMP dtls refused from {from}: {}", match &e { openssl::ssl::HandshakeError::Failure(m) => m.error().to_string(), _ => "handshake timed out".into() });
-                                return;
-                            }
-                        }
-                    };
-                    let leaf = stream.ssl().peer_certificate().and_then(|c| c.to_der().ok());
-                    let chain: Vec<Vec<u8>> = stream.ssl().peer_cert_chain().into_iter().flatten().filter_map(|c| c.to_der().ok()).collect();
-                    let presented: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> =
-                        leaf.into_iter().chain(chain).map(tokio_rustls::rustls::pki_types::CertificateDer::from).collect();
-                    let Some(fields) = (!presented.is_empty()).then(|| tls_cert_fields(&presented, &cas)).flatten() else { return };
-                    let mapped = dsip_events::tsm::security_name(&fields, &table);
-                    let Some(name) = mapped["security_name"].as_str() else {
-                        // RFC 6353 §5.3.2: no name, no messages; the session is shut down
-                        println!("SNMP dtls closed {from}: no-security-name for certificate {}", &fields["sha256"].as_str().unwrap_or("")[..16]);
-                        let _ = stream.shutdown();
-                        return;
-                    };
-                    println!("SNMP dtls session {from}: security name {name:?} (row {})", mapped["row"]);
-                    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                    let peer = TlsPeer { certificate_sha256: fields["sha256"].as_str().unwrap_or("").to_string(),
-                                         security_name: name.to_string(), transport: "dtls", reply: reply_tx };
-                    let mut rec = vec![0u8; 65536];
-                    let mut last = std::time::Instant::now();
-                    loop {
-                        while let Ok(m) = reply_rx.try_recv() {
-                            if stream.ssl_write(&m).is_err() {
-                                return;
-                            }
-                        }
-                        match stream.ssl_read(&mut rec) {
-                            Ok(0) => return,
-                            Ok(n) => {
-                                last = std::time::Instant::now();
-                                match dsip_events::tsm::dtls_record(&rec[..n]) {
-                                    Some(m) => {
-                                        if tx.send(GatewayInput::SnmpTls(m, from, peer.clone())).is_err() {
-                                            return;
-                                        }
-                                    }
-                                    None => println!("SNMP dtls from {from}: a record that is not one message, dropped   E§3"),
-                                }
-                            }
-                            Err(e) if e.code() == openssl::ssl::ErrorCode::WANT_READ => {
-                                if last.elapsed() > std::time::Duration::from_secs(DTLS_IDLE_S) {
-                                    println!("SNMP dtls session {from}: idle for {DTLS_IDLE_S} s, closed");
-                                    let _ = stream.shutdown();
-                                    return;
-                                }
-                                continue;
-                            }
-                            Err(_) => return,
+                    }
+                };
+                let leaf = stream.ssl().peer_certificate().and_then(|c| c.to_der().ok());
+                let chain: Vec<Vec<u8>> = stream.ssl().peer_cert_chain().into_iter().flatten().filter_map(|c| c.to_der().ok()).collect();
+                let presented: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> =
+                    leaf.into_iter().chain(chain).map(tokio_rustls::rustls::pki_types::CertificateDer::from).collect();
+                let Some(fields) = (!presented.is_empty()).then(|| tls_cert_fields(&presented, &cas)).flatten() else { return };
+                let mapped = dsip_events::tsm::security_name(&fields, &table);
+                let Some(name) = mapped["security_name"].as_str() else {
+                    // RFC 6353 §5.3.2: no name, no messages; the session is shut down
+                    println!("SNMP dtls closed {from}: no-security-name for certificate {}", &fields["sha256"].as_str().unwrap_or("")[..16]);
+                    let _ = stream.shutdown();
+                    return;
+                };
+                println!("SNMP dtls session {from}: security name {name:?} (row {})", mapped["row"]);
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                let peer = TlsPeer { certificate_sha256: fields["sha256"].as_str().unwrap_or("").to_string(),
+                                     security_name: name.to_string(), transport: "dtls", reply: reply_tx };
+                let mut rec = vec![0u8; 65536];
+                let mut last = std::time::Instant::now();
+                loop {
+                    while let Ok(m) = reply_rx.try_recv() {
+                        if stream.ssl_write(&m).is_err() {
+                            return;
                         }
                     }
-                });
-            }
+                    match stream.ssl_read(&mut rec) {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            last = std::time::Instant::now();
+                            match dsip_events::tsm::dtls_record(&rec[..n]) {
+                                Some(m) => {
+                                    if tx.send(GatewayInput::SnmpTls(m, from, peer.clone())).is_err() {
+                                        return;
+                                    }
+                                }
+                                None => println!("SNMP dtls from {from}: a record that is not one message, dropped   E§3"),
+                            }
+                        }
+                        Err(e) if e.code() == openssl::ssl::ErrorCode::WANT_READ => {
+                            if last.elapsed() > std::time::Duration::from_secs(DTLS_IDLE_S) {
+                                println!("SNMP dtls session {from}: idle for {DTLS_IDLE_S} s, closed");
+                                let _ = stream.shutdown();
+                                return;
+                            }
+                            continue;
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
         }
     });
     Ok(())

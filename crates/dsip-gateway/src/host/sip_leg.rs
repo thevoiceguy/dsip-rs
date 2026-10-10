@@ -325,6 +325,21 @@ impl SipLeg {
                 m if *m == Method::Invite => {
                     let trying = UserAgentServer::create_trying(&req);
                     self.send_resp(&trying, from).await?;
+                    // a Call-ID we hold: a retransmitted INVITE (our 100 was lost) gets its 100 again and nothing
+                    // else; a re-INVITE (new CSeq: hold, a session-timer refresh) is refused 488 and the dialog
+                    // stands as it was (RFC 3261 §14.2) — round one carries no mid-call offer across
+                    let known = self.calls.lock().await.get(&call_id).map(|c| header(&c.invite, "CSeq"));
+                    if let Some(prev) = known {
+                        if prev == header(&req, "CSeq") {
+                            debug!("INVITE retransmitted on {call_id}: 100 again");
+                        } else {
+                            let mut resp = UserAgentServer::reject_invite(&req, 488, "Not Acceptable Here");
+                            resp.headers_mut().push("Reason", "DSIP;text=\"media.unsupported\"").ok();
+                            self.send_resp(&resp, from).await?;
+                            info!("re-INVITE on {call_id} refused 488: not carried in round one");
+                        }
+                        return Ok(());
+                    }
                     let sdp = String::from_utf8_lossy(req.body()).to_string();
                     let from_tn = user_of(header(&req, "From").as_deref());
                     let to_user = user_of(Some(&req.uri().to_string()));

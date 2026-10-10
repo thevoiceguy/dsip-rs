@@ -18,6 +18,7 @@ dsip-endpoint = { workspace = true, optional = true }
 dsip-transport = { workspace = true, optional = true }
 dsip-number = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+futures = { version = "0.3", optional = true }
 sha2 = { workspace = true, optional = true }
 forge-webrtc = { git = "https://github.com/thevoiceguy/forge-media", rev = "b674552e4d22ad206c49eedca556c79bf77affe4", optional = true }
 forge-rtp = { git = "https://github.com/thevoiceguy/forge-media", rev = "b674552e4d22ad206c49eedca556c79bf77affe4", optional = true }
@@ -38,7 +39,7 @@ clap = { workspace = true, optional = true }
 [features]
 default = []
 # The daemon half (opt-in; pulls siphon-rs + forge-media git deps, like dsip-media's forge feature): real DSIP, SIP and media legs around the pure controller.
-host = ["dep:dsip-session", "dep:dsip-endpoint", "dep:dsip-transport", "dep:dsip-number", "dep:reqwest", "dep:sha2", "dep:forge-webrtc", "dep:forge-rtp",
+host = ["dep:dsip-session", "dep:dsip-endpoint", "dep:dsip-transport", "dep:dsip-number", "dep:reqwest", "dep:futures", "dep:sha2", "dep:forge-webrtc", "dep:forge-rtp",
         "dep:forge-codecs", "dep:sip-core", "dep:sip-parse", "dep:sip-uac", "dep:sip-uas", "dep:sip-dialog", "dep:audiopus",
         "dep:tokio", "dep:anyhow", "dep:tracing", "dep:tracing-subscriber", "dep:bytes", "dep:clap"]
 
