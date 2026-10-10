@@ -60,6 +60,8 @@ pub struct ConsoleOpts {
     pub contacts: Option<PathBuf>,
     /// dsip-nodes to look numbers up on, for `--to tel:+…` (N§6 route 1).
     pub tn_nodes: Vec<String>,
+    /// Number authorities to ask at `/.well-known/dsip/tn/<tn>` (N§6 route 2).
+    pub tn_authorities: Vec<String>,
     /// A gateway's DID for numbers no binding resolves (N§4.1).
     pub gateway: Option<String>,
     /// The tel URI to put on the invite as `destination` when calling through a gateway (set by `run`).
@@ -132,10 +134,12 @@ impl TnContext {
         Ok(TnContext { policy, documents, contacts })
     }
 
-    /// Number → DID (N§6 route 1, N§7): every binding the nodes return, verified in full against its own DID's
-    /// document, the newest winning. The DHT is a hints tier: a node can withhold, never forge (§8.1).
-    async fn lookup(&self, tn: &str, nodes: &[String]) -> Result<String> {
-        anyhow::ensure!(!nodes.is_empty(), "calling a number needs --tn-node (a dsip-node serving /dsip/v1/tn/)");
+    /// Number → DID (N§6 routes 1 and 2, N§7): every binding the nodes and the authorities return, pooled, verified in
+    /// full against its own DID's document, the newest winning. Both are hints tiers: a node or an authority can
+    /// withhold, never forge (§8.1); an authority's name stays on the answer it served (`served_by`).
+    async fn lookup(&self, tn: &str, nodes: &[String], authorities: &[String]) -> Result<String> {
+        anyhow::ensure!(!nodes.is_empty() || !authorities.is_empty(),
+                        "calling a number needs --tn-node (a dsip-node serving /dsip/v1/tn/) or --tn-authority (a carrier's .well-known/dsip/tn/)");
         let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
         let mut bindings: Vec<serde_json::Value> = vec![];
         for n in nodes {
@@ -150,12 +154,36 @@ impl TnContext {
                 Err(e) => println!("number    {tn}: {n} did not answer ({e})"),
             }
         }
+        // route 2: each authority's answer as the README's `authority` check sees it: {authority, status, body}
+        let mut answers: Vec<serde_json::Value> = vec![];
+        for a in authorities {
+            let url = format!("{}/.well-known/dsip/tn/{}", a.trim_end_matches('/'), tn.replace('+', "%2B"));
+            let (status, body) = match http.get(&url).send().await {
+                Ok(r) => {
+                    let st = r.status().as_u16();
+                    (serde_json::json!(st), r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null))
+                }
+                Err(e) => {
+                    println!("number    {tn}: authority {a} did not answer ({e})");
+                    (serde_json::Value::Null, serde_json::Value::Null)
+                }
+            };
+            if status == serde_json::json!(200) {
+                println!("number    {tn}: {} binding(s) from authority {a}   N§6 (route 2)", body["bindings"].as_array().map_or(0, Vec::len));
+            } else if !status.is_null() {
+                println!("number    {tn}: authority {a} answered {status}");
+            }
+            answers.push(serde_json::json!({"authority": a, "status": status, "body": body}));
+        }
+        bindings.extend(dsip_number::pool_answers(&answers).into_iter().filter(|b| !bindings.contains(b)).collect::<Vec<_>>());
         let docs: serde_json::Map<String, serde_json::Value> = self.documents.clone().into_iter().collect();
         let Some(s) = dsip_number::select(tn, &bindings, &docs, dsip_transport::now_s(), &self.policy) else {
             anyhow::bail!("{tn}: no binding verified (none found, or none whose DID claims the number back)   N§3.4");
         };
         let by = s.attested_by.as_deref().map(|b| format!(" by {b}")).unwrap_or_default();
-        println!("number    {tn} → {}  (attested{by}; the DID claims it back)   N§3.4, N§6", s.did);
+        let served = dsip_number::served_by(&answers, &s.binding);
+        let served = if served.is_empty() { String::new() } else { format!("; served by {}", served.join(", ")) };
+        println!("number    {tn} → {}  (attested{by}; the DID claims it back{served})   N§3.4, N§6", s.did);
         if !s.others.is_empty() {
             println!("  ⚠  {tn} is also bound to {} — the newer binding is used   N§7", s.others.join(", "));
         }
@@ -371,10 +399,10 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     let mode = match mode {
         Mode::Call { to } if to.starts_with("tel:") => {
             let number = to[4..].to_string();
-            let looked = if opts.tn_nodes.is_empty() && opts.gateway.is_some() {
-                Err(anyhow::anyhow!("no --tn-node to look it up on"))
+            let looked = if opts.tn_nodes.is_empty() && opts.tn_authorities.is_empty() && opts.gateway.is_some() {
+                Err(anyhow::anyhow!("no --tn-node or --tn-authority to look it up on"))
             } else {
-                tn.lookup(&number, &opts.tn_nodes).await
+                tn.lookup(&number, &opts.tn_nodes, &opts.tn_authorities).await
             };
             match (looked, &opts.gateway) {
                 (Ok(did), _) => Mode::Call { to: did },

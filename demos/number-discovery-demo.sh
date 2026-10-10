@@ -9,11 +9,15 @@
 #      claim it: Bob's lookup still reaches Alice (both directions, or nothing).
 #   5. The number is ported: Mallory's document now claims it too. The newer binding wins, and Bob's client says
 #      that the number is also bound to Alice (N§7).
+#   6. Route 2: Carrier A serves Alice's binding itself, at its .well-known; Bob, configured with the authority and no
+#      node, reaches Alice, and his client names the authority that served the answer; a number the authority does
+#      not hold finds nothing (the log entry that makes the authority's answer auditable is staged with T§ stage 2).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build -q -p dsip-cli -p dsip-relay -p dsip-node
 B=target/debug; D=${DEMO_DIR:-/tmp/dsip-number-discovery-demo}; rm -rf "$D"; mkdir -p "$D"
 PORT=${RELAY_PORT:-8497}; R=wss://127.0.0.1:$PORT/dsip; NPORT=${NODE_PORT:-8098}; NODE=http://127.0.0.1:$NPORT
+APORT=${AUTHORITY_PORT:-8097}; AUTHORITY=http://127.0.0.1:$APORT
 TN=+15551234567; ALICE=did:web:alice.example; MALLORY=did:web:mallory.example
 fail() { echo "FAIL: $*"; exit 1; }
 
@@ -31,8 +35,10 @@ EOF
 $B/dsip-relay --listen 127.0.0.1:$PORT --state "$D/relay" \
   --did-document "$D/alice/did.json" --did-document "$D/mallory/did.json" >"$D/relay.log" 2>&1 & RELAY=$!
 $B/dsip-node --http 127.0.0.1:$NPORT --tn-policy "$D/policy.json" >"$D/node.log" 2>&1 & NODEP=$!
-trap 'kill $RELAY $NODEP 2>/dev/null || true' EXIT
-for _ in $(seq 50); do [ -s "$D/relay/cert.pem" ] && grep -q "^http:" "$D/node.log" && break; sleep 0.2; done
+mkdir -p "$D/carrier-a"; cp "$D/alice.jws" "$D/carrier-a/$TN.jws"   # what Carrier A issued, served by Carrier A
+python3 demos/tn_authority.py 127.0.0.1:$APORT "$D/carrier-a" >"$D/authority.log" 2>&1 & AUTHP=$!
+trap 'kill $RELAY $NODEP $AUTHP 2>/dev/null || true' EXIT
+for _ in $(seq 50); do [ -s "$D/relay/cert.pem" ] && grep -q "^http:" "$D/node.log" && grep -q "^http:" "$D/authority.log" && break; sleep 0.2; done
 CA="$D/relay/cert.pem"; grep "numbers:" "$D/node.log" | sed 's/^/  node: /'
 
 dial() { # n — Alice answers; Bob dials the number
@@ -83,7 +89,25 @@ grep -E "^number|⚠" "$D/5-bob.log" | sed 's/^/  /'
 grep -q "number    $TN → $MALLORY  (attested by Carrier B" "$D/5-bob.log" || fail "5: the ported binding did not win"
 grep -q "⚠  $TN is also bound to $ALICE — the newer binding is used" "$D/5-bob.log" || fail "5: no N§7 notice"
 
+echo "════════ 6. Route 2: Carrier A serves the binding itself; Bob asks the authority, not a node"
+$B/dsip answer --identity "$D/alice" --relay $R --ca "$CA" --auto accept --media none --script "sleep 6; quit" >"$D/6-alice.log" 2>&1 & AP=$!
+for _ in $(seq 50); do grep -q "capabilities" "$D/6-alice.log" && break; sleep 0.2; done
+$B/dsip call --identity "$D/bob" --relay $R --ca "$CA" --to "tel:$TN" --tn-authority $AUTHORITY --tn-policy "$D/policy.json" \
+  --did-document "$D/alice/did.json" --did-document "$D/mallory/did.json" --media none \
+  --script "sleep 3; hangup; sleep 1; quit" >"$D/6-bob.log" 2>&1 || true
+kill $AP 2>/dev/null || true; wait $AP 2>/dev/null || true
+grep -E "^number|← answer" "$D/6-bob.log" | sed 's/^/  /'
+grep -q "number    $TN: 1 binding(s) from authority $AUTHORITY" "$D/6-bob.log" || fail "6: the authority served nothing"
+grep -q "number    $TN → $ALICE  (attested by Carrier Example; the DID claims it back; served by $AUTHORITY)" "$D/6-bob.log" \
+  || fail "6: the served binding did not win, or the authority was not named"
+grep -q "← answer" "$D/6-bob.log" || fail "6: Alice did not answer"
+$B/dsip call --identity "$D/bob" --relay $R --ca "$CA" --to "tel:+15559990000" --tn-authority $AUTHORITY --tn-policy "$D/policy.json" \
+  --did-document "$D/alice/did.json" --media none --script "sleep 1; quit" >"$D/6-none.log" 2>&1 || true
+grep -E "^number|error" "$D/6-none.log" | head -3 | sed 's/^/  /'
+grep -q "authority $AUTHORITY answered 404" "$D/6-none.log" && grep -q "no binding verified" "$D/6-none.log" || fail "6: a number the authority does not hold was not refused"
+
 echo
 echo "PASS: a number was dialled through a dsip-node and reached the DID it is bound to, verified end to end; nothing"
 echo "      unpublished was found; forged and uncovered bindings were refused at the node; a binding whose DID does"
-echo "      not claim the number never won; after a port the newer binding won and the client said so."
+echo "      not claim the number never won; after a port the newer binding won and the client said so; and the"
+echo "      number's own authority served the binding at its .well-known, named on the answer (route 2)."

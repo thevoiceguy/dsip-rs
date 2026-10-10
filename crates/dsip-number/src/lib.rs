@@ -658,6 +658,8 @@ pub struct Selected {
     pub issued: i64,
     /// Other DIDs that also hold verified bindings for the number, sorted: a port in progress, or a hijack.
     pub others: Vec<String>,
+    /// The winning binding's text (for `served_by`, route 2).
+    pub binding: String,
 }
 
 /// Verify every returned binding fully, each against its own DID and that DID's document, and pick the winner:
@@ -676,11 +678,57 @@ pub fn select(tn: &str, bindings: &[Value], documents: &Map<String, Value>, now:
             }
         }
     }
-    let (issued, _, win) = verified.iter().min_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.as_bytes().cmp(y.1.as_bytes())))?.clone();
+    let (issued, text, win) = verified.iter().min_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.as_bytes().cmp(y.1.as_bytes())))?.clone();
     let mut others: Vec<String> = verified.iter().map(|v| v.2.did.clone()).filter(|d| *d != win.did).collect();
     others.sort();
     others.dedup();
-    Some(Selected { did: win.did, attested_by: win.attested_by, issued, others })
+    Some(Selected { did: win.did, attested_by: win.attested_by, issued, others, binding: text.to_string() })
+}
+
+/// The bindings the authorities' `.well-known` answers contribute (route 2, N§6; README `check: "authority"`): from
+/// each `{authority, status, body}` with status 200 and an object body whose `bindings` is an array, every string
+/// element, once, in first-occurrence order.
+pub fn pool_answers(answers: &[Value]) -> Vec<Value> {
+    let mut pool: Vec<Value> = vec![];
+    for a in answers {
+        if a["status"] != json!(200) || !a["body"].is_object() {
+            continue;
+        }
+        for b in a["body"]["bindings"].as_array().into_iter().flatten().filter(|b| b.is_string()) {
+            if !pool.contains(b) {
+                pool.push(b.clone());
+            }
+        }
+    }
+    pool
+}
+
+/// The authorities, in `answers` order and each once, whose contributing answer held `binding`.
+///
+/// Spec: N§6 route 2 (the parties accountable for the answer).
+pub fn served_by(answers: &[Value], binding: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for a in answers {
+        let holds = a["status"] == json!(200)
+            && a["body"].is_object()
+            && a["body"]["bindings"].as_array().is_some_and(|l| l.iter().any(|b| b.as_str() == Some(binding)));
+        if let (true, Some(auth)) = (holds, a["authority"].as_str()) {
+            if !out.iter().any(|x| x == auth) {
+                out.push(auth.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Discovery route 2, the serving half: pool the authorities' answers, choose by N§7, and name who served the winner.
+///
+/// Spec: N§6 (route 2), N§7. Impl (spec-gap 110 J): pooling, not precedence, among routes.
+pub fn authority(tn: &str, answers: &[Value], documents: &Map<String, Value>, now: i64, policy: &Policy) -> Option<(Selected, Vec<String>)> {
+    let pool = pool_answers(answers);
+    let s = select(tn, &pool, documents, now, policy)?;
+    let by = served_by(answers, &s.binding);
+    Some((s, by))
 }
 
 /// What a client does with a `tel` claim carrying a binding (N§4).
@@ -1077,6 +1125,15 @@ pub fn run_vector(v: &Value) -> Value {
             StoreOutcome::Stored(h) => json!({"outcome": "stored", "held": h}),
             StoreOutcome::Kept(r) => json!({"outcome": "kept", "reason": r}),
             StoreOutcome::Rejected(r) => json!({"outcome": "rejected", "reason": r}),
+        };
+    }
+    if i["check"] == "authority" {
+        let answers = i["answers"].as_array().cloned().unwrap_or_default();
+        let docs = i["documents"].as_object().cloned().unwrap_or_default();
+        let tn = i["tn"].as_str().unwrap_or_default();
+        return match authority(tn, &answers, &docs, i["now"].as_i64().unwrap_or_default(), &policy) {
+            None => json!({"outcome": "none"}),
+            Some((s, by)) => json!({"outcome": "found", "did": s.did, "attested_by": s.attested_by, "issued": s.issued, "others": s.others, "served_by": by}),
         };
     }
     if i["check"] == "select" {
