@@ -109,7 +109,21 @@
     <input type="file" id="import-file" accept=".dsip-identity,application/json" class="hidden">
   </div>
   <p class="muted small">The export is your identity key, encrypted with a passphrase you choose. Importing it on another
-  browser makes that browser a second device of the same identity (stage 3) or restores this one.</p>
+  browser enrols that browser as a device of this identity: it makes its own device key there, and your identity key
+  signs the delegation (§7.4). No server is involved. Importing it here replaces this browser's device key.</p>
+  <h3>Devices</h3>
+  <p class="muted small">A <code>did:key</code> identity has no document and no registry of its devices: this list is what this
+  browser knows (itself, and the devices the identity file it was enrolled from listed). A device enrolled elsewhere
+  appears here when you add its DID, shown on its own Settings screen. Revoking a device signs a
+  <code>delegation-revocation</code> with the identity key (§7.4) and hands it to the relay, which ends that device's
+  binding and refuses its next hello; it is held here too. A <code>did:web</code> identity would publish it in its
+  document instead, where every verifier finds it.</p>
+  <ul id="device-list" class="list"></ul>
+  <form id="device-add" class="row">
+    <input id="device-did" placeholder="did:key:z6Mk… of a device enrolled elsewhere" size="52">
+    <button type="submit">Add device</button>
+  </form>
+  <ul id="revoked-list" class="list"></ul>
   <h3>Policy</h3>
   <div class="row"><label class="small"><input type="checkbox" id="set-first-contact"> require first contact: refuse calls from identities that hold no grant (§19.4)</label></div>
   <h3>Contact link</h3>

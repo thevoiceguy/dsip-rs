@@ -5,7 +5,7 @@
 // is the engine's (`relay_hello`); this file only moves bytes and keeps the socket alive.
 
 export class Relay {
-  /** `engine` is the wasm Endpoint; `on` = {bound(relayInfo), frame(text), closed()}. */
+  /** `engine` is the wasm Endpoint; `on` = {bound(relayInfo), frame(text), closed(wasBound), refused(r), rejected(code), dropped(frame)}. */
   constructor(url, engine, on, now) {
     this.url = url; this.engine = engine; this.on = on; this.now = now;
     this.ws = null; this.bound = false; this.backoff = 1000; this.closedByUs = false;
@@ -26,8 +26,12 @@ export class Relay {
       }
       await this.on.frame?.(ev.data);
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       const was = this.bound; this.bound = false; this.ws = null;
+      // The relay refuses a hello by closing with the reason in the close frame (`transport.hello-rejected: <code>`).
+      // A revoked delegation (§7.4) will not verify next time either: stop reconnecting and tell the app.
+      const rejected = /^transport\.hello-rejected: (.*)$/.exec(ev.reason || '');
+      if (rejected) { this.on.rejected?.(rejected[1]); if (rejected[1] === 'delegation-revoked') this.closedByUs = true; }
       this.on.closed?.(was);
       if (!this.closedByUs) { setTimeout(() => this.connect(), this.backoff); this.backoff = Math.min(this.backoff * 2, 15000); }
     };

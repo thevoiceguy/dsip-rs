@@ -27,7 +27,7 @@ use dsip_session::endpoint::Grant;
 use dsip_session::event::SendMsg;
 use dsip_session::{Emission, Endpoint, EndpointConfig, Event, LocalEvent, Message};
 
-use crate::verify::{verify_frame, SeenIds};
+use crate::verify::{verify_frame_with, SeenIds};
 
 /// Interactive Media Profile identifier. Spec: §17.
 pub const PROFILE: &str = "interactive-media/1.0";
@@ -142,6 +142,8 @@ pub struct Core {
     /// Offers by session id (invite) or update id, ours and theirs.
     offers: HashMap<String, Value>,
     peer_delegations: Vec<Envelope>,
+    /// `delegation-revocation` records this endpoint holds (§7.4, v0.8): applied to every verification.
+    revocations: Vec<Envelope>,
     pending_sdp: Option<String>,
     /// Video codec ids the next offer lists (B§3.4 registry ids); a host sets them from the SDP it will supply.
     video_codecs: Vec<String>,
@@ -182,6 +184,7 @@ impl Core {
             seen: SeenIds::default(),
             offers: HashMap::new(),
             peer_delegations: vec![],
+            revocations: vec![],
             pending_sdp: None,
             video_codecs: vec!["codec:video/h264".into()],
             recording: None,
@@ -276,6 +279,14 @@ impl Core {
     /// (Recording Profile C§6: a recording session offers its streams `sendonly`).
     pub fn set_invite_patch(&mut self, patch: Option<serde_json::Value>) {
         self.invite_patch = patch;
+    }
+
+    /// Hold a `delegation-revocation` record: every later verification applies it (§7.4, v0.8: a verifier finds
+    /// revocations "in any store they hold, however obtained").
+    pub fn hold_revocation(&mut self, rev: Envelope) {
+        if !self.revocations.contains(&rev) {
+            self.revocations.push(rev);
+        }
     }
 
     /// Whether `device` presented a delegation, verified now, that grants `capability` (e.g. `dsip.record`,
@@ -382,7 +393,7 @@ impl Core {
             unseal_key: self.unseal_key_for(frame),
             ..Default::default()
         };
-        let inbound = match verify_frame(frame, now, &self.resolver, &self.peer_delegations, &mut self.seen, &sem) {
+        let inbound = match verify_frame_with(frame, now, &self.resolver, &self.peer_delegations, &self.revocations, &mut self.seen, &sem) {
             Ok(i) => i,
             Err(v) => {
                 // Spec: §12.4 — an invalid invite gets "Send `error` or silently drop per policy".

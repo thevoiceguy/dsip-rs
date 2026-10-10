@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The headless call test: a relay serves the client; two browsers (two storage contexts) call each other through it.
 # Usage: web/test/run.sh [firefox|chromium|all]   (default: firefox; CI runs both). Needs `npm ci` in web/ and
-# `npx playwright install [--with-deps] <browser>`.
+# `npx playwright install [--with-deps] <browser>`. TESTS="devices" runs a subset.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 BROWSERS=${1:-firefox}
@@ -16,7 +16,7 @@ grep -q 'listening on' "$D/relay.log" || { echo "relay did not start"; cat "$D/r
 rc=0
 for b in $(echo "$BROWSERS" | sed 's/all/firefox chromium/; s/,/ /g'); do
   echo "== $b"
-  for t in call first-contact; do
+  for t in ${TESTS:-call first-contact devices}; do
     (cd web && BROWSER=$b URL="https://$LISTEN/" node test/$t.mjs) || rc=1
   done
 done

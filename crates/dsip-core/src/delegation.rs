@@ -30,6 +30,25 @@ pub fn delegation_payload(subject: &str, device: &str, issued_at: i64, expires_a
     })
 }
 
+/// Build the `delegation-revocation` payload (§7.4, v0.8; spec-gap 57). Signed directly by a key of `subject`, it
+/// revokes every delegation of `device` for `subject` issued at or before `revoked_at`; `reason` is a
+/// `dsip-revocation-reason` token. Impl: the envelope is valid for 300 s (the replay window): the record is a
+/// credential verified by signature and subject (§7.4), so its envelope window only bounds its delivery.
+pub fn revocation_payload(dsip: Value, id: &str, subject: &str, device: &str, revoked_at: i64, reason: &str, issued_at: i64) -> Value {
+    serde_json::json!({
+        "dsip": dsip,
+        "type": "delegation-revocation",
+        "id": id,
+        "from": subject,
+        "subject": subject,
+        "device": device,
+        "revoked_at": revoked_at,
+        "reason": reason,
+        "issued_at": issued_at,
+        "expires_at": issued_at + 300,
+    })
+}
+
 /// `(subject, device)` named by a delegation envelope, without verifying it.
 pub fn names(deleg: &Envelope) -> Option<(String, String)> {
     let raw = crate::b64::decode(&deleg.payload)?;
