@@ -1591,6 +1591,7 @@ dependencies = [
  "console_error_panic_hook",
  "dsip-core",
  "dsip-endpoint",
+ "dsip-number",
  "dsip-schema",
  "dsip-session",
  "js-sys",
