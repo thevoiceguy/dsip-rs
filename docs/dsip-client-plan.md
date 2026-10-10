@@ -93,6 +93,13 @@ What exists to build on:
 - **Rendering trust** is `dsip_core::trust` through the wasm exports (`verification_basis`, `tel_caller_line`,
   `downgrade_summary`): the same lines the `trust` vectors pin, so the client cannot invent a badge.
 
+**Local or hosted.** The app is static files, so it runs from any origin: a local static server, a local or LAN
+`dsip-relay` serving it on its TLS port, or a hosted relay. What must be reachable is the relay, not the page; the
+browser needs a secure context (`https://` or `localhost`) for the camera, microphone and WebCrypto, and refuses
+wasm from `file://`. Two tabs and a relay on `127.0.0.1` are a complete private setup; hosting (stage 5) adds only
+what strangers need: a public relay with a real certificate, TURN across NATs, and a `did:web` host for those who
+want one.
+
 Where it lives: `impl/web/` (the app) replacing `impl/demos/browser/`, whose page becomes the app's first screen.
 `dsip-wasm` stays where it is. The build is `wasm-pack` plus a few static files; no bundler is required to start,
 and the CI job that builds `dsip-wasm` grows a headless-browser test of the app's first flow.
@@ -198,8 +205,9 @@ Each stage ends in something a person can do, and lands as one PR with its demo 
 the app against a local relay, the way the wire demos drive the CLI).
 
 1. **Call.** `impl/web/` from the demo page: a persistent identity, a contact list, audio and video calls between
-   two browsers through a relay, the basis line on both screens, export and import of the identity. Headless test:
-   two pages call each other and exchange media.
+   two browsers through a relay, the basis line on both screens, export and import of the identity. The deliverable
+   is the local setup (the app served by a local relay; two tabs, or two machines on a LAN); nothing is hosted.
+   Headless test: two pages call each other and exchange media.
 2. **First contact.** Introductions sent and received, grants, the unknown-caller screen, screening (§14.4), the
    relay's rate limits surfaced as what they are. Headless test: a stranger's call is refused until introduced.
 3. **Two devices.** Enrolment from the identity file, forked ringing, answered elsewhere, device list and
