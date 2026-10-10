@@ -1,47 +1,16 @@
 // Headless call test: two browsers (two storage contexts, so two identities) call each other through a relay that
 // serves the client. Drives the screens through the DOM, like a person would; reads state through `window.dsip`.
-// Run by test/run.sh (which starts the relay). Env: BROWSER=firefox|chromium, URL=https://127.0.0.1:8443/.
-import { chromium, firefox } from 'playwright';
+// Run by test/run.sh (which starts the relay); helpers and env in lib.mjs.
+import { launch, person, until, state, checker, dump, which, URL } from './lib.mjs';
 
-const URL = process.env.URL || 'https://127.0.0.1:8443/';
-const which = process.env.BROWSER || 'firefox';
-let failures = 0;
-const check = (name, ok, extra = '') => { console.log(`[${ok ? 'PASS' : 'FAIL'}] ${name} ${extra}`); if (!ok) failures++; };
+const check = checker();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function launch() {
-  if (which === 'chromium') {
-    return chromium.launch({ headless: true, args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
-      '--disable-features=WebRtcHideLocalIpsWithMdns', '--ignore-certificate-errors'] });
-  }
-  return firefox.launch({ headless: true, firefoxUserPrefs: {
-    'media.navigator.streams.fake': true, 'media.navigator.permission.disabled': true,
-    'media.peerconnection.ice.obfuscate_host_addresses': false, 'network.websocket.allowInsecureFromHTTPS': true,
-  } });
-}
-
-async function person(browser, name) {
-  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, permissions: which === 'chromium' ? ['camera', 'microphone'] : [] });
-  const page = await ctx.newPage();
-  page.on('pageerror', (e) => console.log(`  [${name}] page error: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error') console.log(`  [${name}] console: ${m.text()}`); });
-  await page.goto(URL);
-  await page.waitForSelector('#view-welcome:not(.hidden)');
-  await page.fill('#welcome-name', name);
-  await page.click('#welcome-continue');
-  await page.waitForSelector('#view-contacts:not(.hidden)');
-  await page.waitForFunction(() => window.dsip && window.dsip.relay(), null, { timeout: 15000 });
-  const did = await page.evaluate(() => window.dsip.identity());
-  return { ctx, page, did, name };
-}
-
-const until = (page, fn, timeout = 20000) => page.waitForFunction(fn, null, { timeout });
-const state = (p) => p.page.evaluate(() => window.dsip.state());
-
 const browser = await launch();
+let alice, bob;
 try {
-  const alice = await person(browser, 'Alice');
-  const bob = await person(browser, 'Bob');
+  alice = await person(browser, 'Alice');
+  bob = await person(browser, 'Bob');
   check('two identities, both bound to the relay', alice.did !== bob.did && alice.did.startsWith('did:key:'), `${alice.did.slice(0, 24)}… / ${bob.did.slice(0, 24)}…`);
   check('header shows the name and the DID', (await alice.page.textContent('#me-name')) === 'Alice' && (await alice.page.textContent('#me-did')) === alice.did);
 
@@ -74,6 +43,9 @@ try {
   for (let i = 0; i < 60 && !(a > 20 && b > 20); i++) { await sleep(500); a = await alice.page.evaluate(() => window.dsip.inboundPackets()); b = await bob.page.evaluate(() => window.dsip.inboundPackets()); }
   check('media flows both ways (inbound RTP packets)', a > 20 && b > 20, `alice ${a}, bob ${b}`);
 
+  // every info frame was accepted by the relay (an empty or malformed candidate would come back as a refusal)
+  check('no frame of either side was refused by the relay', !/routing-refused|schema-invalid/.test(await alice.page.textContent('#log') + await bob.page.textContent('#log')));
+
   // hang up: both end, both are back at contacts and can call again
   await alice.page.click('#btn-hangup');
   await until(alice.page, () => window.dsip.state() === null);
@@ -95,6 +67,19 @@ try {
   await until(bob.page, () => window.dsip.state() === null);
   check('decline ends the second call for the caller', /ended .*user\.declined/.test(await bob.page.textContent('#log')));
 
+  // a video call: the descriptors and the SDP both carry video (B§2.1); both sides receive a video track
+  await bob.page.click('#contact-list li button:text("Video")');
+  await alice.page.waitForSelector('#view-incoming:not(.hidden)');
+  await alice.page.click('#btn-accept');
+  await until(alice.page, () => window.dsip.state() === 'ACTIVE');
+  await until(bob.page, () => window.dsip.state() === 'ACTIVE');
+  await until(alice.page, () => window.dsip.remoteKinds().includes('video'));
+  await until(bob.page, () => window.dsip.remoteKinds().includes('video'));
+  check('video call: both sides receive audio and video', JSON.stringify(await alice.page.evaluate(() => window.dsip.remoteKinds())) === '["audio","video"]');
+  await bob.page.click('#btn-hangup');
+  await until(alice.page, () => window.dsip.state() === null);
+  await until(bob.page, () => window.dsip.state() === null);
+
   // export and import: a third browser imports Alice's identity file and is Alice
   const file = await alice.page.evaluate(() => window.dsip.exportIdentity('correct horse battery'));
   check('export is an encrypted identity file naming the identity', JSON.parse(file)['dsip-identity'] === 1 && JSON.parse(file).identity === alice.did && !file.includes('seed_hex'));
@@ -115,9 +100,10 @@ try {
   await alice.page.waitForSelector('#view-contacts:not(.hidden)');
   check('reload keeps identity and contacts', (await alice.page.evaluate(() => window.dsip.identity())) === alice.did && (await alice.page.evaluate(() => window.dsip.contacts())).includes(bob.did));
 } catch (e) {
-  console.log(`[FAIL] ${e.message}`); failures++;
+  check.fail(e.message);
+  await dump(alice, bob);
 } finally {
   await browser.close();
 }
-console.log(`\n${which}: ${failures} failure(s)`);
-process.exit(failures ? 1 : 0);
+console.log(`\n${which} call: ${check.failures()} failure(s)`);
+process.exit(check.failures() ? 1 : 0);

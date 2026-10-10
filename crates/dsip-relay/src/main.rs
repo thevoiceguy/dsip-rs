@@ -604,7 +604,15 @@ async fn serve(
                                 // §13.2: no silent drops on a live connection
                                 // A verdict that names a reason token (e.g. `policy.subscription-lifetime`, §9.3 v0.7) is
                                 // answered with that token; otherwise the generic routing refusal.
-                                let f = st.error_frame(&device, v.reason.unwrap_or("transport.routing-refused"), None, None, Some(&format!("{:?}", v.code)));
+                                // The detail is the verdict's code token (`schema-invalid`, …) and its detail, as the
+                                // vectors spell them, so a client can show why its frame was refused.
+                                let expect = v.to_expect();
+                                let code = expect["code"].as_str().unwrap_or("rejected").to_string();
+                                let detail = match &v.detail {
+                                    Some(d) if !d.is_empty() => format!("{code}: {d}"),
+                                    _ => code,
+                                };
+                                let f = st.error_frame(&device, v.reason.unwrap_or("transport.routing-refused"), None, None, Some(&detail));
                                 st.deliver(&device, &f);
                             }
                         }

@@ -12,9 +12,14 @@ export class Media {
     this.on = on;                       // {candidate(entry|null), track(stream), state(str)}
     this.localStream = null;
     this.pendingRemote = [];
-    this.pc.onicecandidate = ({ candidate }) => this.on.candidate?.(candidate
-      ? { candidate: candidate.candidate, sdp_mid: candidate.sdpMid, sdp_m_line_index: candidate.sdpMLineIndex }
-      : null);
+    this.pc.onicecandidate = ({ candidate }) => {
+      // Firefox marks the end of each m-section with an empty candidate string; the binding carries real candidates
+      // (`^candidate:`, B§ Appendix A) and one end_of_candidates, which the final null event supplies.
+      if (candidate && !candidate.candidate) return;
+      this.on.candidate?.(candidate
+        ? { candidate: candidate.candidate, sdp_mid: candidate.sdpMid ?? '0', sdp_m_line_index: candidate.sdpMLineIndex ?? 0 }
+        : null);
+    };
     this.pc.ontrack = (ev) => this.on.track?.(ev.streams[0]);
     this.pc.onconnectionstatechange = () => this.on.state?.(this.pc.connectionState);
   }
@@ -64,6 +69,18 @@ export class Media {
     const v = await navigator.mediaDevices.getUserMedia({ video: true });
     v.getTracks().forEach((t) => { this.pc.addTrack(t, v); this.localStream?.addTrack(t); });
     if (!this.localStream) this.localStream = v;
+  }
+
+  /** Leave screening (§14.4 step 3): capture audio (and video if asked) and send on the transceivers that were
+   *  receive-only; the caller then sees an `update` with `answered_by: "user"`. */
+  async unscreen(video) {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true, video });
+    for (const track of s.getTracks()) {
+      const t = this.pc.getTransceivers().find((x) => x.receiver.track?.kind === track.kind);
+      if (t) { t.direction = 'sendrecv'; await t.sender.replaceTrack(track); } else this.pc.addTrack(track, s);
+    }
+    this.localStream = s;
+    return s;
   }
 
   /** Inbound RTP packets received so far (for tests and the call screen). */
