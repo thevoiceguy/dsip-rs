@@ -44,9 +44,15 @@
   <form id="contact-add" class="row">
     <input id="contact-name" placeholder="name" maxlength="80">
     <input id="contact-did" placeholder="did:key:z6Mk… or did:web:…" size="52">
+    <input id="contact-number" placeholder="+15551234567 (optional)" size="20">
     <button type="submit">Add</button>
   </form>
   <ul id="contact-list" class="list"></ul>
+  <form id="call-number" class="row">
+    <input id="call-tn" placeholder="tel:+15551234567" size="24">
+    <button type="submit" class="primary">Call number</button>
+    <span class="muted small">looked up on the number nodes in Settings (N§6); a number nothing resolves goes to the PSTN through the gateway in Settings (N§4.1)</span>
+  </form>
   <form id="introduce-form" class="notice hidden">
     <div><strong>Introduce yourself</strong> to <span id="introduce-name" class="name"></span> <code id="introduce-did" class="did"></code></div>
     <div class="row"><input id="introduce-purpose" maxlength="280" size="60" placeholder="why you are getting in touch (shown to them as a claim)"></div>
@@ -62,6 +68,7 @@
   <h2 id="call-title">Calling</h2>
   <div class="row"><label>with</label><span id="call-peer-name" class="name"></span> <code id="call-peer-did" class="did"></code></div>
   <div class="row"><label>basis</label><span id="call-basis" class="basis"></span></div>
+  <div id="call-number-line" class="row small hidden"></div>
   <div class="row"><label>state</label><span id="call-state" class="tag"></span> <span id="call-note" class="muted small"></span></div>
   <div class="row"><label>mode</label><span id="call-mode" class="warn small"></span></div>
   <div id="call-downgrade" class="warn small hidden"></div>
@@ -85,6 +92,8 @@
     <div class="row"><label>from</label><span id="in-name" class="name"></span> <code id="in-did" class="did"></code></div>
     <div id="in-caller" class="row small hidden"></div>
     <div class="row"><label>basis</label><span id="in-basis" class="basis"></span></div>
+    <div id="in-numbers" class="small pre"></div>
+    <div id="in-tn-warning" class="warn small pre hidden"></div>
     <div class="row"><label>contact</label><span id="in-contact" class="small"></span></div>
     <div id="in-policy" class="muted small"></div>
     <div id="in-downgrade" class="warn small hidden"></div>
@@ -103,6 +112,10 @@
   <div class="row"><label>name</label><input id="set-name" maxlength="80"> <button id="set-name-save">Save</button></div>
   <div class="row"><label>identity</label><code id="set-did" class="did"></code></div>
   <div class="row"><label>device</label><code id="set-device" class="did"></code></div>
+  <div class="row"><label>did:web</label><input id="set-did-web" placeholder="did:web:alice.example" size="36"> <button id="set-did-web-use">Use did:web</button>
+    <span class="muted small">the same keys under a name you host (§7.2, §8.4); a bound number needs it (N§3.3)</span></div>
+  <div id="did-web-host" class="muted small hidden">Host this document at <code id="did-web-url"></code> (it lists your identity key and your bound number):
+    <button id="btn-did-doc">Download did.json</button> Until it is served there, verifiers that do not hold it cannot verify you.</div>
   <div class="row">
     <button id="btn-export">Export identity…</button>
     <button id="btn-import">Import identity…</button>
@@ -126,6 +139,20 @@
   <ul id="revoked-list" class="list"></ul>
   <h3>Policy</h3>
   <div class="row"><label class="small"><input type="checkbox" id="set-first-contact"> require first contact: refuse calls from identities that hold no grant (§19.4)</label></div>
+  <h3>Phone number</h3>
+  <p class="muted small">A binding your carrier issued (Number Attestation Profile N§3): your calls present the number with it, and a callee
+  verifies it against your identity's document. Your identity must be <code>did:web</code> and its document must list the number.</p>
+  <div class="row"><label>binding</label><textarea id="set-binding" rows="3" cols="72" placeholder="the compact JWS from your carrier"></textarea> <button id="set-binding-save">Save</button></div>
+  <div id="binding-status" class="small"></div>
+  <div class="row"><label>gateway</label><input id="set-gateway" placeholder="did:web:gw.example" size="36"> <span class="muted small">the operator's DSIP↔PSTN gateway: numbers nothing resolves are dialled through it (N§4.1)</span></div>
+  <div class="row"><label>number nodes</label><input id="set-tn-nodes" placeholder="https://node.example:8090, …" size="50"> <span class="muted small">dsip-nodes serving /dsip/v1/tn/ (N§6 route 1); a hints tier, never authoritative</span></div>
+  <div class="row"><label>number policy</label><textarea id="set-tn-policy" rows="2" cols="72" placeholder='{"trust_anchors": [...], "certificates": {...}}  the STI-CA trust list and x5u chains (N§3.2)'></textarea></div>
+  <div class="row"><button id="set-numbers-save">Save numbers</button></div>
+  <h3>Documents you hold</h3>
+  <p class="muted small">DID documents of <code>did:web</code> identities, held here so their signatures verify (§8.1: a document is the
+  authority for its DID; this browser does not fetch them). Paste one from its <code>did.json</code>.</p>
+  <div class="row"><textarea id="set-document" rows="2" cols="72" placeholder='{"id": "did:web:…", "verificationMethod": [...]}'></textarea> <button id="btn-add-document">Hold</button></div>
+  <ul id="document-list" class="list"></ul>
   <h3>Contact link</h3>
   <p class="muted small">A link you hand to one person out of band (a message, a card). Opening it introduces them to you with a
   single-use token, and the introduction is granted at once without a request (§19.4). Each link works once.</p>

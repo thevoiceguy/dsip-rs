@@ -1,6 +1,8 @@
 // Shared by the headless tests: launch a browser with fake media, make a person (a fresh storage context, so a fresh
 // identity), and small waits. Env: BROWSER=firefox|chromium, URL=https://127.0.0.1:8443/.
+import { readFileSync } from 'node:fs';
 import { chromium, firefox } from 'playwright';
+import { exportIdentity } from '../host/identity-file.js';
 
 export const URL = process.env.URL || 'https://127.0.0.1:8443/';
 export const which = process.env.BROWSER || 'firefox';
@@ -44,6 +46,14 @@ export async function person(browser, name, url = URL) {
   await ready(page);
   const did = await page.evaluate(() => window.dsip.identity());
   return { ctx, page, did, name };
+}
+
+/** An identity file for an identity the CLI made (`dsip identity init`, did:web or did:key): its identity seed under
+ *  `pass`, so a browser enrols as a device of it (the keys the fixture's documents and bindings name). */
+export async function identityFile(dir, name, pass) {
+  const meta = JSON.parse(readFileSync(`${dir}/identity.json`, 'utf8'));
+  const seed = readFileSync(`${dir}/controller.key`, 'utf8').trim();
+  return exportIdentity({ controller_seed_hex: seed, identity: meta.identity, display_name: name || meta.display_name }, pass);
 }
 
 /** A fresh browser context enrolled as a device of the identity in `file` (the welcome screen's import, passphrase

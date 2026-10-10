@@ -281,6 +281,12 @@ impl Core {
         self.invite_patch = patch;
     }
 
+    /// Hold a DID document for resolution from now on (§8.1: a document is the authority for its DID; the host
+    /// obtained it, as the CLI does with `--did-document`). `did:web` signers verify against it.
+    pub fn add_document(&mut self, doc: dsip_core::did::DidDocument) {
+        self.resolver.insert(doc);
+    }
+
     /// Hold a `delegation-revocation` record: every later verification applies it (§7.4, v0.8: a verifier finds
     /// revocations "in any store they hold, however obtained").
     pub fn hold_revocation(&mut self, rev: Envelope) {

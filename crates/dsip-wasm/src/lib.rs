@@ -98,6 +98,109 @@ pub fn revocation_frame(identity_json: &str, id: &str, device: &str, reason: &st
     Ok(sign(&p, &controller, &controller.kid()).frame())
 }
 
+/// Rehome an identity to `did:web` (§7.2, §8.4): the same keys, the identity named by the DID, the device delegation
+/// re-signed under `<did>#key-1`. Returns the identity JSON; [`did_document`] gives the document to host at the
+/// DID's URL (`https://<host>/.well-known/did.json`, or `/<path>/did.json`).
+#[wasm_bindgen]
+pub fn rehome(identity_json: &str, did_web: &str, now: f64) -> Result<String, JsValue> {
+    if !did_web.starts_with("did:web:") {
+        return Err(JsValue::from_str("not a did:web DID"));
+    }
+    let mut id: Value = serde_json::from_str(identity_json).map_err(js)?;
+    let controller = KeyPair::from_seed(unhex(id["controller_seed_hex"].as_str().unwrap_or(""))?);
+    let device = KeyPair::from_seed(unhex(id["device_seed_hex"].as_str().unwrap_or(""))?);
+    let now = now as i64;
+    let payload = dsip_core::delegation::delegation_payload(
+        did_web,
+        &device.did(),
+        now - 60,
+        now + 365 * 86_400,
+        &["dsip.signaling", "dsip.media.interactive"],
+    );
+    id["identity"] = json!(did_web);
+    id["delegation"] = json!(sign(&payload, &controller, &format!("{did_web}#key-1")).frame());
+    Ok(id.to_string())
+}
+
+/// The DID document of a `did:web` identity (§7.2; the shape `dsip identity init --did-web` writes): one Multikey
+/// verification method for the identity key, and `alsoKnownAs` (a JSON array of strings; `tel:+…` claims the
+/// number of a binding, N§3.3).
+#[wasm_bindgen]
+pub fn did_document(identity_json: &str, also_known_as_json: &str) -> Result<String, JsValue> {
+    let id: Value = serde_json::from_str(identity_json).map_err(js)?;
+    let did = id["identity"].as_str().unwrap_or("").to_string();
+    if !did.starts_with("did:web:") {
+        return Err(JsValue::from_str("not a did:web identity"));
+    }
+    let controller = KeyPair::from_seed(unhex(id["controller_seed_hex"].as_str().unwrap_or(""))?);
+    let kid = format!("{did}#key-1");
+    let multibase = controller.did().trim_start_matches("did:key:").to_string();
+    let aka: Vec<String> = serde_json::from_str(also_known_as_json).unwrap_or_default();
+    let mut doc = json!({
+        "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+        "id": did,
+        "verificationMethod": [{"id": kid, "type": "Multikey", "controller": did, "publicKeyMultibase": multibase}],
+        "authentication": [kid],
+        "assertionMethod": [kid],
+    });
+    if !aka.is_empty() {
+        doc["alsoKnownAs"] = json!(aka);
+    }
+    serde_json::to_string_pretty(&doc).map_err(js)
+}
+
+fn policy_of(policy_json: &str) -> dsip_number::Policy {
+    dsip_number::Policy::from_json(&serde_json::from_str(policy_json).unwrap_or(json!({})))
+}
+
+/// N§4: check a `tel` claim from an invite's `identity.claims` against the envelope's verified signing identity and
+/// that identity's DID document (JSON, or `null` when none is held), under a `tn-binding` policy (the vectors'
+/// context shape: `trust_anchors`, `certificates`, …; `{}` for none). Returns
+/// `{"outcome": "ignored" | "attested" | "dropped", "line", "reason", "issued", "attested_by"}`: the lines the
+/// `tn-binding/claim-*` vectors pin.
+#[wasm_bindgen]
+pub fn check_claim(claim_json: &str, identity: &str, did_document_json: &str, now: f64, policy_json: &str) -> String {
+    let claim: Value = serde_json::from_str(claim_json).unwrap_or(Value::Null);
+    let doc: Value = serde_json::from_str(did_document_json).unwrap_or(Value::Null);
+    match dsip_number::check_claim(&claim, identity, &doc, now as i64, &policy_of(policy_json)) {
+        dsip_number::ClaimOutcome::Ignored => json!({"outcome": "ignored"}),
+        dsip_number::ClaimOutcome::Attested { line, issued, expires, attested_by } => {
+            json!({"outcome": "attested", "line": line, "issued": issued, "expires": expires, "attested_by": attested_by})
+        }
+        dsip_number::ClaimOutcome::Dropped { reason, line } => json!({"outcome": "dropped", "reason": reason, "line": line}),
+    }
+    .to_string()
+}
+
+/// N§5: the warning when a verified number now belongs to another identity than a stored contact listing it;
+/// `contacts_json` is `[{"name", "did", "numbers": ["+…"]}]`. Returns the warning, or `""` when none is due.
+#[wasm_bindgen]
+pub fn identity_change(contacts_json: &str, tn: &str, did: &str, attested_by: Option<String>, issued: f64) -> String {
+    let v: Vec<Value> = serde_json::from_str(contacts_json).unwrap_or_default();
+    let contacts: Vec<dsip_number::Contact> = v
+        .iter()
+        .map(|c| dsip_number::Contact {
+            name: c["name"].as_str().unwrap_or_default().into(),
+            did: c["did"].as_str().unwrap_or_default().into(),
+            numbers: c["numbers"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect(),
+        })
+        .collect();
+    dsip_number::identity_change(&contacts, tn, did, attested_by.as_deref(), issued as i64).unwrap_or_default()
+}
+
+/// N§6, N§7: the DID a number resolves to, from the bindings a lookup returned (a JSON array of compact JWS
+/// strings), each verified in full against its own DID's document (`documents_json`: `{did: document}`), the newest
+/// winning. Returns `{"did", "attested_by", "issued", "others"}`, or `null` when no binding verifies.
+#[wasm_bindgen]
+pub fn tn_select(tn: &str, bindings_json: &str, documents_json: &str, now: f64, policy_json: &str) -> String {
+    let bindings: Vec<Value> = serde_json::from_str(bindings_json).unwrap_or_default();
+    let docs: serde_json::Map<String, Value> = serde_json::from_str(documents_json).unwrap_or_default();
+    match dsip_number::select(tn, &bindings, &docs, now as i64, &policy_of(policy_json)) {
+        Some(s) => json!({"did": s.did, "attested_by": s.attested_by, "issued": s.issued, "others": s.others}).to_string(),
+        None => "null".into(),
+    }
+}
+
 /// Verify a frame standalone (stages 1–14) with a vector-style context JSON. Returns the `expect` projection.
 #[wasm_bindgen]
 pub fn verify_frame(frame: &str, context_json: &str) -> String {
@@ -290,6 +393,31 @@ impl Endpoint {
         if let Ok(f) = serde_json::from_str::<ContactFile>(json_text) {
             self.core.load_contacts(&f);
         }
+    }
+
+    /// Hold a DID document (JSON) for resolution (§8.1: the document is the authority for its DID; the host obtained
+    /// it, as the CLI's `--did-document`): `did:web` signers verify against it. Returns false for text that is not
+    /// a document.
+    pub fn add_document(&mut self, doc_json: &str) -> bool {
+        match serde_json::from_str::<dsip_core::did::DidDocument>(doc_json) {
+            Ok(d) => {
+                self.resolver.insert(d.clone());
+                self.core.add_document(d);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// `identity.claims` for the next invite (a JSON array): a `tel` claim with the caller's own `binding` (N§4).
+    pub fn set_claims(&mut self, claims_json: &str) {
+        self.core.set_claims(serde_json::from_str(claims_json).unwrap_or_default());
+    }
+
+    /// A patch for the next invite only (JSON object): `{"destination": "tel:+…"}` names the PSTN number a gateway
+    /// should reach (N§4.1); `null` clears it.
+    pub fn set_invite_patch(&mut self, patch_json: &str) {
+        self.core.set_invite_patch(serde_json::from_str::<Value>(patch_json).ok().filter(Value::is_object));
     }
 
     /// Hold a `delegation-revocation` frame (one we signed, or one handed to us): every later verification applies

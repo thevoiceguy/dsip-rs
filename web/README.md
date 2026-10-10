@@ -25,6 +25,17 @@ document and no registry of devices: one enrolled elsewhere is added by its DID)
 refuses its next hello (spec-gap 113 for the carriage), and this engine holds it too. What a `did:key` identity
 cannot do, publish the revocation where every verifier finds it, is said on the screen rather than hidden.
 
+**Stage 4:** the gateway. A PSTN caller arrives as the gateway's `tel` claim and the incoming screen shows the caller
+line and the basis with the STIR level (G§5); what a crossing lost arrives as `gateway.downgraded` and is shown (G§7).
+"Call number" looks a `tel:` up on the number nodes in Settings (N§6, each binding verified against its own DID's
+document held here, the newest winning, N§7) and dials a number nothing resolves through the gateway in Settings as the
+invite's `destination` (N§4.1). A binding from the person's carrier (Settings, N§3) is presented on every call as a
+`tel` claim; a callee checks it against the caller's document (N§4, `check_claim`) and shows the attested number, or
+the number "(unverified)" with the refusal; a number that a stored contact lists but that now belongs to another
+identity is said out loud (N§5, `identity_change`). A bound number needs a `did:web` identity whose document lists it
+(N§3.3): Settings rehomes the identity to a `did:web` name (the same keys, §7.2) and gives the document to host. DID
+documents of `did:web` peers are held in Settings as the CLI holds `--did-document`; the browser does not fetch them.
+
 ## Run it locally
 
 ```bash
@@ -56,7 +67,9 @@ test/lib.mjs            Playwright helpers: launch with fake media, a person (fr
 test/call.mjs           stage 1: two headless browsers call each other through a local relay (audio, video), export/import
 test/first-contact.mjs  stage 2: refusal until introduced, requests, grants, screening + escalation, contact link, ignore
 test/devices.mjs        stage 3: one identity on two browsers (enrolled from the file), forked ringing, answered elsewhere, revocation
-test/run.sh             starts a relay on 127.0.0.1:8443 and runs the Playwright tests in the browser(s) named
+test/gateway.mjs        stage 4: the two-gateway demo with browsers: attested crossing, downgrade, no route, N§4 claim, N§5 warning
+test/run.sh             makes the gateway fixture, starts a relay (serving the client) on 127.0.0.1:8443, a dsip-node and
+                        two gateways, and runs the Playwright tests in the browser(s) named
 ```
 
 ## Tests
@@ -77,7 +90,15 @@ ignored introduction is reported, and a request survives a reload. `devices.mjs`
 identity file as a new device of the same identity, a call rings both devices and whichever answers wins while the
 other ends without a missed call (both ways round), the first device adds the second by DID and revokes it, the
 revoked device is dropped by the relay and refused at its next hello (after a reload too), and the next call rings
-only the remaining device. CI runs all three in Firefox and Chromium.
+only the remaining device. `gateway.mjs` (the two-gateway demo's fixture, made by `run.sh`: did:web identities the
+browsers enrol as devices of, the test number authority, a dsip-node holding Bob's binding, two gateways over a SIP
+trunk): Alice's binding verifies in her Settings, her call to Bob's number crosses gateway A attested (A, under its
+delegate certificate) and gateway B (PASSporT verified, routed by Bob's published binding), Bob sees the PSTN caller
+with the verified attestation and audio crosses both gateways both ways; Mallory, without a binding, crosses
+downgraded and Bob sees no attestation; a number nobody published is refused `identity.unknown`; on a direct call Bob
+sees Alice's own number attested (N§4) and her basis unchanged; Carol presents Carrier B's binding of the same number
+and Bob, who stored Alice with it, is warned (N§5); a did:web name whose document nobody serves cannot bind. CI runs
+all four in Firefox and Chromium.
 
 ## Identity
 
@@ -88,3 +109,15 @@ browser enrols that browser as a device of the identity: a device key of its own
 locally (§7.4). Importing it on the same browser replaces its device key the same way. Without the file, a lost
 browser profile is a lost identity; the client says so at first run. A lost device is revoked from another one
 (Settings): the revocation reaches the relay, not the world, which is what a `did:key` identity can do.
+
+## Numbers and did:web
+
+A `did:key` identity cannot present a bound number: the binding's DID must list the number in its document
+(N§3.3), and `did:key` has none. Settings rehomes the identity to a `did:web` name: the same identity key, the
+device delegation re-signed under `<did>#key-1`, and a `did.json` to host at the DID's URL (with `alsoKnownAs` for the
+bound number). Until it is served there, a verifier that does not hold the document refuses the identity, and the
+client says so. Documents of `did:web` peers (a gateway, a contact) are held in Settings, as the CLI holds
+`--did-document`: the browser does not fetch `did.json` files (CORS and a host's TLS are the host's to arrange).
+The number policy (the STI-CA trust list and `x5u` chains, N§3.2) is pasted the same way; without it every binding is
+`untrusted-certificate`, which is shown rather than hidden. The wasm package is 5.0 MB uncompressed with the number
+crate in it (stage 4); the plan's size risk is measured at each stage.

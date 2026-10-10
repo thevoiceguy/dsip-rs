@@ -5,9 +5,11 @@
 //
 // Spec: §12 (engine states shown as they are), §12.12 (ICE candidates in signed `info`, ACTIVE-only), §14.1 (no
 // media before a signed answer), §14.4 (screening), §18.1 (the verification basis, never a badge), §18.2 (display
-// names are claims), §19.4 (first contact), B§ (SDP in `transports[].sdp`), G§5/G§7 (PSTN caller line, downgrade).
+// names are claims), §19.4 (first contact), B§ (SDP in `transports[].sdp`), G§5/G§7 (PSTN caller line, downgrade),
+// N§4 (a caller's bound number, checked by `check_claim`), N§4.1 (`tel:` through a gateway as `destination`), N§5
+// (a number that moved), N§6 (number lookup on the nodes in Settings).
 
-import init, { create_identity, revocation_frame, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
+import init, { create_identity, revocation_frame, rehome, did_document, check_claim, identity_change, tn_select, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
 import { store } from './host/store.js';
 import { Engine } from './host/engine.js';
 import { Relay } from './host/relay.js';
@@ -29,6 +31,7 @@ let links = [];       // contact links issued here: {token, url, created}
 let onBound = null;   // one action deferred until the relay is bound (a contact link opened before connecting)
 let devices = [];     // {device, enrolled?}: this identity's devices as this browser knows them (no registry for did:key)
 let revoked = [];     // {device, reason, at, frame}: revocations this identity issued here (§7.4)
+let documents = {};   // did → DID document held here (§8.1; the CLI's --did-document): did:web signers verify against them
 const payloadOf = (frame) => { try { return JSON.parse(atob(JSON.parse(frame).payload.replace(/-/g, '+').replace(/_/g, '/'))); } catch { return {}; } };
 
 // ---------------------------------------------------------------- log
@@ -65,9 +68,10 @@ function renderContacts() {
     const asked = Object.values(file.requests || {}).some(([who]) => who === c.did);
     const status = held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them'
       : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant';
-    li.innerHTML = `<span class="name"></span><code class="did"></code><span class="status">${status}</span>`;
+    li.innerHTML = `<span class="name"></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
     li.querySelector('.name').textContent = c.name || '(unnamed)';
     li.querySelector('.did').textContent = c.did;
+    li.querySelector('.num').textContent = (c.numbers || []).join(' ');
     const b = (text, cls, fn) => { const x = document.createElement('button'); x.textContent = text; if (cls) x.className = cls; x.onclick = fn; return x; };
     li.append(b('Call', 'primary', () => placeCall(c.did, false)), b('Video', '', () => placeCall(c.did, true)),
       b('Introduce', '', () => introduce(c.did)), b('Remove', 'ghost', () => removeContact(c.did)));
@@ -110,7 +114,96 @@ function renderSettings() {
   $('set-first-contact').checked = !!settings.first_contact_required;
   $('set-relay').value = settings.relay || '';
   $('set-ice').value = settings.ice ? JSON.stringify(settings.ice) : '';
+  const web = identity.identity.startsWith('did:web:');
+  $('set-did-web').value = web ? identity.identity : '';
+  $('did-web-host').classList.toggle('hidden', !web);
+  if (web) $('did-web-url').textContent = didWebUrl(identity.identity);
+  $('set-binding').value = settings.binding || '';
+  $('binding-status').textContent = bindingStatus();
+  $('set-gateway').value = settings.gateway || '';
+  $('set-tn-nodes').value = (settings.tn_nodes || []).join(', ');
+  $('set-tn-policy').value = settings.tn_policy ? JSON.stringify(settings.tn_policy) : '';
   renderDevices();
+  renderDocuments();
+}
+
+/** Where a did:web document is served (§8.4): `https://<host>/.well-known/did.json`, or `/<path>/did.json`. */
+function didWebUrl(did) {
+  const [host, ...path] = did.slice('did:web:'.length).split(':');
+  return path.length ? `https://${host.replace('%3A', ':')}/${path.join('/')}/did.json` : `https://${host.replace('%3A', ':')}/.well-known/did.json`;
+}
+
+function bindingPayload(jws) { try { return JSON.parse(atob(jws.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch { return {}; } }
+function bindingNumber() { return bindingPayload(settings.binding || '').tn || ''; }
+
+/** Our own did:web document (§7.2): the identity key, and `tel:` for the bound number (N§3.3). `null` for did:key. */
+function ownDocument() {
+  if (!identity.identity.startsWith('did:web:')) return null;
+  return JSON.parse(did_document(JSON.stringify(identity), JSON.stringify(bindingNumber() ? [`tel:${bindingNumber()}`] : [])));
+}
+
+/** What a callee holding our document and this policy would make of our binding (N§3.4), said before any call. */
+function bindingStatus() {
+  if (!settings.binding) return 'no binding: your calls present no number';
+  const claim = { type: 'tel', number: bindingNumber(), binding: settings.binding };
+  const out = JSON.parse(check_claim(JSON.stringify(claim), identity.identity, JSON.stringify(ownDocument()), now(), JSON.stringify(settings.tn_policy || {})));
+  if (out.outcome === 'attested') return `${out.line} — verifies, as a callee holding your document and this policy sees it (N§3.4)`;
+  const hint = out.reason === 'not-claimed-by-did'
+    ? (identity.identity.startsWith('did:web:') ? ' (your document must list the number: host the one above)' : ' (a bound number needs a did:web identity whose document lists it, N§3.3)')
+    : out.reason === 'untrusted-certificate' ? ' (no anchor in the number policy covers the issuer)' : '';
+  return `${out.line || 'the binding'} — would be refused: ${out.reason}${hint}`;
+}
+
+function renderDocuments() {
+  const ul = $('document-list');
+  const ids = Object.keys(documents);
+  ul.innerHTML = ids.length ? '' : '<li class="muted small">none</li>';
+  for (const id of ids) { const li = document.createElement('li'); li.innerHTML = '<code class="did"></code>'; li.querySelector('.did').textContent = id; ul.append(li); }
+}
+
+/** Hold a did:web document (§8.1): it is the authority for its DID; this browser does not fetch, the person pastes. */
+async function addDocument(text) {
+  let doc;
+  try { doc = JSON.parse(text); } catch { return notify('a DID document is JSON'); }
+  if (!doc || typeof doc.id !== 'string' || !doc.id.startsWith('did:web:')) return notify('a DID document names its did:web id');
+  if (!engine.ep.add_document(JSON.stringify(doc))) return notify('that document could not be read');
+  documents[doc.id] = doc;
+  await store.set(key('documents'), documents);
+  renderDocuments();
+  log(`holding the DID document of ${doc.id}`, '§8.1');
+}
+
+/** Rehome to did:web (§7.2): the same keys under a hosted name; the delegation is re-signed under `<did>#key-1`. */
+async function useDidWeb(did) {
+  did = did.trim();
+  if (!/^did:web:[a-z0-9.%:-]+$/i.test(did)) return alert('a did:web DID looks like did:web:alice.example (or did:web:host:path)');
+  identity = JSON.parse(rehome(JSON.stringify(identity), did, now()));
+  await store.set(key('identity'), identity);
+  location.reload();
+}
+
+function downloadDidDocument() {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(ownDocument(), null, 2)], { type: 'application/json' }));
+  a.download = 'did.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function saveNumbers() {
+  settings.gateway = $('set-gateway').value.trim() || undefined;
+  settings.tn_nodes = $('set-tn-nodes').value.split(/[\s,]+/).filter(Boolean);
+  try { settings.tn_policy = $('set-tn-policy').value.trim() ? JSON.parse($('set-tn-policy').value) : undefined; } catch { return alert('the number policy must be JSON'); }
+  await saveSettings();
+  renderSettings();
+}
+
+async function saveBinding(jws) {
+  jws = jws.trim();
+  if (jws && !bindingPayload(jws).tn) return alert('that is not a binding (a compact JWS whose payload names tn)');
+  settings.binding = jws || undefined;
+  await saveSettings();
+  renderSettings();
 }
 
 function renderDevices() {
@@ -206,6 +299,21 @@ async function onReceived(r) {
     $('in-caller').textContent = tel ? '☎ ' + tel_caller_line(JSON.stringify(tel)) + ' (via gateway)' : '';
     $('in-caller').classList.toggle('hidden', !tel);
     $('in-basis').textContent = verification_basis(r.identity, JSON.stringify(claims));
+    // N§4: the caller's own bound numbers, verified against the identity that signed this invite and its document;
+    // N§5: a number that a stored contact lists but that now belongs to another identity is said out loud
+    const numberLines = [], warnings = [];
+    for (const c of claims) {
+      const out = JSON.parse(check_claim(JSON.stringify(c), r.identity, JSON.stringify(documents[r.identity] ?? null), now(), JSON.stringify(settings.tn_policy || {})));
+      if (out.outcome === 'attested') {
+        numberLines.push(`☎ ${out.line} (N§4)`);
+        const w = identity_change(JSON.stringify(contacts), c.number, r.identity, out.attested_by ?? undefined, out.issued);
+        if (w) warnings.push(`⚠ ${w} (N§5)`);
+      } else if (out.outcome === 'dropped') numberLines.push(`☎ ${out.line || 'a number'} — number binding refused: ${out.reason} (N§4, §18.2)`);
+    }
+    $('in-numbers').textContent = numberLines.join('\n');
+    $('in-tn-warning').textContent = warnings.join('\n');
+    $('in-tn-warning').classList.toggle('hidden', !warnings.length);
+    for (const l of [...numberLines, ...warnings]) log(l, 'N§4');
     const file = JSON.parse(engine.contactsFile());
     const granted = Object.values(file.grants_issued || {}).some((g) => g.identity === r.identity) || (file.allow || []).includes(r.identity);
     const known = contacts.some((c) => c.did === r.identity);
@@ -255,8 +363,11 @@ async function onEmission(e) {
       const refused = e.reason === 'policy.first-contact-required' && peer;
       // §12.7: a forked invite answered on another device ends this leg; §12.11: never a missed call
       const elsewhere = e.reason === 'session.answered-elsewhere';
+      const noRoute = e.reason === 'identity.unknown' && call?.destination;
       $('call-note').textContent = refused ? 'They require an introduction before calls (§19.4). Introduce yourself; once they grant you, call again.'
-        : elsewhere ? 'answered on another of your devices (§12.7); not a missed call' : e.reason ? `ended: ${e.reason}` : 'ended';
+        : elsewhere ? 'answered on another of your devices (§12.7); not a missed call'
+        : noRoute ? `${call.destination}: the gateway found no identity for that number and no route (identity.unknown, N§6.1)`
+        : e.reason ? `ended: ${e.reason}` : 'ended';
       endCall(refused);
       if (refused) { $('btn-introduce-after').classList.remove('hidden'); $('btn-introduce-after').onclick = () => introduce(peer); }
     }
@@ -292,12 +403,19 @@ async function flushLocalCandidates() {
   await engine.local({ local: 'info', session: call.sid });
 }
 
-async function placeCall(to, video) {
+/** Place a call to a DID; with `destination` (`tel:+…`), `to` is a gateway and the number rides as the invite's
+ *  destination (N§4.1). A saved binding is presented on every call as a `tel` claim (N§4). */
+async function placeCall(to, video, destination) {
   if (call && engine.state(call.sid) !== 'ENDED') return notify('already in a call');
-  call = { sid: engine.newId(), role: 'initiator', peer: to, media: null, pendingLocal: [], pendingUpdate: null, screening: false };
+  call = { sid: engine.newId(), role: 'initiator', peer: to, destination, media: null, pendingLocal: [], pendingUpdate: null, screening: false };
   $('call-peer-name').textContent = nameOf(to) || '';
   $('call-peer-did').textContent = to;
   $('call-basis').textContent = verification_basis(to, '[]');
+  const lines = [];
+  if (destination) lines.push(`to ${destination} through the gateway ${short(to)}: the number is the invite's destination (N§4.1)`);
+  if (settings.binding) lines.push(`presenting ${bindingNumber()} with its binding (N§4)`);
+  $('call-number-line').textContent = lines.join(' · ');
+  $('call-number-line').classList.toggle('hidden', !lines.length);
   $('call-note').textContent = ''; $('call-mode').textContent = '';
   $('call-downgrade').classList.add('hidden');
   $('btn-introduce-after').classList.add('hidden');
@@ -310,9 +428,39 @@ async function placeCall(to, video) {
     engine.setVideo(video);
     if (video) engine.setVideoCodecsFromSdp(sdp);
     engine.setSdp(sdp);                                     // B§: SDP as the transport binding object
+    engine.ep.set_claims(JSON.stringify(settings.binding ? [{ type: 'tel', number: bindingNumber(), binding: settings.binding }] : []));
+    engine.ep.set_invite_patch(destination ? JSON.stringify({ destination }) : 'null');
     await engine.local({ local: 'place_call', session: call.sid, to });
   } catch (err) { notify(`cannot call: ${err.message || err}`); endCall(); }
   renderCall();
+}
+
+/** Call a phone number: looked up on the number nodes (N§6 route 1, each binding verified against its own DID's
+ *  document held here, the newest winning, N§7); a number nothing resolves is a PSTN number, dialled through the
+ *  gateway in Settings as the invite's destination (N§4.1). */
+async function callNumber(input) {
+  const tn = input.trim().replace(/^tel:/, '').replace(/[\s().-]/g, '');
+  if (!/^\+[1-9][0-9]{1,14}$/.test(tn)) return notify('a number is tel:+ and 2 to 15 digits (E.164)');
+  const nodes = settings.tn_nodes || [];
+  if (nodes.length) {
+    const bindings = [];
+    for (const n of nodes) {
+      try {
+        const r = await fetch(`${n.replace(/\/$/, '')}/dsip/v1/tn/${encodeURIComponent(tn)}`);
+        if (r.ok) for (const b of (await r.json()).bindings || []) if (!bindings.includes(b)) bindings.push(b);
+        log(`number ${tn}: ${r.ok ? `${bindings.length} binding(s)` : `${r.status}`} from ${n} (hints tier)`, 'N§6');
+      } catch (e) { log(`number ${tn}: ${n} did not answer (${e.message})`, 'N§6'); }
+    }
+    const sel = JSON.parse(tn_select(tn, JSON.stringify(bindings), JSON.stringify(documents), now(), JSON.stringify(settings.tn_policy || {})));
+    if (sel) {
+      log(`number ${tn} → ${sel.did}${sel.attested_by ? ` (attested by ${sel.attested_by})` : ''}${sel.others.length ? `; also claimed by ${sel.others.join(', ')}` : ''}`, 'N§6 · N§7');
+      return placeCall(sel.did, false);
+    }
+    log(`number ${tn}: no binding verifies`, 'N§6');
+  }
+  if (!settings.gateway) return notify(nodes.length ? `${tn} resolves to no identity, and no gateway is set in Settings` : 'calling a number needs number nodes or a gateway in Settings');
+  log(`number ${tn} → PSTN through gateway ${short(settings.gateway)}, as the invite's destination`, 'N§4.1');
+  return placeCall(settings.gateway, false, `tel:${tn}`);
 }
 
 async function accept(screening) {
@@ -420,12 +568,15 @@ async function sendIntroduction(to, purpose, token) {
 
 // ---------------------------------------------------------------- contacts
 
-async function addContact(name, did) {
+async function addContact(name, did, number = '') {
   did = did.trim();
   if (!/^did:(key|web):/.test(did)) return notify('a DID starts with did:key: or did:web:');
   if (did === identity.identity) return notify('that is you');
+  number = number.trim();
+  if (number && !/^\+[1-9][0-9]{1,14}$/.test(number)) return notify('a number is E.164: +15551234567');
   const existing = contacts.find((c) => c.did === did);
-  if (existing) existing.name = name || existing.name; else contacts.push({ name: name.trim(), did });
+  if (existing) { existing.name = name || existing.name; if (number && !(existing.numbers || []).includes(number)) existing.numbers = [...(existing.numbers || []), number]; }
+  else contacts.push({ name: name.trim(), did, numbers: number ? [number] : [] });
   await saveContacts();
 }
 
@@ -461,7 +612,8 @@ async function importFromText(text) {
  *  device list and revocations come along. Impl: every import makes a new device (a restore too): a key that was in
  *  a file is not known to be only here. */
 async function enrol(file) {
-  const fresh = JSON.parse(create_identity(file.controller_seed_hex, null, file.display_name || '', now()));
+  let fresh = JSON.parse(create_identity(file.controller_seed_hex, null, file.display_name || '', now()));
+  if (/^did:web:/.test(file.identity || '')) fresh = JSON.parse(rehome(JSON.stringify(fresh), file.identity, now()));   // §7.2: the file's did:web name, the same key
   const known = (file.devices || []).filter((d) => d.device !== fresh.device);
   if (file.device && !known.some((d) => d.device === file.device)) known.push({ device: file.device });
   known.push({ device: fresh.device, enrolled: Math.floor(now()) });
@@ -517,7 +669,7 @@ function connect() {
       if (revokedHere) notify('This device was revoked by your identity. If that was a mistake, enrol it again from the identity file (a new delegation).');
     },
     frame: (text) => engine.inbound(text),
-    closed: () => { if (!relay.closedByUs) renderRelay('disconnected, reconnecting…', 'bad'); },
+    closed: () => { if (!relay.closedByUs && !relay.rejected) renderRelay('disconnected, reconnecting…', 'bad'); },
     dropped: (f) => log(`✗ not connected: a ${JSON.parse(f).type || 'frame'} was not sent`),
   }, now);
   relay.connect();
@@ -529,6 +681,7 @@ async function startEngine() {
   engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required }, now);
   engine.loadContactsFile(await store.get(key('engine.contacts')));
   for (const r of revoked) engine.ep.hold_revocation(r.frame);   // §7.4: revocations this identity issued apply here too
+  for (const d of Object.values(documents)) engine.ep.add_document(JSON.stringify(d));   // §8.1: documents held
   engine.on = {
     send: (frame, meta) => {
       relay.send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}`, '§12.4');
@@ -552,6 +705,7 @@ async function startEngine() {
   identity = await store.get(key('identity'));
   devices = (await store.get(key('devices'))) || [];
   revoked = (await store.get(key('revoked'))) || [];
+  documents = (await store.get(key('documents'))) || {};
 
   const fresh = !identity;
   if (fresh) {
@@ -586,7 +740,13 @@ async function startEngine() {
   for (const b of document.querySelectorAll('nav button[data-view]')) b.onclick = () => { if (!call) show(b.dataset.view); else notify('finish the call first'); };
   $('btn-log-toggle').onclick = () => $('log-panel').classList.toggle('hidden');
   $('me-did').onclick = () => navigator.clipboard?.writeText(identity.identity).then(() => notify('your DID is on the clipboard'));
-  $('contact-add').onsubmit = async (e) => { e.preventDefault(); await addContact($('contact-name').value, $('contact-did').value); $('contact-name').value = ''; $('contact-did').value = ''; };
+  $('contact-add').onsubmit = async (e) => { e.preventDefault(); await addContact($('contact-name').value, $('contact-did').value, $('contact-number').value); $('contact-name').value = ''; $('contact-did').value = ''; $('contact-number').value = ''; };
+  $('call-number').onsubmit = (e) => { e.preventDefault(); callNumber($('call-tn').value); };
+  $('set-did-web-use').onclick = () => useDidWeb($('set-did-web').value);
+  $('btn-did-doc').onclick = downloadDidDocument;
+  $('set-binding-save').onclick = () => saveBinding($('set-binding').value);
+  $('set-numbers-save').onclick = saveNumbers;
+  $('btn-add-document').onclick = async () => { await addDocument($('set-document').value); $('set-document').value = ''; };
   $('introduce-form').onsubmit = (e) => { e.preventDefault(); sendIntroduction($('introduce-form').dataset.to, $('introduce-purpose').value.trim()); };
   $('introduce-cancel').onclick = () => $('introduce-form').classList.add('hidden');
   $('btn-contact-link').onclick = newContactLink;
@@ -632,6 +792,17 @@ async function startEngine() {
     devices: () => devices.map((d) => d.device),
     revoked: () => revoked.map((r) => r.device),
     relayText: () => $('relay-status').textContent,
+    addDocument,
+    didDocument: () => JSON.stringify(ownDocument()),
+    useDidWeb,
+    setBinding: saveBinding,
+    setNumbers: async ({ gateway, nodes, policy }) => { settings.gateway = gateway || undefined; settings.tn_nodes = nodes || []; settings.tn_policy = policy ? JSON.parse(policy) : undefined; await saveSettings(); renderSettings(); },
+    bindingStatus,
+    callNumber,
+    numberLine: () => $('call-number-line').textContent,
+    inNumbers: () => $('in-numbers').textContent,
+    inWarning: () => $('in-tn-warning').textContent,
+    downgrade: () => $('call-downgrade').textContent,
     contacts: () => contacts.map((c) => c.did),
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
     requests: () => engine.requests(),
