@@ -64,6 +64,7 @@ try {
   const row = bob.page.locator('#device-list li', { has: bob.page.locator(`code.did:text-is("${dev2}")`) });
   await row.locator('button:text-is("Revoke")').click();
   await until(bob.page, (d) => window.dsip.revoked().includes(d), dev2);
+  await until(bob.page, () => /delegation-revocation of/.test(document.getElementById('log').textContent));
   check('device 1: the revocation is signed by the identity key and sent to the relay', /delegation-revocation of .* \(lost\) to the relay/.test(await logOf(bob)));
   await until(bob2.page, () => /revoked/.test(window.dsip.relayText()), null, 30000);
   check('device 2: told it was revoked, stops reconnecting', /delegation no longer verifies/.test(await bob2.page.evaluate(() => window.dsip.relayText())) && /delegation-revoked/.test(await logOf(bob2)), await bob2.page.evaluate(() => window.dsip.relayText()));

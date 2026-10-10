@@ -483,13 +483,13 @@ async function revoke(device) {
   const frame = revocation_frame(JSON.stringify(identity), engine.newId(), device, reason, now());
   engine.ep.hold_revocation(frame);
   relay.send(frame);
+  log(`→ delegation-revocation of ${short(device)} (${reason}) to the relay; held here`, '§7.4');
+  notify(`device ${short(device)} revoked: the relay ends its binding and refuses its next hello`);
   revoked.push({ device, reason, at, frame });
   devices = devices.filter((d) => d.device !== device);
   await store.set(key('devices'), devices);
   await store.set(key('revoked'), revoked);
   renderDevices();
-  log(`→ delegation-revocation of ${short(device)} (${reason}) to the relay; held here`, '§7.4');
-  notify(`device ${short(device)} revoked: the relay ends its binding and refuses its next hello`);
 }
 
 async function saveSettings() { await store.set(key('settings'), settings); }
