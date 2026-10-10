@@ -1,7 +1,7 @@
 # DSIP Client Plan — a reference client a person can use (M7)
 
-**Status:** plan, 2026-10-09. Written after v0.11 froze at `poc-v0.11` (1,924 vectors) and v0.12 opened. Decided with
-the user: build it, as a reference client, not a product.
+**Status:** plan, 2026-10-09; stage 1 landed 2026-10-10 (`impl/web/`, the headless call test in CI). Written after v0.11
+froze at `poc-v0.11` (1,924 vectors) and v0.12 opened. Decided with the user: build it, as a reference client, not a product.
 
 **Spec:** none (infrastructure). The client is a host of the pure crates, like `dsip-cli` and the daemons; every
 normative decision it renders is one the vectors already pin.

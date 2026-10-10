@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build -q -p dsip-cli -p dsip-relay
-[ -f demos/browser/pkg/dsip_wasm.js ] || demos/browser/build.sh
+[ -f web/pkg/dsip_wasm.js ] || web/build.sh
 B=target/debug; D=${DEMO_DIR:-/tmp/dsip-browser-forge}; rm -rf "$D"; mkdir -p "$D"
 LISTEN=${LISTEN:-127.0.0.1:8443}
 HOLD=${HOLD:-40}   # seconds the native endpoint stays up for you to place the call
@@ -32,7 +32,7 @@ else
 fi
 
 # ---- relay (serves the page over the same TLS port it speaks wss on) ---------
-$B/dsip-relay --listen "$LISTEN" --state "$D/relay" --www demos/browser >"$D/relay.log" 2>&1 & RELAY=$!
+$B/dsip-relay --listen "$LISTEN" --state "$D/relay" --www web >"$D/relay.log" 2>&1 & RELAY=$!
 trap 'kill $RELAY ${BOBPID:-} 2>/dev/null || true' EXIT
 for i in $(seq 1 40); do grep -q 'listening on' "$D/relay.log" && break; sleep 0.25; done
 CA="$D/relay/cert.pem"

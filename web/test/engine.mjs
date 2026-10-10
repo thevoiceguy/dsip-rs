@@ -1,9 +1,9 @@
 // Node smoke test for the WASM endpoint: two endpoints exchange frames in memory (no relay),
-// exercising verify → engine → build inside dsip_wasm. Run: node demos/browser/test.mjs
+// exercising verify → engine → build inside dsip_wasm. Run: node web/test/engine.mjs
 import { readFile } from 'node:fs/promises';
-import init, { create_identity, Endpoint, verify_frame } from './pkg/dsip_wasm.js';
+import init, { create_identity, Endpoint, verify_frame } from '../pkg/dsip_wasm.js';
 
-await init({ module_or_path: await readFile(new URL('./pkg/dsip_wasm_bg.wasm', import.meta.url)) });
+await init({ module_or_path: await readFile(new URL('../pkg/dsip_wasm_bg.wasm', import.meta.url)) });
 const now = () => Date.now() / 1000;
 let failures = 0;
 const check = (name, ok, extra = '') => { console.log(`[${ok ? 'PASS' : 'FAIL'}] ${name} ${extra}`); if (!ok) failures++; };
