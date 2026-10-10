@@ -52,8 +52,9 @@ try {
   await bob.page.click('#btn-screen');
   await until(alice.page, () => window.dsip.state() === 'ACTIVE');
   await until(bob.page, () => window.dsip.state() === 'ACTIVE');
-  await until(alice.page, () => /screening/.test(window.dsip.note()));
+  await until(alice.page, () => /screening/.test(window.dsip.mode()));
   check('Alice: told the call was answered in screening mode (§14.4)', true);
+  check('Bob: his screen says nothing of his is sent', /screening/.test(await bob.page.evaluate(() => window.dsip.mode())));
   check('Bob: can answer for real', await bob.page.isVisible('#btn-escalate'));
   await bob.page.click('#btn-escalate');
   await until(alice.page, () => document.getElementById('btn-answer-update').offsetParent !== null);
@@ -61,6 +62,7 @@ try {
   await alice.page.click('#btn-answer-update');
   await until(bob.page, () => /media apply_update/.test(document.getElementById('log').textContent));
   check('Bob: the escalation is applied', true);
+  check('both sides: screening mode is cleared', (await alice.page.evaluate(() => window.dsip.mode())) === '' && (await bob.page.evaluate(() => window.dsip.mode())) === '');
   await alice.page.click('#btn-hangup');
   await until(bob.page, () => window.dsip.state() === null);
   await until(alice.page, () => window.dsip.state() === null);

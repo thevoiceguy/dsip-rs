@@ -202,7 +202,7 @@ async function onReceived(r) {
     for (const id of ['call-downgrade', 'in-downgrade']) { $(id).textContent = text; $(id).classList.remove('hidden'); }
     log(text, 'G§7');
   }
-  if (m.type === 'update') { call.offer = p; call.pendingUpdate = m.id; }
+  if (m.type === 'update') { call.offer = p; call.pendingUpdate = m.id; if (p.answered_by === 'user') $('call-mode').textContent = ''; }   // §14.4 step 3: the screener answered for real
   if (m.type === 'info' && p.about === 'transport:webrtc' && p.data?.candidates && call.media) {
     for (const c of p.data.candidates) await call.media.addRemoteCandidate(c);
   }
@@ -222,7 +222,7 @@ async function onEmission(e) {
       update_rejected: '§12.8', introduction_received: '§19.4', granted: '§19.4', introduction_rejected: '§19.4' }[e.ui] || '§12';
     log(`◆ ${e.ui} ${fields}`, sec);
     if (e.ui === 'progress') $('call-note').textContent = e.status === 'ringing' ? 'ringing at the other end' : e.status || '';
-    if (e.ui === 'answered') { $('call-note').textContent = e.answered_by === 'screening' ? 'answered in screening mode: they hear you, you do not hear them (§14.4)' : ''; }
+    if (e.ui === 'answered') $('call-mode').textContent = e.answered_by === 'screening' ? 'answered in screening mode: they hear you, you do not hear them (§14.4)' : '';
     if (e.ui === 'missed_call') notify(`Missed call from ${nameOf(call?.peer) || short(call?.peer)}`);
     if (e.ui === 'ended') {
       const peer = call?.peer;
@@ -269,7 +269,7 @@ async function placeCall(to, video) {
   $('call-peer-name').textContent = nameOf(to) || '';
   $('call-peer-did').textContent = to;
   $('call-basis').textContent = verification_basis(to, '[]');
-  $('call-note').textContent = '';
+  $('call-note').textContent = ''; $('call-mode').textContent = '';
   $('call-downgrade').classList.add('hidden');
   $('btn-introduce-after').classList.add('hidden');
   show('call');
@@ -292,7 +292,8 @@ async function accept(screening) {
   $('call-peer-name').textContent = nameOf(call.peer) || '';
   $('call-peer-did').textContent = call.peer;
   $('call-basis').textContent = $('in-basis').textContent;
-  $('call-note').textContent = screening ? 'screening: nothing of yours is sent (§14.4)' : '';
+  $('call-note').textContent = '';
+  $('call-mode').textContent = screening ? 'screening: nothing of yours is sent (§14.4)' : '';
   $('btn-introduce-after').classList.add('hidden');
   show('call');
   try {
@@ -333,7 +334,7 @@ async function sendUpdate(escalate) {
   engine.setVideoCodecsFromSdp(sdp);
   engine.setSdp(sdp);
   const ev = { local: 'update', session: call.sid, id: engine.newId() };
-  if (escalate) { ev.answered_by = 'user'; call.screening = false; }   // §14.4 step 3
+  if (escalate) { ev.answered_by = 'user'; call.screening = false; $('call-mode').textContent = ''; }   // §14.4 step 3
   await engine.local(ev);
   renderCall();
 }
@@ -550,5 +551,6 @@ async function startEngine() {
     requests: () => engine.requests(),
     links: () => links.map((l) => l.url),
     note: () => $('call-note').textContent,
+    mode: () => $('call-mode').textContent,
   };
 })();
