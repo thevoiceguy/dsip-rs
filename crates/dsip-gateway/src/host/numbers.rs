@@ -26,6 +26,8 @@ pub struct Numbers {
     pub nodes: Vec<String>,
     /// Resolved DID documents, by DID (for N§3.4 steps 6–7).
     pub documents: Map<String, Value>,
+    /// One HTTP client for every lookup.
+    http: reqwest::Client,
 }
 
 impl Numbers {
@@ -59,7 +61,8 @@ impl Numbers {
                 }
             }
         }
-        Ok(Numbers { policy, gateway, configured: Value::Object(configured), nodes, documents: docs })
+        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build()?;
+        Ok(Numbers { policy, gateway, configured: Value::Object(configured), nodes, documents: docs, http })
     }
 
     /// The facts behind the G§5 claim for an inbound INVITE: its `Identity` header verified (N§4.1, RFC 8224 §6.2).
@@ -72,22 +75,22 @@ impl Numbers {
         if let Some(did) = self.configured.get(to_tn).and_then(Value::as_str) {
             return Route::Configured(did.to_string());
         }
-        let mut bindings: Vec<Value> = vec![];
-        if !self.nodes.is_empty() {
-            if let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
-                for n in &self.nodes {
-                    let url = format!("{}/dsip/v1/tn/{}", n.trim_end_matches('/'), to_tn.replace('+', "%2B"));
-                    if let Ok(r) = http.get(&url).send().await.and_then(|r| r.error_for_status()) {
-                        let v: Value = r.json().await.unwrap_or_default();
-                        for b in v["bindings"].as_array().cloned().unwrap_or_default() {
-                            if !bindings.contains(&b) {
-                                bindings.push(b);
-                            }
-                        }
+        // every node at once, each bounded by the client's timeout, so a dead node costs one wait, not one per node
+        let asks = self.nodes.iter().map(|n| {
+            let url = format!("{}/dsip/v1/tn/{}", n.trim_end_matches('/'), to_tn.replace('+', "%2B"));
+            let http = self.http.clone();
+            async move {
+                match http.get(&url).send().await {
+                    Ok(r) => {
+                        let status = r.status().as_u16();
+                        serde_json::json!({"authority": n, "status": status, "body": r.json::<Value>().await.unwrap_or(Value::Null)})
                     }
+                    Err(_) => serde_json::json!({"authority": n, "status": null, "body": null}),
                 }
             }
-        }
+        });
+        let answers: Vec<Value> = futures::future::join_all(asks).await;
+        let bindings = dsip_number::pool_answers(&answers); // the README's contribution rule: 200, an object, an array
         dsip_number::route(to_tn, &self.configured, &bindings, &self.documents, now, &self.policy)
     }
 

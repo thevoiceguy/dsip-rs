@@ -264,7 +264,9 @@ impl MediaTable {
             let Some(remote) = m.sip_remote.clone().or_else(|| call.remote_rtp_handle()) else { continue };
             let key = key.clone();
             drop(guard);
-            let (Some(rtp_in), Ok(sender)) = (m.rtp_in.take(), m.pc.sender()) else { continue };
+            // the sender first: taking `rtp_in` before a sender exists would lose it for every later tick
+            let Ok(sender) = m.pc.sender() else { continue };
+            let Some(rtp_in) = m.rtp_in.take() else { continue };
             rtp.set_remote(remote.addr).await;
             let pcma = remote.payload_types.first() == Some(&8);
             let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
@@ -277,10 +279,14 @@ impl MediaTable {
         }
     }
 
-    /// Close the media of sessions whose call has ended.
+    /// Close the media of sessions whose call has ended, and drop the ended calls from the table.
     async fn drop_ended(&mut self, calls: &Arc<Mutex<Calls>>) {
-        let guard = calls.lock().await;
+        let mut guard = calls.lock().await;
         let live: std::collections::HashSet<String> = guard.0.values().filter(|c| !c.ended()).filter_map(|c| c.dsip_session.clone()).collect();
+        let ended: Vec<String> = guard.0.iter().filter(|(_, c)| c.ended()).map(|(k, _)| k.clone()).collect();
+        for k in ended {
+            guard.0.remove(&k);
+        }
         drop(guard);
         let gone: Vec<String> = self.0.keys().filter(|k| !live.contains(*k)).cloned().collect();
         for k in gone {
@@ -345,7 +351,7 @@ async fn inbound_invite(
         Ok(m) => match m.pc.offer().await {
             Ok(offer) => {
                 m.pump();
-                agent.set_sdp(Some(offer));
+                call.offer_sdp = Some(offer); // set on the agent right before place_call (one pending slot)
             }
             Err(e) => tracing::warn!("media offer: {e}"),
         },
@@ -413,6 +419,9 @@ async fn dsip_event(
         "reject" => json!({"dsip": {"type": "reject", "reason": message.reason}}),
         "cancel" => json!({"dsip": {"type": "cancel"}}),
         "bye" => json!({"dsip": {"type": "bye", "reason": message.reason}}),
+        // G§9: DTMF from the DSIP caller crosses as a signed info about media:dtmf (the transport:webrtc infos were
+        // handled above); the controller refuses any other `about`
+        "info" => json!({"dsip": {"type": "info", "about": payload["about"], "data": payload["data"]}}),
         "error" => {
             println!("← error    from {identity}: {} {}   (in reply to {})", message.reason.clone().unwrap_or_default(),
                      payload.get("detail").map(|d| d.to_string()).unwrap_or_default(), message.in_reply_to.clone().unwrap_or_default());
@@ -440,7 +449,9 @@ async fn outbound_invite(
 ) -> Result<()> {
     let destination = payload.get("destination").and_then(Value::as_str).unwrap_or("");
     println!("← invite   from {caller}  destination {}  session …{}", if destination.is_empty() { "(none)" } else { destination }, &sid[sid.len().saturating_sub(8)..]);
-    let (Some(to_tn), Some(trunk)) = (destination.strip_prefix("tel:").and_then(e164), trunk) else {
+    // the destination is a tel: E.164 URI (spec-gap 111): a local number without its `+` is not dialled under a guessed
+    // country code, it is declined
+    let (Some(to_tn), Some(trunk)) = (destination.strip_prefix("tel:").filter(|d| d.starts_with('+')).and_then(e164), trunk) else {
         println!("reject    no PSTN destination (or no --sip-peer trunk): identity.unknown   N§4.1, spec-gap 111");
         return agent.local(dsip_session::LocalEvent::Decline { session: sid.to_string(), reason: Some("identity.unknown".into()) }).await;
     };
@@ -465,12 +476,13 @@ async fn outbound_invite(
         println!("→ error    gateway.downgraded {}   G§7", detail["losses"]);
     }
     // the caller's SDP offer (§16.3): answer it with a peer connection of our own, the SDP riding in our answer
+    let mut answer_sdp: Option<String> = None;
     if let Some(offer) = payload.pointer("/transports/0/sdp").and_then(Value::as_str) {
         match media.open(sid).await {
             Ok(m) => match m.pc.answer(offer).await {
                 Ok(answer) => {
                     m.pump();
-                    agent.set_sdp(Some(answer));
+                    answer_sdp = Some(answer);
                     println!("media     WebRTC answer prepared for the caller's offer   §16.3");
                 }
                 Err(e) => tracing::warn!("media answer: {e}"),
@@ -481,6 +493,7 @@ async fn outbound_invite(
     let rtp = RtpLeg::bind(local_ip, 0, rand_ssrc(sid)).await?;
     let mut call = Call::outbound(format!("sip:{to_tn}@{trunk}"), rtp);
     call.dsip_session = Some(sid.to_string());
+    call.answer_sdp = answer_sdp; // set on the agent right before accept (one pending slot, §16.3)
     call.from_tn = a.from.clone();
     call.identity_header = a.passport.as_ref().map(|p| p.identity_header());
     let emits = call.step(&json!({"dsip": {"type": "invite"}}));

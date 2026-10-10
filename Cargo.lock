@@ -1366,6 +1366,7 @@ dependencies = [
  "forge-codecs",
  "forge-rtp 0.2.1",
  "forge-webrtc 0.3.0",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
