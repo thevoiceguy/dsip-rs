@@ -1,0 +1,15 @@
+{
+  "name": "dsip-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "DSIP reference client (browser): a host of the dsip-wasm engine",
+  "type": "module",
+  "scripts": {
+    "build": "./build.sh",
+    "test:engine": "node test/engine.mjs",
+    "test:call": "node test/call.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.47.2"
+  }
+}
