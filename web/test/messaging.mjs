@@ -18,6 +18,8 @@ let alice, bob;
 const mailboxBound = (p, did) => until(p.page, (d) => window.dsip.mailbox() === d, did, 20000);
 const personalUp = (p) => until(p.page, () => /◇ personal /.test(document.getElementById('log').textContent), null, 20000);
 const convWith = (p, did) => p.page.evaluate((d) => window.dsip.conversations().find((c) => c.kind === 'direct' && c.peer === d) || null, did);
+/** A service log line may land a moment after the browser saw the effect: poll the file for it. */
+const fileHas = async (path, re) => { for (let i = 0; i < 50; i++) { if (re.test(readFileSync(path, 'utf8'))) return true; await sleep(200); } return false; };
 const texts = (p, gid) => p.page.evaluate((g) => window.dsip.thread(g).map((m) => [m.mine ? 'me' : 'them', m.object.text, m.seq]), gid);
 try {
   // 1. Alice on operator A: the served mailbox is bound, this identity enrolled there, the personal group created
@@ -26,7 +28,7 @@ try {
   check('Alice: bound to the operator default mailbox (config.json)', true);
   await personalUp(alice);
   check('Alice: personal group created at her mailbox (hub accepted its GroupInfo)', !!(await alice.page.evaluate(() => window.dsip.personalGroup())));
-  check('Alice: the mailbox enrolled her identity (spec-gap 115)', new RegExp(`enrolled ${alice.did}`).test(readFileSync(`${FIXTURE}/mbx-a.log`, 'utf8')));
+  check('Alice: the mailbox enrolled her identity (spec-gap 115)', await fileHas(`${FIXTURE}/mbx-a.log`, new RegExp(`enrolled ${alice.did}`)));
   await until(alice.page, () => /hint published → .*\+ mailbox .*accepted/.test(document.getElementById('log').textContent));
   check('Alice: her hint names the mailbox beside the relay (M§4.2)', true);
   check('Alice: KeyPackages uploaded (M§5.5)', /◇ key_packages_uploaded/.test(await logOf(alice)));
@@ -36,10 +38,10 @@ try {
   await bob.page.evaluate(async ({ relay, uri, did }) => { await window.dsip.setMailbox({ uri, did }); await window.dsip.setNetwork({ relay }); }, { relay: RELAY_B, uri: MAILBOX_B, did: MAILBOX_B_DID });
   await ready(bob.page);
   await mailboxBound(bob, MAILBOX_B_DID);
-  await personalUp(bob);
+  // his personal group was made at whichever mailbox bound him first (A, or B when the move came first): not moved here
   await until(bob.page, (r) => new RegExp(`hint published → .*: ${r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\+ mailbox .*accepted`).test(document.getElementById('log').textContent), RELAY_B);
   check('Bob: on relay B with mailbox B, hint published naming both', true);
-  check('Bob: mailbox B enrolled him', new RegExp(`enrolled ${bob.did}`).test(readFileSync(`${FIXTURE}/mbx-b.log`, 'utf8')));
+  check('Bob: mailbox B enrolled him', await fileHas(`${FIXTURE}/mbx-b.log`, new RegExp(`enrolled ${bob.did}`)));
 
   // 3. First contact across operators (§19.4): Alice's introduction goes through relay B, which Bob's hint names, on a
   //    connection kept for his answer; his grant carries dsip.message beside dsip.invite (M§14.2)
@@ -68,7 +70,7 @@ try {
   check('Alice: the conversation has both identities and is hubbed at her mailbox', conv.members.length === 2 && conv.hub.did === MAILBOX_A_DID, JSON.stringify(conv));
   await until(bob.page, (did) => window.dsip.conversations().some((c) => c.kind === 'direct' && c.peer === did), alice.did, 30000);
   check('Bob: joined from the welcome his mailbox received (M§6.6, M§6.7)', /◇ joined .*kind=direct/.test(await logOf(bob)));
-  check('mailbox A found Bob\'s mailbox through his hint (M§4.2, hub fan-out)', /hint for .*DSIPMailbox endpoint/.test(readFileSync(`${FIXTURE}/mbx-a.log`, 'utf8')));
+  check('mailbox A found Bob\'s mailbox through his hint (M§4.2, hub fan-out)', await fileHas(`${FIXTURE}/mbx-a.log`, /hint for .*DSIPMailbox endpoint/));
 
   // 5. Text both ways; delivered receipts
   await alice.page.evaluate((gid) => window.dsip.openConversation(gid), conv.group);

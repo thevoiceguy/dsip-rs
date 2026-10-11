@@ -905,7 +905,13 @@ function heldGrantFrames() {
 
 /** Start (or restart) the messaging device: a `Messenger` on this identity's mailbox (M§4.2), bound with our hello
  *  (M§4.3); its state is restored from storage and saved after every step (spec-gap 44). */
-async function startMessaging() {
+let messagingStart = null;   // a restart asked for twice in quick succession (relay and mailbox settings) starts once
+function startMessaging() {
+  clearTimeout(messagingStart);
+  messagingStart = setTimeout(() => { messagingStart = null; startMessagingNow().catch((e) => log(`messaging: ${e.message || e}`, 'M§4')); }, 50);
+}
+
+async function startMessagingNow() {
   mailboxConn?.close(); mailboxConn = null; mailboxInfo = null; messenger = null;
   const mb = mailboxOf();
   renderMessages();
