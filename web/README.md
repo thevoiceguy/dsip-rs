@@ -36,6 +36,20 @@ identity is said out loud (N§5, `identity_change`). A bound number needs a `did
 (N§3.3): Settings rehomes the identity to a `did:web` name (the same keys, §7.2) and gives the document to host. DID
 documents of `did:web` peers are held in Settings as the CLI holds `--did-document`; the browser does not fetch them.
 
+**Stage 5:** deployment. The relay serves the client under a real certificate (`--cert`/`--key`, Let's Encrypt on
+the WAN testbed) and, beside it, what a deployed client needs from its origin and nothing in the protocol carries
+(spec-gap 114): the operator's defaults as `config.json` (`--client-config`: nodes, gateway, policy, ICE), short-lived
+TURN credentials minted at `/turn` from the secret coturn holds (`--turn-uri`, `--turn-secret-file`; TURN REST API
+credentials, fetched again at half-life), and the co-located `dsip-node` proxied at `/dsip/v1/` (`--node-proxy`), so a
+page served over `https` reaches a node that speaks plain HTTP on the loopback. Settings → Network shows what is in
+effect and where each value came from; `none` overrides an operator default. The client publishes its reachability
+on the nodes (a signed, expiring hint naming its relay, DHT Hints Profile §10, re-signed at ⅔ of its life and on every
+bind) and looks a callee up before the invite (§8.1): the frames the nodes return go through the same §8.3 selection a
+node applies (`hint_select`, the DHT crate's `record` module compiled to wasm), and a callee whose hint names another
+relay is called through that relay on a connection opened for the call, labelled hint-sourced on the call screen. The
+media path in use (candidate types, TURN or direct) is shown once connected. Runbook below; the WAN record in
+`impl/docs/dht-findings.md` ("The browser client on the WAN").
+
 ## Run it locally
 
 ```bash
@@ -50,7 +64,58 @@ the `wss://` signaling. The browser needs a secure context (`https://` or `local
 and WebCrypto, and refuses wasm from `file://`.
 
 The app is static files: any origin can serve it, and Settings → Network points it at any relay. Only the relay must
-be reachable by both ends. Hosting (a public relay with a real certificate, TURN, a `did:web` host) is stage 5.
+be reachable by both ends. Hosting is the runbook below.
+
+## Runbook: hosting it (stage 5)
+
+What the WAN testbed runs (`impl/tools/wan/README.md`), as an operator would set it up. Everything below is
+`impl/tools/wan/node-setup.sh` with its stage 5 variables; the units it writes are the reference.
+
+1. **A name and a certificate.** The relay's `wss://` and the page share one origin, so one certificate covers both
+   (§13.2: validated against the advertised hostname). Any name that resolves to the host works; a Linode's reverse
+   DNS name (`<ip-dashed>.ip.linodeusercontent.com`) is on the public suffix list, so Let's Encrypt issues for it
+   without a domain of your own:
+   ```bash
+   apt install certbot
+   certbot certonly --standalone -d <name>          # port 80 open for the HTTP-01 challenge; nothing listens between renewals
+   ```
+   `node-setup.sh` installs a deploy hook that restarts the relay when the certificate renews.
+2. **TURN.** A call across two NATs needs it (`impl/docs/dht-findings.md`, Run 3: symmetric NAT fails without). coturn
+   with `use-auth-secret` and a `static-auth-secret` (`ROLE=turn`, the secret in `/var/lib/dsip/turn.secret`; the relay
+   ports 49160–49200/udp open). Copy the secret file to every relay host: the relay mints credentials from it, valid
+   `--turn-ttl` seconds, for whoever loads the page. coturn allows one credential mechanism at a time, so the CLI
+   mints its own with `dsipctl turn-cred`.
+3. **The client and the relay.** Build the wasm (`web/build.sh`) and copy `index.html`, `style.css`, `app.js`,
+   `host/` and `pkg/` to the host (5.0 MB, 1 MB compressed). Write the operator's defaults, served as `config.json`:
+   ```json
+   {"nodes": ["https://<this relay>:8443", "https://<another relay>:8443"], "publish_hint": true}
+   ```
+   (`gateway`, `tn_policy`, `ice` and `relay` are the other keys; a person's own Settings override every one.) Then:
+   ```bash
+   ROLE=relay PREBUILT=<dir with the binaries> RELAY_HOST=<name> \
+     RELAY_CERT=/etc/letsencrypt/live/<name>/fullchain.pem RELAY_KEY=/etc/letsencrypt/live/<name>/privkey.pem \
+     RELAY_WWW=/var/lib/dsip/www TURN_URI=turn:<turn host>:3478 ./node-setup.sh
+   ```
+   which runs `dsip-relay --cert --key --www --client-config /var/lib/dsip/client.json --turn-uri --turn-secret-file
+   --node-proxy 127.0.0.1:8090`. The relay is open (§13.6) with the §19.4 introduction limits at their defaults and
+   24 h retention; `--serve` makes it private.
+4. **A hints node** beside it (`dsip-node`, its own README): the relay forwards `/dsip/v1/*` to it, so the page's
+   lookups and publishes stay on the page's origin. Nodes find each other over the overlay; a client needs only one or
+   two in `config.json`. They are a hints tier: a client verifies every record it gets back, and nothing a node says is
+   authority (§8.1).
+5. **Check it:**
+   ```bash
+   curl https://<name>:8443/config.json      # the defaults
+   curl https://<name>:8443/turn             # {"iceServers":[{"urls":[…],"username":"<expiry>:dsip","credential":"…"}],"ttl":3600}
+   curl https://<name>:8443/dsip/v1/node     # the node through the relay
+   ```
+   then open the page in two browsers on two networks: each publishes its hint on bind (the log says where and whether
+   the node accepted it), and a call to the other's DID says on the call screen which relay it went through and, once
+   connected, which media path (host, srflx or relay candidates) carries it.
+
+What the operator can and cannot see: the relay routes signed envelopes it cannot alter and media it never carries;
+it sees who talks to whom and when, as any relay does (§20). The node sees who publishes a hint and who looks one up.
+TURN sees the media's endpoints, not its content (DTLS-SRTP). A public relay logs counts, not content.
 
 ## Layout
 
@@ -68,8 +133,11 @@ test/call.mjs           stage 1: two headless browsers call each other through a
 test/first-contact.mjs  stage 2: refusal until introduced, requests, grants, screening + escalation, contact link, ignore
 test/devices.mjs        stage 3: one identity on two browsers (enrolled from the file), forked ringing, answered elsewhere, revocation
 test/gateway.mjs        stage 4: the two-gateway demo with browsers: attested crossing, downgrade, no route, N§4 claim, N§5 warning
-test/run.sh             makes the gateway fixture, starts a relay (serving the client) on 127.0.0.1:8443, a dsip-node and
-                        two gateways, and runs the Playwright tests in the browser(s) named
+test/deploy.mjs         stage 5: config.json in effect, minted TURN credentials verified, hints published and looked up, a
+                        call through the relay the callee's hint names (both ways), none without a hint, a reload
+test/run.sh             makes the gateway fixture, starts relay A (serving the client, with config.json, /turn and the node
+                        proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node and two gateways, and runs the Playwright
+                        tests in the browser(s) named
 ```
 
 ## Tests
@@ -97,8 +165,13 @@ delegate certificate) and gateway B (PASSporT verified, routed by Bob's publishe
 with the verified attestation and audio crosses both gateways both ways; Mallory, without a binding, crosses
 downgraded and Bob sees no attestation; a number nobody published is refused `identity.unknown`; on a direct call Bob
 sees Alice's own number attested (N§4) and her basis unchanged; Carol presents Carrier B's binding of the same number
-and Bob, who stored Alice with it, is warned (N§5); a did:web name whose document nobody serves cannot bind. CI runs
-all four in Firefox and Chromium.
+and Bob, who stored Alice with it, is warned (N§5); a did:web name whose document nobody serves cannot bind.
+`deploy.mjs`: the operator's `config.json` is in effect and Settings says so, `/turn` mints credentials that verify
+under the secret and the client uses them, Bob on relay B publishes a hint the node holds, Alice's lookup verifies it
+and her call goes through relay B on a connection for the call (both ACTIVE, media both ways, the media path
+reported, the connection closed after), Bob calls her back through relay A the same way, a DID with no hint is called
+through our own relay, and a reload keeps Bob's relay and re-publishes his hint. CI runs all five in Firefox and
+Chromium.
 
 ## Identity
 

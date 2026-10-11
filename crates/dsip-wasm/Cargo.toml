@@ -16,6 +16,7 @@ dsip-schema.workspace = true
 dsip-session.workspace = true
 dsip-endpoint = { workspace = true, features = ["wasm"] }
 dsip-number.workspace = true
+dsip-dht = { workspace = true, default-features = false }
 serde_json.workspace = true
 wasm-bindgen.workspace = true
 js-sys.workspace = true

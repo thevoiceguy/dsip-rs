@@ -3,7 +3,8 @@
 # it, and the gateway fixture (the two-gateway demo's setup: did:web identities, the test number authority, a
 # dsip-node, two gateways over a SIP trunk) stands behind it for the stage 4 test.
 # Usage: web/test/run.sh [firefox|chromium|all]   (default: firefox; CI runs both). Needs `npm ci` in web/ and
-# `npx playwright install [--with-deps] <browser>`. TESTS="devices gateway" runs a subset.
+# `npx playwright install [--with-deps] <browser>`. TESTS="devices gateway" runs a subset. Stage 5 adds a second relay
+# and the deployment routes on the first (config.json, /turn, the node proxied at /dsip/v1/).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 BROWSERS=${1:-firefox}
@@ -29,13 +30,21 @@ python3 demos/tn_issuer.py bind A +15552000001 $BOB "$D/bob.jws"
 python3 demos/tn_issuer.py bind B +15551234567 $CAROL "$D/carol.jws"      # the number, ported to another identity (N§5)
 DOCS=(); for n in alice bob carol gw-a gw-b; do DOCS+=(--did-document "$D/$n/did.json"); done
 
-# --- the relay (serving the client), a dsip-node holding Bob's binding, the two gateways
-$B/dsip-relay --listen "$LISTEN" --state "$D/relay" --www web "${DOCS[@]}" >"$D/relay.log" 2>&1 & RELAY=$!
+# --- relay A (serving the client, with the stage 5 deployment routes: the operator's config.json, TURN credentials
+# minted at /turn, the dsip-node proxied at /dsip/v1/), relay B (another operator: calls between the two go through
+# the hints the nodes hold), the dsip-node (an overlay of one, holding hints and Bob's binding), the two gateways
 NPORT=${NODE_PORT:-8099}; NODE=http://127.0.0.1:$NPORT
-$B/dsip-node --http 127.0.0.1:$NPORT --tn-policy "$D/policy.json" >"$D/node.log" 2>&1 & NODEP=$!
-trap 'kill $RELAY $NODEP ${GWAP:-} ${GWBP:-} 2>/dev/null || true' EXIT
-for i in $(seq 1 80); do grep -q 'listening on' "$D/relay.log" && [ -s "$D/relay/cert.pem" ] && grep -q "^http:" "$D/node.log" && break; sleep 0.25; done
+LISTEN_B=${LISTEN_B:-127.0.0.1:8444}
+TURN_SECRET=${TURN_SECRET:-$(openssl rand -hex 16)}
+printf '{"nodes": ["https://%s"], "publish_hint": true}\n' "$LISTEN" > "$D/client.json"
+$B/dsip-relay --listen "$LISTEN" --state "$D/relay" --www web "${DOCS[@]}" --client-config "$D/client.json" \
+  --turn-uri turn:127.0.0.1:3478 --turn-secret "$TURN_SECRET" --turn-ttl 600 --node-proxy 127.0.0.1:$NPORT >"$D/relay.log" 2>&1 & RELAY=$!
+$B/dsip-relay --listen "$LISTEN_B" --state "$D/relay-b" "${DOCS[@]}" >"$D/relay-b.log" 2>&1 & RELAYB=$!
+$B/dsip-node --http 127.0.0.1:$NPORT --overlay-listen /ip4/127.0.0.1/tcp/${OVERLAY_PORT:-4699} --tn-policy "$D/policy.json" >"$D/node.log" 2>&1 & NODEP=$!
+trap 'kill $RELAY $RELAYB $NODEP ${GWAP:-} ${GWBP:-} 2>/dev/null || true' EXIT
+for i in $(seq 1 80); do grep -q 'listening on' "$D/relay.log" && [ -s "$D/relay/cert.pem" ] && grep -q 'listening on' "$D/relay-b.log" && grep -q "^http:" "$D/node.log" && break; sleep 0.25; done
 grep -q 'listening on' "$D/relay.log" || { echo "relay did not start"; cat "$D/relay.log"; exit 1; }
+grep -q 'listening on' "$D/relay-b.log" || { echo "relay B did not start"; cat "$D/relay-b.log"; exit 1; }
 grep -q "^http:" "$D/node.log" || { echo "dsip-node did not start"; cat "$D/node.log"; exit 1; }
 CA="$D/relay/cert.pem"
 $B/dsip tn-publish --binding "$D/bob.jws" --node $NODE >/dev/null
@@ -52,8 +61,8 @@ grep -q "DSIP leg" "$D/gw-a.log" && grep -q "DSIP leg" "$D/gw-b.log" || { echo "
 rc=0
 for b in $(echo "$BROWSERS" | sed 's/all/firefox chromium/; s/,/ /g'); do
   echo "== $b"
-  for t in ${TESTS:-call first-contact devices gateway}; do
-    (cd web && BROWSER=$b URL="https://$LISTEN/" FIXTURE="$D" node test/$t.mjs) || rc=1
+  for t in ${TESTS:-call first-contact devices gateway deploy}; do
+    (cd web && BROWSER=$b URL="https://$LISTEN/" RELAY_B="wss://$LISTEN_B/dsip" TURN_SECRET="$TURN_SECRET" FIXTURE="$D" node test/$t.mjs) || rc=1
   done
 done
 exit $rc

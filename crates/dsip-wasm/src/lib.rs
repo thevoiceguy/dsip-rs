@@ -201,6 +201,45 @@ pub fn tn_select(tn: &str, bindings_json: &str, documents_json: &str, now: f64, 
     }
 }
 
+/// A signed reachability hint for this identity at `relay_uri` (DHT Hints Profile §2; §8.3: `seq` is the
+/// publisher's, newer wins): the frame to `POST /dsip/v1/hints` on a node (§10). Signed by the device under its
+/// delegation, as the CLI's `--publish-hint` signs; `ttl_s` is clamped to the profile's maximum (§12.9, spec-gap 96).
+#[wasm_bindgen]
+pub fn hint_frame(identity_json: &str, id: &str, relay_uri: &str, ttl_s: f64, seq: f64, now: f64) -> Result<String, JsValue> {
+    let id_v: Value = serde_json::from_str(identity_json).map_err(js)?;
+    let device = KeyPair::from_seed(unhex(id_v["device_seed_hex"].as_str().unwrap_or(""))?);
+    let delegation = Envelope::from_frame(id_v["delegation"].as_str().unwrap_or("")).map_err(|v| JsValue::from_str(&format!("{:?}", v.code)))?;
+    let subject = id_v["identity"].as_str().unwrap_or("");
+    let ttl = (ttl_s as i64).clamp(3, dsip_core::HINT_MAX_VALIDITY_S);
+    let endpoints = [dsip_dht::record::Endpoint { uri: relay_uri.to_string(), bindings: vec!["ws/1.0".into()] }];
+    let payload = dsip_dht::record::hint_payload_with_id(subject, subject, &endpoints, seq as i64, now as i64, ttl, id);
+    Ok(dsip_dht::record::sign_hint(&payload, &device, vec![delegation]).frame())
+}
+
+/// Fold the hint frames a node (or several) returned for `did` down to the winner (§8.3: verified against the
+/// subject DID or its delegation, unexpired, highest `seq`), with every candidate's verdict. `documents_json` is
+/// `{did: document}` for `did:web` subjects. Returns `{"hint": {uri, bindings, seq, issued_at, expires_at, signer} |
+/// null, "report": [[verdict], …]}`. What it returns is a hint: never authority (§8.1 rule 6).
+#[wasm_bindgen]
+pub fn hint_select(did: &str, frames_json: &str, documents_json: &str, now: f64) -> String {
+    let frames: Vec<String> = serde_json::from_str(frames_json).unwrap_or_default();
+    let mut resolver = StaticResolver::default();
+    if let Ok(docs) = serde_json::from_str::<Value>(documents_json) {
+        for d in docs.as_object().map(|o| o.values().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+            if let Ok(doc) = serde_json::from_value::<dsip_core::did::DidDocument>(d) {
+                resolver.insert(doc);
+            }
+        }
+    }
+    let ctx = Context::new(now as i64, &resolver);
+    let (winner, report) = dsip_dht::record::select(&frames, &ctx);
+    let hint = winner.filter(|h| h.subject == did).map(|h| {
+        json!({"uri": h.endpoints.first().map(|e| e.uri.clone()), "bindings": h.endpoints.first().map(|e| e.bindings.clone()),
+               "seq": h.seq, "issued_at": h.issued_at, "expires_at": h.expires_at, "signer": h.signer})
+    });
+    json!({"hint": hint, "report": report.into_iter().map(|(_, v)| v).collect::<Vec<_>>()}).to_string()
+}
+
 /// Verify a frame standalone (stages 1–14) with a vector-style context JSON. Returns the `expect` projection.
 #[wasm_bindgen]
 pub fn verify_frame(frame: &str, context_json: &str) -> String {

@@ -20,7 +20,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "node")]
 pub mod control;
+#[cfg(feature = "node")]
 pub mod node;
 pub mod record;
 

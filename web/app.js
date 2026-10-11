@@ -7,9 +7,11 @@
 // media before a signed answer), §14.4 (screening), §18.1 (the verification basis, never a badge), §18.2 (display
 // names are claims), §19.4 (first contact), B§ (SDP in `transports[].sdp`), G§5/G§7 (PSTN caller line, downgrade),
 // N§4 (a caller's bound number, checked by `check_claim`), N§4.1 (`tel:` through a gateway as `destination`), N§5
-// (a number that moved), N§6 (number lookup on the nodes in Settings).
+// (a number that moved), N§6 (number lookup on the nodes in Settings), §8.1/§8.3 and DHT Hints Profile §10 (a
+// signed reachability hint published on the nodes and looked up before a call: hint-sourced, never authoritative;
+// a call to someone bound elsewhere goes through the relay their hint names).
 
-import init, { create_identity, revocation_frame, rehome, did_document, check_claim, identity_change, tn_select, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
+import init, { create_identity, revocation_frame, rehome, did_document, check_claim, identity_change, tn_select, hint_frame, hint_select, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
 import { store } from './host/store.js';
 import { Engine } from './host/engine.js';
 import { Relay } from './host/relay.js';
@@ -32,6 +34,17 @@ let onBound = null;   // one action deferred until the relay is bound (a contact
 let devices = [];     // {device, enrolled?}: this identity's devices as this browser knows them (no registry for did:key)
 let revoked = [];     // {device, reason, at, frame}: revocations this identity issued here (§7.4)
 let documents = {};   // did → DID document held here (§8.1; the CLI's --did-document): did:web signers verify against them
+let served = {};      // the operator's defaults, `config.json` beside this page (spec-gap 114); a setting left empty takes them
+const callRelays = new Map();   // session → a Relay opened to the peer's own relay for that call (their hint named it, §8.1)
+let ice = null;       // {servers, until}: ICE servers in effect, from Settings, the operator, or the relay's /turn (short-lived)
+let hintTimer = null; // re-signs the published reachability hint at ⅔ of its life
+let hintSeq = 0;      // the last `seq` this browser published (§8.3: newer wins; a re-sign within the same second must still be newer)
+const HINT_TTL_S = 3600;   // the profile's maximum (§12.9, spec-gap 96)
+// A setting of null says "none", overriding the operator's default (typed as `none` in Settings).
+const setting = (k) => (settings[k] === null ? undefined : settings[k] !== undefined && settings[k] !== '' && !(Array.isArray(settings[k]) && !settings[k].length) ? settings[k] : served[k]);
+const noneable = (text, list) => (/^none$/i.test(text.trim()) ? null : list ? text.split(/[\s,]+/).filter(Boolean) : text.trim() || undefined);
+const nodesInEffect = () => setting('nodes') || [];
+const publishHint = () => (setting('publish_hint') ?? true) && nodesInEffect().length > 0;
 const payloadOf = (frame) => { try { return JSON.parse(atob(JSON.parse(frame).payload.replace(/-/g, '+').replace(/_/g, '/'))); } catch { return {}; } };
 
 // ---------------------------------------------------------------- log
@@ -113,18 +126,38 @@ function renderSettings() {
   $('set-device').textContent = identity.device;
   $('set-first-contact').checked = !!settings.first_contact_required;
   $('set-relay').value = settings.relay || '';
+  $('set-relay').placeholder = served.relay || `wss://${location.host}/dsip`;
   $('set-ice').value = settings.ice ? JSON.stringify(settings.ice) : '';
+  if (served.ice) $('set-ice').placeholder = JSON.stringify(served.ice);
+  $('set-nodes').value = settings.nodes === null ? 'none' : (settings.nodes || []).join(', ');
+  $('set-nodes').placeholder = (served.nodes || []).join(', ') || 'https://node.example:8090, …';
+  $('set-publish-hint').checked = publishHint();
+  renderNetwork();
   const web = identity.identity.startsWith('did:web:');
   $('set-did-web').value = web ? identity.identity : '';
   $('did-web-host').classList.toggle('hidden', !web);
   if (web) $('did-web-url').textContent = didWebUrl(identity.identity);
   $('set-binding').value = settings.binding || '';
   $('binding-status').textContent = bindingStatus();
-  $('set-gateway').value = settings.gateway || '';
-  $('set-tn-nodes').value = (settings.tn_nodes || []).join(', ');
+  $('set-gateway').value = settings.gateway === null ? 'none' : settings.gateway || '';
+  if (served.gateway) $('set-gateway').placeholder = `${served.gateway} (operator default; type none to override)`;
   $('set-tn-policy').value = settings.tn_policy ? JSON.stringify(settings.tn_policy) : '';
   renderDevices();
   renderDocuments();
+}
+
+/** What the network settings resolve to, with where each came from. */
+function renderNetwork() {
+  const src = (k) => (settings[k] === null ? 'yours: none' : settings[k] !== undefined && settings[k] !== '' && !(Array.isArray(settings[k]) && !settings[k].length) ? 'yours' : served[k] !== undefined ? 'operator default' : 'built-in default');
+  const iceLine = settings.ice ? `${JSON.stringify(settings.ice)} (yours)` : served.ice ? `${JSON.stringify(served.ice)} (operator default)`
+    : ice?.servers?.length ? `${ice.servers.map((s) => [].concat(s.urls).join(' ')).join('; ')} (short-lived credentials from the relay's /turn, until ${new Date(ice.until * 1000).toLocaleTimeString()})` : 'none: host candidates only (the relay mints no TURN credentials)';
+  $('network-effective').textContent = [
+    `relay: ${relayUrl()} (${src('relay')})`,
+    `ICE: ${iceLine}`,
+    `nodes: ${nodesInEffect().join(', ') || 'none'} (${src('nodes')})`,
+    `reachability hint: ${publishHint() ? `published on the nodes, ${HINT_TTL_S} s, re-signed at ⅔` : 'not published'}`,
+    `gateway: ${setting('gateway') || 'none'} (${src('gateway')})`,
+  ].join('\n');
 }
 
 /** Where a did:web document is served (§8.4): `https://<host>/.well-known/did.json`, or `/<path>/did.json`. */
@@ -191,8 +224,7 @@ function downloadDidDocument() {
 }
 
 async function saveNumbers() {
-  settings.gateway = $('set-gateway').value.trim() || undefined;
-  settings.tn_nodes = $('set-tn-nodes').value.split(/[\s,]+/).filter(Boolean);
+  settings.gateway = noneable($('set-gateway').value);
   try { settings.tn_policy = $('set-tn-policy').value.trim() ? JSON.parse($('set-tn-policy').value) : undefined; } catch { return alert('the number policy must be JSON'); }
   await saveSettings();
   renderSettings();
@@ -303,7 +335,7 @@ async function onReceived(r) {
     // N§5: a number that a stored contact lists but that now belongs to another identity is said out loud
     const numberLines = [], warnings = [];
     for (const c of claims) {
-      const out = JSON.parse(check_claim(JSON.stringify(c), r.identity, JSON.stringify(documents[r.identity] ?? null), now(), JSON.stringify(settings.tn_policy || {})));
+      const out = JSON.parse(check_claim(JSON.stringify(c), r.identity, JSON.stringify(documents[r.identity] ?? null), now(), JSON.stringify(setting('tn_policy') || {})));
       if (out.outcome === 'attested') {
         numberLines.push(`☎ ${out.line} (N§4)`);
         const w = identity_change(JSON.stringify(contacts), c.number, r.identity, out.attested_by ?? undefined, out.issued);
@@ -387,11 +419,40 @@ function notify(text) { $('call-note').textContent = text; log(text); }
 
 // ---------------------------------------------------------------- calls
 
-function newMedia() {
-  return new Media(settings.ice || [], {
+/** The ICE servers for a call: Settings, else the operator's, else short-lived TURN credentials minted by the relay's
+ *  origin (`/turn`, spec-gap 114), fetched again once half their life is gone; else none (host candidates only). */
+async function iceServers() {
+  if (settings.ice) return settings.ice;
+  if (served.ice) return served.ice;
+  if (ice && now() < ice.until - ice.ttl / 2) return ice.servers;
+  try {
+    const r = await fetch(`${httpOrigin(relayUrl())}/turn`);
+    if (!r.ok) { ice = { servers: [], until: now() + 300, ttl: 600 }; log(`no TURN credentials at the relay's origin (${r.status}): host candidates only`, 'B§'); return []; }
+    const t = await r.json();
+    ice = { servers: t.iceServers || [], until: now() + (t.ttl || 600), ttl: t.ttl || 600 };
+    log(`TURN credentials from the relay's origin: ${ice.servers.map((s) => [].concat(s.urls).join(' ')).join('; ')}, valid ${ice.ttl} s`, 'B§');
+  } catch (e) { ice = { servers: [], until: now() + 60, ttl: 120 }; log(`the relay's origin did not answer /turn: ${e.message}`, 'B§'); }
+  renderNetwork();
+  return ice.servers;
+}
+
+/** `https://host:port` of a `wss://host:port/dsip` relay URL. */
+function httpOrigin(wss) { return wss.replace(/^wss:/, 'https:').replace(/\/dsip\/?$/, ''); }
+
+async function newMedia() {
+  return new Media(await iceServers(), {
     candidate: (entry) => { call.pendingLocal.push(entry); if (engine.state(call.sid) === 'ACTIVE') flushLocalCandidates(); },
     track: (stream) => { $('remote').srcObject = stream; },
-    state: (s) => { log(`webrtc: ${s}`, 'B§'); if (call) $('call-note').textContent = s === 'connected' ? 'media connected (DTLS-SRTP)' : s === 'failed' ? 'media failed: check ICE servers in Settings' : $('call-note').textContent; },
+    state: async (s) => {
+      log(`webrtc: ${s}`, 'B§');
+      if (!call) return;
+      if (s === 'connected') {
+        const path = await call.media?.path();
+        const via = path ? ` · path ${path.local}↔${path.remote}${path.relayed ? ' (through TURN)' : ' (direct)'}` : '';
+        $('call-note').textContent = `media connected (DTLS-SRTP)${via}`;
+        if (path) log(`media path ${path.local}↔${path.remote} ${path.protocol}${path.relayed ? ' relayed through TURN' : ' direct'}${path.rtt_ms != null ? `, rtt ${path.rtt_ms} ms` : ''}`, 'B§');
+      } else if (s === 'failed') $('call-note').textContent = 'media failed: check ICE servers in Settings';
+    },
   });
 }
 
@@ -416,12 +477,26 @@ async function placeCall(to, video, destination) {
   if (settings.binding) lines.push(`presenting ${bindingNumber()} with its binding (N§4)`);
   $('call-number-line').textContent = lines.join(' · ');
   $('call-number-line').classList.toggle('hidden', !lines.length);
+  $('call-route').classList.add('hidden');
   $('call-note').textContent = ''; $('call-mode').textContent = '';
   $('call-downgrade').classList.add('hidden');
   $('btn-introduce-after').classList.add('hidden');
   show('call');
   try {
-    call.media = newMedia();
+    // §8.1: discovery before the invite. A did:key has no document; the hints tier may name the peer's relay, and a
+    // call to someone bound elsewhere goes through that relay on a connection of its own (the hint is not authority:
+    // it only says where to try).
+    const sid = call.sid;
+    const hint = await discover(to);
+    if (!call || call.sid !== sid) return;
+    if (hint && hint.uri && hint.uri !== relayUrl()) {
+      $('call-route').textContent = `via their relay ${hint.uri} (a hint from the nodes, signed by ${short(hint.signer)}, expires in ${Math.max(0, Math.round(hint.expires_at - now()))} s; hint-sourced, not authoritative, §8.1)`;
+      $('call-route').classList.remove('hidden');
+      const r = await openCallRelay(hint.uri, sid);
+      if (!call || call.sid !== sid) { r?.close(); return; }
+      if (!r) { log(`their relay ${hint.uri} did not bind us; trying our own relay instead`, '§8.1'); $('call-route').textContent += ' — unreachable; through our own relay'; }
+    } else if (hint) { $('call-route').textContent = `their hint names our relay (${hint.uri})`; $('call-route').classList.remove('hidden'); }
+    call.media = await newMedia();
     await call.media.capture(video);
     $('local').srcObject = call.media.localStream;
     const sdp = await call.media.offer();
@@ -441,7 +516,7 @@ async function placeCall(to, video, destination) {
 async function callNumber(input) {
   const tn = input.trim().replace(/^tel:/, '').replace(/[\s().-]/g, '');
   if (!/^\+[1-9][0-9]{1,14}$/.test(tn)) return notify('a number is tel:+ and 2 to 15 digits (E.164)');
-  const nodes = settings.tn_nodes || [];
+  const nodes = nodesInEffect();
   if (nodes.length) {
     const bindings = [];
     for (const n of nodes) {
@@ -451,16 +526,84 @@ async function callNumber(input) {
         log(`number ${tn}: ${r.ok ? `${bindings.length} binding(s)` : `${r.status}`} from ${n} (hints tier)`, 'N§6');
       } catch (e) { log(`number ${tn}: ${n} did not answer (${e.message})`, 'N§6'); }
     }
-    const sel = JSON.parse(tn_select(tn, JSON.stringify(bindings), JSON.stringify(documents), now(), JSON.stringify(settings.tn_policy || {})));
+    const sel = JSON.parse(tn_select(tn, JSON.stringify(bindings), JSON.stringify(documents), now(), JSON.stringify(setting('tn_policy') || {})));
     if (sel) {
       log(`number ${tn} → ${sel.did}${sel.attested_by ? ` (attested by ${sel.attested_by})` : ''}${sel.others.length ? `; also claimed by ${sel.others.join(', ')}` : ''}`, 'N§6 · N§7');
       return placeCall(sel.did, false);
     }
     log(`number ${tn}: no binding verifies`, 'N§6');
   }
-  if (!settings.gateway) return notify(nodes.length ? `${tn} resolves to no identity, and no gateway is set in Settings` : 'calling a number needs number nodes or a gateway in Settings');
-  log(`number ${tn} → PSTN through gateway ${short(settings.gateway)}, as the invite's destination`, 'N§4.1');
-  return placeCall(settings.gateway, false, `tel:${tn}`);
+  const gateway = setting('gateway');
+  if (!gateway) return notify(nodes.length ? `${tn} resolves to no identity, and no gateway is set in Settings` : 'calling a number needs nodes or a gateway in Settings');
+  log(`number ${tn} → PSTN through gateway ${short(gateway)}, as the invite's destination`, 'N§4.1');
+  return placeCall(gateway, false, `tel:${tn}`);
+}
+
+/** Look `did` up on the nodes (DHT Hints Profile §10): every frame they return goes through the same §8.3 selection
+ *  a node applies (`hint_select`: verified against the subject or its delegation, unexpired, highest `seq`). What
+ *  comes back is a hint. */
+async function discover(did) {
+  const nodes = nodesInEffect();
+  if (!nodes.length) return null;
+  const frames = [];
+  const t0 = performance.now();
+  for (const n of nodes) {
+    try {
+      const r = await fetch(`${n.replace(/\/$/, '')}/dsip/v1/hints/${encodeURIComponent(did)}`);
+      const got = r.ok ? (await r.json()).hints || [] : [];
+      for (const f of got) if (!frames.includes(f)) frames.push(f);
+      log(`hints for ${short(did)}: ${r.ok ? `${got.length} record(s)` : r.status === 404 ? 'none (no overlay at that node)' : r.status} from ${n} in ${Math.round(performance.now() - t0)} ms (hints tier)`, '§8.5 · profile §10');
+    } catch (e) { log(`hints for ${short(did)}: ${n} did not answer (${e.message})`, '§8.5'); }
+  }
+  const out = JSON.parse(hint_select(did, JSON.stringify(frames), JSON.stringify(documents), now()));
+  for (const v of out.report) if (v.verdict !== 'accept') log(`   a hint record was refused: ${v.code}${v.detail ? ' ' + v.detail : ''}`, '§8.3');
+  if (out.hint) log(`hint for ${short(did)}: ${out.hint.uri} seq ${out.hint.seq}, signed by ${out.hint.signer === did ? 'the subject' : 'delegated device ' + short(out.hint.signer)} — HINT-SOURCED, NOT AUTHORITATIVE (§8.1 rule 6)`, '§8.3');
+  else if (frames.length) log(`hint for ${short(did)}: none of ${frames.length} verified`, '§8.3');
+  return out.hint;
+}
+
+/** A connection to another relay for one call: our hello binds this device there, and the session's frames go
+ *  through it (routed by `to` on that relay); closed when the call ends. Resolves to null if it refuses or is not
+ *  reachable within 8 s. */
+function openCallRelay(uri, sid) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    const r = new Relay(uri, engine.ep, {
+      bound: (info) => { log(`← hello        their relay ${short(info.did)} bound us for this call (in_reply_to matched)`, '§13.2 · §20.5'); done(r); },
+      refused: (x) => { log(`✗ their relay's hello rejected: ${x.code}`, '§20.5'); r.close(); done(null); },
+      rejected: (code) => { log(`✗ their relay refused our hello: ${code}`, '§13.2'); r.close(); done(null); },
+      frame: (text) => engine.inbound(text),
+      closed: () => { if (settled && callRelays.get(sid) === r && !r.closedByUs) log(`their relay ${uri} dropped the connection; reconnecting`, '§13.2'); },
+      dropped: (f) => log(`✗ their relay not connected: a ${JSON.parse(f).type || 'frame'} was not sent`),
+    }, now);
+    callRelays.set(sid, r);
+    r.connect();
+    setTimeout(() => { if (!settled) { r.close(); callRelays.delete(sid); done(null); } }, 8000);
+  }).then((r) => { if (!r) callRelays.delete(sid); return r; });
+}
+
+/** Publish our reachability hint on the nodes (DHT Hints Profile §10 `POST /dsip/v1/hints`): signed by this
+ *  device under its delegation, naming our relay, `seq` = now, ttl the profile's maximum; re-signed at ⅔ of it. */
+async function publishReachability() {
+  clearInterval(hintTimer); hintTimer = null;
+  if (!publishHint() || !relay?.bound) return;
+  // Impl: `seq` is the issue time, as the CLI's, but never at or below the last one this browser published: a relay
+  // changed within the same second would otherwise tie with the held record and lose to it (§8.3, same seq, live).
+  // The last seq is kept in storage, so a reload stays newer too. Two devices of one identity on different relays
+  // are not reconciled here (each publishes its own, and the newest wins at a node).
+  const seq = Math.max(Math.floor(now()), hintSeq + 1);
+  hintSeq = seq; store.set(key('hint_seq'), seq);
+  const uri = relayUrl();
+  const frame = hint_frame(JSON.stringify(identity), engine.newId(), uri, HINT_TTL_S, seq, now());
+  for (const n of nodesInEffect()) {
+    try {
+      const r = await fetch(`${n.replace(/\/$/, '')}/dsip/v1/hints`, { method: 'POST', body: frame, headers: { 'content-type': 'text/plain' } });
+      const text = r.status === 202 ? `accepted (${(await r.json()).acknowledged ?? '?'} peer(s) acknowledged)` : r.status === 409 ? 'a held record wins (§8.3)' : `${r.status} ${(await r.text()).slice(0, 80)}`;
+      log(`hint published → ${n}: ${uri} seq ${seq} for ${HINT_TTL_S} s: ${text}`, '§8.3 · profile §10');
+    } catch (e) { log(`hint not published: ${n} did not answer (${e.message})`, '§8.5'); }
+  }
+  hintTimer = setInterval(publishReachability, (HINT_TTL_S * 2 / 3) * 1000);
 }
 
 async function accept(screening) {
@@ -475,7 +618,7 @@ async function accept(screening) {
   show('call');
   try {
     call.pendingLocal = []; call.screening = screening;
-    call.media = newMedia();
+    call.media = await newMedia();
     const offerSdp = call.offer.transports?.[0]?.sdp;
     if (!screening) { await call.media.capture(!!call.offer.media?.some((m) => m.type === 'video')); $('local').srcObject = call.media.localStream; }
     engine.setSdp(await call.media.answer(offerSdp, screening));
@@ -541,6 +684,8 @@ async function rejectUpdate() {
 function endCall(stay = false) {
   if (!call) return;
   call.media?.close();
+  const cr = callRelays.get(call.sid);
+  if (cr) { const sid = call.sid; setTimeout(() => { cr.close(); callRelays.delete(sid); log(`their relay ${cr.url}: connection for the call closed`, '§13.2'); }, 1000); }
   $('local').srcObject = null; $('remote').srcObject = null;
   $('view-incoming').classList.add('hidden');
   const ended = call; call = null;
@@ -653,7 +798,7 @@ async function saveSettings() { await store.set(key('settings'), settings); }
 
 // ---------------------------------------------------------------- relay
 
-function relayUrl() { return settings.relay || `wss://${location.host}/dsip`; }
+function relayUrl() { return settings.relay || served.relay || `wss://${location.host}/dsip`; }
 
 function connect() {
   relay?.close();
@@ -665,6 +810,8 @@ function connect() {
       renderRelay(`relay ${short(r.did)}`, 'ok');
       $('relay-caps').textContent = `relay ${r.did}: ${JSON.stringify(r.capabilities)}`;
       log(`← hello        relay ${short(r.did)} bound (in_reply_to matched)`, '§13.2 · §20.5');
+      ice = null; iceServers().catch(() => {});   // credentials are the relay's origin's: fetch them on each bind
+      publishReachability();
     },
     refused: (r) => { renderRelay(`relay hello refused: ${r.code}`, 'bad'); log(`✗ relay hello rejected: ${r.code} (anti-splicing)`, '§20.5'); },
     rejected: (code) => {
@@ -689,7 +836,9 @@ async function startEngine() {
   for (const d of Object.values(documents)) engine.ep.add_document(JSON.stringify(d));   // §8.1: documents held
   engine.on = {
     send: (frame, meta) => {
-      relay.send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}`, '§12.4');
+      // a session placed through the peer's own relay stays there; everything else goes through ours
+      const via = callRelays.get(meta.session);
+      (via || relay).send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}${via ? ` via ${via.url}` : ''}`, '§12.4');
       if (meta.type === 'reject' && payloadOf(frame).reason === 'policy.first-contact-required') log(`refused a call from ${short(meta.to)} without ringing: first contact required`, '§19.4');
     },
     received: onReceived,
@@ -704,6 +853,11 @@ async function startEngine() {
 (async () => {
   await init();
   settings = (await store.get(key('settings'))) || {};
+  if (settings.tn_nodes && !settings.nodes) { settings.nodes = settings.tn_nodes; delete settings.tn_nodes; }   // stage 4's name
+  try {
+    const r = await fetch('config.json');
+    if (r.ok) { served = await r.json(); log(`operator defaults from ${location.origin}/config.json: ${Object.keys(served).join(', ') || 'none'}`, 'spec-gap 114'); }
+  } catch { /* no operator config: every setting is the person's or built in */ }
   contacts = (await store.get(key('contacts'))) || [];
   purposes = (await store.get(key('purposes'))) || {};
   links = (await store.get(key('links'))) || [];
@@ -711,6 +865,7 @@ async function startEngine() {
   devices = (await store.get(key('devices'))) || [];
   revoked = (await store.get(key('revoked'))) || [];
   documents = (await store.get(key('documents'))) || {};
+  hintSeq = (await store.get(key('hint_seq'))) || 0;
 
   const fresh = !identity;
   if (fresh) {
@@ -768,7 +923,9 @@ async function startEngine() {
   $('set-network-save').onclick = async () => {
     settings.relay = $('set-relay').value.trim();
     try { settings.ice = $('set-ice').value.trim() ? JSON.parse($('set-ice').value) : undefined; } catch { return alert('ICE servers must be a JSON array'); }
-    await saveSettings(); connect();
+    settings.nodes = noneable($('set-nodes').value, true);
+    settings.publish_hint = $('set-publish-hint').checked;
+    await saveSettings(); ice = null; renderSettings(); connect();
   };
   $('btn-export').onclick = exportToFile;
   $('device-add').onsubmit = async (e) => {
@@ -801,7 +958,22 @@ async function startEngine() {
     didDocument: () => JSON.stringify(ownDocument()),
     useDidWeb,
     setBinding: saveBinding,
-    setNumbers: async ({ gateway, nodes, policy }) => { settings.gateway = gateway || undefined; settings.tn_nodes = nodes || []; settings.tn_policy = policy ? JSON.parse(policy) : undefined; await saveSettings(); renderSettings(); },
+    setNumbers: async ({ gateway, nodes, policy }) => { settings.gateway = gateway === null ? null : gateway || undefined; if (nodes !== undefined) settings.nodes = nodes; settings.tn_policy = policy ? JSON.parse(policy) : undefined; await saveSettings(); renderSettings(); },
+    setNetwork: async ({ relay: url, ice: servers, nodes, publish }) => {
+      if (url !== undefined) settings.relay = url || undefined;
+      if (servers !== undefined) settings.ice = servers || undefined;
+      if (nodes !== undefined) settings.nodes = nodes;
+      if (publish !== undefined) settings.publish_hint = publish;
+      await saveSettings(); ice = null; renderSettings(); connect();
+    },
+    served: () => served,
+    network: () => $('network-effective').textContent,
+    iceServers,
+    discover,
+    callRelay: () => (call && callRelays.get(call.sid)?.url) || null,
+    callRelays: () => [...callRelays.values()].map((r) => r.url),
+    route: () => $('call-route').textContent,
+    mediaPath: () => (call?.media ? call.media.path() : Promise.resolve(null)),
     bindingStatus,
     callNumber,
     numberLine: () => $('call-number-line').textContent,

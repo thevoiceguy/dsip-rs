@@ -50,12 +50,17 @@ pub struct Endpoint {
     pub bindings: Vec<String>,
 }
 
-/// Build a hint payload.
+/// Build a hint payload with a fresh id.
 pub fn hint_payload(subject: &str, from: &str, endpoints: &[Endpoint], seq: i64, issued_at: i64, ttl_s: i64) -> Value {
+    hint_payload_with_id(subject, from, endpoints, seq, issued_at, ttl_s, Ulid::generate().as_str())
+}
+
+/// Build a hint payload under a caller-supplied id (a host whose clock and randomness are its own, such as wasm).
+pub fn hint_payload_with_id(subject: &str, from: &str, endpoints: &[Endpoint], seq: i64, issued_at: i64, ttl_s: i64, id: &str) -> Value {
     json!({
         "dsip": {"core": "1.0", "min_core": "1.0", "profiles": [], "extensions": [], "critical": []},
         "type": HINT_TYPE,
-        "id": Ulid::generate().as_str(),
+        "id": id,
         "from": from,
         "subject": subject,
         "endpoints": endpoints,
