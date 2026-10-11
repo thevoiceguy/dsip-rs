@@ -21,7 +21,8 @@ const browser = await launch();
 let alice, bob, carol, mallory;
 const hold = async (p, numbers = {}) => {
   for (const d of docs) await p.page.evaluate((t) => window.dsip.addDocument(t), d);
-  await p.page.evaluate((o) => window.dsip.setNumbers(o), { policy, ...numbers });
+  // stage 5 serves the operator's nodes beside the page; this test's numbers are resolved by the gateways, not here
+  await p.page.evaluate((o) => window.dsip.setNumbers(o), { policy, nodes: null, ...numbers });
 };
 const incomingAt = (p) => p.page.waitForSelector('#view-incoming:not(.hidden)', { timeout: 30000 });
 const ended = async (...ps) => { for (const p of ps) await until(p.page, () => window.dsip.state() === null, null, 30000); };
@@ -32,10 +33,11 @@ try {
   mallory = await person(browser, 'Mallory');
   check('did:web identities enrolled from the fixture (the same identity keys, a browser device each)', alice.did === ALICE && bob.did === BOB && carol.did === CAROL, `${alice.did} ${bob.did} ${carol.did}`);
 
-  // a number with no nodes and no gateway: the client says what it needs
+  // a number with no nodes and no gateway: the client says what it needs (`none` overrides the operator's nodes)
+  await mallory.page.evaluate(() => window.dsip.setNumbers({ nodes: null }));
   await mallory.page.fill('#call-tn', '+15552000001');
   await mallory.page.click('#call-number button[type=submit]');
-  check('calling a number needs nodes or a gateway in Settings', /needs number nodes or a gateway/.test(await mallory.page.evaluate(() => window.dsip.note())));
+  check('calling a number needs nodes or a gateway in Settings', /needs nodes or a gateway/.test(await mallory.page.evaluate(() => window.dsip.note())));
   await hold(alice, { gateway: GWA }); await hold(bob); await hold(carol); await hold(mallory, { gateway: GWA });
 
   // Alice's bound number, pasted in Settings: it verifies against her own document (N§3.4)

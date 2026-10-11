@@ -1525,6 +1525,7 @@ name = "dsip-relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "dsip-broadcast",
  "dsip-core",
@@ -1532,7 +1533,9 @@ dependencies = [
  "dsip-session",
  "dsip-transport",
  "futures-util",
+ "hmac 0.12.1",
  "serde_json",
+ "sha1 0.10.7",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1590,6 +1593,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "dsip-core",
+ "dsip-dht",
  "dsip-endpoint",
  "dsip-number",
  "dsip-schema",

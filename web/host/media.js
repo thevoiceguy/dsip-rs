@@ -91,6 +91,19 @@ export class Media {
     return n;
   }
 
+  /** The candidate pair in use (`local`/`remote` candidate types, `protocol`, `relayed`, `rtt_ms`), or null. */
+  async path() {
+    const stats = await this.pc.getStats();
+    const by = {}; stats.forEach((s) => { by[s.id] = s; });
+    let pair = null;
+    stats.forEach((s) => { if (s.type === 'candidate-pair' && (s.nominated || s.selected) && s.state === 'succeeded') pair = pair && !s.nominated ? pair : s; });
+    if (!pair) stats.forEach((s) => { if (s.type === 'transport' && s.selectedCandidatePairId && by[s.selectedCandidatePairId]) pair = by[s.selectedCandidatePairId]; });
+    if (!pair) return null;
+    const l = by[pair.localCandidateId] || {}, r = by[pair.remoteCandidateId] || {};
+    return { local: l.candidateType || '?', remote: r.candidateType || '?', protocol: l.protocol || r.protocol || '?', relayed: l.candidateType === 'relay' || r.candidateType === 'relay',
+      rtt_ms: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null };
+  }
+
   close() {
     this.pc.close();
     this.localStream?.getTracks().forEach((t) => t.stop());

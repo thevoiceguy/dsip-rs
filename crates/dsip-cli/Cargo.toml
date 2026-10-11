@@ -16,7 +16,7 @@ dsip-core.workspace = true
 dsip-schema.workspace = true
 dsip-session.workspace = true
 dsip-transport.workspace = true
-dsip-dht.workspace = true
+dsip-dht = { workspace = true, features = ["node"] }
 dsip-media.workspace = true
 dsip-broadcast.workspace = true
 dsip-webrtc-binding.workspace = true

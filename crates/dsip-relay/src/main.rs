@@ -85,9 +85,38 @@ struct Args {
     /// Maximum seconds an envelope is held for an offline recipient (advertised as offline_retention_s).
     #[arg(long, default_value_t = 86_400)]
     offline_retention: i64,
-    /// Serve static files from this directory on the same TLS port (browser demo; one origin, one cert).
+    /// Serve static files from this directory on the same TLS port (the browser client; one origin, one cert).
     #[arg(long)]
     www: Option<PathBuf>,
+    /// A certificate chain (PEM) for the TLS port, with --key: a deployment's real certificate (§13.2: validated
+    /// against the advertised hostname). Without it a self-signed certificate is made in --state.
+    #[arg(long, requires = "key")]
+    cert: Option<PathBuf>,
+    /// The private key (PEM) for --cert.
+    #[arg(long, requires = "cert")]
+    key: Option<PathBuf>,
+    /// A JSON file served as `/config.json`: the operator's defaults for the client it serves (`relay`, `nodes`,
+    /// `gateway`, `tn_policy`, `ice`, `publish_hint`); the client's own settings override them.
+    #[arg(long)]
+    client_config: Option<PathBuf>,
+    /// ICE server URI(s) (`turn:host:3478`, `stun:host:3478`; repeatable) minted into short-lived credentials at
+    /// `/turn` with --turn-secret.
+    #[arg(long)]
+    turn_uri: Vec<String>,
+    /// The secret coturn holds as `static-auth-secret` (TURN REST API credentials). Prefer --turn-secret-file: a
+    /// command line is visible to every process on the host.
+    #[arg(long, requires = "turn_uri", conflicts_with = "turn_secret_file")]
+    turn_secret: Option<String>,
+    /// A file holding that secret (trailing whitespace ignored).
+    #[arg(long, requires = "turn_uri")]
+    turn_secret_file: Option<PathBuf>,
+    /// Lifetime of minted TURN credentials, seconds.
+    #[arg(long, default_value_t = 3600)]
+    turn_ttl: i64,
+    /// Forward `/dsip/v1/*` to a hints node at this `host:port` (plain HTTP, DHT Hints Profile §10), so the client
+    /// reaches the node through the origin that served it.
+    #[arg(long)]
+    node_proxy: Option<String>,
 }
 
 type Tx = mpsc::UnboundedSender<String>;
@@ -463,11 +492,18 @@ async fn main() -> Result<()> {
     };
     let mut hosts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     hosts.extend(args.host.iter().cloned());
-    let (cert, keyfile) = tls::ensure_self_signed(&args.state, &hosts)?;
+    let (cert, keyfile) = match (&args.cert, &args.key) {
+        (Some(c), Some(k)) => (c.clone(), k.clone()),
+        _ => tls::ensure_self_signed(&args.state, &hosts)?,
+    };
     let acceptor = tls::acceptor(&cert, &keyfile)?;
 
     tracing::info!("relay did: {}", key.did());
-    tracing::info!("listening on wss://{}/dsip  (clients: --ca {})", args.listen, cert.display());
+    if args.cert.is_some() {
+        tracing::info!("listening on wss://{}/dsip  (certificate {})", args.listen, cert.display());
+    } else {
+        tracing::info!("listening on wss://{}/dsip  (clients: --ca {})", args.listen, cert.display());
+    }
 
     let mut served: HashSet<String> = args.serve.iter().cloned().collect();
     if let Some(path) = &args.serve_file {
@@ -506,16 +542,33 @@ async fn main() -> Result<()> {
     if let Some(w) = &args.www {
         tracing::info!("serving {} at https://{}/", w.display(), args.listen);
     }
-    let www = args.www.clone();
+    let client_config = match &args.client_config {
+        Some(p) => Some(serde_json::from_str::<Value>(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+            .with_context(|| format!("parsing {}", p.display()))?),
+        None => None,
+    };
+    let turn_secret = match (&args.turn_secret, &args.turn_secret_file) {
+        (Some(s), _) => Some(s.clone()),
+        (None, Some(p)) => Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?.trim_end().to_string()),
+        (None, None) => None,
+    };
+    let turn = turn_secret.map(|secret| www::Turn { uris: args.turn_uri.clone(), secret, ttl_s: args.turn_ttl });
+    if let Some(t) = &turn {
+        tracing::info!("minting TURN credentials for {} at /turn ({} s)", t.uris.join(" "), t.ttl_s);
+    }
+    if let Some(n) = &args.node_proxy {
+        tracing::info!("forwarding /dsip/v1/* to the hints node at {n}");
+    }
+    let routes = Arc::new(www::Routes { www: args.www.clone(), client_config, turn, node_proxy: args.node_proxy.clone() });
     let listener = TcpListener::bind(args.listen).await.with_context(|| format!("binding {}", args.listen))?;
     loop {
         let (tcp, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let state = state.clone();
-        let www = www.clone();
+        let routes = routes.clone();
         tokio::spawn(async move {
             match acceptor.accept(tcp).await {
-                Ok(tls_stream) => match www::dispatch(tls_stream, www.as_deref()).await {
+                Ok(tls_stream) => match www::dispatch(tls_stream, &routes).await {
                     Ok(www::First::WebSocket(stream)) => {
                         if let Err(e) = serve(stream, peer, state).await {
                             tracing::info!("{peer}: {e}");
