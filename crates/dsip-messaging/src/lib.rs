@@ -26,6 +26,8 @@ pub mod hub;
 pub mod mailbox;
 pub mod mls_wire;
 pub mod schemas;
+pub mod verify;
+pub mod wire;
 
 use serde_json::{json, Value};
 

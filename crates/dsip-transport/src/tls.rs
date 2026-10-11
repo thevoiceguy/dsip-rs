@@ -52,12 +52,14 @@ pub fn acceptor(cert_pem: &Path, key_pem: &Path) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(cfg)))
 }
 
-/// Client config trusting exactly the CA/self-signed certificate(s) in `ca_pem`
-/// (plus nothing else). `None` ⇒ the platform's native roots via tokio-tungstenite's default connector.
+/// Client config trusting the CA/self-signed certificate(s) in `ca_pem` beside the platform's native roots: a
+/// service dials peers under self-signed certificates (a lab) and under public ones (a deployment) from the same
+/// configuration. `None` ⇒ the native roots alone via tokio-tungstenite's default connector.
 pub fn client_config(ca_pem: Option<&Path>) -> Result<Option<Arc<ClientConfig>>> {
     install_provider();
     let Some(p) = ca_pem else { return Ok(None) };
     let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
     for c in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(p)?)) {
         roots.add(c?)?;
     }

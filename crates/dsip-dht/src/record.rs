@@ -41,13 +41,30 @@ pub fn key_for(did: &str) -> Vec<u8> {
     out
 }
 
-/// An advertised signaling endpoint.
+/// An advertised endpoint: a signaling relay (`service` absent, `DSIPSignaling`), or another DID service type the
+/// hint stands in for — `DSIPMailbox` carries that service entry's fields (`mailbox`, `profiles`, `priority`, …;
+/// Messaging Profile M§4.2), kept in `extra` exactly as published (profile §2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
     /// `wss://…` URI.
     pub uri: String,
     /// Bindings, e.g. `["ws/1.0"]`.
     pub bindings: Vec<String>,
+    /// Every other field of the endpoint object (`service`, and the service entry's fields).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Endpoint {
+    /// A signaling endpoint (`service` absent).
+    pub fn signaling(uri: &str) -> Endpoint {
+        Endpoint { uri: uri.to_string(), bindings: vec!["ws/1.0".into()], extra: Default::default() }
+    }
+
+    /// The DID service type this endpoint stands in for: `DSIPSignaling` when `service` is absent (profile §2).
+    pub fn service(&self) -> &str {
+        self.extra.get("service").and_then(|s| s.as_str()).unwrap_or("DSIPSignaling")
+    }
 }
 
 /// Build a hint payload with a fresh id.

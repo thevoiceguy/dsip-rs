@@ -97,7 +97,7 @@ pub fn mailbox_capabilities(hub: bool, blob_endpoint: &str, max_blob_bytes: i64)
             "modes": ["sync", "queue"],
             "hub": hub,
             "ciphersuites": [1],
-            "max_mls_bytes": dsip_messaging::checks::MAX_MLS_BYTES,
+            "max_mls_bytes": crate::checks::MAX_MLS_BYTES,
             "mls_retention_s": 2_592_000,
             "blob_endpoint": blob_endpoint,
             "max_blob_bytes": max_blob_bytes,

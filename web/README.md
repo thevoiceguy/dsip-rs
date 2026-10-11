@@ -50,6 +50,24 @@ relay is called through that relay on a connection opened for the call, labelled
 media path in use (candidate types, TURN or direct) is shown once connected. Runbook below; the WAN record in
 `impl/docs/dht-findings.md` ("The browser client on the WAN").
 
+**Stage 6:** messaging. The Messaging Profile's device side runs in the browser: `dsip-wasm::messaging` is OpenMLS
+(on its rust-crypto provider, `js` for the browser's randomness) and the profile's vector-pinned client rules behind a
+`Messenger` driven like the §12 engine — frames in, frames and events out — and the Messages screen renders what it
+returns. Its MLS state (OpenMLS's memory storage) and its delivery state (the ack cursor and seq positions, the
+outbox, the thread) are one record the host saves after every step and restores on load (spec-gap 44): a reload
+keeps the groups, the KeyPackages' private halves and the history. The identity's mailbox comes from Settings → Network
+or the operator's `config.json` (`mailbox: {uri, did}`); the device binds there with the same `hello` (the mailbox's
+is verified under the DID the entry names, M§4.2), the mailbox enrols the identity on its first owner operation
+(`dsip-mailbox --serve-any`, spec-gap 115), fresh KeyPackages go up on every bind (M§5.5), the personal group is
+created with its first archive key (M§7.1, M§12.1), and the hint the client publishes names the mailbox beside the
+relay (a `DSIPMailbox` endpoint, M§4.2). "Message" on a contact finds their mailbox (their document, else their hint:
+hint-sourced, said so), fetches a KeyPackage there presenting the grant they issued (M§5.5, M§14.2: the Grant button
+now issues `dsip.message` beside `dsip.invite`), creates the group at our mailbox and adds them once the hub holds it
+(M§7.2, M§6.5: committed on `accepted`, discarded and re-proposed after a conflict). The welcome reaches them
+through hub fan-out to a mailbox the hub resolves the same way (spec-gap 116); text is an MLS application message
+(M§8.1), delivered receipts are decided per sync batch (M§10.2) and shown on our own messages. Not in this round:
+archive and history for a second device, read receipts, voice and blobs, successor groups.
+
 ## Run it locally
 
 ```bash
@@ -117,6 +135,14 @@ What the operator can and cannot see: the relay routes signed envelopes it canno
 it sees who talks to whom and when, as any relay does (§20). The node sees who publishes a hint and who looks one up.
 TURN sees the media's endpoints, not its content (DTLS-SRTP). A public relay logs counts, not content.
 
+6. **A mailbox for messaging (stage 6).** `ROLE=…,mailbox MAILBOX_SERVE_ANY=<n>` with the same `RELAY_CERT`/`RELAY_KEY`:
+   the mailbox serves under the relay's certificate on port 9443, enrols up to `n` identities that bind to it
+   (spec-gap 115), and reaches a member on another operator through the hint on the co-located node (`--hints-node`).
+   Put it in the client's defaults: `"mailbox": {"uri": "wss://<name>:9443/dsip", "did": "<$STATE/mailbox/service.did>"}`
+   in `/var/lib/dsip/client.json`, and restart the relay. A person on another origin sets the mailbox by hand under
+   Settings → Network. The hub a conversation uses is the creator's mailbox; the other side's mailbox sees group ids,
+   sizes and timing, never content (M§15.1).
+
 ## Layout
 
 ```
@@ -127,6 +153,7 @@ host/relay.js           the WebSocket: hello first, the relay's hello verified b
 host/media.js           RTCPeerConnection per call; candidate buffering (§12.12: info is ACTIVE-only)
 host/store.js           IndexedDB (localStorage fallback) for identity, contacts, engine state, settings
 host/identity-file.js   the identity export: PBKDF2 + AES-GCM under a passphrase, version 1
+../crates/dsip-wasm/src/messaging.rs   the messaging device (stage 6): OpenMLS + the profile's client rules, driven by app.js
 test/engine.mjs         Node: two wasm endpoints run a call + first contact in memory (no browser)
 test/lib.mjs            Playwright helpers: launch with fake media, a person (fresh context = fresh identity), waits
 test/call.mjs           stage 1: two headless browsers call each other through a local relay (audio, video), export/import
@@ -135,9 +162,12 @@ test/devices.mjs        stage 3: one identity on two browsers (enrolled from the
 test/gateway.mjs        stage 4: the two-gateway demo with browsers: attested crossing, downgrade, no route, N§4 claim, N§5 warning
 test/deploy.mjs         stage 5: config.json in effect, minted TURN credentials verified, hints published and looked up, a
                         call through the relay the callee's hint names (both ways), none without a hint, a reload
-test/run.sh             makes the gateway fixture, starts relay A (serving the client, with config.json, /turn and the node
-                        proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node and two gateways, and runs the Playwright
-                        tests in the browser(s) named
+test/messaging.mjs      stage 6: two browsers on two operators enrol at two mailboxes, personal groups, hints naming the
+                        mailboxes, a conversation from a KeyPackage fetched at the peer's mailbox with the grant, the welcome
+                        federated through the hint, text both ways, delivered receipts, a reload keeping MLS state and history
+test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
+                        client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
+                        and two gateways, and runs the Playwright tests in the browser(s) named
 ```
 
 ## Tests
@@ -170,8 +200,15 @@ and Bob, who stored Alice with it, is warned (N§5); a did:web name whose docume
 under the secret and the client uses them, Bob on relay B publishes a hint the node holds, Alice's lookup verifies it
 and her call goes through relay B on a connection for the call (both ACTIVE, media both ways, the media path
 reported, the connection closed after), Bob calls her back through relay A the same way, a DID with no hint is called
-through our own relay, and a reload keeps Bob's relay and re-publishes his hint. CI runs all five in Firefox and
-Chromium.
+through our own relay, and a reload keeps Bob's relay and re-publishes his hint. `messaging.mjs`: Alice binds to the
+operator's mailbox, is enrolled, creates her personal group and uploads KeyPackages, and her hint names the mailbox;
+first contact over the relay; Bob moves to relay B and mailbox B (enrolled there, his hint follows); Alice's
+"Message" finds Bob's mailbox through his hint, fetches his KeyPackage there with his grant, creates the conversation
+at her mailbox and commits the add on the hub's accepted; Bob joins from the welcome his mailbox received (the hub
+found it through his hint); text both ways, the hub's accepted back through Bob's mailbox's forwarding, a delivered
+receipt shown on Alice's message, each message once with its hub seq; Bob reloads and the thread, the MLS state and
+the delivery state survive, a message after the reload decrypts, nothing is shown twice. CI runs all six in Firefox
+and Chromium.
 
 ## Identity
 

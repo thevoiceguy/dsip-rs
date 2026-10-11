@@ -16,6 +16,7 @@
   <div class="relay"><span id="relay-dot" class="dot"></span><span id="relay-status" class="small muted">connecting…</span></div>
   <nav>
     <button data-view="contacts">Contacts</button>
+    <button data-view="messages">Messages</button>
     <button data-view="settings">Settings</button>
     <button id="btn-log-toggle" class="ghost">Log</button>
   </nav>
@@ -62,6 +63,31 @@
   <p class="muted small">Someone who requires first contact refuses calls from identities they have not granted; introduce yourself first (§19.4).</p>
   <h3>Requests <span class="muted small">introductions received; silence is a valid answer</span></h3>
   <ul id="request-list" class="list"><li class="muted small">none</li></ul>
+</section>
+
+<section id="view-messages" class="view hidden">
+  <h2>Messages</h2>
+  <div id="mailbox-status" class="muted small pre"></div>
+  <div class="messages">
+    <div class="conv-pane">
+      <h3>Conversations</h3>
+      <ul id="conv-list" class="list"><li class="muted small">none yet: open a contact and choose Message</li></ul>
+      <h3>Requests <span class="muted small">introductions delivered through the mailbox (M§14.1)</span></h3>
+      <ul id="msg-request-list" class="list"><li class="muted small">none</li></ul>
+    </div>
+    <div class="thread-pane">
+      <div class="row"><strong id="thread-title">no conversation open</strong> <code id="thread-did" class="did"></code></div>
+      <div id="thread-meta" class="muted small"></div>
+      <div id="thread" class="thread"></div>
+      <form id="compose" class="row">
+        <input id="compose-text" placeholder="a message (MLS application message, M§6.4)" size="60" maxlength="4000" disabled>
+        <button type="submit" class="primary" id="compose-send" disabled>Send</button>
+      </form>
+      <p class="muted small">Messages are MLS application messages in a group hubbed at the creator's mailbox; the hub orders them and
+      fans them out to every member's mailbox (M§6.5), which pushes them to bound devices. A delivered receipt is sent per sync
+      batch (M§10.2). The hub sees group ids, sizes and timing, never content (M§15.1).</p>
+    </div>
+  </div>
 </section>
 
 <section id="view-call" class="view hidden">
@@ -166,6 +192,7 @@
   <div class="row"><label>ICE servers</label><input id="set-ice" size="60" placeholder='[{"urls":"stun:stun.example:3478"}]'> <span class="muted small">empty: short-lived TURN credentials from the relay's origin (<code>/turn</code>), if it mints them</span></div>
   <div class="row"><label>nodes</label><input id="set-nodes" size="50" placeholder="https://node.example:8090, …"> <span class="muted small">dsip-nodes (DHT Hints Profile §10): reachability hints and number lookups (N§6); a hints tier, never authoritative (§8.1); <code>none</code> overrides the operator's</span></div>
   <div class="row"><label class="small"><input type="checkbox" id="set-publish-hint"> publish my reachability on the nodes: a signed, expiring hint naming my relay (§8.3), re-signed while this page is open, so someone on another relay can find me</label></div>
+  <div class="row"><label>mailbox</label><input id="set-mailbox" size="40" placeholder="wss://host:9443/dsip"> <input id="set-mailbox-did" size="52" placeholder="did:key:… of the mailbox service"> <span class="muted small">the Messaging Profile mailbox this identity uses (M§4.2); a <code>did:key</code> identity advertises it in its reachability hint; <code>none</code> turns messaging off</span></div>
   <div class="row"><button id="set-network-save">Save and reconnect</button></div>
   <div id="relay-caps" class="muted small"></div>
   <div id="network-effective" class="muted small pre"></div>

@@ -64,13 +64,16 @@ python3 - "$DIR/mbx-b/mailbox-state.json" "$DIR/gap.txt" <<'PY'
 import json, sys
 path, out = sys.argv[1], sys.argv[2]
 s = json.load(open(path))
-items = s["mailbox"]["items"]
+# the mailbox's state: one owner's machine under "owners" (format 2, client stage 6), or "mailbox" (format 1)
+owned = next(iter(s["owners"].values())) if "owners" in s else s
+mbx, store = owned["mailbox"], owned["store"]
+items = mbx["items"]
 commit = max(i["seq"] for i in items if i["class"] == "handshake" and i.get("seq"))      # the rekey
 lost = max(i["seq"] for i in items if i["class"] == "application" and i.get("seq", 0) < commit)
 gone = [i["cursor"] for i in items if i.get("seq") == lost and i["class"] == "application"]
-s["mailbox"]["items"] = [i for i in items if i["cursor"] not in gone]
+mbx["items"] = [i for i in items if i["cursor"] not in gone]
 for c in gone:
-    s["store"]["items"].pop(c, None)
+    store["items"].pop(c, None)
 json.dump(s, open(path, "w"))
 open(out, "w").write(str(commit))
 print(f"    dropped the item at seq {lost}; the rekey at seq {commit} now sits beyond a gap")

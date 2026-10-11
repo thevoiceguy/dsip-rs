@@ -59,7 +59,7 @@ async fn overlay_routes_verify_before_store() {
     let http = reqwest::Client::new();
     let k = KeyPair::from_seed([9; 32]);
     let did = k.did();
-    let ep = [Endpoint { uri: "wss://relay.example/dsip".into(), bindings: vec!["ws/1.0".into()] }];
+    let ep = [Endpoint::signaling("wss://relay.example/dsip")];
     let now = now_s();
     let frame = |seq: i64| sign_hint(&hint_payload(&did, &did, &ep, seq, now, 1800), &k, vec![]).frame();
 

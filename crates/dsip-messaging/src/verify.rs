@@ -6,7 +6,7 @@
 //! so a mailbox runs this instead.
 
 use dsip_core::envelope::{self, Context, Envelope, Verified};
-use dsip_messaging::checks::check_message;
+use crate::checks::check_message;
 
 /// Why a frame was refused: an implementation-neutral code and, where the profile defines one, the
 /// reason token the sender is told (M§16).
@@ -75,8 +75,8 @@ pub fn delegated_identity(verified: &Verified, ctx: &Context) -> Option<String> 
 
 /// Verify one frame: envelope stages 1–11, then the profile message rules (M§5).
 ///
-/// `hello` is passed through to the caller's binding logic; every other type must be a profile
-/// message this service speaks.
+/// `hello` is passed through to the caller's binding logic, and a core `error` (§15: how a service refuses, M§5.3)
+/// to the caller's reading of its reason; every other type must be a profile message this service speaks.
 pub fn verify_frame(frame: &str, ctx: &Context) -> Result<Inbound, Rejection> {
     let core = |v: dsip_core::Verdict| Rejection {
         code: v.code.and_then(|c| serde_json::to_value(c).ok()).and_then(|c| c.as_str().map(String::from)).unwrap_or_default(),
@@ -84,7 +84,7 @@ pub fn verify_frame(frame: &str, ctx: &Context) -> Result<Inbound, Rejection> {
     };
     let envelope = Envelope::from_frame(frame).map_err(core)?;
     let verified = envelope::verify(&envelope, ctx, Some(frame)).map_err(core)?;
-    if verified.msg_type() != "hello" {
+    if !matches!(verified.msg_type(), "hello" | "error") {
         let v = check_message(&verified.payload);
         if v["verdict"] != "accept" {
             return Err(Rejection {
@@ -110,7 +110,20 @@ pub fn grant_credential(compact: &str, ctx: &Context) -> Option<serde_json::Valu
     if !dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, ctx).ok() {
         return None;
     }
-    (ver.payload.get("type")? == "grant").then(|| ver.payload.clone())
+    let mut payload = ver.payload.clone();
+    if from == ver.signer_did {
+        // Impl: a core endpoint names its device in `from` and acts for the identity its delegation binds it to
+        // (§13.2, §7.4); the granter is that identity, taken from the delegation presented in the header, so the
+        // grant reads the same as one whose `from` is the identity (the console's).
+        let identity = ver.header.delegations.iter().find_map(|d| {
+            let (subject, device) = dsip_core::delegation::names(d)?;
+            (device == ver.signer_did && dsip_core::delegation::verify_delegation(d, &subject, &device, ctx).ok()).then_some(subject)
+        });
+        if let Some(id) = identity {
+            payload["from"] = serde_json::Value::String(id);
+        }
+    }
+    (payload.get("type")? == "grant").then_some(payload)
 }
 
 #[cfg(test)]
@@ -147,6 +160,12 @@ mod tests {
 
         let honest = sign_bytes(&encode_payload(&grant("did:web:bob.example")), &bob_phone, &bob_phone.kid(), vec![deleg(&bob_phone)]);
         assert!(grant_credential(&compact(honest), &ctx).is_some(), "Bob's delegated phone grants for Bob");
+
+        // a core endpoint's grant: `from` is the device, bound to Bob by the delegation it presents (§13.2)
+        let by_device = sign_bytes(&encode_payload(&grant(&bob_phone.did())), &bob_phone, &bob_phone.kid(), vec![deleg(&bob_phone)]);
+        assert_eq!(grant_credential(&compact(by_device), &ctx).expect("verifies")["from"], "did:web:bob.example", "the granter is the bound identity");
+        let device_alone = sign(&grant(&bob_phone.did()), &bob_phone, &bob_phone.kid());
+        assert_eq!(grant_credential(&compact(device_alone), &ctx).expect("a device may grant for itself")["from"], bob_phone.did());
 
         let bare = sign(&grant("did:web:bob.example"), &bob_phone, &bob_phone.kid());
         assert!(grant_credential(&compact(bare), &ctx).is_none(), "no delegation presented: not Bob's consent");
