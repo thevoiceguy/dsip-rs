@@ -9,6 +9,7 @@ export class Relay {
   constructor(url, engine, on, now) {
     this.url = url; this.engine = engine; this.on = on; this.now = now;
     this.ws = null; this.bound = false; this.backoff = 1000; this.closedByUs = false;
+    this.rejected = null;         // the code of the last hello refusal, until a hello is accepted
   }
 
   connect() {
@@ -20,7 +21,7 @@ export class Relay {
       if (!this.bound) {
         const r = JSON.parse(this.engine.relay_hello(ev.data, this.now()));
         if (!r.ok) { this.on.refused?.(r); ws.close(); return; }
-        this.bound = true; this.backoff = 1000;
+        this.bound = true; this.backoff = 1000; this.rejected = null;
         this.on.bound?.(r);
         return;
       }
@@ -31,7 +32,7 @@ export class Relay {
       // The relay refuses a hello by closing with the reason in the close frame (`transport.hello-rejected: <code>`).
       // A revoked delegation (§7.4) will not verify next time either: stop reconnecting and tell the app.
       const rejected = /^transport\.hello-rejected: (.*)$/.exec(ev.reason || '');
-      if (rejected) { this.on.rejected?.(rejected[1]); if (rejected[1] === 'delegation-revoked') this.closedByUs = true; }
+      if (rejected) { this.rejected = rejected[1]; this.on.rejected?.(rejected[1]); if (rejected[1] === 'delegation-revoked') this.closedByUs = true; }
       this.on.closed?.(was);
       if (!this.closedByUs) { setTimeout(() => this.connect(), this.backoff); this.backoff = Math.min(this.backoff * 2, 15000); }
     };

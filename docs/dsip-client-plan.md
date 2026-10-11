@@ -1,6 +1,6 @@
 # DSIP Client Plan — a reference client a person can use (M7)
 
-**Status:** plan, 2026-10-09; stages 1–3 landed 2026-10-10 (`impl/web/`, headless tests in CI; spec-gap 113 from stage 3). Written after v0.11
+**Status:** plan, 2026-10-09; stages 1–4 landed 2026-10-10 (`impl/web/`, headless tests in CI; spec-gap 113 from stage 3). Written after v0.11
 froze at `poc-v0.11` (1,924 vectors) and v0.12 opened. Decided with the user: build it, as a reference client, not a product.
 
 **Spec:** none (infrastructure). The client is a host of the pure crates, like `dsip-cli` and the daemons; every

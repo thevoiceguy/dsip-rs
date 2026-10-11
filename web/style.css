@@ -38,3 +38,4 @@ video { width:100%; background:#000; border-radius:8px; aspect-ratio: 4/3; }
 #log-panel { margin-top:14px; background:var(--card); border-radius:10px; padding:10px 14px; }
 #log { margin:0; max-height: 300px; overflow:auto; font-size:12px; white-space: pre-wrap; background:#0d0f14; padding:10px; border-radius:8px; }
 @media (max-width: 700px) { .videos { grid-template-columns: 1fr; } header { gap:8px; } }
+.pre { white-space: pre-line; }
