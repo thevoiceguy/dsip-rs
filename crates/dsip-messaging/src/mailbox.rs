@@ -419,10 +419,12 @@ impl Mailbox {
         }
         let mut adder = s(&e["adder_identity"]);
         if e["via_hub"].as_bool().unwrap_or(false) {
-            // M§14.2 (spec-gap 46): only `origin` proves who added the owner; the hub connection does not
+            // M§14.2 (spec-gap 46): only `origin` proves who added the owner; the hub connection does not. Its age
+            // (spec-gap 118): not from the future beyond 300 s of skew, and not older than the pending-group retention —
+            // the hub re-signs every retry, so a welcome delivered after an outage carries an origin as old as the outage.
             let o = &e["origin"];
-            let fresh = |t: &Value| (t.as_i64().unwrap_or(i64::MIN / 2) - e["issued_at"].as_i64().unwrap_or(0)).abs() <= ORIGIN_SKEW_S;
-            if !o.is_object() || o["group"] != e["group"] || !fresh(&o["issued_at"]) {
+            let age = e["issued_at"].as_i64().unwrap_or(0).saturating_sub(o["issued_at"].as_i64().unwrap_or(i64::MAX / 2));
+            if !o.is_object() || o["group"] != e["group"] || age < -ORIGIN_SKEW_S || age > self.pending_ttl {
                 return Self::error(&e["from"], &e["id"], "policy.blocked");
             }
             adder = s(&o["identity"]);
