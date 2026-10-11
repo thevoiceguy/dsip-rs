@@ -9,9 +9,12 @@
 // N§4 (a caller's bound number, checked by `check_claim`), N§4.1 (`tel:` through a gateway as `destination`), N§5
 // (a number that moved), N§6 (number lookup on the nodes in Settings), §8.1/§8.3 and DHT Hints Profile §10 (a
 // signed reachability hint published on the nodes and looked up before a call: hint-sourced, never authoritative;
-// a call to someone bound elsewhere goes through the relay their hint names).
+// a call to someone bound elsewhere goes through the relay their hint names), Messaging Profile M§4.2 (the mailbox a
+// did:key identity names in its hint, and the peer's found the same way), M§4.3 (bound with a verified hello), M§7.2
+// and M§8.1 (text in a direct conversation; every decision inside `Messenger`, spec-gap 44: its MLS and delivery state
+// saved together after each step).
 
-import init, { create_identity, revocation_frame, rehome, did_document, check_claim, identity_change, tn_select, hint_frame, hint_select, Endpoint, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
+import init, { create_identity, revocation_frame, rehome, did_document, check_claim, identity_change, tn_select, hint_frame, hint_select, mailbox_select, redelegate, Endpoint, Messenger, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
 import { store } from './host/store.js';
 import { Engine } from './host/engine.js';
 import { Relay } from './host/relay.js';
@@ -39,6 +42,10 @@ const callRelays = new Map();   // session → a Relay opened to the peer's own 
 let ice = null;       // {servers, until}: ICE servers in effect, from Settings, the operator, or the relay's /turn (short-lived)
 let hintTimer = null; // re-signs the published reachability hint at ⅔ of its life
 let hintSeq = 0;      // the last `seq` this browser published (§8.3: newer wins; a re-sign within the same second must still be newer)
+let messenger = null; // the wasm messaging device (stage 6), when a mailbox is configured
+let mailboxConn = null, mailboxInfo = null;   // the Relay to this identity's mailbox, and its verified hello
+let activeConv = null;                        // the group id open on the Messages screen
+const waiters = [];                           // {pred, resolve}: one-shot waits for a Messenger emission on the mailbox connection
 const HINT_TTL_S = 3600;   // the profile's maximum (§12.9, spec-gap 96)
 // A setting of null says "none", overriding the operator's default (typed as `none` in Settings).
 const setting = (k) => (settings[k] === null ? undefined : settings[k] !== undefined && settings[k] !== '' && !(Array.isArray(settings[k]) && !settings[k].length) ? settings[k] : served[k]);
@@ -87,7 +94,7 @@ function renderContacts() {
     li.querySelector('.num').textContent = (c.numbers || []).join(' ');
     const b = (text, cls, fn) => { const x = document.createElement('button'); x.textContent = text; if (cls) x.className = cls; x.onclick = fn; return x; };
     li.append(b('Call', 'primary', () => placeCall(c.did, false)), b('Video', '', () => placeCall(c.did, true)),
-      b('Introduce', '', () => introduce(c.did)), b('Remove', 'ghost', () => removeContact(c.did)));
+      b('Message', '', () => messagePeer(c.did)), b('Introduce', '', () => introduce(c.did)), b('Remove', 'ghost', () => removeContact(c.did)));
     ul.append(li);
   }
   const reqs = engine.requests();
@@ -101,7 +108,7 @@ function renderContacts() {
     li.querySelector('.purpose').textContent = purposes[id]?.purpose ? `“${purposes[id].purpose}”  (a claim, §18.2)` : '(no purpose given)';
     li.querySelector('.basis').textContent = purposes[id]?.basis || '';
     const g = document.createElement('button'); g.textContent = 'Grant'; g.className = 'primary';
-    g.onclick = () => engine.local({ local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite'], valid_until: Math.floor(now()) + 31536000 });
+    g.onclick = () => engine.local({ local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message'], valid_until: Math.floor(now()) + 31536000 });   // §19.4; M§14.2: calls and messages
     const r = document.createElement('button'); r.textContent = 'Ignore';
     r.onclick = () => engine.local({ local: 'reject_introduction', introduction: id, reason: 'user.declined' });
     li.append(g, r);
@@ -132,6 +139,9 @@ function renderSettings() {
   $('set-nodes').value = settings.nodes === null ? 'none' : (settings.nodes || []).join(', ');
   $('set-nodes').placeholder = (served.nodes || []).join(', ') || 'https://node.example:8090, …';
   $('set-publish-hint').checked = publishHint();
+  $('set-mailbox').value = settings.mailbox === null ? 'none' : settings.mailbox?.uri || '';
+  $('set-mailbox-did').value = settings.mailbox?.did || '';
+  if (served.mailbox) { $('set-mailbox').placeholder = served.mailbox.uri || ''; $('set-mailbox-did').placeholder = served.mailbox.did || ''; }
   renderNetwork();
   const web = identity.identity.startsWith('did:web:');
   $('set-did-web').value = web ? identity.identity : '';
@@ -157,7 +167,14 @@ function renderNetwork() {
     `nodes: ${nodesInEffect().join(', ') || 'none'} (${src('nodes')})`,
     `reachability hint: ${publishHint() ? `published on the nodes, ${HINT_TTL_S} s, re-signed at ⅔` : 'not published'}`,
     `gateway: ${setting('gateway') || 'none'} (${src('gateway')})`,
+    `mailbox: ${mailboxOf() ? `${mailboxOf().uri} ${mailboxOf().did}` : 'none (messaging off)'} (${src('mailbox')})`,
   ].join('\n');
+}
+
+/** The mailbox this identity uses (M§4.2): Settings, else the operator's; `{uri, did}` or null. */
+function mailboxOf() {
+  const m = setting('mailbox');
+  return m && m.uri && m.did ? m : null;
 }
 
 /** Where a did:web document is served (§8.4): `https://<host>/.well-known/did.json`, or `/<path>/did.json`. */
@@ -406,7 +423,7 @@ async function onEmission(e) {
     if (e.ui === 'introduction_received' && e.token) { notify(`${short(e.from)} used your contact link: granted`); if (!contacts.some((c) => c.did === e.from)) await addContact('', e.from); }
     else if (e.ui === 'introduction_received') notify(`Introduction from ${nameOf(e.from) || short(e.from)}: see Requests`);
     if (e.ui === 'introduction_rejected') notify(`an introduction of yours was declined${e.reason ? ` (${e.reason})` : ''}`);
-    if (e.ui === 'granted') notify(`${nameOf(e.by) || short(e.by)} granted you contact`);
+    if (e.ui === 'granted') { notify(`${nameOf(e.by) || short(e.by)} granted you contact`); closePeerRelay(e.by); }
     return;
   }
   if (e.info) { log(`ℹ info for ${e.info.about}`, '§12.12'); return; }
@@ -595,12 +612,17 @@ async function publishReachability() {
   const seq = Math.max(Math.floor(now()), hintSeq + 1);
   hintSeq = seq; store.set(key('hint_seq'), seq);
   const uri = relayUrl();
-  const frame = hint_frame(JSON.stringify(identity), engine.newId(), uri, HINT_TTL_S, seq, now());
+  // M§4.2: a did:key identity advertises its mailbox in the hint, as a DSIPMailbox endpoint carrying the service
+  // entry's fields; only once the mailbox has bound this device (it serves this identity, spec-gap 115)
+  const endpoints = [{ uri }];
+  const mb = mailboxOf();
+  if (mb && mailboxInfo && mailboxInfo.did === mb.did) endpoints.push({ uri: mb.uri, service: 'DSIPMailbox', mailbox: mb.did, priority: 0, profiles: ['messaging/1.0'], accepts: ['text'] });
+  const frame = hint_frame(JSON.stringify(identity), engine.newId(), JSON.stringify(endpoints), HINT_TTL_S, seq, now());
   for (const n of nodesInEffect()) {
     try {
       const r = await fetch(`${n.replace(/\/$/, '')}/dsip/v1/hints`, { method: 'POST', body: frame, headers: { 'content-type': 'text/plain' } });
       const text = r.status === 202 ? `accepted (${(await r.json()).acknowledged ?? '?'} peer(s) acknowledged)` : r.status === 409 ? 'a held record wins (§8.3)' : `${r.status} ${(await r.text()).slice(0, 80)}`;
-      log(`hint published → ${n}: ${uri} seq ${seq} for ${HINT_TTL_S} s: ${text}`, '§8.3 · profile §10');
+      log(`hint published → ${n}: ${uri}${endpoints.length > 1 ? ' + mailbox' : ''} seq ${seq} for ${HINT_TTL_S} s: ${text}`, '§8.3 · profile §10');
     } catch (e) { log(`hint not published: ${n} did not answer (${e.message})`, '§8.5'); }
   }
   hintTimer = setInterval(publishReachability, (HINT_TTL_S * 2 / 3) * 1000);
@@ -711,9 +733,28 @@ function introduce(to) {
 async function sendIntroduction(to, purpose, token) {
   const ev = { local: 'introduce', id: engine.newId(), to, purpose };
   if (token) ev.contact_token = token;
+  // §8.1: as before a call, the hints tier may say they are bound to another relay; the introduction goes through
+  // it on a connection kept open for the answer (their grant comes back on their relay, where we are now bound)
+  if (!callRelays.has(to)) {
+    const hint = await discover(to).catch(() => null);
+    if (hint?.uri && hint.uri !== relayUrl()) {
+      const r = await openCallRelay(hint.uri, to);
+      if (r) { log(`introduction to ${short(to)} goes through their relay ${hint.uri} (hint-sourced, §8.1); kept open for their answer`, '§19.4'); setTimeout(() => closePeerRelay(to), 600000); }
+      else log(`their relay ${hint.uri} did not bind us; introducing through our own relay`, '§8.1');
+    }
+  }
   await engine.local(ev);
   $('introduce-form').classList.add('hidden');
   notify('introduction sent; it never rings, and silence is a valid answer');
+}
+
+/** Close the connection kept to a peer's relay for an introduction, once answered or given up. */
+function closePeerRelay(did) {
+  const r = callRelays.get(did);
+  if (!r) return;
+  callRelays.delete(did);
+  r.close();
+  log(`their relay ${r.url}: connection for the introduction closed`, '§13.2');
 }
 
 // ---------------------------------------------------------------- contacts
@@ -836,18 +877,238 @@ async function startEngine() {
   for (const d of Object.values(documents)) engine.ep.add_document(JSON.stringify(d));   // §8.1: documents held
   engine.on = {
     send: (frame, meta) => {
-      // a session placed through the peer's own relay stays there; everything else goes through ours
-      const via = callRelays.get(meta.session);
+      // a session placed through the peer's own relay stays there, an introduction through the relay their hint
+      // named (keyed by their DID); everything else goes through ours
+      const via = callRelays.get(meta.session) || callRelays.get(meta.to);
       (via || relay).send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}${via ? ` via ${via.url}` : ''}`, '§12.4');
       if (meta.type === 'reject' && payloadOf(frame).reason === 'policy.first-contact-required') log(`refused a call from ${short(meta.to)} without ringing: first contact required`, '§19.4');
     },
     received: onReceived,
     emission: onEmission,
     rejected: (code, detail) => log(`✗ inbound rejected: ${code} ${detail || ''}`, '§10.2'),
-    changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); },
+    changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); messenger?.set_grants(JSON.stringify(heldGrantFrames())); },
   };
   engine.startTimers();
   connect();
+  startMessaging();
+}
+
+// ---------------------------------------------------------------- messaging (stage 6)
+
+/** Grants held from others as `{identity: compact}` (§19.4: the grantee holds the signed grant; presented at M§14.2). */
+function heldGrantFrames() {
+  const file = JSON.parse(engine.contactsFile());
+  const out = {};
+  for (const [id, g] of Object.entries(file.grants_held || {})) if (file.grant_frames?.[id]) out[g.identity] = file.grant_frames[id];
+  return out;
+}
+
+/** Start (or restart) the messaging device: a `Messenger` on this identity's mailbox (M§4.2), bound with our hello
+ *  (M§4.3); its state is restored from storage and saved after every step (spec-gap 44). */
+async function startMessaging() {
+  mailboxConn?.close(); mailboxConn = null; mailboxInfo = null; messenger = null;
+  const mb = mailboxOf();
+  renderMessages();
+  if (!mb) return;
+  // M§4.3: the delegation must carry dsip.messaging; an identity made before stage 6 is re-delegated here when its
+  // identity key is on this device
+  const saved = await store.get(key('messenger'));
+  try {
+    let m = new Messenger(JSON.stringify(identity), mb.did, mb.uri, saved ? JSON.stringify(saved) : undefined, now());
+    if (!m.delegation_ok()) {
+      if (!identity.controller_seed_hex) { log('messaging needs a delegation with dsip.messaging (M§4.3): enrol this device again from the identity file', 'M§4.3'); renderMessages(); return; }
+      identity = JSON.parse(redelegate(JSON.stringify(identity), now()));
+      await store.set(key('identity'), identity);
+      log('delegation re-issued with dsip.messaging (M§4.3, §7.4): reloading', 'M§4.3');
+      location.reload();
+      return;
+    }
+    messenger = m;
+  } catch (e) { log(`messaging not started: ${e.message || e}`, 'M§4'); renderMessages(); return; }
+  messenger.set_grants(JSON.stringify(heldGrantFrames()));
+  for (const d of Object.values(documents)) messenger.add_document(JSON.stringify(d));
+  mailboxConn = new Relay(mb.uri, messenger, {
+    bound: async (r) => {
+      if (r.did !== mb.did) {   // M§4.2: the mailbox's hello must be signed under the DID the entry names
+        log(`✗ mailbox at ${mb.uri} is ${short(r.did)}, not ${short(mb.did)}: not used`, 'M§4.2');
+        mailboxConn.close(); renderMessages(); return;
+      }
+      mailboxInfo = r;
+      log(`← hello        mailbox ${short(r.did)} bound us (in_reply_to matched); ${r.capabilities?.mailbox?.hub ? 'a hub' : 'no hub'}, modes ${(r.capabilities?.mailbox?.modes || []).join('/')}`, 'M§4.3 · §20.5');
+      await driveMailbox(messenger.on_bound(now()));                      // pending items again, then sync live (M§9.3, M§5.4)
+      await driveMailbox([messenger.key_packages_frame(2, now())]);        // M§5.5: fresh KeyPackages on every bind
+      if (!messenger.personal()) { try { await driveMailbox(messenger.create_personal(now())); log('creating the personal group at the mailbox', 'M§7.1'); } catch (e) { log(`personal group: ${e.message || e}`, 'M§7.1'); } }
+      publishReachability();                                               // the hint now names the mailbox too (M§4.2)
+      renderMessages();
+    },
+    refused: (x) => log(`✗ mailbox hello rejected: ${x.code}`, '§20.5'),
+    rejected: (code) => { log(`✗ mailbox refused our hello: ${code}`, 'M§4.3'); renderMessages(); },
+    frame: async (text) => { await driveMailbox(messenger.inbound(text, now())); },
+    closed: (was) => { if (was) { mailboxInfo = null; log(`mailbox ${mb.uri} dropped the connection; reconnecting`, '§13.2'); renderMessages(); } },
+    dropped: (f) => log(`✗ mailbox not connected: a ${payloadOf(f).type || 'frame'} was not sent`),
+  }, now);
+  mailboxConn.connect();
+  log(`messaging: mailbox ${mb.uri} (${short(mb.did)})`, 'M§4.2');
+}
+
+/** Act on what the Messenger returned (a JSON array of emissions, or of frames): send frames to the mailbox, log
+ *  and render events, then save its state (MLS and delivery state together, spec-gap 44). */
+async function driveMailbox(result) {
+  const list = typeof result === 'string' ? JSON.parse(result) : result;
+  for (const e of list) {
+    if (typeof e === 'string') { mailboxConn.send(e); log(`→ ${payloadOf(e).type?.padEnd(12)} to mailbox${payloadOf(e).class ? ` (${payloadOf(e).class})` : ''}`, 'M§5'); continue; }
+    if (e.send) { mailboxConn.send(e.send); const p = payloadOf(e.send); log(`→ ${(p.type || '').padEnd(12)} to ${p.to === mailboxOf()?.did ? 'mailbox' : 'hub ' + short(p.to)}${p.class ? ` (${p.class})` : ''}`, 'M§5'); }
+    else if (e.sync) { const f = messenger.sync_frame(false, now()); mailboxConn.send(f); log('→ sync         after a refused commit (M§6.5, spec-gap 58)', 'M§6.5'); }
+    else if (e.ui) onMessagingUi(e);
+    else if (e.refused) { log(`✗ refused: ${e.refused}`, 'M§16'); notify(`Messaging: ${e.refused}`); }
+    else if (e.error) log(`✗ messaging error: ${e.error}`, 'M§5');
+    else if (e.rejected) log(`✗ mailbox frame rejected: ${e.rejected.code}${e.rejected.reason ? ' ' + e.rejected.reason : ''}`, '§10.2');
+    else if (e.drop) log(`· mailbox: ${e.drop}`);
+    for (let i = waiters.length - 1; i >= 0; i--) if (waiters[i].pred(e)) waiters.splice(i, 1)[0].resolve(e);
+  }
+  await store.set(key('messenger'), JSON.parse(messenger.save()));
+  renderMessages();
+}
+
+function onMessagingUi(e) {
+  const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
+    key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5' }[e.ui] || 'M§';
+  const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
+  log(`◇ ${e.ui} ${fields}`, sec);
+  if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
+  if (e.ui === 'joined' && e.kind === 'direct') { activeConv = activeConv || e.group; notify(`${nameOf(e.members.find((m) => m !== identity.identity)) || 'someone'} opened a conversation with you`); }
+  if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
+  if (e.ui === 'request') notify(`Message request from ${short(e.from)}: see Messages`);
+  if (e.ui === 'granted') notify(`${nameOf(e.by) || short(e.by)} granted you dsip.message`);
+}
+
+/** Wait for one Messenger emission on the mailbox connection. */
+function awaitEmission(pred, ms = 15000) {
+  return new Promise((resolve, reject) => {
+    const w = { pred, resolve };
+    waiters.push(w);
+    setTimeout(() => { const i = waiters.indexOf(w); if (i >= 0) { waiters.splice(i, 1); reject(new Error('no answer from the mailbox')); } }, ms);
+  });
+}
+
+/** The peer's mailbox (M§4.2, §8.1): its DID document's entry when held here, else the DSIPMailbox endpoint of its
+ *  reachability hint on the nodes (a hint: never authority). `{did, uri, source}` or null. */
+async function peerMailbox(did) {
+  const hint = did.startsWith('did:web:') && documents[did] ? null : await discover(did);
+  const sel = JSON.parse(mailbox_select(JSON.stringify(documents[did] ?? null), JSON.stringify(hint?.endpoints || [])));
+  if (!sel.selected) return null;
+  log(`mailbox of ${short(did)}: ${sel.uri} ${short(sel.selected)} (${sel.source === 'hint' ? 'HINT-SOURCED, NOT AUTHORITATIVE, §8.1 rule 6' : 'from their DID document, §8.1'})`, 'M§4.2');
+  return { did: sel.selected, uri: sel.uri, source: sel.source };
+}
+
+/** A short-lived connection to another mailbox for one `key-package-fetch` (M§5.5): bound with our hello, the
+ *  answer returned, closed. */
+function fetchFromMailbox(mb, target) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn) => { if (!done) { done = true; r.close(); fn(); } };
+    const r = new Relay(mb.uri, messenger, {
+      bound: (info) => {
+        if (info.did !== mb.did) return finish(() => reject(new Error(`their mailbox is ${short(info.did)}, not ${short(mb.did)}`)));
+        log(`← hello        their mailbox ${short(info.did)} bound us (in_reply_to matched)`, 'M§4.3 · §20.5');
+        r.send(messenger.fetch_frame(mb.did, target, now()));
+        log(`→ key-package-fetch for ${short(target)} to their mailbox${heldGrantFrames()[target] ? ', presenting their grant' : ', no grant held'}`, 'M§5.5 · M§14.2');
+      },
+      refused: (x) => finish(() => reject(new Error(`their mailbox's hello rejected: ${x.code}`))),
+      rejected: (code) => finish(() => reject(new Error(`their mailbox refused our hello: ${code}`))),
+      frame: (text) => {
+        for (const e of JSON.parse(messenger.inbound(text, now()))) {
+          if (e.key_packages) return finish(() => resolve(e.key_packages));
+          if (e.error) return finish(() => reject(new Error(e.error)));
+          if (e.rejected) return finish(() => reject(new Error(`frame rejected: ${e.rejected.code}`)));
+        }
+      },
+      closed: () => { if (!done) finish(() => reject(new Error('their mailbox closed the connection'))); },
+      dropped: () => {},
+    }, now);
+    r.connect();
+    setTimeout(() => finish(() => reject(new Error('their mailbox did not answer in 15 s'))), 15000);
+  });
+}
+
+/** Open (or create, M§7.2) the direct conversation with `did`: the peer's mailbox found, its KeyPackages fetched with
+ *  the grant we hold, our own other devices' too, the group created at our mailbox and the add committed. */
+async function messagePeer(did) {
+  if (!messenger) return notify('messaging needs a mailbox in Settings → Network');
+  show('messages');
+  messenger.set_grants(JSON.stringify(heldGrantFrames()));   // grants held since the messenger started (§19.4)
+  const existing = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === did);
+  if (existing) { activeConv = existing.group; renderMessages(); return; }
+  if (!mailboxInfo) return notify('the mailbox is not bound yet');
+  $('thread-title').textContent = `opening a conversation with ${nameOf(did) || short(did)}…`;
+  try {
+    const mb = await peerMailbox(did);
+    if (!mb) throw new Error('no mailbox found for them: no document held, and no DSIPMailbox hint on the nodes');
+    const theirs = await fetchFromMailbox(mb, did);
+    log(`key packages of ${short(did)}: ${(theirs.key_packages || []).length} one-time${theirs.last_resort ? ' + last resort' : ''}`, 'M§5.5');
+    // M§7.2: our own other devices join in the same commit; our mailbox is asked over the bound connection
+    let own = null;
+    try {
+      const p = awaitEmission((e) => (e.key_packages && e.key_packages.subject === identity.identity) || e.error, 8000);
+      mailboxConn.send(messenger.fetch_frame(mailboxOf().did, identity.identity, now()));
+      const got = await p;
+      if (got.error) throw new Error(got.error);
+      own = got.key_packages;
+    } catch (e) { log(`own devices: none added (${e.message})`, 'M§7.2'); }
+    const frames = messenger.create_direct(did, JSON.stringify(theirs), own ? JSON.stringify(own) : undefined, now());
+    await driveMailbox(frames);
+    log(`conversation with ${short(did)} created at our mailbox (hub); the add goes out once the hub holds the group`, 'M§7.2 · M§6.5');
+    activeConv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === did)?.group || activeConv;
+  } catch (e) { notify(`cannot message ${nameOf(did) || short(did)}: ${e.message || e}`); log(`✗ ${e.message || e}`, 'M§7.2'); }
+  renderMessages();
+}
+
+async function sendText(text) {
+  if (!messenger || !activeConv || !text.trim()) return;
+  try { await driveMailbox([{ send: messenger.send_text(activeConv, text.trim(), now()) }]); } catch (e) { notify(`not sent: ${e.message || e}`); }
+}
+
+function renderMessages() {
+  const mb = mailboxOf();
+  const status = !mb ? 'no mailbox: set one under Settings → Network (the operator may serve a default)'
+    : !messenger ? `mailbox ${mb.uri}: messaging not started`
+    : !mailboxInfo ? `mailbox ${mb.uri} (${short(mb.did)}): connecting…`
+    : `mailbox ${mb.uri} (${short(mb.did)}): bound · personal group ${messenger.personal() ? 'yes' : 'pending'} · this device's MLS state is kept in this browser's storage`;
+  $('mailbox-status').textContent = status;
+  const convs = messenger ? JSON.parse(messenger.conversations(now())).filter((c) => c.kind !== 'personal') : [];
+  const ul = $('conv-list');
+  ul.innerHTML = convs.length ? '' : '<li class="muted small">none yet: open a contact and choose Message</li>';
+  for (const c of convs) {
+    const li = document.createElement('li');
+    li.className = c.group === activeConv ? 'active' : '';
+    li.innerHTML = '<span class="name"></span> <code class="did"></code> <span class="muted small meta"></span>';
+    li.querySelector('.name').textContent = c.peer ? nameOf(c.peer) || '(unnamed)' : c.kind;
+    li.querySelector('.did').textContent = c.peer || c.group;
+    li.querySelector('.meta').textContent = `${c.members.length} identit${c.members.length === 1 ? 'y' : 'ies'}, epoch ${c.epoch}${c.pending ? `, ${c.pending} pending` : ''}`;
+    li.onclick = () => { activeConv = c.group; renderMessages(); };
+    ul.append(li);
+  }
+  const rl = $('msg-request-list');
+  const reqs = messenger ? Object.entries(JSON.parse(messenger.requests())) : [];
+  rl.innerHTML = reqs.length ? '' : '<li class="muted small">none</li>';
+  for (const [id, r] of reqs) { const li = document.createElement('li'); li.innerHTML = '<code class="did"></code> <span class="small purpose"></span>'; li.querySelector('.did').textContent = r.from; li.querySelector('.purpose').textContent = `“${r.purpose}” (${id})`; rl.append(li); }
+  const conv = convs.find((c) => c.group === activeConv);
+  $('thread-title').textContent = conv ? (conv.peer ? nameOf(conv.peer) || '(unnamed)' : conv.kind) : 'no conversation open';
+  $('thread-did').textContent = conv?.peer || '';
+  $('thread-meta').textContent = conv ? `group ${conv.group} · hub ${short(conv.hub.did)} (${conv.hub.did === mb?.did ? 'our mailbox' : 'their mailbox'}) · epoch ${conv.epoch}` : '';
+  const th = $('thread');
+  th.innerHTML = '';
+  if (conv) for (const m of JSON.parse(messenger.thread(conv.group))) {
+    const d = document.createElement('div');
+    d.className = `msg${m.mine ? ' mine' : ''}`;
+    d.innerHTML = '<span class="who"></span><span class="text"></span><span class="seq"></span>';
+    d.querySelector('.who').textContent = m.mine ? 'you' : nameOf(m.sender) || short(m.sender);
+    d.querySelector('.text').textContent = m.object.text || `(${m.object.kind})`;
+    d.querySelector('.seq').textContent = m.seq == null ? 'pending' : `#${m.seq}${m.mine && m.delivered && Object.keys(m.delivered).length ? ' ✓✓' : ''}`;
+    th.append(d);
+  }
+  th.scrollTop = th.scrollHeight;
+  $('compose-text').disabled = !conv; $('compose-send').disabled = !conv;
 }
 
 (async () => {
@@ -909,6 +1170,7 @@ async function startEngine() {
   $('btn-add-document').onclick = async () => { await addDocument($('set-document').value); $('set-document').value = ''; };
   $('introduce-form').onsubmit = (e) => { e.preventDefault(); sendIntroduction($('introduce-form').dataset.to, $('introduce-purpose').value.trim()); };
   $('introduce-cancel').onclick = () => $('introduce-form').classList.add('hidden');
+  $('compose').onsubmit = async (e) => { e.preventDefault(); const t = $('compose-text').value; $('compose-text').value = ''; await sendText(t); };
   $('btn-contact-link').onclick = newContactLink;
   $('btn-accept').onclick = () => accept(false);
   $('btn-screen').onclick = () => accept(true);
@@ -925,7 +1187,9 @@ async function startEngine() {
     try { settings.ice = $('set-ice').value.trim() ? JSON.parse($('set-ice').value) : undefined; } catch { return alert('ICE servers must be a JSON array'); }
     settings.nodes = noneable($('set-nodes').value, true);
     settings.publish_hint = $('set-publish-hint').checked;
-    await saveSettings(); ice = null; renderSettings(); connect();
+    const mbUri = noneable($('set-mailbox').value), mbDid = $('set-mailbox-did').value.trim();
+    settings.mailbox = mbUri === null ? null : mbUri ? { uri: mbUri, did: mbDid } : undefined;
+    await saveSettings(); ice = null; renderSettings(); connect(); startMessaging();
   };
   $('btn-export').onclick = exportToFile;
   $('device-add').onsubmit = async (e) => {
@@ -986,5 +1250,17 @@ async function startEngine() {
     links: () => links.map((l) => l.url),
     note: () => $('call-note').textContent,
     mode: () => $('call-mode').textContent,
+    // messaging (stage 6)
+    mailbox: () => mailboxInfo?.did || null,
+    mailboxText: () => $('mailbox-status').textContent,
+    setMailbox: async (m) => { settings.mailbox = m === null ? null : m || undefined; await saveSettings(); renderSettings(); startMessaging(); },
+    conversations: () => (messenger ? JSON.parse(messenger.conversations(now())) : []),
+    thread: (gid) => (messenger ? JSON.parse(messenger.thread(gid || activeConv)) : []),
+    activeConversation: () => activeConv,
+    openConversation: (gid) => { activeConv = gid; renderMessages(); },
+    messagePeer,
+    sendText,
+    personalGroup: () => messenger?.personal() || null,
+    messengerSaved: () => store.get(key('messenger')),
   };
 })();

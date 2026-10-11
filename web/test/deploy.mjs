@@ -37,7 +37,7 @@ try {
   const relayA = await bob.page.evaluate(() => window.dsip.relay());
   await bob.page.evaluate((url) => window.dsip.setNetwork({ relay: url }), RELAY_B);
   await until(bob.page, (a) => window.dsip.relay() && window.dsip.relay() !== a, relayA);
-  const published = new RegExp(`hint published → ${URL.replace(/\/$/, '')}: ${RELAY_B.replace(/[.]/g, '\\.')} seq \\d+ for 3600 s: accepted`);
+  const published = new RegExp(`hint published → ${URL.replace(/\/$/, '')}: ${RELAY_B.replace(/[.]/g, '\\.')}( \\+ mailbox)? seq \\d+ for 3600 s: accepted`);
   await until(bob.page, (re) => new RegExp(re).test(document.getElementById('log').textContent), published.source);
   check('Bob is bound to relay B and his hint for it was accepted by the node (a newer seq than the one for relay A, published the same second)', published.test(await bob.page.textContent('#log')));
   const got = await (await fetch(`${URL.replace(/\/$/, '')}/dsip/v1/hints/${encodeURIComponent(bob.did)}`)).json();

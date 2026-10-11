@@ -85,6 +85,7 @@ tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
+rustls-native-certs = "0.8"
 rcgen = "0.13"
 futures-util = "0.3"
 mainline = { version = "8.0.1", default-features = false, features = ["async"] }

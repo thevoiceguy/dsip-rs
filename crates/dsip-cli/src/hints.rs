@@ -62,7 +62,7 @@ pub async fn publish(handle: &Handle, id: &Identity, relay_uri: &str, ttl_s: i64
     let payload = hint_payload(
         &id.meta.identity,
         &id.meta.identity,
-        &[Endpoint { uri: relay_uri.to_string(), bindings: vec!["ws/1.0".into()] }],
+        &[Endpoint::signaling(relay_uri)],
         now,
         now,
         ttl_s,

@@ -11,6 +11,12 @@
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
+pub mod messaging;
+
+/// What this client's device delegation carries (§7.4): signaling and interactive media for calls, and
+/// `dsip.messaging` for the mailbox (M§4.3).
+const DEVICE_CAPABILITIES: &[&str] = &["dsip.signaling", "dsip.media.interactive", "dsip.messaging"];
+
 use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{sign, Context, Envelope};
 use dsip_core::keys::KeyPair;
@@ -23,7 +29,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Result<[u8; 32], JsValue> {
+pub(crate) fn unhex(s: &str) -> Result<[u8; 32], JsValue> {
     let s = s.trim();
     if s.len() != 64 {
         return Err(JsValue::from_str("seed must be 64 hex chars"));
@@ -35,7 +41,7 @@ fn unhex(s: &str) -> Result<[u8; 32], JsValue> {
     Ok(out)
 }
 
-fn js<E: std::fmt::Display>(e: E) -> JsValue {
+pub(crate) fn js<E: std::fmt::Display>(e: E) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 
@@ -74,7 +80,7 @@ pub fn create_identity(controller_seed_hex: Option<String>, device_seed_hex: Opt
         &device.did(),
         now - 60,
         now + 365 * 86_400,
-        &["dsip.signaling", "dsip.media.interactive"],
+        DEVICE_CAPABILITIES,
     );
     let delegation = sign(&payload, &controller, &controller.kid());
     Ok(json!({
@@ -115,7 +121,7 @@ pub fn rehome(identity_json: &str, did_web: &str, now: f64) -> Result<String, Js
         &device.did(),
         now - 60,
         now + 365 * 86_400,
-        &["dsip.signaling", "dsip.media.interactive"],
+        DEVICE_CAPABILITIES,
     );
     id["identity"] = json!(did_web);
     id["delegation"] = json!(sign(&payload, &controller, &format!("{did_web}#key-1")).frame());
@@ -201,17 +207,28 @@ pub fn tn_select(tn: &str, bindings_json: &str, documents_json: &str, now: f64, 
     }
 }
 
-/// A signed reachability hint for this identity at `relay_uri` (DHT Hints Profile §2; §8.3: `seq` is the
-/// publisher's, newer wins): the frame to `POST /dsip/v1/hints` on a node (§10). Signed by the device under its
-/// delegation, as the CLI's `--publish-hint` signs; `ttl_s` is clamped to the profile's maximum (§12.9, spec-gap 96).
+/// A signed reachability hint for this identity (DHT Hints Profile §2; §8.3: `seq` is the publisher's, newer wins):
+/// the frame to `POST /dsip/v1/hints` on a node (§10). `endpoints_json` is `[{uri, bindings?, service?, …}]`: the
+/// signaling relay (`service` absent) and, with `"service": "DSIPMailbox"`, the mailbox entry a `did:key` identity
+/// advertises this way (Messaging Profile M§4.2). Signed by the device under its delegation, as the CLI's
+/// `--publish-hint` signs; `ttl_s` is clamped to the profile's maximum (§12.9, spec-gap 96).
 #[wasm_bindgen]
-pub fn hint_frame(identity_json: &str, id: &str, relay_uri: &str, ttl_s: f64, seq: f64, now: f64) -> Result<String, JsValue> {
+pub fn hint_frame(identity_json: &str, id: &str, endpoints_json: &str, ttl_s: f64, seq: f64, now: f64) -> Result<String, JsValue> {
     let id_v: Value = serde_json::from_str(identity_json).map_err(js)?;
     let device = KeyPair::from_seed(unhex(id_v["device_seed_hex"].as_str().unwrap_or(""))?);
     let delegation = Envelope::from_frame(id_v["delegation"].as_str().unwrap_or("")).map_err(|v| JsValue::from_str(&format!("{:?}", v.code)))?;
     let subject = id_v["identity"].as_str().unwrap_or("");
     let ttl = (ttl_s as i64).clamp(3, dsip_core::HINT_MAX_VALIDITY_S);
-    let endpoints = [dsip_dht::record::Endpoint { uri: relay_uri.to_string(), bindings: vec!["ws/1.0".into()] }];
+    let endpoints: Vec<dsip_dht::record::Endpoint> = serde_json::from_str::<Vec<Value>>(endpoints_json)
+        .map_err(js)?
+        .into_iter()
+        .map(|mut e| {
+            if e.get("bindings").is_none() {
+                e["bindings"] = json!(["ws/1.0"]);
+            }
+            serde_json::from_value(e).map_err(js)
+        })
+        .collect::<Result<_, _>>()?;
     let payload = dsip_dht::record::hint_payload_with_id(subject, subject, &endpoints, seq as i64, now as i64, ttl, id);
     Ok(dsip_dht::record::sign_hint(&payload, &device, vec![delegation]).frame())
 }
@@ -234,7 +251,9 @@ pub fn hint_select(did: &str, frames_json: &str, documents_json: &str, now: f64)
     let ctx = Context::new(now as i64, &resolver);
     let (winner, report) = dsip_dht::record::select(&frames, &ctx);
     let hint = winner.filter(|h| h.subject == did).map(|h| {
-        json!({"uri": h.endpoints.first().map(|e| e.uri.clone()), "bindings": h.endpoints.first().map(|e| e.bindings.clone()),
+        // `uri` is the signaling endpoint's (profile §2: `service` absent); every endpoint is in `endpoints`
+        let signaling = h.endpoints.iter().find(|e| e.service() == "DSIPSignaling").or(h.endpoints.first());
+        json!({"uri": signaling.map(|e| e.uri.clone()), "bindings": signaling.map(|e| e.bindings.clone()), "endpoints": h.endpoints,
                "seq": h.seq, "issued_at": h.issued_at, "expires_at": h.expires_at, "signer": h.signer})
     });
     json!({"hint": hint, "report": report.into_iter().map(|(_, v)| v).collect::<Vec<_>>()}).to_string()
@@ -470,4 +489,28 @@ impl Endpoint {
             Err(_) => false,
         }
     }
+}
+
+/// Choose a peer's mailbox (M§4.2, §8.1): its DID document's `DSIPMailbox` entries when it has a document held here,
+/// else the `DSIPMailbox` endpoints of its reachability hint (`hint_select`'s `endpoints`), through the vector-pinned
+/// `select_mailbox`. Returns `{"source": "did-document"|"hint"|null, "selected": did|null, "uri": …, "order": […]}`.
+#[wasm_bindgen]
+pub fn mailbox_select(document_json: &str, hint_endpoints_json: &str) -> String {
+    let doc: Value = serde_json::from_str(document_json).unwrap_or(Value::Null);
+    let document_entries: Vec<Value> = doc["service"].as_array().into_iter().flatten()
+        .filter(|s| s["type"] == "DSIPMailbox").map(|s| s["serviceEndpoint"].clone()).collect();
+    let hint_entries: Vec<Value> = serde_json::from_str::<Vec<Value>>(hint_endpoints_json).unwrap_or_default().into_iter()
+        .filter(|e| e["service"] == "DSIPMailbox")
+        .map(|mut e| { if let Some(m) = e.as_object_mut() { m.remove("service"); } e }).collect();
+    let all: Vec<Value> = document_entries.iter().chain(hint_entries.iter()).cloned().collect();
+    let mut out = dsip_messaging::client::select_mailbox(&json!({"document_entries": document_entries, "hint_entries": hint_entries}));
+    out["uri"] = all.iter().find(|e| e["mailbox"] == out["selected"]).map(|e| e["uri"].clone()).unwrap_or(Value::Null);
+    out.to_string()
+}
+
+/// Re-issue this identity's delegation with `dsip.messaging` (M§4.3) when the identity key is on this device: the
+/// identity JSON with the new delegation (see [`messaging::redelegate`]).
+#[wasm_bindgen]
+pub fn redelegate(identity_json: &str, now: f64) -> Result<String, JsValue> {
+    messaging::redelegate(identity_json, now as i64)
 }

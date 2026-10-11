@@ -1,7 +1,8 @@
 # DSIP Client Plan — a reference client a person can use (M7)
 
-**Status:** plan, 2026-10-09; stages 1–4 landed 2026-10-10, stage 5 2026-10-11 (`impl/web/`, headless tests in CI; spec-gaps 113
-and 114; deployed on the WAN testbed's relays under Let's Encrypt certificates, runbook in `impl/web/README.md`). Written after v0.11
+**Status:** plan, 2026-10-09; stages 1–4 landed 2026-10-10, stages 5 and 6 2026-10-11 (`impl/web/`, headless tests in CI;
+spec-gaps 113–118; deployed on the WAN testbed's relays and mailboxes under Let's Encrypt certificates, runbook in
+`impl/web/README.md`; WAN records `client-5` and `client-6`). Written after v0.11
 froze at `poc-v0.11` (1,924 vectors) and v0.12 opened. Decided with the user: build it, as a reference client, not a product.
 
 **Spec:** none (infrastructure). The client is a host of the pure crates, like `dsip-cli` and the daemons; every
@@ -54,9 +55,10 @@ What exists to build on:
 
 - A product: no accounts, no recovery service, no push notifications, no app-store packaging. The browser must be
   open to be reachable; a PWA with wake-ups is a later step.
-- Messaging. The Messaging Profile needs MLS, which `dsip-mailbox`/`dsip-msg` have in Rust and the browser does
-  not. It is stage 6, after calls, and only if OpenMLS compiles to wasm at an acceptable size; it never blocks the
-  calling client.
+- Messaging beyond text. Stage 6 (decided after stage 5: OpenMLS compiles to wasm, +0.5 MB gzipped, and runs in
+  the bundle) brings the Messaging Profile's direct conversations with text and delivered receipts; archive and
+  history for a second device, voice and blobs, read receipts and successor groups stay with the Rust console until a
+  later round.
 - Group calls. The Interactive Media Profile's small-group sessions are a later round; the client is one-to-one.
 - Native or mobile apps. The browser is first because the engine is already there, WebRTC is native, and nothing is
   installed. A desktop shell around the same page can come later.
@@ -219,9 +221,18 @@ the app against a local relay, the way the wire demos drive the CLI).
 5. **Deployment.** The app served by L1's relay under a real certificate, TURN credentials, the hints nodes in
    settings, a runbook for an operator (`impl/web/README.md`), and the WAN run record extended with a browser call
    across NATs. The first stage anyone outside the repository can use.
-6. **Messaging** (conditional). OpenMLS to wasm; the Messaging Profile's client rules are pinned (`messaging/`
-   client traces) and the mailbox exists; the question is size and the key-package lifecycle in a browser. Decided
-   after stage 5, not before.
+6. **Messaging.** Decided after stage 5 on two measurements: OpenMLS on its rust-crypto provider compiles to wasm
+   (`openmls` `js`) and adds 0.52 MB gzipped (1.62 → 2.14 MB; the full stage, with the profile's schemas, 2.51 MB) and
+   a key package, group, welcome and message round trip runs in 30 ms. The browser device (`dsip-wasm::messaging`,
+   a `Messenger` driven like the §12 engine) keeps its MLS state in OpenMLS's memory storage and exports it with the
+   delivery state as one record the host saves after every step (spec-gap 44): the KeyPackage lifecycle in a browser
+   is that record. The mailbox serves identities that enrol by binding (`--serve-any`, spec-gap 115), under the
+   relay's certificate, and finds a member with no document through its hint (M§4.2; spec-gap 116); a `did:key`
+   client advertises its mailbox in its hint. First contact is the calling client's (§19.4; the grant carries
+   `dsip.message`, presented at the peer's mailbox, spec-gap 117). Headless test: two browsers on two operators,
+   a conversation created from a KeyPackage fetched at the peer's mailbox, text both ways with delivered receipts,
+   a reload keeping MLS state and history. Not in this round: archive records and history for a second device,
+   read receipts, voice and blobs, successor groups (the Rust console has them).
 
 ## 11. Risks
 

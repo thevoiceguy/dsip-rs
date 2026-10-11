@@ -92,6 +92,12 @@ pub struct ContactFile {
     /// Out-of-band contact tokens issued and unused, token → grant id (single use; §19.4).
     #[serde(default)]
     pub tokens: std::collections::BTreeMap<String, String>,
+    /// The signed grants we hold, by grant id, as compact serializations (`protected.payload.signature`): what a
+    /// grantee presents where a grant is checked as a credential — a mailbox's `key-package-fetch` (M§14.2).
+    ///
+    /// Spec: §19.4 — "the grantee also holds the signed grant".
+    #[serde(default)]
+    pub grant_frames: std::collections::BTreeMap<String, String>,
 }
 
 /// What the core hands back to its host.
@@ -141,6 +147,8 @@ pub struct Core {
     seen: SeenIds,
     /// Offers by session id (invite) or update id, ours and theirs.
     offers: HashMap<String, Value>,
+    /// Signed grants held, by id, compact (§19.4; presented as credentials, M§14.2).
+    grant_frames: std::collections::BTreeMap<String, String>,
     peer_delegations: Vec<Envelope>,
     /// `delegation-revocation` records this endpoint holds (§7.4, v0.8): applied to every verification.
     revocations: Vec<Envelope>,
@@ -183,6 +191,7 @@ impl Core {
             ep: Endpoint::new(c),
             seen: SeenIds::default(),
             offers: HashMap::new(),
+            grant_frames: Default::default(),
             peer_delegations: vec![],
             revocations: vec![],
             pending_sdp: None,
@@ -356,6 +365,7 @@ impl Core {
         self.ep.contacts.requests = file.requests.clone();
         self.ep.contacts.pending_sent = file.pending_sent.clone();
         self.ep.contacts.tokens = file.tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.grant_frames = file.grant_frames.clone();
     }
 
     /// Export first-contact state.
@@ -368,6 +378,7 @@ impl Core {
             requests: self.ep.contacts.requests.clone(),
             pending_sent: self.ep.contacts.pending_sent.clone(),
             tokens: self.ep.contacts.tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            grant_frames: self.grant_frames.clone(),
         }
     }
 
@@ -455,6 +466,12 @@ impl Core {
         if session_scoped {
             // Broadcast/subscription traffic (§9.3, §22) is handled by the host, not the §12 engine.
             let em = self.ep.step(&Event::Recv { recv: msg.clone() });
+            if msg.msg_type == "grant" && self.ep.contacts.grants_held.contains_key(&msg.id) {
+                // §19.4: the grantee holds the signed grant — the bytes as received, for presenting as a credential
+                if let Ok(env) = Envelope::from_frame(frame) {
+                    self.grant_frames.insert(msg.id.clone(), format!("{}.{}.{}", env.protected, env.payload, env.signature));
+                }
+            }
             out.extend(self.handle(em, now)?);
             if let Some((code, reason, detail)) = binding_failure {
                 // B§8: an offer that fails the binding is rejected (`media.unsupported` …); a failed

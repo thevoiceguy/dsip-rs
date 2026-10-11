@@ -39,3 +39,14 @@ video { width:100%; background:#000; border-radius:8px; aspect-ratio: 4/3; }
 #log { margin:0; max-height: 300px; overflow:auto; font-size:12px; white-space: pre-wrap; background:#0d0f14; padding:10px; border-radius:8px; }
 @media (max-width: 700px) { .videos { grid-template-columns: 1fr; } header { gap:8px; } }
 .pre { white-space: pre-line; }
+
+/* messages (stage 6) */
+.messages { display: flex; gap: 1.5rem; align-items: flex-start; }
+.conv-pane { flex: 0 0 22rem; min-width: 0; }
+.thread-pane { flex: 1 1 auto; min-width: 0; }
+.thread { border: 1px solid var(--line, #ddd); border-radius: 6px; padding: .5rem .75rem; min-height: 12rem; max-height: 28rem; overflow-y: auto; font-size: .95rem; }
+.thread .msg { margin: .25rem 0; }
+.thread .msg.mine { text-align: right; }
+.thread .msg .who { font-size: .8rem; opacity: .7; margin-right: .4rem; }
+.thread .msg .seq { font-size: .75rem; opacity: .5; margin-left: .4rem; }
+.conv-pane li.active { font-weight: 600; }

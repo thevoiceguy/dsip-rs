@@ -17,6 +17,14 @@ dsip-session.workspace = true
 dsip-endpoint = { workspace = true, features = ["wasm"] }
 dsip-number.workspace = true
 dsip-dht = { workspace = true, default-features = false }
+dsip-mls.workspace = true
+dsip-messaging.workspace = true
+dsip-recording.workspace = true
+# The browser's MLS: OpenMLS on its rust-crypto provider with the memory storage the host saves (client stage 6);
+# `js` gives it the browser's randomness and clock.
+openmls = { version = "0.9.0", features = ["js"] }
+openmls_rust_crypto = "0.6.0"
+openmls_traits = "0.6.0"
 serde_json.workspace = true
 wasm-bindgen.workspace = true
 js-sys.workspace = true
