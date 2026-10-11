@@ -1794,6 +1794,11 @@ async fn peer_task(
                         let (outs, refused) = st.local_deposit(&dep, now_s());
                         // the rest of what deliver_local does: acknowledge the hub's queue and route what it releases
                         let mut outs = outs;
+                        if let Some(reason) = &refused {
+                            let class = s_of(&dep["class"]);
+                            let queued = if dep["seq"].is_i64() || class == "welcome" { " (queued, retried)" } else { "" };
+                            tracing::info!("our own mailbox refused hub fan-out {class} seq {} in {group}: {reason}{queued}", dep["seq"]);
+                        }
                         if refused.is_none() {
                             let (class, id) = (s_of(&dep["class"]), s_of(&dep["id"]));
                             let welcome_seq = if class == "welcome" { st.welcomes_sent.remove(&id).map(|(_, _, s)| s) } else { None };
