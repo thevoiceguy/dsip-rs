@@ -82,7 +82,9 @@ try {
   // 4. Past the threshold Alice's device creates the successor and re-adds Bob; Bob checks it and joins
   await until(alice.page, () => /successor of .* created at our mailbox/.test(document.getElementById('log').textContent), null, 90000);
   check('Alice: fetched Bob\'s KeyPackages for the successor from his new mailbox, without a grant (M§7.5, spec-gap 61)', /key packages of .* for the successor: [1-9]/.test(await logOf(alice)));
-  await until(bob.page, () => /◇ successor /.test(document.getElementById('log').textContent), null, 40000);
+  // the hub finds Bob's new mailbox at its next lookup (spec-gap 116: a lookup is reused at most 60 s) and retries an
+  // unacknowledged welcome with backoff, so this can take a couple of minutes after a move
+  await until(bob.page, () => /◇ successor /.test(document.getElementById('log').textContent), null, 180000);
   check('Bob: checked the successor (creator in the dead group, nobody added who was not) and joined it (M§7.5)', true);
   await until(bob.page, (g) => { const c = window.dsip.conversations().find((x) => x.predecessors?.includes(g)); return c && window.dsip.thread(c.group).some((m) => m.object.text === 'while the hub is gone'); }, bConv.group, 40000);
   const bNew = await bob.page.evaluate((g) => window.dsip.conversations().find((x) => x.predecessors?.includes(g)), bConv.group);
@@ -105,6 +107,11 @@ try {
 } catch (err) {
   check.fail(`exception: ${err.message}`);
   await dump(alice, bob);
+  // the mailboxes' side of the deliveries, for a failure in CI
+  for (const m of ['mbx-a', 'mbx-b']) {
+    const lines = readFileSync(`${FIXTURE}/${m}.log`, 'utf8').split('\n').filter((l) => /welcome|refused|unreachable|looked up|enrolled|successor/.test(l));
+    console.log(`--- ${m}`); for (const l of lines.slice(-25)) console.log('   ' + l.slice(0, 260));
+  }
 }
 mbxC?.kill('SIGKILL');
 await browser.close();
