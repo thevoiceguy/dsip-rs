@@ -4,7 +4,8 @@
 //! for the current or previous epoch, per-group `seq`, per-mailbox fan-out in `seq` order with
 //! retry before later items), M§6.8 (external joins), M§7.3 (membership rules), M§9.3
 //! (idempotent re-deposit), M§11.2 (ephemeral activity is forwarded, never sequenced), M§7.4 (a commit with `moves_to`
-//! is the group's last here: later deposits are refused `mailbox.unknown-group` while the queues drain; spec-gap 60).
+//! is the group's last here: later deposits are refused `mailbox.unknown-group` while the queues drain; spec-gap 60),
+//! M§4.4 (`mls_retention_s` bounds what is kept for a member that acknowledges nothing; spec-gap 119).
 //!
 //! Impl: MLS is abstracted — a deposit event carries the epoch, a digest of the MLS bytes, and for
 //! a commit its adds, removes, validity and whether it is external. Refusals without a
@@ -40,6 +41,22 @@ pub struct Hub {
     /// gained a device is not among them (spec-gap 87).
     #[serde(default)]
     unregistered: BTreeSet<String>,
+    /// How long a member identity may acknowledge nothing before its queues are dropped, seconds (spec-gap 119).
+    #[serde(default = "default_retention")]
+    retention: i64,
+    /// Per member identity with something queued: when its queues last went from empty to not, or saw a head
+    /// acknowledged (spec-gap 119).
+    #[serde(default)]
+    waiting: BTreeMap<String, i64>,
+}
+
+/// The retention bound a hub uses when its context names none.
+///
+/// Spec: M§4.4 (`mls_retention_s`, RECOMMENDED 2,592,000 s). Impl (spec-gap 119): it bounds the hub's queues too.
+pub const MLS_RETENTION_S: i64 = 2_592_000;
+
+fn default_retention() -> i64 {
+    MLS_RETENTION_S
 }
 
 fn s(v: &Value) -> String {
@@ -67,14 +84,44 @@ impl Hub {
             moved_to: None,
             welcomes: BTreeMap::new(),
             unregistered: BTreeSet::new(),
+            retention: ctx["mls_retention_s"].as_i64().unwrap_or(MLS_RETENTION_S),
+            waiting: BTreeMap::new(),
         }
+    }
+
+    /// The hub's clock, seconds.
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+
+    /// Time passes: a member identity whose clock has reached the retention bound has every queue it has here dropped,
+    /// welcome included, and its welcome hold lifted; it stays in the roster.
+    ///
+    /// Spec: M§6.5 rule 5, M§4.4. Impl (spec-gap 119): the clock runs while anything is queued for the identity and
+    /// restarts at every acknowledgement of a head; a returning device re-joins by external commit (M§6.8).
+    fn advance(&mut self, n: i64) -> Vec<Value> {
+        self.now += n;
+        let due: Vec<String> = self.waiting.iter().filter(|(_, t)| self.now - **t >= self.retention).map(|(i, _)| i.clone()).collect();
+        let mut out = vec![];
+        for i in due {
+            let pending = self.pending.remove(&i).unwrap_or_default();
+            let welcomes = self.welcomes.remove(&i).unwrap_or_default();
+            self.unregistered.remove(&i);
+            self.waiting.remove(&i);
+            out.push(json!({"dropped": {"identity": i, "pending": pending, "welcomes": welcomes}}));
+        }
+        out
+    }
+
+    fn start_clock(&mut self, ident: &str) {
+        let now = self.now;
+        self.waiting.entry(ident.to_string()).or_insert(now);
     }
 
     /// Apply one event (`deposit`, `ack`, `advance`, `restart`) and return what the hub emits.
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         if let Some(n) = ev.get("advance").and_then(Value::as_i64) {
-            self.now += n;
-            return vec![];
+            return self.advance(n);
         }
         if let Some(a) = ev.get("ack") {
             return self.ack(&s(&a["identity"]), a["seq"].as_i64().unwrap_or(0), a["class"].as_str().unwrap_or(""));
@@ -248,6 +295,7 @@ impl Hub {
             self.unregistered.extend(gained.iter().filter(|i| !before.contains_key(*i)).cloned());
             let seq = self.digests[&s(&d["digest"])];
             for i in gained {
+                self.start_clock(&i); // spec-gap 119
                 // spec-gap 66: a welcome is queued and retried like any fan-out, in its own queue — a member adding its
                 // own device needs both the commit (for its other devices) and the welcome (for the new one)
                 let q = self.welcomes.entry(i.clone()).or_default();
@@ -269,6 +317,7 @@ impl Hub {
         let mut out = vec![json!({"accepted": {"to": d["device"], "in_reply_to": d["id"], "seq": seq}})];
         for i in targets {
             // M§6.5 rule 5: per-mailbox seq order; an unacknowledged item blocks later ones
+            self.start_clock(i); // spec-gap 119
             let held = self.unregistered.contains(i);
             let q = self.pending.entry(i.clone()).or_default();
             q.push(seq);
@@ -286,17 +335,27 @@ impl Hub {
         let welcome = class == "welcome";
         // the hold behind an unacknowledged welcome applies here too: the queue moves, nothing is sent (spec-gap 87)
         let held = !welcome && self.unregistered.contains(ident);
-        let queue = if welcome { &mut self.welcomes } else { &mut self.pending };
-        let Some(q) = queue.get_mut(ident) else { return vec![] };
-        if q.first() != Some(&seq) {
-            return vec![];
+        let next = {
+            let queue = if welcome { &mut self.welcomes } else { &mut self.pending };
+            let Some(q) = queue.get_mut(ident) else { return vec![] };
+            if q.first() != Some(&seq) {
+                return vec![];
+            }
+            q.remove(0);
+            q.first().copied()
+        };
+        // spec-gap 119: progress restarts the clock; nothing left queued stops it
+        let queued = self.pending.get(ident).is_some_and(|q| !q.is_empty()) || self.welcomes.get(ident).is_some_and(|q| !q.is_empty());
+        if queued {
+            self.waiting.insert(ident.to_string(), self.now);
+        } else {
+            self.waiting.remove(ident);
         }
-        q.remove(0);
         if held {
             return vec![];
         }
-        if let Some(next) = q.first() {
-            let class = if welcome { "welcome".to_string() } else { self.seq_class[next].clone() };
+        if let Some(next) = next {
+            let class = if welcome { "welcome".to_string() } else { self.seq_class[&next].clone() };
             return vec![json!({"fanout": {"to": ident, "seq": next, "class": class}})];
         }
         if welcome && self.unregistered.remove(ident) {

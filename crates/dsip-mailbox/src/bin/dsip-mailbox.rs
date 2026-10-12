@@ -105,6 +105,11 @@ struct Args {
     /// (M§7.4, RECOMMENDED 300; spec-gap 71).
     #[arg(long, default_value_t = dsip_messaging::mailbox::HANDOVER_WAIT_S)]
     handover_wait: i64,
+    /// How long a hub keeps fanning out to a member identity that acknowledges nothing, seconds: past it, that
+    /// identity's queues are dropped and a returning device re-joins by external commit (M§4.4 `mls_retention_s`,
+    /// RECOMMENDED 2,592,000; spec-gap 119).
+    #[arg(long, default_value_t = dsip_messaging::hub::MLS_RETENTION_S)]
+    mls_retention: i64,
     /// Fault injection for demos: never deliver hub fan-out to this peer mailbox (a hub that dies before delivering).
     #[arg(long)]
     drop_fanout_to: Option<String>,
@@ -383,6 +388,25 @@ impl Service {
     /// never waits.
     fn retry_fanout(&mut self, service: &Arc<Mutex<Service>>, restarted: bool) {
         let now = now_s();
+        // spec-gap 119: each hub's clock follows ours; a member that acknowledged nothing for mls_retention_s loses its
+        // queues here (the payloads go with the next persist), and nothing more is retried for it until new items come
+        let mut dropped = false;
+        for (group, h) in self.hubs.iter_mut() {
+            let behind = now - h.now();
+            if behind <= 0 {
+                continue;
+            }
+            for e in h.step(&json!({"advance": behind})) {
+                if let Some(d) = e.get("dropped") {
+                    dropped = true;
+                    tracing::info!("hub of {group}: {} acknowledged nothing for mls_retention_s: dropped its queue (seqs {}, welcomes {}); \
+                        a returning device re-joins by external commit (spec-gap 119)", s_of(&d["identity"]), d["pending"], d["welcomes"]);
+                }
+            }
+        }
+        if dropped {
+            self.persist();
+        }
         let heads: Vec<(String, Value)> =
             self.hubs.iter().flat_map(|(g, h)| h.resend_heads().into_iter().map(move |e| (g.clone(), e))).collect();
         let mut live = std::collections::HashSet::new();
@@ -801,7 +825,7 @@ async fn main() -> Result<()> {
 
     let mailbox_ctx = json!({"now": now_s(), "owner": "", "serves": [], "devices": [],
         "admit": args.admit, "intro_limit": args.intro_limit, "intro_window": args.intro_window, "inbox_cap": args.inbox_cap,
-        "handover_wait": args.handover_wait, "quota_bytes": args.quota_bytes});
+        "handover_wait": args.handover_wait, "quota_bytes": args.quota_bytes, "mls_retention_s": args.mls_retention});
     let service = Arc::new(Mutex::new(Service {
         key,
         configured: args.owners.clone(),
@@ -1573,7 +1597,8 @@ fn hub_deposit(
                 let kind = conv["kind"].as_str().unwrap_or("direct");
                 // M§7.4 (spec-gap 60): a group moved here continues the numbering its previous hub reached
                 let next_seq = p["handover_seq"].as_i64().map_or(1, |h| h + 1);
-                let mut ctx_hub = json!({"now": now, "kind": kind, "epoch": view.epoch(), "roster": roster, "next_seq": next_seq});
+                let mut ctx_hub = json!({"now": now, "kind": kind, "epoch": view.epoch(), "roster": roster, "next_seq": next_seq,
+                    "mls_retention_s": st.mailbox_ctx["mls_retention_s"]});
                 if kind == "personal" {
                     // Impl (spec-gap 62): a personal group is hubbed at its owner's mailbox (M§7.1), so the owner — who may
                     // re-join it by external commit with no leaf left (M§6.8) — is the served identity that brought it here
