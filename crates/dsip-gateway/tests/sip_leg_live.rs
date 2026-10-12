@@ -22,8 +22,12 @@ async fn invite_is_answered_and_surfaced() {
     let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let caller_addr = caller.local_addr().unwrap();
 
-    // The gateway SIP leg on a fixed loopback port.
-    let listen = "127.0.0.1:45061".parse().unwrap();
+    // The gateway SIP leg on a loopback port that is free now (a fixed one collided with another test binary or a
+    // demo on the CI runner: "Address already in use").
+    let listen = {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        probe.local_addr().unwrap()
+    };
     let (leg, mut rx) = SipLeg::new(listen, "127.0.0.1", "gateway").await.unwrap();
 
     let invite = format!(
