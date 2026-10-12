@@ -73,7 +73,7 @@ grep -q "DSIP leg" "$D/gw-a.log" && grep -q "DSIP leg" "$D/gw-b.log" || { echo "
 rc=0
 for b in $(echo "$BROWSERS" | sed 's/all/firefox chromium/; s/,/ /g'); do
   echo "== $b"
-  for t in ${TESTS:-call first-contact devices gateway deploy messaging}; do
+  for t in ${TESTS:-call first-contact devices gateway deploy messaging messaging-devices}; do
     (cd web && BROWSER=$b URL="https://$LISTEN/" RELAY_B="wss://$LISTEN_B/dsip" TURN_SECRET="$TURN_SECRET" FIXTURE="$D" \
        MAILBOX_A="wss://$MBX_A/dsip" MAILBOX_A_DID="$MAILBOX_A_DID" MAILBOX_B="wss://$MBX_B/dsip" MAILBOX_B_DID="$MAILBOX_B_DID" node test/$t.mjs) || rc=1
   done

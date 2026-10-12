@@ -46,6 +46,9 @@ let messenger = null; // the wasm messaging device (stage 6), when a mailbox is 
 let mailboxConn = null, mailboxInfo = null;   // the Relay to this identity's mailbox, and its verified hello
 let activeConv = null;                        // the group id open on the Messages screen
 const waiters = [];                           // {pred, resolve}: one-shot waits for a Messenger emission on the mailbox connection
+let messagingTick = null;                     // advances the receipts machines (M§10.3: a held read goes out when 5 s pass)
+const lastRead = {};                          // group → the content id this screen last reported read (M§10.3)
+let reconciling = null;                       // the device reconciliation in progress (M§12.3), one at a time
 const HINT_TTL_S = 3600;   // the profile's maximum (§12.9, spec-gap 96)
 // A setting of null says "none", overriding the operator's default (typed as `none` in Settings).
 const setting = (k) => (settings[k] === null ? undefined : settings[k] !== undefined && settings[k] !== '' && !(Array.isArray(settings[k]) && !settings[k].length) ? settings[k] : served[k]);
@@ -132,6 +135,7 @@ function renderSettings() {
   $('set-did').textContent = identity.identity;
   $('set-device').textContent = identity.device;
   $('set-first-contact').checked = !!settings.first_contact_required;
+  $('set-read-disclosed').checked = !!settings.read_disclosed;
   $('set-relay').value = settings.relay || '';
   $('set-relay').placeholder = served.relay || `wss://${location.host}/dsip`;
   $('set-ice').value = settings.ice ? JSON.stringify(settings.ice) : '';
@@ -929,9 +933,12 @@ async function startMessagingNow() {
       location.reload();
       return;
     }
+    m.set_read_disclosed(!!settings.read_disclosed, now());
     messenger = m;
   } catch (e) { log(`messaging not started: ${e.message || e}`, 'M§4'); renderMessages(); return; }
   messenger.set_grants(JSON.stringify(heldGrantFrames()));
+  clearInterval(messagingTick);
+  messagingTick = setInterval(() => { if (messenger === m && mailboxInfo) driveMailbox(m.tick(now())).catch(() => {}); }, 5000);
   for (const d of Object.values(documents)) messenger.add_document(JSON.stringify(d));
   // Every callback belongs to this connection: a restart replaces `mailboxConn`, and the old socket's late close or
   // frame must not touch the state of the new one.
@@ -949,9 +956,16 @@ async function startMessagingNow() {
       log(`← hello        mailbox ${short(r.did)} bound us (in_reply_to matched); ${r.capabilities?.mailbox?.hub ? 'a hub' : 'no hub'}, modes ${(r.capabilities?.mailbox?.modes || []).join('/')}`, 'M§4.3 · §20.5');
       await driveMailbox(messenger.on_bound(now()));                      // pending items again, then sync live (M§9.3, M§5.4)
       await driveMailbox([messenger.key_packages_frame(2, now())]);        // M§5.5: fresh KeyPackages on every bind
-      if (!messenger.personal()) { try { await driveMailbox(messenger.create_personal(now())); log('creating the personal group at the mailbox', 'M§7.1'); } catch (e) { log(`personal group: ${e.message || e}`, 'M§7.1'); } }
+      if (!messenger.personal()) {
+        // M§7.1: the identity's first messaging device creates the personal group; a device that knows of siblings
+        // (the identity file it was enrolled from listed them) waits to be added by one of them (M§12.3)
+        const siblings = devices.filter((d) => d.device !== identity.device);
+        if (!siblings.length) { try { await driveMailbox(messenger.create_personal(now())); log('creating the personal group at the mailbox', 'M§7.1'); } catch (e) { log(`personal group: ${e.message || e}`, 'M§7.1'); } }
+        else log(`waiting for another device of this identity (${siblings.map((d) => short(d.device)).join(', ')}) to add this one to the personal group (M§12.3)`, 'M§12.3');
+      }
       publishReachability();                                               // the hint now names the mailbox too (M§4.2)
       renderMessages();
+      reconcileDevices();                                                  // M§12.3: siblings this browser knows of join the groups
     },
     refused: (x) => { if (mine()) log(`✗ mailbox hello rejected: ${x.code}`, '§20.5'); },
     rejected: (code) => { if (mine()) { log(`✗ mailbox refused our hello: ${code}`, 'M§4.3'); renderMessages(); } },
@@ -985,12 +999,15 @@ async function driveMailbox(result) {
 
 function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
-    key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5' }[e.ui] || 'M§';
+    key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
+    archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
   log(`◇ ${e.ui} ${fields}`, sec);
   if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
   if (e.ui === 'joined' && e.kind === 'direct') { activeConv = activeConv || e.group; notify(`${nameOf(e.members.find((m) => m !== identity.identity)) || 'someone'} opened a conversation with you`); }
-  if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
+  if (e.ui === 'committed' && e.device) notify(`device ${short(e.device)} added to ${e.personal ? 'the personal group' : 'a conversation'} (epoch ${e.epoch})`);
+  else if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
+  if (e.ui === 'history') notify(`history: ${e.from === identity.identity ? 'you' : nameOf(e.from) || short(e.from)} #${e.seq}`);
   if (e.ui === 'request') notify(`Message request from ${short(e.from)}: see Messages`);
   if (e.ui === 'granted') notify(`${nameOf(e.by) || short(e.by)} granted you dsip.message`);
 }
@@ -1076,6 +1093,42 @@ async function messagePeer(did) {
   renderMessages();
 }
 
+/** Our own identity's KeyPackage directory answer (M§5.5), asked of our mailbox on the bound connection. */
+async function fetchOwnKeyPackages() {
+  const p = awaitEmission((e) => (e.key_packages && e.key_packages.subject === identity.identity) || e.error, 10000);
+  mailboxConn.send(messenger.fetch_frame(mailboxOf().did, identity.identity, now()));
+  const got = await p;
+  if (got.error) throw new Error(got.error);
+  return got.key_packages;
+}
+
+/** M§12.3, M§6.7: every device this browser knows of (the Devices list) that is not yet in the personal group and
+ *  every conversation is added there by this device, personal group first; after that add every live archive key
+ *  is re-sent so the new device reads the history. One reconciliation at a time; nothing when there is nothing to do. */
+async function reconcileDevices() {
+  if (!messenger || !mailboxInfo || !messenger.personal()) return;
+  if (reconciling) return reconciling;
+  reconciling = (async () => {
+    for (const d of devices.map((d) => d.device).filter((d) => d !== identity.device)) {
+      const groups = JSON.parse(messenger.groups_for_new_device(d, now()));
+      for (const gid of groups) {
+        if (!messenger || !mailboxInfo) return;
+        try {
+          const kps = await fetchOwnKeyPackages();
+          if (!(kps.key_packages || []).length && !kps.last_resort) { log(`device ${short(d)}: no KeyPackage at the mailbox yet (it uploads on its first bind, M§5.5)`, 'M§12.3'); return; }
+          const done = awaitEmission((e) => (e.ui === 'committed' && e.device === d && e.group === gid) || (e.refused && /commit|add/.test(e.refused)), 30000);
+          await driveMailbox([{ send: messenger.add_device(gid, d, JSON.stringify(kps), now()) }]);
+          log(`adding device ${short(d)} to ${gid === messenger.personal() ? 'the personal group' : 'a conversation'}`, 'M§12.3 · M§6.7');
+          const r = await done;
+          if (r.refused) { log(`device ${short(d)}: ${r.refused}`, 'M§12.3'); return; }
+          if (r.personal) { await driveMailbox(messenger.resend_archive_keys(now())); log(`re-sent ${JSON.parse(messenger.archive_keys()).length} archive key(s) to the personal group for ${short(d)}`, 'M§12.3'); }
+        } catch (e) { log(`device ${short(d)}: ${e.message || e}`, 'M§12.3'); return; }
+      }
+    }
+  })().finally(() => { reconciling = null; renderMessages(); });
+  return reconciling;
+}
+
 async function sendText(text) {
   if (!messenger || !activeConv || !text.trim()) return;
   try { await driveMailbox([{ send: messenger.send_text(activeConv, text.trim(), now()) }]); } catch (e) { notify(`not sent: ${e.message || e}`); }
@@ -1086,7 +1139,7 @@ function renderMessages() {
   const status = !mb ? 'no mailbox: set one under Settings → Network (the operator may serve a default)'
     : !messenger ? `mailbox ${mb.uri}: messaging not started`
     : !mailboxInfo ? `mailbox ${mb.uri} (${short(mb.did)}): connecting…`
-    : `mailbox ${mb.uri} (${short(mb.did)}): bound · personal group ${messenger.personal() ? 'yes' : 'pending'} · this device's MLS state is kept in this browser's storage`;
+    : `mailbox ${mb.uri} (${short(mb.did)}): bound · personal group ${messenger.personal() ? 'yes' : devices.length > 1 ? 'waiting to be added by another device (M§12.3)' : 'pending'} · this device's MLS state is kept in this browser's storage`;
   $('mailbox-status').textContent = status;
   const convs = messenger ? JSON.parse(messenger.conversations(now())).filter((c) => c.kind !== 'personal') : [];
   const ul = $('conv-list');
@@ -1111,17 +1164,30 @@ function renderMessages() {
   $('thread-meta').textContent = conv ? `group ${conv.group} · hub ${short(conv.hub.did)} (${conv.hub.did === mb?.did ? 'our mailbox' : 'their mailbox'}) · epoch ${conv.epoch}` : '';
   const th = $('thread');
   th.innerHTML = '';
-  if (conv) for (const m of JSON.parse(messenger.thread(conv.group))) {
+  const thread = conv ? JSON.parse(messenger.thread(conv.group)) : [];
+  // M§10.3: each identity's watermark is a content id; the seq it names is the thread's
+  const marks = conv ? JSON.parse(messenger.read_marks(conv.group)) : {};
+  const seqOf = (id) => thread.find((m) => m.object.id === id)?.seq ?? -1;
+  const theirRead = Math.max(-1, ...Object.entries(marks).filter(([who]) => who !== identity.identity).map(([, id]) => seqOf(id)));
+  for (const m of thread) {
     const d = document.createElement('div');
-    d.className = `msg${m.mine ? ' mine' : ''}`;
-    d.innerHTML = '<span class="who"></span><span class="text"></span><span class="seq"></span>';
+    d.className = `msg${m.mine ? ' mine' : ''}${m.from_archive ? ' archive' : ''}`;
+    d.innerHTML = '<span class="who"></span><span class="text"></span><span class="seq"></span><span class="read"></span>';
     d.querySelector('.who').textContent = m.mine ? 'you' : nameOf(m.sender) || short(m.sender);
     d.querySelector('.text').textContent = m.object.text || `(${m.object.kind})`;
     d.querySelector('.seq').textContent = m.seq == null ? 'pending' : `#${m.seq}${m.mine && m.delivered && Object.keys(m.delivered).length ? ' ✓✓' : ''}`;
+    d.querySelector('.read').textContent = m.mine && m.seq != null && m.seq <= theirRead ? 'read' : '';
     th.append(d);
   }
+  $('thread-marks').textContent = conv ? Object.entries(marks).map(([who, id]) => `${who === identity.identity ? 'you' : nameOf(who) || short(who)} read through #${seqOf(id)}`).join(' · ') : '';
   th.scrollTop = th.scrollHeight;
   $('compose-text').disabled = !conv; $('compose-send').disabled = !conv;
+  // M§10.3: the thread is on screen, so its last content is read; the machine decides whether a watermark goes out
+  const last = [...thread].reverse().find((m) => m.seq != null && m.object.object === 'content');
+  if (conv && last && !$('view-messages').classList.contains('hidden') && lastRead[conv.group] !== last.object.id) {
+    lastRead[conv.group] = last.object.id;
+    setTimeout(() => { if (messenger) driveMailbox(messenger.read_through(conv.group, last.object.id, now())).catch(() => {}); }, 0);
+  }
 }
 
 (async () => {
@@ -1171,7 +1237,7 @@ function renderMessages() {
   log(`identity ${identity.identity}`, '§7.3');
   log(`device   ${identity.device} (delegated, §7.4)`);
 
-  for (const b of document.querySelectorAll('nav button[data-view]')) b.onclick = () => { if (!call) show(b.dataset.view); else notify('finish the call first'); };
+  for (const b of document.querySelectorAll('nav button[data-view]')) b.onclick = () => { if (!call) { show(b.dataset.view); if (b.dataset.view === 'messages') renderMessages(); } else notify('finish the call first'); };
   $('btn-log-toggle').onclick = () => $('log-panel').classList.toggle('hidden');
   $('me-did').onclick = () => navigator.clipboard?.writeText(identity.identity).then(() => notify('your DID is on the clipboard'));
   $('contact-add').onsubmit = async (e) => { e.preventDefault(); await addContact($('contact-name').value, $('contact-did').value, $('contact-number').value); $('contact-name').value = ''; $('contact-did').value = ''; $('contact-number').value = ''; };
@@ -1195,6 +1261,7 @@ function renderMessages() {
   $('btn-reject-update').onclick = rejectUpdate;
   $('set-name-save').onclick = async () => { identity.display_name = $('set-name').value.trim(); await store.set(key('identity'), identity); location.reload(); };
   $('set-first-contact').onchange = async (e) => { settings.first_contact_required = e.target.checked; await saveSettings(); location.reload(); };
+  $('set-read-disclosed').onchange = async (e) => { settings.read_disclosed = e.target.checked; await saveSettings(); if (messenger) { messenger.set_read_disclosed(settings.read_disclosed, now()); await store.set(key('messenger'), JSON.parse(messenger.save())); } log(`read receipts ${settings.read_disclosed ? 'disclosed to the conversation' : 'kept to your own devices'}`, 'M§10.5'); };
   $('set-network-save').onclick = async () => {
     settings.relay = $('set-relay').value.trim();
     try { settings.ice = $('set-ice').value.trim() ? JSON.parse($('set-ice').value) : undefined; } catch { return alert('ICE servers must be a JSON array'); }
@@ -1213,6 +1280,7 @@ function renderMessages() {
     await store.set(key('devices'), devices);
     $('device-did').value = '';
     renderDevices();
+    reconcileDevices();   // M§12.3: with a mailbox, the new device joins the personal group and every conversation
   };
   $('btn-import').onclick = () => $('import-file').click();
   $('import-file').onchange = async (e) => { const f = e.target.files[0]; if (f) await importFromText(await f.text()); };
@@ -1275,5 +1343,10 @@ function renderMessages() {
     sendText,
     personalGroup: () => messenger?.personal() || null,
     messengerSaved: () => store.get(key('messenger')),
+    readMarks: (gid) => (messenger ? JSON.parse(messenger.read_marks(gid || activeConv)) : {}),
+    setReadDisclosed: async (v) => { settings.read_disclosed = !!v; await saveSettings(); messenger?.set_read_disclosed(!!v, now()); renderSettings(); },
+    reconcileDevices,
+    archiveKeys: () => (messenger ? JSON.parse(messenger.archive_keys()) : []),
+    addDevice: async (did) => { if (!devices.some((d) => d.device === did)) devices.push({ device: did }); await store.set(key('devices'), devices); renderDevices(); return reconcileDevices(); },
   };
 })();
