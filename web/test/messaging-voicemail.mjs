@@ -15,6 +15,11 @@ const convWith = (p, did) => p.page.evaluate((d) => window.dsip.conversations().
 const call = async () => {
   await alice.page.click('nav button[data-view=contacts]');
   await rowButton(alice, bob, 'Call');
+  // the contact list re-renders on many events; a click that lands mid-render places no call, so confirm it did
+  if (!(await until(alice.page, () => window.dsip.state() !== null, null, 3000).then(() => true, () => false))) {
+    console.log('  note: the Call click placed no call; clicking again');
+    await rowButton(alice, bob, 'Call');
+  }
   await bob.page.waitForSelector('#view-incoming:not(.hidden)', { timeout: 20000 });
   await until(bob.page, () => /◆ alert|progress|ALERTING/.test(document.getElementById('log').textContent), null, 5000).catch(() => {});
   await sleep(500);

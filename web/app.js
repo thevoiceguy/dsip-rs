@@ -500,6 +500,7 @@ async function flushLocalCandidates() {
 async function placeCall(to, video, destination) {
   if (call && engine.state(call.sid) !== 'ENDED') return notify('already in a call');
   pendingVoicemail = null; $('btn-voicemail').classList.add('hidden');
+  log(`placing a ${video ? 'video ' : ''}call to ${nameOf(to) || short(to)}${destination ? ` (${destination})` : ''}`, '§12.4');
   call = { sid: engine.newId(), role: 'initiator', peer: to, destination, media: null, pendingLocal: [], pendingUpdate: null, screening: false };
   $('call-peer-name').textContent = nameOf(to) || '';
   $('call-peer-did').textContent = to;
