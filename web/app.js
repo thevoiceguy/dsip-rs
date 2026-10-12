@@ -52,6 +52,8 @@ let reconciling = null;                       // the device reconciliation in pr
 const media = {};                             // content id → {url, state: 'fetching'|'ready'|'failed', attempt, why}: blobs fetched and opened (M§8.4)
 let recorder = null;                          // {rec, chunks, started, stream} while a voice message is being recorded
 const VOICEMAIL_MAX_S = 180;                  // what this client's owner accepts as voicemail (M§4.2 `voicemail.max_duration_s`)
+const EXTERNAL_JOIN_WAIT_S = 30;              // Impl (spec-gap 120): how long a device that knows of siblings waits to be added (M§12.3) before joining by external commit (M§6.8)
+let externalJoinTimer = null;
 let pendingVoicemail = null;                  // {peer, session, max_s}: a voicemail offered after an unanswered call (M§13.2)
 let lastVoice = null;                         // what the last recording became: {plain_size, sha256, size, content_type, duration_ms} (for tests)
 const HINT_TTL_S = 3600;   // the profile's maximum (§12.9, spec-gap 96)
@@ -719,12 +721,34 @@ async function rejectUpdate() {
   renderCall();
 }
 
+/** M§6.8: no sibling added this device, so it joins by external commit every group its mailbox holds a GroupInfo for,
+ *  the personal group first; each member (and the hub) checks the joiner's identity already had a leaf there. No
+ *  archive key comes with it: history waits for a sibling to re-send one (M§12.3). */
+async function joinAvailable() {
+  if (!messenger || !mailboxInfo) return [];
+  const groups = JSON.parse(messenger.available());
+  if (!groups.length) { log('external join: the mailbox holds no GroupInfo for a group this device is not in', 'M§6.8'); return []; }
+  const joined = [];
+  for (const g of groups) {
+    try {
+      const p = awaitEmission((e) => (e.ui === 'joined' && e.group === g.group) || (e.refused && e.refused.includes(g.group)), 30000);
+      await driveMailbox(JSON.parse(messenger.external_join(g.group, now())).map((f) => ({ send: f })));
+      log(`external commit for the ${g.kind} group ${short(g.group)} sent to its hub ${short(g.hub?.did)}`, 'M§6.8');
+      const r = await p;
+      if (r.ui === 'joined') joined.push(g.group);
+      else log(`external join of ${short(g.group)} refused: ${r.refused}`, 'M§6.8');
+    } catch (e) { log(`external join of ${short(g.group)}: ${e.message || e}`, 'M§6.8'); }
+  }
+  renderMessages();
+  return joined;
+}
+
 /** M§13.3: a callee leg ended; the pinned decision says whether this device records a call event in the personal
  *  group (alerted here, not answered here, never answered elsewhere). */
 async function callEnded(leg, endedBy, reason) {
   if (!messenger || !leg) return;
   try {
-    const frames = JSON.parse(messenger.call_ended(leg.sid, leg.peer, !!leg.alerted, !!leg.answered, endedBy, reason || '', now()));
+    const frames = JSON.parse(messenger.call_ended(JSON.stringify({ session: leg.sid, peer: leg.peer, alerted: !!leg.alerted, answered_here: !!leg.answered, ended_by: endedBy, reason: reason || '' }), now()));
     if (frames.length) { await driveMailbox(frames.map((f) => ({ send: f }))); log(`call event for ${short(leg.sid)} to the personal group: ${reason === 'user.declined' && endedBy === 'local' ? 'declined' : 'missed'}`, 'M§13.3'); }
     else log(`no call event for ${short(leg.sid)} (${reason || 'ended'})`, 'M§13.3');
   } catch (e) { log(`call event not sent: ${e.message || e}`, 'M§13.3'); }
@@ -1029,7 +1053,11 @@ async function startMessagingNow() {
         // (the identity file it was enrolled from listed them) waits to be added by one of them (M§12.3)
         const siblings = devices.filter((d) => d.device !== identity.device);
         if (!siblings.length) { try { await driveMailbox(messenger.create_personal(now())); log('creating the personal group at the mailbox', 'M§7.1'); } catch (e) { log(`personal group: ${e.message || e}`, 'M§7.1'); } }
-        else log(`waiting for another device of this identity (${siblings.map((d) => short(d.device)).join(', ')}) to add this one to the personal group (M§12.3)`, 'M§12.3');
+        else {
+          log(`waiting for another device of this identity (${siblings.map((d) => short(d.device)).join(', ')}) to add this one to the personal group (M§12.3); joining by external commit in ${EXTERNAL_JOIN_WAIT_S} s if none does (M§6.8)`, 'M§12.3');
+          clearTimeout(externalJoinTimer);
+          externalJoinTimer = setTimeout(() => { if (mine() && !messenger.personal()) joinAvailable(); }, EXTERNAL_JOIN_WAIT_S * 1000);
+        }
       }
       publishReachability();                                               // the hint now names the mailbox too (M§4.2)
       renderMessages();
@@ -1075,6 +1103,7 @@ function onMessagingUi(e) {
   if (e.ui === 'joined' && e.kind === 'direct') { activeConv = activeConv || e.group; notify(`${nameOf(e.members.find((m) => m !== identity.identity)) || 'someone'} opened a conversation with you`); }
   if (e.ui === 'committed' && e.device) notify(`device ${short(e.device)} added to ${e.personal ? 'the personal group' : 'a conversation'} (epoch ${e.epoch})`);
   else if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
+  if (e.ui === 'epoch' && e.added?.length) notify(`${e.added.map((a) => { const [who, dev] = a.split('#'); return `${who === identity.identity ? 'your' : `${nameOf(who) || short(who)}'s`} device ${short(dev)}`; }).join(', ')} joined (epoch ${e.epoch})`);
   if (e.ui === 'history') notify(`history: ${e.from === identity.identity ? 'you' : nameOf(e.from) || short(e.from)} #${e.seq}`);
   if (e.ui === 'request') notify(`Message request from ${short(e.from)}: see Messages`);
   if (e.ui === 'granted') notify(`${nameOf(e.by) || short(e.by)} granted you dsip.message`);
@@ -1538,6 +1567,9 @@ function renderMessages() {
     voicemailOffered: () => pendingVoicemail,
     leaveVoicemail: async (ms) => { await leaveVoicemail(); await new Promise((r) => setTimeout(r, ms)); lastVoice = null; await leaveVoicemail(); await until(() => lastVoice, 30000); return lastVoice; },
     calls: () => JSON.parse(messenger.calls()),
+    // external join (round 2C)
+    available: () => JSON.parse(messenger.available()),
+    joinAvailable,
     timeline: (gid) => JSON.parse(messenger.timeline(gid || activeConv)),
     media: (id) => (media[id] ? { state: media[id].state, from: media[id].from, size: media[id].size, why: media[id].why } : null),
     playAudio: async (id) => { const a = document.querySelector(`audio[data-id="${id}"]`); if (!a) return false; await a.play().catch(() => {}); return true; },

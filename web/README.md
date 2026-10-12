@@ -86,9 +86,21 @@ the identity's mailbox at `PUT {blob_endpoint}/{sha256}` with a signed `blob-put
 `audio` content carries the key, the deposit's manifest does not (rules 3–4). A receiver fetches from the sources the
 pinned rule orders — its own mailbox's replicated copy first, then the origin (rule 6) — verifies size and SHA-256
 before decrypting (rule 7), tries again when nothing was served yet (spec-gap 106), and plays it in the thread; a
-`played` receipt goes out under the same opt-in as `read` (M§10.4, M§10.5). Still with the Rust console only:
-joining by external commit when no sibling is available (M§6.8), successor groups, voicemail after an unanswered
-call (M§13).
+`played` receipt goes out under the same opt-in as `read` (M§10.4, M§10.5).
+
+**Round 2, part C — voicemail, call history, external join.** A callee leg that alerted and was not answered on this
+device sends a `call-event` to the personal group, by the pinned decision: `declined` on this device's own decline,
+`missed` otherwise, nothing for a leg answered elsewhere (M§13.3, spec-gap 63). Every device collapses them by
+session, archives them, and interleaves them with the peer's conversation in one timeline (the pinned
+`peer_timeline`). A caller whose attempt ended unanswered is offered a voicemail by the pinned M§13.2 rule: the
+callee's `DSIPMailbox` entry carries `voicemail` (the client's own hint now advertises it, with `audio`), the caller
+can send to them, and the outcome is one the rule lists (not the caller's own hang-up). The recording stops at the
+callee's `max_duration_s` and goes out as `audio` content with `purpose: voicemail` and the invite's `session`, end
+to end like any voice message (M§13.1). A device that knows of siblings and is not added within 30 s joins by
+external commit every group its mailbox holds a GroupInfo for, personal group first (M§6.8; the wait is spec-gap
+120); the hub and every member check that its identity already had a leaf there, and no archive key comes with it.
+Still with the Rust console only: successor groups when a hub is gone for good (M§7.5), which need the hub-outage
+machine (M§9.4) and a mailbox move in the browser first.
 
 ## Run it locally
 
@@ -192,6 +204,10 @@ test/messaging-devices.mjs  round 2A: archive records, a second browser of the s
                         and disclosed, three devices live, a reload
 test/messaging-voice.mjs    round 2B: a voice message recorded, sealed, uploaded with a signed blob-put, received through the
                         mailbox's replica, verified, decrypted and played, a played receipt, a reload, a voice reply
+test/messaging-voicemail.mjs  round 2C: a missed and a declined call recorded as call events, a voicemail offered after the
+                        decline and not after the caller's own hang-up, recorded, received with its session, one timeline
+test/messaging-rejoin.mjs   round 2C: a new device that nobody adds joins the personal group and the conversation by external
+                        commit; the peer verifies the join; messages flow; no history comes with it
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
@@ -245,7 +261,14 @@ first, Bob's delivered marks stay one per identity; a reload keeps it all and th
 uploaded with a signed blob-put and accepted, the mailbox logs the ciphertext's hash and never sees a plaintext, the
 content carries the key and duration; Bob fetches it from the source the pinned rule orders, verifies size and hash,
 decrypts and plays it, his played receipt shows on Alice's message; after a reload the blob opens again and his voice
-reply reaches Alice. CI runs all eight in Firefox and Chromium.
+reply reaches Alice. `messaging-voicemail.mjs`: Alice calls and hangs up while it rings, Bob's device records a
+missed call and Alice is offered nothing; she calls again and Bob declines, Bob's device records a declined call and
+Alice is offered a voicemail up to Bob's advertised limit; it reaches Bob as audio with purpose voicemail and the
+declined call's session, its blob verified; Bob's timeline reads missed call, declined call, voicemail, and a reload
+keeps the call log. `messaging-rejoin.mjs`: Alice's only device goes away; a new one enrolled from her identity file
+waits for a sibling, then joins her personal group and the conversation by external commit; Bob verifies the join
+and sees the new device; messages flow both ways, and nothing from before the join is shown. CI runs all ten in
+Firefox and Chromium.
 
 ## Identity
 
