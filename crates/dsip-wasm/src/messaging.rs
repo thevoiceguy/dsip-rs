@@ -14,7 +14,8 @@
 //! M§14.2 (a grant presented to the peer's mailbox), M§8.4 and M§5.6 (a blob sealed under a single-use key, uploaded
 //! with a signed `blob-put`, named with its key in the content and without it in the manifest; fetched from the
 //! sources the pinned rule orders and verified before it is opened), M§8.2 (`audio` content), M§10.4 (`played`, under
-//! the same opt-in as `read`), M§12.1–M§12.3 (archive keys, archive records written for what
+//! the same opt-in as `read`), M§13.2–M§13.3 (voicemail as caller-recorded audio carrying the session; a callee
+//! leg's call event to the personal group, collapsed by session, interleaved into the peer's timeline), M§12.1–M§12.3 (archive keys, archive records written for what
 //! is shown and read back as history by a device added later, every live key re-sent to a new sibling), M§10.3 and
 //! M§10.5 (a read watermark per conversation, disclosed only with the opt-in, else to the personal group).
 //!
@@ -116,6 +117,8 @@ enum Op {
     /// Add `peer`'s devices (and our own others) from these TLS-serialized KeyPackages, with the grants that
     /// authorize the add (M§14.2). `device` names one device of our own identity when that is what is added (M§12.3).
     Add { peer: String, kps: Vec<Vec<u8>>, grants: Vec<String>, device: Option<String> },
+    /// Join the group by external commit from the latest GroupInfo this identity's mailbox delivered (M§6.8).
+    Rejoin,
 }
 
 /// A deposit awaiting the hub's answer, by deposit id (M§9.2).
@@ -185,6 +188,8 @@ pub struct Messenger {
     archive_keys: BTreeMap<String, (Vec<u8>, i64)>,
     /// The latest GroupInfo per group (M§6.8), base64url.
     group_info: BTreeMap<String, String>,
+    /// Call events of this identity's devices, in personal-group order, one per `session` (M§13.3, spec-gap 63).
+    calls: Vec<Value>,
     /// Seq gaps per group (M§6.5, spec-gap 69), and the items held behind them.
     gaps: BTreeMap<String, GapTracker>,
     held_items: BTreeMap<String, Vec<Value>>,
@@ -255,6 +260,7 @@ impl Messenger {
             archive_keys: st["archive_keys"].as_object().into_iter().flatten()
                 .map(|(a, v)| (a.clone(), (unb64(&v["key"]), v["created_at"].as_i64().unwrap_or(0)))).collect(),
             group_info: serde_json::from_value(st["group_info"].clone()).unwrap_or_default(),
+            calls: st["calls"].as_array().cloned().unwrap_or_default(),
             gaps: BTreeMap::new(),
             held_items: serde_json::from_value(st["held_items"].clone()).unwrap_or_default(),
             retries: BTreeMap::new(),
@@ -302,7 +308,7 @@ impl Messenger {
             "convs": convs, "personal": self.personal, "resume": self.resume.snapshot(), "own": self.own, "outbox": self.outbox,
             "messages": self.messages, "grants_held": self.grants_held, "archive_keys": archive, "group_info": self.group_info,
             "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored,
-            "read_disclosed": self.read_disclosed,
+            "read_disclosed": self.read_disclosed, "calls": self.calls,
         }}).to_string()
     }
 
@@ -437,6 +443,80 @@ impl Messenger {
     /// Archive keys this device holds, `[{akid, created_at}]`, newest current (M§12.1).
     pub fn archive_keys(&self) -> String {
         json!(self.archive_keys.iter().map(|(a, (_, at))| json!({"akid": a, "created_at": at})).collect::<Vec<_>>()).to_string()
+    }
+
+    /// Groups this identity's mailbox delivered a GroupInfo for that this device is not in (M§6.8): what it can join by
+    /// external commit. `[{group, conversation, kind}]`, the personal group first.
+    pub fn available(&self) -> String {
+        let mut out: Vec<Value> = self.group_info.iter().filter(|(g, _)| !self.convs.contains_key(*g)).filter_map(|(g, gi)| {
+            let conv = dsip_mls::group_info_conversation(&unb64(&json!(gi)))?;
+            Some(json!({"group": g, "conversation": conv["conversation"], "kind": conv["kind"], "hub": conv["hub"]}))
+        }).collect();
+        out.sort_by_key(|c| c["kind"] != "personal");
+        json!(out).to_string()
+    }
+
+    /// Join `gid` by external commit (M§6.8): a device of an identity that has a leaf there, or the identity's own
+    /// personal group, with no sibling online to add it. The commit goes to the hub; a `commit-conflict` or
+    /// `stale-epoch` refusal discards the joined state, syncs and joins again from the newer GroupInfo (the pinned
+    /// `CommitRetry`, spec-gap 58). No archive key comes with it: history waits for a sibling (M§12.3). Frames.
+    pub fn external_join(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
+        if self.convs.contains_key(gid) {
+            return Err(JsValue::from_str("this device is in that group already"));
+        }
+        let frame = self.external_commit(gid, now as i64)?;
+        self.retries.insert(gid.to_string(), (CommitRetry::new(&json!({})), Op::Rejoin));
+        Ok(json!([frame]).to_string())
+    }
+
+    /// A callee leg of this device ended (M§13.3): whether it sends a `call-event` to the personal group, by the
+    /// vector-pinned decision (spec-gap 63) — alerted here and not answered here, never `session.answered-elsewhere`;
+    /// `declined` when this device ended it with `user.declined`, else `missed`. `leg_json` is `{session, peer, alerted,
+    /// answered_here, ended_by: "local"|"remote", reason}`. Frames to send (`[]` when none).
+    pub fn call_ended(&mut self, leg_json: &str, now: f64) -> Result<String, JsValue> {
+        let leg: Value = serde_json::from_str(leg_json).map_err(js)?;
+        let d = dsip_messaging::client::call_event_decision(&json!({"alerted": leg["alerted"], "answered_here": leg["answered_here"],
+            "ended_by": leg["ended_by"], "reason": leg["reason"]}));
+        if d["send"] != json!(true) {
+            return Ok("[]".into());
+        }
+        let personal = self.personal.clone().ok_or_else(|| JsValue::from_str("no personal group yet"))?;
+        let obj = json!({"object": "call-event", "session": leg["session"], "peer": leg["peer"], "direction": "inbound", "outcome": d["outcome"], "at": now as i64});
+        self.record_call(&obj);
+        Ok(json!([self.send_object(&personal, &obj, now as i64)?]).to_string())
+    }
+
+    /// The call log, one entry per session (M§13.3).
+    pub fn calls(&self) -> String {
+        json!(self.calls).to_string()
+    }
+
+    /// One conversation's timeline (M§13.3, the pinned `peer_timeline`): its messages with this identity's call events
+    /// for the peer interleaved — `{"call": {…}}` or the message as [`Messenger::thread`] gives it.
+    pub fn timeline(&self, gid: &str) -> String {
+        let thread: Vec<Value> = serde_json::from_str(&self.thread(gid)).unwrap_or_default();
+        let peer = self.convs.get(gid).and_then(|c| c.peer.clone());
+        let calls: Vec<Value> = self.calls.iter().filter(|c| peer.as_deref().is_some_and(|p| c["peer"] == p)).cloned().collect();
+        if calls.is_empty() {
+            return json!(thread).to_string();
+        }
+        let content: Vec<Value> = thread.iter().enumerate().map(|(i, m)| json!({"id": i.to_string(), "at": m["object"]["sent_at"]})).collect();
+        let order = dsip_messaging::client::peer_timeline(&json!({"content": content, "calls": calls}));
+        let out: Vec<Value> = order["timeline"].as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(|e| {
+            if let Some(i) = e.strip_prefix("content:") {
+                i.parse::<usize>().ok().and_then(|i| thread.get(i).cloned())
+            } else {
+                let sess = e.strip_prefix("call:").unwrap_or("");
+                calls.iter().find(|c| c["session"] == sess).map(|c| json!({"call": c}))
+            }
+        }).collect();
+        json!(out).to_string()
+    }
+
+    /// Whether this device can send to `peer` (M§13.2 condition 2): a direct conversation exists, or a grant from them
+    /// is held that would let one be created (M§14.2).
+    pub fn can_send(&self, peer: &str) -> bool {
+        self.convs.values().any(|c| c.kind == "direct" && c.peer.as_deref() == Some(peer)) || self.grants_held.contains_key(peer)
     }
 
     /// Seal a payload for upload (M§8.4 rule 1): a fresh single-use 32-byte key, AES-256-GCM, no AAD, stored as
@@ -831,8 +911,11 @@ impl Messenger {
     fn propose(&mut self, gid: &str, op: &Op, now: i64) -> Result<String, JsValue> {
         let ctx = Context::new(now, &self.resolver);
         let (provider, signer) = (self.mls.provider(), self.mls.signer());
+        if matches!(op, Op::Rejoin) {
+            return self.external_commit(gid, now);
+        }
         let c = self.convs.get_mut(gid).ok_or_else(|| JsValue::from_str("group"))?;
-        let Op::Add { kps, grants, .. } = op;
+        let Op::Add { kps, grants, .. } = op else { unreachable!("handled above") };
         let mut packages = vec![];
         for bytes in kps {
             let (kp, _) = authenticate_key_package(bytes, provider, &ctx).map_err(|e| js(e.0))?;
@@ -889,6 +972,33 @@ impl Messenger {
         let mut out = vec![];
         let Some(pending) = self.pending.remove(&s_of(&p["in_reply_to"])) else { return out };
         match pending {
+            Pending::Commit { gid, op: Some(Op::Rejoin) } => {
+                // M§6.8: the external commit is already applied locally (OpenMLS stores it merged)
+                let Some(c) = self.convs.get(&gid) else { return out };
+                let (epoch, kind, conversation) = (c.group.epoch().as_u64(), c.kind.clone(), c.conversation.clone());
+                let members = self.member_identities(&gid, now);
+                if kind == "personal" {
+                    self.personal = Some(gid.clone());
+                }
+                self.history.step(&json!({"joined": {"group": gid, "epoch": epoch}}));
+                if let Some(seq) = p["seq"].as_i64() {
+                    self.resume.sent(&gid, seq);
+                    self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
+                }
+                self.retries.remove(&gid);
+                let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
+                    json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined"}]}));
+                self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+                out.push(json!({"send": env.frame()}));
+                out.push(json!({"ui": "joined", "group": gid, "conversation": conversation, "kind": kind, "members": members, "epoch": epoch,
+                    "external": true, "seq": p["seq"]}));
+                // M§6.5 rule 6: the hub gets the GroupInfo of the new epoch
+                if let Ok(f) = self.group_info_frame(&gid, now) {
+                    let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+                    self.pending.insert(id, Pending::GroupInfo { gid, then: None });
+                    out.push(json!({"send": f}));
+                }
+            }
             Pending::Commit { gid, op } => {
                 if let Some(c) = self.convs.get_mut(&gid) {
                     if let Err(e) = c.group.merge_pending_commit(self.mls.provider()) {
@@ -896,7 +1006,7 @@ impl Messenger {
                         return out;
                     }
                     let epoch = c.group.epoch().as_u64();
-                    let (added, device) = match &op { Some(Op::Add { peer, device, .. }) => (Some(peer.clone()), device.clone()), None => (None, None) };
+                    let (added, device) = match &op { Some(Op::Add { peer, device, .. }) => (Some(peer.clone()), device.clone()), _ => (None, None) };
                     out.push(json!({"ui": "committed", "group": gid, "epoch": epoch, "seq": p["seq"], "added": added, "device": device,
                         "personal": self.personal.as_deref() == Some(gid.as_str())}));
                 }
@@ -951,6 +1061,11 @@ impl Messenger {
                     let emissions = self.history.step(&json!({"sent": {"group": gid, "seq": seq, "id": key, "object": "content"}}));
                     let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
                     out.extend(self.archive_requests(&gid, &emissions, &obj, &me, &dev, seq, now));
+                } else if let (Some(obj), Some(seq)) = (obj.clone().filter(|o| o["object"] == "call-event"), p["seq"].as_i64()) {
+                    // spec-gap 63: a call event is archived like a read watermark, state for a device added later
+                    let emissions = self.history.step(&json!({"sent": {"group": gid, "seq": seq, "id": object_key(&obj), "object": "call-event"}}));
+                    let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
+                    out.extend(self.archive_requests(&gid, &emissions, &obj, &me, &dev, seq, now));
                 } else if let (Some(obj), Some(seq)) = (obj.filter(|o| o["object"] == "receipt" && o["kind"] == "read"), p["seq"].as_i64()) {
                     // spec-gap 68: our own read watermark is history too, under the group it went to
                     let key = format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""));
@@ -989,7 +1104,12 @@ impl Messenger {
                 let mut retry = self.retries.remove(&gid).map(|(r, _)| r).unwrap_or_else(|| CommitRetry::new(&json!({})));
                 for action in retry.answer(Some(&reason)) {
                     if action.get("discard").is_some() {
-                        if let Some(c) = self.convs.get_mut(&gid) {
+                        if matches!(op, Some(Op::Rejoin)) {
+                            // M§6.8: the joined state from a GroupInfo that was not the latest is discarded
+                            if let Some(mut c) = self.convs.remove(&gid) {
+                                let _ = c.group.delete(self.mls.provider().storage());
+                            }
+                        } else if let Some(c) = self.convs.get_mut(&gid) {
                             let _ = c.group.clear_pending_commit(self.mls.provider().storage());
                         }
                     } else if let Some(r) = action.get("surface") {
@@ -1027,10 +1147,15 @@ impl Messenger {
         let mut out = vec![];
         for gid in self.retries.keys().cloned().collect::<Vec<_>>() {
             let (mut retry, op) = self.retries.remove(&gid).expect("present");
-            let Op::Add { peer, device, .. } = &op;
-            let ctx = self.ctx(now);
-            let needed = self.convs.get(&gid).is_some_and(|c| !c.group.members().any(|m| member_identity(&c.group, m.index, &ctx).ok()
-                .is_some_and(|w| &w.identity == peer && device.as_ref().is_none_or(|d| &w.device == d))));
+            let needed = match &op {
+                // M§6.8: still needed while this device is not in the group
+                Op::Rejoin => !self.convs.contains_key(&gid),
+                Op::Add { peer, device, .. } => {
+                    let ctx = self.ctx(now);
+                    self.convs.get(&gid).is_some_and(|c| !c.group.members().any(|m| member_identity(&c.group, m.index, &ctx).ok()
+                        .is_some_and(|w| &w.identity == peer && device.as_ref().is_none_or(|d| &w.device == d))))
+                }
+            };
             for action in retry.synced(needed, false) {
                 if action.get("done").is_some() {
                     out.push(json!({"ui": "no_longer_needed", "group": gid}));
@@ -1214,6 +1339,16 @@ impl Messenger {
                 }
                 out.push(json!({"ui": "archive_key", "akid": akid, "from": sender, "fresh": fresh}));
             }
+            Some("call-event") => {
+                // M§13.3: every device of the identity shows one entry per call, whichever device sent it
+                let key = object_key(&object);
+                let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
+                let emissions = self.history.step(&json!({"mls": {"group": gid, "seq": seq, "epoch": epoch, "id": key}}));
+                out.extend(self.archive_requests(gid, &emissions, &object, sender, sender_device, seq, now));
+                let fresh = self.record_call(&object);
+                out.push(json!({"ui": "call_event", "session": object["session"], "peer": object["peer"], "outcome": object["outcome"],
+                    "from_device": sender_device, "collapsed": !fresh}));
+            }
             Some("receipt") => {
                 if let Some(c) = self.convs.get_mut(gid) {
                     let batch = json!({"seq": seq, "object": object, "src": gid, "sender_device": sender_device});
@@ -1245,6 +1380,53 @@ impl Messenger {
             _ => {}
         }
         out
+    }
+
+    /// Build the external commit from the latest GroupInfo held for `gid` and deposit it at the group's hub (M§6.8).
+    fn external_commit(&mut self, gid: &str, now: i64) -> Result<String, JsValue> {
+        let gi = self.group_info.get(gid).cloned().ok_or_else(|| JsValue::from_str("no GroupInfo for that group from this mailbox; sync first"))?;
+        if let Some(mut old) = self.convs.remove(gid) {
+            let _ = old.group.delete(self.mls.provider().storage()); // superseded: the resync removes the old leaf
+        }
+        let (group, commit) = self.mls.external_join(&unb64(&json!(gi))).map_err(|e| js(e.0))?;
+        let conv: Value = conversation_extension(&group).and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| JsValue::from_str("no dsip_conversation"))?;
+        let epoch = group.epoch().as_u64();
+        let kind = s_of(&conv["kind"]);
+        self.convs.insert(gid.to_string(), Conv {
+            group, conversation: s_of(&conv["conversation"]), kind: kind.clone(), hub: (s_of(&conv["hub"]["did"]), s_of(&conv["hub"]["uri"])),
+            peer: None, receipts: self.new_receipts(now), joined_epoch: epoch, batch: vec![],
+        });
+        if kind == "direct" {
+            let me = self.keys.identity.clone();
+            let peer = self.member_identities(gid, now).into_iter().find(|m| *m != me);
+            if let Some(c) = self.convs.get_mut(gid) {
+                c.peer = peer;
+            }
+        }
+        let bytes = commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?;
+        let frame = self.hub_deposit(gid, "handshake", json!({"mls": b64(&bytes)}), now);
+        let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+        self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(Op::Rejoin) });
+        Ok(frame)
+    }
+
+    /// The identities with a verified leaf in `gid`, sorted.
+    fn member_identities(&self, gid: &str, now: i64) -> Vec<String> {
+        let ctx = Context::new(now, &self.resolver);
+        let mut ids: Vec<String> = self.convs.get(gid).map(|c| c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok())
+            .map(|w| w.identity).collect()).unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Keep a call event unless one for its session is held (spec-gap 63: collapsed by `session`, the first kept).
+    fn record_call(&mut self, obj: &Value) -> bool {
+        if self.calls.iter().any(|c| c["session"] == obj["session"]) {
+            return false;
+        }
+        self.calls.push(obj.clone());
+        true
     }
 
     /// M§10.2: delivered receipts are decided once per sync batch, per conversation; each is sent as an object.
@@ -1368,7 +1550,7 @@ impl Messenger {
         };
         let Ok(record) = serde_json::from_slice::<Value>(&plain) else { return out };
         let obj = record["payload"].clone();
-        let key_id = format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""));
+        let key_id = object_key(&obj);
         let decisions = self.history.step(&json!({"archive": {"cursor": item["cursor"], "akid": akid, "group": gid, "seq": seq, "id": key_id,
             "object": obj["object"]}}));
         let sender = s_of(&record["sender"]);
@@ -1378,8 +1560,15 @@ impl Messenger {
             self.restored.push(json!({"seq": seq, "object": obj, "conversation": obj["conversation"]}));
             out.push(json!({"ui": "history", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"], "text": obj["text"]}));
         } else if decisions.iter().any(|d| d.get("apply").is_some()) {
-            self.restored.push(json!({"seq": seq, "object": obj, "conversation": obj["conversation"]}));
-            out.push(json!({"ui": "history_receipt", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"]}));
+            if obj["object"] == "call-event" {
+                // spec-gap 63: an archived call event goes to the call log, not the timeline's content
+                if self.record_call(&obj) {
+                    out.push(json!({"ui": "call_event", "session": obj["session"], "peer": obj["peer"], "outcome": obj["outcome"], "from_archive": true}));
+                }
+            } else {
+                self.restored.push(json!({"seq": seq, "object": obj, "conversation": obj["conversation"]}));
+                out.push(json!({"ui": "history_receipt", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"]}));
+            }
         }
         out.extend(self.apply_restored(now));
         out
@@ -1568,6 +1757,15 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
         }
         _ => Ok(Outcome::Nothing),
     }
+}
+
+/// The key an object is shown and archived under (M§8.5): `conversation:id`, or `call:session` for a call event,
+/// which has no `id` (M§13.3).
+fn object_key(obj: &Value) -> String {
+    if obj["object"] == "call-event" {
+        return format!("call:{}", obj["session"].as_str().unwrap_or(""));
+    }
+    format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""))
 }
 
 /// Re-issue this identity's delegation to its device with `dsip.messaging` beside the capabilities it has (M§4.3,

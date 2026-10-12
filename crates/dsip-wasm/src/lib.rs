@@ -504,8 +504,20 @@ pub fn mailbox_select(document_json: &str, hint_endpoints_json: &str) -> String 
         .map(|mut e| { if let Some(m) = e.as_object_mut() { m.remove("service"); } e }).collect();
     let all: Vec<Value> = document_entries.iter().chain(hint_entries.iter()).cloned().collect();
     let mut out = dsip_messaging::client::select_mailbox(&json!({"document_entries": document_entries, "hint_entries": hint_entries}));
-    out["uri"] = all.iter().find(|e| e["mailbox"] == out["selected"]).map(|e| e["uri"].clone()).unwrap_or(Value::Null);
+    let entry = all.iter().find(|e| e["mailbox"] == out["selected"]).cloned().unwrap_or(Value::Null);
+    out["uri"] = entry["uri"].clone();
+    out["entry"] = entry; // M§4.2: `accepts` and `voicemail` are read from the selected entry
     out.to_string()
+}
+
+/// Whether the caller may offer to record a voicemail after an attempt ended (M§13.2, the pinned rule):
+/// `entry_json` the callee's selected `DSIPMailbox` entry, `can_send` from [`messaging::Messenger::can_send`],
+/// `outcome_type` `reject` or `cancel` (our own), `reason` its token. `{"offer": bool, "max_duration_s"?}`.
+#[wasm_bindgen]
+pub fn voicemail_offer(entry_json: &str, can_send: bool, outcome_type: &str, reason: &str) -> String {
+    let entry: Value = serde_json::from_str(entry_json).unwrap_or(Value::Null);
+    dsip_messaging::client::voicemail_offer(&json!({"voicemail": entry["voicemail"], "can_send": can_send,
+        "outcome": {"type": outcome_type, "reason": reason}})).to_string()
 }
 
 /// Re-issue this identity's delegation with `dsip.messaging` (M§4.3) when the identity key is on this device: the

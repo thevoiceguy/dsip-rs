@@ -238,8 +238,10 @@ the app against a local relay, the way the wire demos drive the CLI).
    (M§10.3, M§10.5); headless test `messaging-devices.mjs`. Part B, landed 2026-10-12: voice messages recorded in the
    browser, sealed and uploaded to the mailbox's blob endpoint with a signed `blob-put`, fetched from the replica or the
    origin, verified and played, with `played` receipts (M§8.4, M§5.6, M§10.4); headless test `messaging-voice.mjs`.
-   Part C: joining by external commit when no sibling is available (M§6.8), successor groups (M§7.5), voicemail after
-   an unanswered call (M§13).
+   Part C, landed 2026-10-12: voicemail after an unanswered call and call history across devices (M§13.2, M§13.3),
+   joining by external commit when no sibling adds a new device (M§6.8, spec-gap 120); headless tests
+   `messaging-voicemail.mjs` and `messaging-rejoin.mjs`. Part D: successor groups when a hub is gone for good (M§7.5),
+   after the hub-outage machine (M§9.4) and a mailbox move come to the browser.
 
 ## 11. Risks
 
