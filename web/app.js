@@ -14,7 +14,7 @@
 // and M§8.1 (text in a direct conversation; every decision inside `Messenger`, spec-gap 44: its MLS and delivery state
 // saved together after each step).
 
-import init, { create_identity, revocation_frame, rehome, did_document, check_claim, identity_change, tn_select, hint_frame, hint_select, mailbox_select, redelegate, Endpoint, Messenger, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
+import init, { create_identity, revocation_frame, rehome, did_document, check_claim, identity_change, tn_select, hint_frame, hint_select, mailbox_select, voicemail_offer, redelegate, Endpoint, Messenger, verification_basis, tel_caller_line, downgrade_summary } from './pkg/dsip_wasm.js';
 import { store } from './host/store.js';
 import { Engine } from './host/engine.js';
 import { Relay } from './host/relay.js';
@@ -51,6 +51,8 @@ const lastRead = {};                          // group → the content id this s
 let reconciling = null;                       // the device reconciliation in progress (M§12.3), one at a time
 const media = {};                             // content id → {url, state: 'fetching'|'ready'|'failed', attempt, why}: blobs fetched and opened (M§8.4)
 let recorder = null;                          // {rec, chunks, started, stream} while a voice message is being recorded
+const VOICEMAIL_MAX_S = 180;                  // what this client's owner accepts as voicemail (M§4.2 `voicemail.max_duration_s`)
+let pendingVoicemail = null;                  // {peer, session, max_s}: a voicemail offered after an unanswered call (M§13.2)
 let lastVoice = null;                         // what the last recording became: {plain_size, sha256, size, content_type, duration_ms} (for tests)
 const HINT_TTL_S = 3600;   // the profile's maximum (§12.9, spec-gap 96)
 // A setting of null says "none", overriding the operator's default (typed as `none` in Settings).
@@ -379,6 +381,7 @@ async function onReceived(r) {
     $('in-downgrade').classList.add('hidden');
     $('view-incoming').classList.remove('hidden');
     // §12.4 OFFERED → ALERTING: policy admitted; progress ringing goes out; the person decides
+    if (call?.sid === m.id) call.alerted = true;   // M§13.3: an alerted leg that is not answered here is a call event
     await engine.local({ local: 'alert', session: m.id, ring_timeout: 120 });
     return;
   }
@@ -424,7 +427,9 @@ async function onEmission(e) {
         : elsewhere ? 'answered on another of your devices (§12.7); not a missed call'
         : noRoute ? `${call.destination}: the gateway found no identity for that number and no route (identity.unknown, N§6.1)`
         : e.reason ? `ended: ${e.reason}` : 'ended';
-      endCall(refused);
+      const leg = endCall(refused);
+      if (leg?.role === 'responder') callEnded(leg, e.reason === 'user.no-answer' ? 'local' : 'remote', e.reason);
+      if (leg?.role === 'initiator' && !refused) offerVoicemail(leg, e.reason);
       if (refused) { $('btn-introduce-after').classList.remove('hidden'); $('btn-introduce-after').onclick = () => introduce(peer); }
     }
     if (e.ui === 'introduction_received' && e.token) { notify(`${short(e.from)} used your contact link: granted`); if (!contacts.some((c) => c.did === e.from)) await addContact('', e.from); }
@@ -492,6 +497,7 @@ async function flushLocalCandidates() {
  *  destination (N§4.1). A saved binding is presented on every call as a `tel` claim (N§4). */
 async function placeCall(to, video, destination) {
   if (call && engine.state(call.sid) !== 'ENDED') return notify('already in a call');
+  pendingVoicemail = null; $('btn-voicemail').classList.add('hidden');
   call = { sid: engine.newId(), role: 'initiator', peer: to, destination, media: null, pendingLocal: [], pendingUpdate: null, screening: false };
   $('call-peer-name').textContent = nameOf(to) || '';
   $('call-peer-did').textContent = to;
@@ -623,7 +629,7 @@ async function publishReachability() {
   // entry's fields; only once the mailbox has bound this device (it serves this identity, spec-gap 115)
   const endpoints = [{ uri }];
   const mb = mailboxOf();
-  if (mb && mailboxInfo && mailboxInfo.did === mb.did) endpoints.push({ uri: mb.uri, service: 'DSIPMailbox', mailbox: mb.did, priority: 0, profiles: ['messaging/1.0'], accepts: ['text'] });
+  if (mb && mailboxInfo && mailboxInfo.did === mb.did) endpoints.push({ uri: mb.uri, service: 'DSIPMailbox', mailbox: mb.did, priority: 0, profiles: ['messaging/1.0'], accepts: ['text', 'audio'], voicemail: { max_duration_s: VOICEMAIL_MAX_S } });
   const frame = hint_frame(JSON.stringify(identity), engine.newId(), JSON.stringify(endpoints), HINT_TTL_S, seq, now());
   for (const n of nodesInEffect()) {
     try {
@@ -637,6 +643,7 @@ async function publishReachability() {
 
 async function accept(screening) {
   if (!call || call.role !== 'responder') return;
+  call.answered = true;
   $('view-incoming').classList.add('hidden');
   $('call-peer-name').textContent = nameOf(call.peer) || '';
   $('call-peer-did').textContent = call.peer;
@@ -659,8 +666,10 @@ async function accept(screening) {
 async function decline() {
   if (!call) return;
   $('view-incoming').classList.add('hidden');
+  const leg = call;
   await engine.local({ local: 'decline', session: call.sid });
   endCall();
+  callEnded(leg, 'local', 'user.declined');
 }
 
 async function hangup() {
@@ -710,6 +719,62 @@ async function rejectUpdate() {
   renderCall();
 }
 
+/** M§13.3: a callee leg ended; the pinned decision says whether this device records a call event in the personal
+ *  group (alerted here, not answered here, never answered elsewhere). */
+async function callEnded(leg, endedBy, reason) {
+  if (!messenger || !leg) return;
+  try {
+    const frames = JSON.parse(messenger.call_ended(leg.sid, leg.peer, !!leg.alerted, !!leg.answered, endedBy, reason || '', now()));
+    if (frames.length) { await driveMailbox(frames.map((f) => ({ send: f }))); log(`call event for ${short(leg.sid)} to the personal group: ${reason === 'user.declined' && endedBy === 'local' ? 'declined' : 'missed'}`, 'M§13.3'); }
+    else log(`no call event for ${short(leg.sid)} (${reason || 'ended'})`, 'M§13.3');
+  } catch (e) { log(`call event not sent: ${e.message || e}`, 'M§13.3'); }
+  renderMessages();
+}
+
+/** M§13.2: after an attempt of ours ended unanswered, offer to record a voicemail when the callee's mailbox entry
+ *  carries `voicemail`, we can send to them, and the outcome is one the pinned rule lists. */
+async function offerVoicemail(leg, reason) {
+  $('btn-voicemail').classList.add('hidden');
+  if (!messenger || !reason) return;
+  const type = reason === 'session.timeout' ? 'cancel' : 'reject';   // §12.9: our own cancel on T-Establish/T-Ring expiry
+  let mb = null;
+  try { mb = await peerMailboxEntry(leg.peer); } catch { /* no entry: no offer */ }
+  const d = JSON.parse(voicemail_offer(JSON.stringify(mb?.entry ?? null), messenger.can_send(leg.peer), type, reason));
+  log(`voicemail ${d.offer ? `offered (up to ${d.max_duration_s ?? '?'} s)` : 'not offered'}: ${type} ${reason}${mb?.entry?.voicemail ? '' : ', the callee advertises no voicemail'}`, 'M§13.2');
+  if (!d.offer) return;
+  pendingVoicemail = { peer: leg.peer, session: leg.sid, max_s: d.max_duration_s || VOICEMAIL_MAX_S };
+  $('btn-voicemail').textContent = 'Leave a voicemail';
+  $('btn-voicemail').classList.remove('hidden');
+  if (!call) show('call');
+}
+
+/** Record the offered voicemail (M§13.1): caller-recorded audio with `purpose: voicemail` and the invite's `session`,
+ *  sent end to end in the direct conversation — created first when only a grant is held (M§14.2). */
+async function leaveVoicemail() {
+  const vm = pendingVoicemail;
+  if (!vm) return;
+  if (recorder) { await toggleVoice(); return; }
+  let conv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === vm.peer);
+  if (!conv) {
+    await messagePeer(vm.peer);
+    try { await until(() => JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === vm.peer && c.members.length === 2), 30000); }
+    catch { return notify('voicemail: no conversation with them could be opened'); }
+    conv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === vm.peer);
+    show('call');
+  }
+  await toggleVoice({ gid: conv.group, purpose: 'voicemail', session: vm.session, max_s: vm.max_s });
+  $('btn-voicemail').textContent = 'Stop and send voicemail';
+  const done = setInterval(() => { if (!recorder) { clearInterval(done); pendingVoicemail = null; $('btn-voicemail').classList.add('hidden'); } }, 200);
+}
+
+/** Poll until `fn` returns something truthy. */
+function until(fn, ms) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const t = setInterval(() => { const v = fn(); if (v) { clearInterval(t); resolve(v); } else if (Date.now() - t0 > ms) { clearInterval(t); reject(new Error('timeout')); } }, 200);
+  });
+}
+
 function endCall(stay = false) {
   if (!call) return;
   call.media?.close();
@@ -722,7 +787,7 @@ function endCall(stay = false) {
   if (!$('view-call').classList.contains('hidden')) {
     $('call-state').textContent = 'ENDED';
     $('call-title').textContent = 'Call ended';
-    if (!stay) setTimeout(() => { if (!call && !$('view-call').classList.contains('hidden')) show('contacts'); }, 1500);
+    if (!stay) setTimeout(() => { if (!call && !pendingVoicemail && !$('view-call').classList.contains('hidden')) show('contacts'); }, 1500);
   }
   return ended;
 }
@@ -1031,8 +1096,9 @@ async function peerMailbox(did) {
   const sel = JSON.parse(mailbox_select(JSON.stringify(documents[did] ?? null), JSON.stringify(hint?.endpoints || [])));
   if (!sel.selected) return null;
   log(`mailbox of ${short(did)}: ${sel.uri} ${short(sel.selected)} (${sel.source === 'hint' ? 'HINT-SOURCED, NOT AUTHORITATIVE, §8.1 rule 6' : 'from their DID document, §8.1'})`, 'M§4.2');
-  return { did: sel.selected, uri: sel.uri, source: sel.source };
+  return { did: sel.selected, uri: sel.uri, source: sel.source, entry: sel.entry };
 }
+const peerMailboxEntry = peerMailbox;
 
 /** A short-lived connection to another mailbox for one `key-package-fetch` (M§5.5): bound with our hello, the
  *  answer returned, closed. */
@@ -1143,21 +1209,23 @@ const b64u = {
 function blobEndpoint() { return mailboxInfo?.capabilities?.mailbox?.blob_endpoint || null; }
 
 /** Start or stop recording a voice message for the open conversation; on stop it is sealed, uploaded and sent. */
-async function toggleVoice() {
-  if (!messenger || !activeConv) return;
+async function toggleVoice(opts = {}) {
+  if (!messenger || !(opts.gid || activeConv)) return;
   if (recorder) { recorder.rec.stop(); return; }
   if (!blobEndpoint()) return notify('the mailbox advertises no blob endpoint (M§4.3)');
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mime = ['audio/ogg;codecs=opus', 'audio/webm;codecs=opus', 'audio/ogg', 'audio/webm'].find((m) => window.MediaRecorder?.isTypeSupported?.(m)) || '';
     const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-    recorder = { rec, chunks: [], started: Date.now(), stream, gid: activeConv };
+    recorder = { rec, chunks: [], started: Date.now(), stream, gid: opts.gid || activeConv, purpose: opts.purpose || 'voice-message', session: opts.session };
+    // M§13.2: a voicemail recording stops at the callee's max_duration_s
+    if (opts.max_s) { const r = recorder; setTimeout(() => { if (recorder === r) { log(`voicemail: stopped at the callee's limit of ${opts.max_s} s`, 'M§13.2'); rec.stop(); } }, opts.max_s * 1000); }
     rec.ondataavailable = (ev) => { if (ev.data.size) recorder.chunks.push(ev.data); };
     rec.onstop = async () => {
       const r = recorder; recorder = null;
       r.stream.getTracks().forEach((t) => t.stop());
       $('compose-voice').textContent = 'Record voice'; $('compose-voice-state').textContent = 'sealing and uploading…';
-      try { await sendVoice(r.gid, new Blob(r.chunks, { type: rec.mimeType || mime || 'audio/webm' }), Date.now() - r.started); }
+      try { await sendVoice(r.gid, new Blob(r.chunks, { type: rec.mimeType || mime || 'audio/webm' }), Math.min(Date.now() - r.started, (opts.max_s || 1e9) * 1000), r.purpose, r.session); }
       catch (e) { notify(`voice message not sent: ${e.message || e}`); log(`✗ voice message: ${e.message || e}`, 'M§8.4'); }
       $('compose-voice-state').textContent = '';
     };
@@ -1168,7 +1236,7 @@ async function toggleVoice() {
 
 /** M§8.4 rules 1–4 and M§5.6: seal under a fresh key, PUT the ciphertext to our mailbox with a signed blob-put, then
  *  send the audio content carrying the key; the deposit's manifest carries the blob without it. */
-async function sendVoice(gid, blob, durationMs) {
+async function sendVoice(gid, blob, durationMs, purpose = 'voice-message', session = undefined) {
   const plain = await blob.arrayBuffer();
   const sealed = JSON.parse(messenger.seal_blob(b64u.encode(plain)));
   const uri = `${blobEndpoint().replace(/\/$/, '')}/${sealed.sha256}`;
@@ -1179,9 +1247,9 @@ async function sendVoice(gid, blob, durationMs) {
   log(`blob ${sealed.sha256.slice(0, 12)}… (${sealed.size} B, ciphertext) uploaded to ${uri}: ${r.status}${answer.duplicate ? ' (already held)' : ''}`, 'M§5.6');
   const content_type = blob.type || 'audio/webm';
   lastVoice = { plain_size: plain.byteLength, sha256: sealed.sha256, size: sealed.size, content_type, duration_ms: durationMs };
-  const frame = messenger.send_audio(gid, JSON.stringify({ uri, sha256: sealed.sha256, size: sealed.size, key: sealed.key, content_type }), durationMs, 'voice-message', undefined, now());
+  const frame = messenger.send_audio(gid, JSON.stringify({ uri, sha256: sealed.sha256, size: sealed.size, key: sealed.key, content_type }), durationMs, purpose, session, now());
   await driveMailbox([{ send: frame }]);
-  log(`voice message sent: ${Math.round(durationMs / 1000)} s, ${content_type}, the key in the content and never on the mailbox`, 'M§8.2 · M§8.4');
+  log(`${purpose === 'voicemail' ? `voicemail for call ${short(session)}` : 'voice message'} sent: ${Math.round(durationMs / 1000)} s, ${content_type}, the key in the content and never on the mailbox`, 'M§8.2 · M§8.4');
 }
 
 /** Fetch and open a content's blob (M§8.4 rules 6–7): the sources the pinned rule orders (our mailbox's copy first),
@@ -1252,13 +1320,22 @@ function renderMessages() {
   $('thread-meta').textContent = conv ? `group ${conv.group} · hub ${short(conv.hub.did)} (${conv.hub.did === mb?.did ? 'our mailbox' : 'their mailbox'}) · epoch ${conv.epoch}` : '';
   const th = $('thread');
   th.innerHTML = '';
-  const thread = conv ? JSON.parse(messenger.thread(conv.group)) : [];
+  const timeline = conv ? JSON.parse(messenger.timeline(conv.group)) : [];
+  const thread = timeline.filter((m) => !m.call);
   // M§10.3: each identity's watermark is a content id; the seq it names is the thread's
   const marks = conv ? JSON.parse(messenger.read_marks(conv.group)) : {};
   const seqOf = (id) => thread.find((m) => m.object.id === id)?.seq ?? -1;
   const theirRead = Math.max(-1, ...Object.entries(marks).filter(([who]) => who !== identity.identity).map(([, id]) => seqOf(id)));
-  for (const m of thread) {
+  for (const m of timeline) {
     const d = document.createElement('div');
+    if (m.call) {
+      // M§13.3: this identity's call events for the peer, interleaved by the pinned rule
+      d.className = 'msg call';
+      d.textContent = `${m.call.outcome === 'declined' ? 'Declined call' : 'Missed call'} · ${new Date(m.call.at * 1000).toLocaleTimeString()}`;
+      d.dataset.session = m.call.session;
+      th.append(d);
+      continue;
+    }
     d.className = `msg${m.mine ? ' mine' : ''}${m.from_archive ? ' archive' : ''}`;
     d.innerHTML = '<span class="who"></span><span class="text"></span><span class="seq"></span><span class="read"></span>';
     d.querySelector('.who').textContent = m.mine ? 'you' : nameOf(m.sender) || short(m.sender);
@@ -1274,7 +1351,7 @@ function renderMessages() {
         }
         text.append(st.el);
       } else text.textContent = st?.state === 'failed' ? `(voice message: ${st.why})` : '(voice message, fetching…)';
-      text.append(` ${Math.round((m.object.duration_ms || 0) / 1000)} s${m.object.purpose === 'voicemail' ? ' voicemail' : ''}`);
+      text.append(` ${Math.round((m.object.duration_ms || 0) / 1000)} s${m.object.purpose === 'voicemail' ? ` voicemail${m.object.session ? ` for call ${short(m.object.session)}` : ''}` : ''}`);
       if (!st) setTimeout(() => fetchBlob(m.group, m), 0);
     } else d.querySelector('.text').textContent = m.object.text || `(${m.object.kind})`;
     d.querySelector('.seq').textContent = m.seq == null ? 'pending' : `#${m.seq}${m.mine && m.delivered && Object.keys(m.delivered).length ? ' ✓✓' : ''}`;
@@ -1354,7 +1431,8 @@ function renderMessages() {
   $('introduce-form').onsubmit = (e) => { e.preventDefault(); sendIntroduction($('introduce-form').dataset.to, $('introduce-purpose').value.trim()); };
   $('introduce-cancel').onclick = () => $('introduce-form').classList.add('hidden');
   $('compose').onsubmit = async (e) => { e.preventDefault(); const t = $('compose-text').value; $('compose-text').value = ''; await sendText(t); };
-  $('compose-voice').onclick = toggleVoice;
+  $('compose-voice').onclick = () => toggleVoice();
+  $('btn-voicemail').onclick = leaveVoicemail;
   $('btn-contact-link').onclick = newContactLink;
   $('btn-accept').onclick = () => accept(false);
   $('btn-screen').onclick = () => accept(true);
@@ -1456,6 +1534,11 @@ function renderMessages() {
     // voice and blobs (round 2B)
     recordVoice: async (ms) => { await toggleVoice(); await new Promise((r) => setTimeout(r, ms)); const done = new Promise((r) => { const t = setInterval(() => { if (!recorder && lastVoice) { clearInterval(t); r(); } }, 100); }); await toggleVoice(); await done; return lastVoice; },
     lastVoice: () => lastVoice,
+    // voicemail and call history (round 2C)
+    voicemailOffered: () => pendingVoicemail,
+    leaveVoicemail: async (ms) => { await leaveVoicemail(); await new Promise((r) => setTimeout(r, ms)); lastVoice = null; await leaveVoicemail(); await until(() => lastVoice, 30000); return lastVoice; },
+    calls: () => JSON.parse(messenger.calls()),
+    timeline: (gid) => JSON.parse(messenger.timeline(gid || activeConv)),
     media: (id) => (media[id] ? { state: media[id].state, from: media[id].from, size: media[id].size, why: media[id].why } : null),
     playAudio: async (id) => { const a = document.querySelector(`audio[data-id="${id}"]`); if (!a) return false; await a.play().catch(() => {}); return true; },
     blobEndpoint,
