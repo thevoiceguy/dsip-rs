@@ -1027,6 +1027,7 @@ async function startMessagingNow() {
       return;
     }
     m.set_read_disclosed(!!settings.read_disclosed, now());
+    if (settings.hub_timeout_s) m.set_hub_timeout(settings.hub_timeout_s);   // M§9.4: the device's own threshold
     messenger = m;
   } catch (e) { log(`messaging not started: ${e.message || e}`, 'M§4'); renderMessages(); return; }
   messenger.set_grants(JSON.stringify(heldGrantFrames()));
@@ -1081,6 +1082,7 @@ async function driveMailbox(result) {
   const list = typeof result === 'string' ? JSON.parse(result) : result;
   for (const e of list) {
     if (typeof e === 'string') { mailboxConn.send(e); log(`→ ${payloadOf(e).type?.padEnd(12)} to mailbox${payloadOf(e).class ? ` (${payloadOf(e).class})` : ''}`, 'M§5'); continue; }
+    if (e.send === '') continue;   // M§9.4: queued behind an unreachable hub, or kept for a successor
     if (e.send) { mailboxConn.send(e.send); const p = payloadOf(e.send); log(`→ ${(p.type || '').padEnd(12)} to ${p.to === mailboxOf()?.did ? 'mailbox' : 'hub ' + short(p.to)}${p.class ? ` (${p.class})` : ''}`, 'M§5'); }
     else if (e.sync) { const f = messenger.sync_frame(false, now()); mailboxConn.send(f); log('→ sync         after a refused commit (M§6.5, spec-gap 58)', 'M§6.5'); }
     else if (e.ui) onMessagingUi(e);
@@ -1088,6 +1090,7 @@ async function driveMailbox(result) {
     else if (e.error) log(`✗ messaging error: ${e.error}`, 'M§5');
     else if (e.rejected) log(`✗ mailbox frame rejected: ${e.rejected.code}${e.rejected.reason ? ' ' + e.rejected.reason : ''}`, '§10.2');
     else if (e.drop) log(`· mailbox: ${e.drop}`);
+    else if (e.successor_due) successorDue(e.successor_due);
     for (let i = waiters.length - 1; i >= 0; i--) if (waiters[i].pred(e)) waiters.splice(i, 1)[0].resolve(e);
   }
   await store.set(key('messenger'), JSON.parse(messenger.save()));
@@ -1097,7 +1100,8 @@ async function driveMailbox(result) {
 function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
     key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
-    archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5' }[e.ui] || 'M§';
+    archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5',
+    hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
   log(`◇ ${e.ui} ${fields}`, sec);
   if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
@@ -1105,6 +1109,9 @@ function onMessagingUi(e) {
   if (e.ui === 'committed' && e.device) notify(`device ${short(e.device)} added to ${e.personal ? 'the personal group' : 'a conversation'} (epoch ${e.epoch})`);
   else if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
   if (e.ui === 'epoch' && e.added?.length) notify(`${e.added.map((a) => { const [who, dev] = a.split('#'); return `${who === identity.identity ? 'your' : `${nameOf(who) || short(who)}'s`} device ${short(dev)}`; }).join(', ')} joined (epoch ${e.epoch})`);
+  if (e.ui === 'hub_down') notify(`the hub of a conversation is unreachable: messages wait (M§9.4)`);
+  if (e.ui === 'hub_back') notify('the hub answers again: pending messages sent');
+  if (e.ui === 'successor') { if (activeConv === e.of) activeConv = e.group; notify(`the conversation continues in a successor group (its old hub is gone, M§7.5)`); }
   if (e.ui === 'history') notify(`history: ${e.from === identity.identity ? 'you' : nameOf(e.from) || short(e.from)} #${e.seq}`);
   if (e.ui === 'request') notify(`Message request from ${short(e.from)}: see Messages`);
   if (e.ui === 'granted') notify(`${nameOf(e.by) || short(e.by)} granted you dsip.message`);
@@ -1132,7 +1139,7 @@ const peerMailboxEntry = peerMailbox;
 
 /** A short-lived connection to another mailbox for one `key-package-fetch` (M§5.5): bound with our hello, the
  *  answer returned, closed. */
-function fetchFromMailbox(mb, target) {
+function fetchFromMailbox(mb, target, successorOf) {
   return new Promise((resolve, reject) => {
     let done = false;
     const finish = (fn) => { if (!done) { done = true; r.close(); fn(); } };
@@ -1140,7 +1147,7 @@ function fetchFromMailbox(mb, target) {
       bound: (info) => {
         if (info.did !== mb.did) return finish(() => reject(new Error(`their mailbox is ${short(info.did)}, not ${short(mb.did)}`)));
         log(`← hello        their mailbox ${short(info.did)} bound us (in_reply_to matched)`, 'M§4.3 · §20.5');
-        r.send(messenger.fetch_frame(mb.did, target, now()));
+        r.send(messenger.fetch_frame(mb.did, target, now(), successorOf));
         log(`→ key-package-fetch for ${short(target)} to their mailbox${heldGrantFrames()[target] ? ', presenting their grant' : ', no grant held'}`, 'M§5.5 · M§14.2');
       },
       refused: (x) => finish(() => reject(new Error(`their mailbox's hello rejected: ${x.code}`))),
@@ -1190,6 +1197,33 @@ async function messagePeer(did) {
     activeConv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === did)?.group || activeConv;
   } catch (e) { notify(`cannot message ${nameOf(did) || short(did)}: ${e.message || e}`); log(`✗ ${e.message || e}`, 'M§7.2'); }
   renderMessages();
+}
+
+/** M§9.4 → M§7.5: a group's hub has been unreachable past the threshold. Fetch the KeyPackages of the other
+ *  identities of its last roster from their mailboxes, `successor_of` naming the dead group (served without a grant
+ *  when the group is registered for them, spec-gap 61), and create the successor at our own mailbox; the pending items
+ *  follow once it holds its members. A failure is retried with the §13.2 backoff (spec-gap 72). */
+const successorBusy = new Set();
+async function successorDue(d) {
+  if (successorBusy.has(d.group)) return;
+  successorBusy.add(d.group);
+  try {
+    log(`hub of ${short(d.group)} unreachable past the threshold: creating its successor${d.peers.length ? ` with ${d.peers.map((p) => nameOf(p) || short(p)).join(', ')}` : ''}`, 'M§9.4 · M§7.5');
+    const kps = {};
+    for (const peer of d.peers) {
+      const mb = await peerMailbox(peer);
+      if (!mb) throw new Error(`no mailbox found for ${short(peer)}`);
+      kps[peer] = await fetchFromMailbox(mb, peer, d.group);
+      log(`key packages of ${short(peer)} for the successor: ${(kps[peer].key_packages || []).length} one-time${kps[peer].last_resort ? ' + last resort' : ''}`, 'M§7.5');
+    }
+    const frames = JSON.parse(messenger.create_successor(d.group, JSON.stringify(kps), now()));
+    await driveMailbox(frames.map((f) => ({ send: f })));
+    log(`successor of ${short(d.group)} created at our mailbox; the members are added once the hub holds it`, 'M§7.5');
+    if (activeConv === d.group) activeConv = JSON.parse(messenger.conversations(now())).find((c) => c.predecessors.includes(d.group))?.group || activeConv;
+  } catch (e) {
+    messenger.successor_failed(d.group);
+    log(`successor of ${short(d.group)} not created: ${e.message || e}; retried`, 'M§9.4');
+  } finally { successorBusy.delete(d.group); }
 }
 
 /** Our own identity's KeyPackage directory answer (M§5.5), asked of our mailbox on the bound connection. */
@@ -1336,7 +1370,7 @@ function renderMessages() {
     li.innerHTML = '<span class="name"></span> <code class="did"></code> <span class="muted small meta"></span>';
     li.querySelector('.name').textContent = c.peer ? nameOf(c.peer) || '(unnamed)' : c.kind;
     li.querySelector('.did').textContent = c.peer || c.group;
-    li.querySelector('.meta').textContent = `${c.members.length} identit${c.members.length === 1 ? 'y' : 'ies'}, epoch ${c.epoch}${c.pending ? `, ${c.pending} pending` : ''}`;
+    li.querySelector('.meta').textContent = `${c.members.length} identit${c.members.length === 1 ? 'y' : 'ies'}, epoch ${c.epoch}${c.pending ? `, ${c.pending} pending` : ''}${c.hub_down ? ', hub unreachable' : ''}${c.predecessors?.length ? ', continued from a group whose hub is gone' : ''}`;
     li.onclick = () => { activeConv = c.group; renderMessages(); };
     ul.append(li);
   }
@@ -1344,6 +1378,10 @@ function renderMessages() {
   const reqs = messenger ? Object.entries(JSON.parse(messenger.requests())) : [];
   rl.innerHTML = reqs.length ? '' : '<li class="muted small">none</li>';
   for (const [id, r] of reqs) { const li = document.createElement('li'); li.innerHTML = '<code class="did"></code> <span class="small purpose"></span>'; li.querySelector('.did').textContent = r.from; li.querySelector('.purpose').textContent = `“${r.purpose}” (${id})`; rl.append(li); }
+  if (activeConv && !convs.some((c) => c.group === activeConv)) {
+    const next = convs.find((c) => c.predecessors?.includes(activeConv));   // M§7.5: the conversation moved on
+    if (next) activeConv = next.group;
+  }
   const conv = convs.find((c) => c.group === activeConv);
   $('thread-title').textContent = conv ? (conv.peer ? nameOf(conv.peer) || '(unnamed)' : conv.kind) : 'no conversation open';
   $('thread-did').textContent = conv?.peer || '';
@@ -1570,6 +1608,9 @@ function renderMessages() {
     calls: () => JSON.parse(messenger.calls()),
     // external join (round 2C)
     available: () => JSON.parse(messenger.available()),
+    // successor groups (round 2D)
+    setHubTimeout: async (s) => { settings.hub_timeout_s = s; await saveSettings(); messenger?.set_hub_timeout(s); },
+    outages: () => JSON.parse(messenger.outages()),
     joinAvailable,
     timeline: (gid) => JSON.parse(messenger.timeline(gid || activeConv)),
     media: (id) => (media[id] ? { state: media[id].state, from: media[id].from, size: media[id].size, why: media[id].why } : null),

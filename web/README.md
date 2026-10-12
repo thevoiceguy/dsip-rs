@@ -99,8 +99,19 @@ callee's `max_duration_s` and goes out as `audio` content with `purpose: voicema
 to end like any voice message (M§13.1). A device that knows of siblings and is not added within 30 s joins by
 external commit every group its mailbox holds a GroupInfo for, personal group first (M§6.8; the wait is spec-gap
 120); the hub and every member check that its identity already had a leaf there, and no archive key comes with it.
-Still with the Rust console only: successor groups when a hub is gone for good (M§7.5), which need the hub-outage
-machine (M§9.4) and a mailbox move in the browser first.
+
+**Round 2, part D — hub outages, successor groups, moving mailbox.** A deposit the hub cannot take
+(`mailbox.hub-unreachable`, `mailbox.quota-exceeded`, or no answer within 60 s) starts an outage, run by the pinned
+outbox (M§9.4): new content queues behind the pending head, the head is re-deposited as the same bytes with the
+§13.2 backoff, and an `accepted` flushes the rest. When the hub has been gone past the device's threshold (24 h by
+default; `setHubTimeout` changes it), the device fetches the KeyPackages of the dead group's other identities from
+their mailboxes with `successor_of` (served without a grant where the group is registered for them, spec-gap 61),
+creates the successor at its own mailbox for the same conversation, and re-encrypts the pending items into it once
+it holds its members. A device welcomed to a successor checks it by the pinned tracker (its creator, leaf 0, was in
+the dead group, and it adds nobody new) and joins, declines, or leaves a higher one so that everyone converges on
+the lowest group id (M§7.5). The thread keeps the dead group's history before the successor's, and the dead group is
+no longer listed. An identity that moves to another mailbox registers every group it is in there and syncs it from
+the start (spec-gap 122), which is what lets a successor's creator find it.
 
 ## Run it locally
 
@@ -208,6 +219,9 @@ test/messaging-voicemail.mjs  round 2C: a missed and a declined call recorded as
                         decline and not after the caller's own hang-up, recorded, received with its session, one timeline
 test/messaging-rejoin.mjs   round 2C: a new device that nobody adds joins the personal group and the conversation by external
                         commit; the peer verifies the join; messages flow; no history comes with it
+test/messaging-successor.mjs  round 2D: a conversation hubbed at a third mailbox the test starts and kills; Bob moves to
+                        mailbox B; Alice's message waits out the outage, her device creates the successor and re-adds
+                        Bob without a grant; Bob checks it and joins; the message arrives; the thread is kept
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
@@ -267,7 +281,12 @@ Alice is offered a voicemail up to Bob's advertised limit; it reaches Bob as aud
 declined call's session, its blob verified; Bob's timeline reads missed call, declined call, voicemail, and a reload
 keeps the call log. `messaging-rejoin.mjs`: Alice's only device goes away; a new one enrolled from her identity file
 waits for a sibling, then joins her personal group and the conversation by external commit; Bob verifies the join
-and sees the new device; messages flow both ways, and nothing from before the join is shown. CI runs all ten in
+and sees the new device; messages flow both ways, and nothing from before the join is shown.
+`messaging-successor.mjs`: Bob's mailbox is a third one the test starts; he opens the conversation there and the
+test kills it. Bob moves to mailbox B and registers his groups. Alice's next message is refused as hub-unreachable and
+kept pending; past her 12 s threshold her device fetches Bob's KeyPackages from B without a grant and creates the
+successor at A; Bob checks it and joins; the pending message arrives, re-encrypted; both see one conversation whose
+thread runs from the dead group into the successor; Bob's reply arrives; a reload keeps it all. CI runs all eleven in
 Firefox and Chromium.
 
 ## Identity
