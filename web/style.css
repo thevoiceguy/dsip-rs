@@ -50,3 +50,5 @@ video { width:100%; background:#000; border-radius:8px; aspect-ratio: 4/3; }
 .thread .msg .who { font-size: .8rem; opacity: .7; margin-right: .4rem; }
 .thread .msg .seq { font-size: .75rem; opacity: .5; margin-left: .4rem; }
 .conv-pane li.active { font-weight: 600; }
+.thread .msg.archive .who::after { content: " (history)"; opacity: .6; }
+.thread .msg .read { font-size: .75rem; opacity: .6; margin-left: .4rem; }

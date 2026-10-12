@@ -231,8 +231,13 @@ the app against a local relay, the way the wire demos drive the CLI).
    client advertises its mailbox in its hint. First contact is the calling client's (§19.4; the grant carries
    `dsip.message`, presented at the peer's mailbox, spec-gap 117). Headless test: two browsers on two operators,
    a conversation created from a KeyPackage fetched at the peer's mailbox, text both ways with delivered receipts,
-   a reload keeping MLS state and history. Not in this round: archive records and history for a second device,
-   read receipts, voice and blobs, successor groups (the Rust console has them).
+   a reload keeping MLS state and history.
+7. **Messaging, round 2** (after `poc-v0.12`). Part A, landed 2026-10-12: archive records for everything shown
+   (M§12.2), a second browser of the identity added by its sibling to the personal group and every conversation
+   with the archive keys re-sent (M§12.3, M§6.7) and reading the history, read watermarks private or disclosed
+   (M§10.3, M§10.5); headless test `messaging-devices.mjs`. Part B: voice and blobs (M§8.4, the blob endpoint, a
+   recording in the browser). Part C: joining by external commit when no sibling is available (M§6.8) and successor
+   groups (M§7.5).
 
 ## 11. Risks
 

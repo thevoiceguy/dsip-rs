@@ -189,6 +189,10 @@ struct Service {
     /// Hub `{did, uri}` of each group registered for the owner, from its welcome (M§6.6): where to forward.
     hub_refs: HashMap<String, Value>,
     bound: HashMap<String, mpsc::UnboundedSender<String>>,
+    /// A device's second connection while its binding is still open (a KeyPackage fetch at its own mailbox, or a
+    /// reconnection whose predecessor has not closed yet): answered on itself, and promoted to the binding when the
+    /// first one closes.
+    standby: HashMap<String, mpsc::UnboundedSender<String>>,
     /// Connections to other identities' mailboxes, by the member identity they were resolved for.
     peers: HashMap<String, mpsc::UnboundedSender<PeerMsg>>,
     /// `delegation-revocation` records from the owner identities (spec-gap 57).
@@ -679,24 +683,6 @@ impl Service {
         out
     }
 
-    /// Feed a hub fan-out addressed to our own owner straight into the mailbox (no socket). The second value is the
-    /// mailbox's refusal reason, if it refused.
-    fn local_deposit(&mut self, dep: &Value, now: i64) -> (Vec<Out>, Option<String>) {
-        let owner = s_of(&dep["recipient"]);
-        let item = Item::from_deposit(dep, &self.key.did(), now);
-        // A welcome's `seq` (spec-gap 83) tells the new member where it starts counting; it is not a place in the
-        // mailbox's sequence — the commit holds that seq — so the mailbox stores the welcome unsequenced, as before.
-        let seq = if dep["class"] == "welcome" { Value::Null } else { dep["seq"].clone() };
-        let event = json!({"hub_deposit": {"id": dep["id"], "from": self.key.did(), "recipient": owner,
-            "group": dep["group"], "seq": seq, "class": dep["class"], "expires_at": dep["expires_at"]}});
-        let emissions = self.mailbox_for(&owner).step(&event);
-        let refused = emissions.iter().find_map(|e| e["error"]["reason"].as_str().map(String::from));
-        let mut out = self.ephemeral_pushes(&emissions, dep, &self.key.did(), now);
-        self.absorb(&owner, &emissions, item);
-        out.extend(self.mailbox_out(&owner, emissions, now));
-        (out, refused)
-    }
-
     /// Ephemeral pushes (no cursor) become `items` carrying the sealed activity and its originating expiry.
     ///
     /// Spec: M§11.2. Impl (spec-gap 49): the pushed item is `{class, group, source, sealed, expires_at}`.
@@ -836,6 +822,7 @@ async fn main() -> Result<()> {
         conversations: HashMap::new(),
         hub_refs: HashMap::new(),
         bound: HashMap::new(),
+        standby: HashMap::new(),
         peers: HashMap::new(),
         revocations: vec![],
         blob_dir: args.state.join("blobs"),
@@ -1140,19 +1127,26 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     {
         let mut st = service.lock().await;
-        // Every binding can be pushed to (its replies, and an enrolment later on this connection); only a served
-        // identity's device is registered (M§4.4).
-        st.bound.insert(device.clone(), tx.clone());
-        if st.serves(&identity) {
-            // M§5.4: live push belongs to a connection. A new binding starts not live, whatever an earlier connection
-            // of this device asked for, until it syncs live; otherwise a push could jump its cursor past items stored
-            // while it was away, which it would then never sync.
-            let o = st.ensure_owner(&identity);
-            o.mailbox.step(&json!({"unbind": {"device": device}}));
-            // The owner's registered devices are the ones that have bound (M§4.4), including before a restart.
-            let mut devices: Vec<String> = o.mailbox.devices().to_vec();
-            devices.push(device.clone());
-            o.mailbox.register_devices(&devices);
+        // A device may hold a second, short-lived connection beside its binding (a KeyPackage fetch at its own mailbox):
+        // that connection gets its replies on itself and changes nothing about the binding, its live push included.
+        let second = st.bound.get(&device).is_some_and(|t| !t.is_closed());
+        if second {
+            st.standby.insert(device.clone(), tx.clone());
+        } else {
+            // Every binding can be pushed to (its replies, and an enrolment later on this connection); only a served
+            // identity's device is registered (M§4.4).
+            st.bound.insert(device.clone(), tx.clone());
+            if st.serves(&identity) {
+                // M§5.4: live push belongs to a connection. A new binding starts not live, whatever an earlier
+                // connection of this device asked for, until it syncs live; otherwise a push could jump its cursor past
+                // items stored while it was away, which it would then never sync.
+                let o = st.ensure_owner(&identity);
+                o.mailbox.step(&json!({"unbind": {"device": device}}));
+                // The owner's registered devices are the ones that have bound (M§4.4), including before a restart.
+                let mut devices: Vec<String> = o.mailbox.devices().to_vec();
+                devices.push(device.clone());
+                o.mailbox.register_devices(&devices);
+            }
         }
         st.persist();
     }
@@ -1187,13 +1181,19 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     }
     .await;
     let mut st = service.lock().await;
-    // A device may hold a second, short-lived connection; only its own binding ends here.
-    if st.bound.get(&device).is_some_and(|t| t.same_channel(&tx)) {
+    if st.standby.get(&device).is_some_and(|t| t.same_channel(&tx)) {
+        st.standby.remove(&device); // a second connection ending changes nothing about the binding
+    } else if st.bound.get(&device).is_some_and(|t| t.same_channel(&tx)) {
         st.bound.remove(&device);
         if let Some(o) = st.owned.get_mut(&identity) {
             o.mailbox.step(&json!({"unbind": {"device": device}}));
         }
         tracing::info!("unbound {device}");
+        // a connection that arrived while this one was still open becomes the binding: not live until it syncs (M§5.4)
+        if let Some(next) = st.standby.remove(&device).filter(|t| !t.is_closed()) {
+            st.bound.insert(device.clone(), next);
+            tracing::info!("bound {device} again on its later connection");
+        }
     }
     result
 }
@@ -1789,34 +1789,58 @@ async fn peer_task(
                 let mut st = service.lock().await;
                 match msg {
                     PeerMsg::Fanout(env) => {
-                        let group = wire::payload_of(&env).map(|p| s_of(&p["group"])).unwrap_or_default();
-                        let dep = wire::payload_of(&env).unwrap_or_default();
-                        let (outs, refused) = st.local_deposit(&dep, now_s());
-                        // the rest of what deliver_local does: acknowledge the hub's queue and route what it releases
-                        let mut outs = outs;
-                        if let Some(reason) = &refused {
-                            let class = s_of(&dep["class"]);
-                            let queued = if dep["seq"].is_i64() || class == "welcome" { " (queued, retried)" } else { "" };
-                            tracing::info!("our own mailbox refused hub fan-out {class} seq {} in {group}: {reason}{queued}", dep["seq"]);
-                        }
-                        if refused.is_none() {
-                            let (class, id) = (s_of(&dep["class"]), s_of(&dep["id"]));
-                            let welcome_seq = if class == "welcome" { st.welcomes_sent.remove(&id).map(|(_, _, s)| s) } else { None };
-                            let more = match st.hubs.get_mut(&group) {
-                                Some(h) => {
-                                    let mut more = vec![];
+                        // Exactly what a remote mailbox would do with this deposit: addressed to this service, verified
+                        // as a frame and dispatched — a welcome through M§14.2's authorization, a fan-out into the
+                        // member's registration — and the answers read as the peer loop reads them (M§6.5 rule 5).
+                        let now = now_s();
+                        let mut dep = wire::payload_of(&env).unwrap_or_default();
+                        let (group, class, id) = (s_of(&dep["group"]), s_of(&dep["class"]), s_of(&dep["id"]));
+                        let seq = dep["seq"].as_i64().unwrap_or(-1);
+                        dep["to"] = json!(st.key.did());
+                        let env = envelope::sign(&dep, &st.key, &st.key.kid());
+                        let frame = env.frame();
+                        let resolver = st.resolver();
+                        let me = st.key.did();
+                        let inb = {
+                            let ctx = ctx_of(&resolver, &st.seen, &st.supported, &st.revocations);
+                            match verify_frame(&frame, &ctx) {
+                                Ok(i) => i,
+                                Err(r) => {
+                                    tracing::info!("our own fan-out {class} in {group} does not verify: {r}");
+                                    continue;
+                                }
+                            }
+                        };
+                        st.seen.insert(&id, now, now);
+                        let outs = dispatch(&service, &mut st, &inb, &frame, &me, &me, &resolver, now);
+                        let mut refused: Option<String> = None;
+                        let mut more = vec![];
+                        let (replies, rest): (Vec<Out>, Vec<Out>) = outs.into_iter().partition(|o| matches!(o, Out::Device(to, _) if *to == me));
+                        for reply in replies {
+                            let Out::Device(_, renv) = reply else { continue };
+                            let Some(p) = wire::payload_of(&renv) else { continue };
+                            if p["type"] == "error" {
+                                refused = Some(s_of(&p["reason"]));
+                                let queued = if seq >= 0 || class == "welcome" { " (queued, retried)" } else { "" };
+                                tracing::info!("our own mailbox refused hub fan-out {class} seq {} in {group}: {}{queued}", dep["seq"], p["reason"]);
+                            } else if p["type"] == "accepted" {
+                                if p["duplicate"] == json!(true) {
+                                    tracing::info!("our own mailbox already had {class} seq {} in {group}", dep["seq"]);
+                                }
+                                // spec-gap 66: a welcome carries no seq; its acknowledgement is matched by deposit id
+                                let welcome_seq = if class == "welcome" { st.welcomes_sent.remove(&id).map(|(_, _, s)| s) } else { None };
+                                if let Some(h) = st.hubs.get_mut(&group) {
                                     if let Some(s) = welcome_seq {
                                         more.extend(h.step(&json!({"ack": {"identity": identity, "seq": s, "class": "welcome"}})));
                                     }
-                                    if let Some(s) = dep["seq"].as_i64().filter(|_| class != "welcome") {
-                                        more.extend(h.step(&json!({"ack": {"identity": identity, "seq": s}})));
+                                    if seq >= 0 && class != "welcome" {
+                                        more.extend(h.step(&json!({"ack": {"identity": identity, "seq": seq}})));
                                     }
-                                    more
                                 }
-                                None => vec![],
-                            };
-                            outs.extend(st.hub_out(&group, more, now_s()));
+                            }
                         }
+                        let mut outs = rest;
+                        outs.extend(st.hub_out(&group, more, now));
                         let (local, rest): (Vec<Out>, Vec<Out>) = outs.into_iter().partition(|o| matches!(o, Out::Device(..)));
                         st.send_local(local);
                         route_identities(&service, &mut st, rest);

@@ -83,6 +83,7 @@
         <input id="compose-text" placeholder="a message (MLS application message, M§6.4)" size="60" maxlength="4000" disabled>
         <button type="submit" class="primary" id="compose-send" disabled>Send</button>
       </form>
+      <div id="thread-marks" class="muted small"></div>
       <p class="muted small">Messages are MLS application messages in a group hubbed at the creator's mailbox; the hub orders them and
       fans them out to every member's mailbox (M§6.5), which pushes them to bound devices. A delivered receipt is sent per sync
       batch (M§10.2). The hub sees group ids, sizes and timing, never content (M§15.1).</p>
@@ -154,7 +155,8 @@
   <h3>Devices</h3>
   <p class="muted small">A <code>did:key</code> identity has no document and no registry of its devices: this list is what this
   browser knows (itself, and the devices the identity file it was enrolled from listed). A device enrolled elsewhere
-  appears here when you add its DID, shown on its own Settings screen. Revoking a device signs a
+  appears here when you add its DID, shown on its own Settings screen; with a mailbox set, this device then adds it to
+  the personal group and every conversation and re-sends the archive keys, so it reads the history (M§12.3). Revoking a device signs a
   <code>delegation-revocation</code> with the identity key (§7.4) and hands it to the relay, which ends that device's
   binding and refuses its next hello; it is held here too. A <code>did:web</code> identity would publish it in its
   document instead, where every verifier finds it.</p>
@@ -166,6 +168,7 @@
   <ul id="revoked-list" class="list"></ul>
   <h3>Policy</h3>
   <div class="row"><label class="small"><input type="checkbox" id="set-first-contact"> require first contact: refuse calls from identities that hold no grant (§19.4)</label></div>
+  <div class="row"><label class="small"><input type="checkbox" id="set-read-disclosed"> disclose read receipts: tell the other side how far you have read (M§10.3); off, your read position goes only to your own devices (M§10.5)</label></div>
   <h3>Phone number</h3>
   <p class="muted small">A binding your carrier issued (Number Attestation Profile N§3): your calls present the number with it, and a callee
   verifies it against your identity's document. Your identity must be <code>did:web</code> and its document must list the number.</p>

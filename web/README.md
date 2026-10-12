@@ -65,8 +65,22 @@ hint-sourced, said so), fetches a KeyPackage there presenting the grant they iss
 now issues `dsip.message` beside `dsip.invite`), creates the group at our mailbox and adds them once the hub holds it
 (M§7.2, M§6.5: committed on `accepted`, discarded and re-proposed after a conflict). The welcome reaches them
 through hub fan-out to a mailbox the hub resolves the same way (spec-gap 116); text is an MLS application message
-(M§8.1), delivered receipts are decided per sync batch (M§10.2) and shown on our own messages. Not in this round:
-archive and history for a second device, read receipts, voice and blobs, successor groups.
+(M§8.1), delivered receipts are decided per sync batch (M§10.2) and shown on our own messages.
+
+**Round 2, part A — history, a second device, read watermarks.** Every content item a device shows from MLS, its own
+included, and every receipt that changes rendering is archived: an archive record sealed under the identity's current
+archive key (AES-256-GCM, AAD the group id and seq) and deposited to the mailbox as `class: archive` (M§12.2). A
+browser enrolled from the identity file does not create a personal group of its own (M§7.1): it uploads KeyPackages
+and waits; the device that holds the Devices list adds it, personal group first, then every conversation (the "Add
+device" form or any bind runs the reconciliation), and re-sends every live archive key after the personal-group add
+(M§12.3, M§6.7). The new device opens the archive records its mailbox holds as history, keeping sealed any whose key
+has not arrived yet (M§12.3 step 5), restores them into its receipt state without sending anything (spec-gap 64),
+and takes part live: a sibling's message is the identity's own on every device. Read watermarks follow M§10.3: the
+thread on screen reports its last content read, at most one watermark per 5 s; with "disclose read receipts" off
+(the default, M§10.5) it goes to the personal group, where siblings pick it up and a device added later finds it in
+the archive (spec-gap 68); on, it goes to the conversation and the other side's thread shows how far you read.
+Still with the Rust console only: joining by external commit when no sibling is available (M§6.8), voice and blobs,
+successor groups.
 
 ## Run it locally
 
@@ -165,6 +179,9 @@ test/deploy.mjs         stage 5: config.json in effect, minted TURN credentials 
 test/messaging.mjs      stage 6: two browsers on two operators enrol at two mailboxes, personal groups, hints naming the
                         mailboxes, a conversation from a KeyPackage fetched at the peer's mailbox with the grant, the welcome
                         federated through the hint, text both ways, delivered receipts, a reload keeping MLS state and history
+test/messaging-devices.mjs  round 2A: archive records, a second browser of the same identity added by the first (personal group,
+                        conversation, archive keys re-sent) reading the history both sides in seq order, read watermarks private
+                        and disclosed, three devices live, a reload
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
@@ -207,8 +224,14 @@ first contact over the relay; Bob moves to relay B and mailbox B (enrolled there
 at her mailbox and commits the add on the hub's accepted; Bob joins from the welcome his mailbox received (the hub
 found it through his hint); text both ways, the hub's accepted back through Bob's mailbox's forwarding, a delivered
 receipt shown on Alice's message, each message once with its hub seq; Bob reloads and the thread, the MLS state and
-the delivery state survive, a message after the reload decrypts, nothing is shown twice. CI runs all six in Firefox
-and Chromium.
+the delivery state survive, a message after the reload decrypts, nothing is shown twice. `messaging-devices.mjs`: Alice
+and Bob exchange four messages and both archive them; Bob's read position goes to his personal group only and Alice
+sees no mark, Alice opts in and Bob sees how far she read; Alice's second browser, enrolled from her file, is added
+by the first to the personal group and the conversation with the archive keys re-sent, shows the five earlier
+messages from archive with both sides and the right seqs and the identity's read position, sends nothing for them;
+Bob's next message reaches both of her devices, the second device's reply reaches Bob and shows as her own on the
+first, Bob's delivered marks stay one per identity; a reload keeps it all and the next message decrypts. CI runs all
+seven in Firefox and Chromium.
 
 ## Identity
 
