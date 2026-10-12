@@ -900,6 +900,9 @@ type Tls = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 
 /// One blob request: `PUT` authorized by a `blob-put` envelope, or `GET` by hash (M§5.6, M§8.4).
 async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>) -> Result<()> {
+    if req.method == "OPTIONS" {
+        return Ok(http::preflight(&mut req.stream).await?); // a browser's CORS preflight before a PUT with Authorization
+    }
     let Some(sha) = req.path.strip_prefix(http::BLOB_PATH).map(String::from) else {
         return Ok(http::respond(&mut req.stream, 404, "text/plain", b"not found").await?);
     };

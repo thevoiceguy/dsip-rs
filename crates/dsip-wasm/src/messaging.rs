@@ -11,7 +11,10 @@
 //! M§8.1 (content objects checked before rendering), M§8.5 (seq dedup and the ack cursor — `Resume`, spec-gap 44),
 //! M§9.2–M§9.3 (pending until `accepted`; the same bytes re-deposited), M§10.2 (delivered receipts decided per sync
 //! batch by the vector-pinned `Client`), M§12.1 (the archive key, kept for the device that will read history),
-//! M§14.2 (a grant presented to the peer's mailbox), M§12.1–M§12.3 (archive keys, archive records written for what
+//! M§14.2 (a grant presented to the peer's mailbox), M§8.4 and M§5.6 (a blob sealed under a single-use key, uploaded
+//! with a signed `blob-put`, named with its key in the content and without it in the manifest; fetched from the
+//! sources the pinned rule orders and verified before it is opened), M§8.2 (`audio` content), M§10.4 (`played`, under
+//! the same opt-in as `read`), M§12.1–M§12.3 (archive keys, archive records written for what
 //! is shown and read back as history by a device added later, every live key re-sent to a new sibling), M§10.3 and
 //! M§10.5 (a read watermark per conversation, disclosed only with the opt-in, else to the personal group).
 //!
@@ -37,7 +40,7 @@ use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
 use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, Resume};
-use dsip_messaging::mls_wire::{open as open_sealed, seal, SealUse};
+use dsip_messaging::mls_wire::{open as open_sealed, open_blob, seal, SealUse};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
@@ -335,7 +338,7 @@ impl Messenger {
         // Receipts booked so far are not carried over; they arrive again only if re-sent, so the marks reset.
         let me = self.keys.identity.clone();
         for (gid, c) in self.convs.iter_mut() {
-            let mut fresh = Client::new(&json!({"now": now as i64, "me": me, "member_identities": 2, "policy": {"delivered": true, "read": disclosed}}));
+            let mut fresh = Client::new(&json!({"now": now as i64, "me": me, "member_identities": 2, "policy": {"delivered": true, "read": disclosed, "played": disclosed}}));
             let items: Vec<Value> = self.messages.iter().filter(|m| m["group"] == *gid && m["seq"].is_i64())
                 .map(|m| json!({"seq": m["seq"], "object": m["object"]})).collect();
             let _ = fresh.step(&json!({"restore": {"items": items}}));
@@ -434,6 +437,80 @@ impl Messenger {
     /// Archive keys this device holds, `[{akid, created_at}]`, newest current (M§12.1).
     pub fn archive_keys(&self) -> String {
         json!(self.archive_keys.iter().map(|(a, (_, at))| json!({"akid": a, "created_at": at})).collect::<Vec<_>>()).to_string()
+    }
+
+    /// Seal a payload for upload (M§8.4 rule 1): a fresh single-use 32-byte key, AES-256-GCM, no AAD, stored as
+    /// `nonce ‖ ciphertext ‖ tag`. Returns `{"sealed": b64url, "key": b64url, "sha256": hex, "size": n}`.
+    pub fn seal_blob(&self, plain_b64: &str) -> String {
+        let plain = dsip_core::b64::decode(plain_b64).unwrap_or_default();
+        let key = KeyPair::generate().seed();
+        let nonce: [u8; 12] = KeyPair::generate().seed()[..12].try_into().expect("12 bytes");
+        let sealed = seal(&key, &nonce, &plain, SealUse::Blob);
+        json!({"sealed": b64(&sealed), "key": b64(&key), "sha256": digest(&sealed), "size": sealed.len()}).to_string()
+    }
+
+    /// The `blob-put` that authorizes one upload of `sha256`/`size` to this identity's mailbox (M§5.6), as the compact
+    /// envelope for `Authorization: DSIP …`, carrying the device's delegation (M§5.1).
+    pub fn blob_put(&self, sha256: &str, size: f64, now: f64) -> String {
+        let env = wire::message_delegated(&self.keys.device, vec![self.keys.delegation.clone()], "blob-put", &self.mailbox.0, now as i64,
+            wire::TTL_S, json!({"sha256": sha256, "size": size as u64}));
+        compact(&env)
+    }
+
+    /// An `audio` content object (M§8.2) for a blob already uploaded: `blob_json` is `{uri, sha256, size, key, content_type}`
+    /// from [`Messenger::seal_blob`] and the upload; `purpose` `voice-message` or `voicemail` (with `session`). The deposit
+    /// carries the manifest without the key (M§8.4 rule 4). The frame to send.
+    pub fn send_audio(&mut self, gid: &str, blob_json: &str, duration_ms: f64, purpose: &str, session: Option<String>, now: f64) -> Result<String, JsValue> {
+        let now_i = now as i64;
+        let b: Value = serde_json::from_str(blob_json).map_err(js)?;
+        let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        let mut obj = json!({"object": "content", "id": self.fresh_id(now_i), "conversation": conversation, "sender": self.keys.identity,
+            "sent_at": now_i, "kind": "audio", "purpose": purpose, "duration_ms": duration_ms as i64,
+            "blob": {"uri": b["uri"], "sha256": b["sha256"], "size": b["size"], "key": b["key"], "alg": "A256GCM",
+                     "content_type": b["content_type"]}});
+        if let Some(sid) = session {
+            obj["session"] = json!(sid);
+        }
+        self.send_object(gid, &obj, now_i)
+    }
+
+    /// Where to fetch a content's blob from, in order (M§8.4 rules 6–7, the pinned `blob_sources`): the manifest's copy
+    /// at another `uri` for the same `sha256` and `size`, then the content's own. `object_json` is the content object,
+    /// `manifest_json` the item's `blobs` (or null).
+    pub fn blob_sources(&self, object_json: &str, manifest_json: &str) -> String {
+        let object: Value = serde_json::from_str(object_json).unwrap_or(Value::Null);
+        let manifest: Value = serde_json::from_str(manifest_json).unwrap_or(Value::Null);
+        dsip_messaging::client::blob_sources(&json!({"blob": object["blob"], "manifest": manifest}))["sources"].to_string()
+    }
+
+    /// Open a fetched blob for a content object (M§8.4 rule 7): the size and SHA-256 must match the content's `blob`
+    /// before it is decrypted under the key the content carries. The plaintext, base64url, or the refusal code.
+    pub fn open_blob(&self, object_json: &str, stored_b64: &str) -> Result<String, JsValue> {
+        let object: Value = serde_json::from_str(object_json).map_err(js)?;
+        let b = &object["blob"];
+        let key: [u8; 32] = unb64(&b["key"]).try_into().map_err(|_| JsValue::from_str("blob key"))?;
+        let stored = dsip_core::b64::decode(stored_b64).unwrap_or_default();
+        let plain = open_blob(&key, &stored, b["size"].as_u64().unwrap_or(0) as usize, b["sha256"].as_str().unwrap_or("")).map_err(JsValue::from_str)?;
+        Ok(b64(&plain))
+    }
+
+    /// What a device does after its blob sources answered (`tried`: `[{uri, status, sha256?, size?}]`; the pinned
+    /// `blob_fetch`, spec-gap 106): `{"action": "retry"|"give-up", "reason"}`.
+    pub fn blob_fetch_decision(&self, object_json: &str, tried_json: &str, attempt: f64) -> String {
+        let object: Value = serde_json::from_str(object_json).unwrap_or(Value::Null);
+        let tried: Value = serde_json::from_str(tried_json).unwrap_or(Value::Null);
+        dsip_messaging::client::blob_fetch(&json!({"blob": {"sha256": object["blob"]["sha256"], "size": object["blob"]["size"]}, "tried": tried,
+            "attempt": attempt as i64})).to_string()
+    }
+
+    /// The user played an `audio` or `video` content (M§10.4): a `played` receipt under the same opt-in as `read`
+    /// (M§10.5). Frames and events, as `inbound` returns them.
+    pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> String {
+        let now_i = now as i64;
+        let Some(c) = self.convs.get_mut(gid) else { return "[]".into() };
+        c.receipts.step(&json!({"advance": (now_i - c.receipts.now()).max(0)}));
+        let emissions = c.receipts.step(&json!({"play": {"id": content_id}}));
+        json!(self.receipt_sends(gid, emissions, now_i)).to_string()
     }
 
     /// A DID document to hold (§8.1), for `did:web` peers.
@@ -579,10 +656,11 @@ impl Messenger {
     /// from_archive}]`; `read_through` of the whole thread is `{identity: content id}` (M§10.3), in
     /// [`Messenger::read_marks`].
     pub fn thread(&self, gid: &str) -> String {
-        let delivered = self.convs.get(gid).map(|c| c.receipts.snapshot()["delivered"].clone()).unwrap_or(Value::Null);
+        let snap = self.convs.get(gid).map(|c| c.receipts.snapshot()).unwrap_or(Value::Null);
         let mut list: Vec<Value> = self.messages.iter().filter(|m| m["group"] == gid).map(|m| {
             let mut m = m.clone();
-            m["delivered"] = delivered[s_of(&m["object"]["id"])].clone();
+            m["delivered"] = snap["delivered"][s_of(&m["object"]["id"])].clone();
+            m["played"] = snap["played"][s_of(&m["object"]["id"])].clone();
             m
         }).collect();
         list.sort_by_key(|m| (m["seq"].as_i64().unwrap_or(i64::MAX), s_of(&m["key"])));
@@ -678,7 +756,7 @@ impl Messenger {
 
     fn new_receipts(&self, now: i64) -> Client {
         Client::new(&json!({"now": now, "me": self.keys.identity, "member_identities": 2,
-            "policy": {"delivered": true, "read": self.read_disclosed}}))
+            "policy": {"delivered": true, "read": self.read_disclosed, "played": self.read_disclosed}}))
     }
 
 
@@ -778,7 +856,11 @@ impl Messenger {
         let c = self.convs.get_mut(gid).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
         let bytes = c.group.create_message(provider, &signer, &serde_json::to_vec(obj).map_err(js)?)
             .map_err(|e| js(format!("{e:?}")))?.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?;
-        let item = json!({"id": self.fresh_id(now), "mls": b64(&bytes), "obj": obj});
+        let mut item = json!({"id": self.fresh_id(now), "mls": b64(&bytes), "obj": obj});
+        if let Some(b) = obj.get("blob") {
+            // M§8.4 rule 4: the deposit's manifest names the blob without its key
+            item["blobs"] = json!([{"uri": b["uri"], "sha256": b["sha256"], "size": b["size"]}]);
+        }
         self.outbox.entry(gid.to_string()).or_default().push(item.clone());
         if obj["object"] == "content" {
             // shown at once as ours; its seq is filled in by the hub's accepted (M§8.5)
@@ -792,7 +874,11 @@ impl Messenger {
 
     /// The deposit of a pending item, under a fresh envelope but the same item id and bytes (M§9.3).
     fn deposit_item(&mut self, gid: &str, item: &Value, now: i64) -> String {
-        let frame = self.hub_deposit(gid, "application", json!({"mls": item["mls"]}), now);
+        let mut fields = json!({"mls": item["mls"]});
+        if let Some(b) = item.get("blobs") {
+            fields["blobs"] = b.clone();
+        }
+        let frame = self.hub_deposit(gid, "application", fields, now);
         let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
         self.pending.insert(id, Pending::Application { gid: gid.to_string(), item: s_of(&item["id"]) });
         frame
@@ -1145,7 +1231,7 @@ impl Messenger {
                 }
                 // a sibling device's content is this identity's own (M§12.3: sent messages reach every device)
                 self.messages.push(json!({"group": gid, "key": key, "sender": sender, "sender_device": sender_device, "object": object,
-                    "seq": seq, "mine": sender == self.keys.identity, "item": null}));
+                    "seq": seq, "mine": sender == self.keys.identity, "item": null, "blobs": item["blobs"]}));
                 if let Some(c) = self.convs.get_mut(gid) {
                     c.pending_batch_push(json!({"seq": seq, "object": object.clone()}));
                 }
@@ -1153,7 +1239,8 @@ impl Messenger {
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
                 let emissions = self.history.step(&json!({"mls": {"group": gid, "seq": seq, "epoch": epoch, "id": key}}));
                 out.extend(self.archive_requests(gid, &emissions, &object, sender, sender_device, seq, now));
-                out.push(json!({"ui": "message", "group": gid, "from": sender, "seq": seq, "kind": object["kind"], "text": object["text"], "sent_at": object["sent_at"]}));
+                out.push(json!({"ui": "message", "group": gid, "from": sender, "seq": seq, "kind": object["kind"], "text": object["text"], "sent_at": object["sent_at"],
+                    "id": object["id"], "blobs": item["blobs"]}));
             }
             _ => {}
         }

@@ -49,6 +49,9 @@ const waiters = [];                           // {pred, resolve}: one-shot waits
 let messagingTick = null;                     // advances the receipts machines (M§10.3: a held read goes out when 5 s pass)
 const lastRead = {};                          // group → the content id this screen last reported read (M§10.3)
 let reconciling = null;                       // the device reconciliation in progress (M§12.3), one at a time
+const media = {};                             // content id → {url, state: 'fetching'|'ready'|'failed', attempt, why}: blobs fetched and opened (M§8.4)
+let recorder = null;                          // {rec, chunks, started, stream} while a voice message is being recorded
+let lastVoice = null;                         // what the last recording became: {plain_size, sha256, size, content_type, duration_ms} (for tests)
 const HINT_TTL_S = 3600;   // the profile's maximum (§12.9, spec-gap 96)
 // A setting of null says "none", overriding the operator's default (typed as `none` in Settings).
 const setting = (k) => (settings[k] === null ? undefined : settings[k] !== undefined && settings[k] !== '' && !(Array.isArray(settings[k]) && !settings[k].length) ? settings[k] : served[k]);
@@ -1129,6 +1132,91 @@ async function reconcileDevices() {
   return reconciling;
 }
 
+// ---------------------------------------------------------------- voice messages and blobs (M§8.4, M§5.6)
+
+const b64u = {
+  encode: (bytes) => { let s = ''; const u = new Uint8Array(bytes); for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); },
+  decode: (text) => { const bin = atob(text.replace(/-/g, '+').replace(/_/g, '/')); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; },
+};
+
+/** The mailbox's blob endpoint, from its hello capabilities (M§4.3). */
+function blobEndpoint() { return mailboxInfo?.capabilities?.mailbox?.blob_endpoint || null; }
+
+/** Start or stop recording a voice message for the open conversation; on stop it is sealed, uploaded and sent. */
+async function toggleVoice() {
+  if (!messenger || !activeConv) return;
+  if (recorder) { recorder.rec.stop(); return; }
+  if (!blobEndpoint()) return notify('the mailbox advertises no blob endpoint (M§4.3)');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = ['audio/ogg;codecs=opus', 'audio/webm;codecs=opus', 'audio/ogg', 'audio/webm'].find((m) => window.MediaRecorder?.isTypeSupported?.(m)) || '';
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    recorder = { rec, chunks: [], started: Date.now(), stream, gid: activeConv };
+    rec.ondataavailable = (ev) => { if (ev.data.size) recorder.chunks.push(ev.data); };
+    rec.onstop = async () => {
+      const r = recorder; recorder = null;
+      r.stream.getTracks().forEach((t) => t.stop());
+      $('compose-voice').textContent = 'Record voice'; $('compose-voice-state').textContent = 'sealing and uploading…';
+      try { await sendVoice(r.gid, new Blob(r.chunks, { type: rec.mimeType || mime || 'audio/webm' }), Date.now() - r.started); }
+      catch (e) { notify(`voice message not sent: ${e.message || e}`); log(`✗ voice message: ${e.message || e}`, 'M§8.4'); }
+      $('compose-voice-state').textContent = '';
+    };
+    rec.start(250);
+    $('compose-voice').textContent = 'Stop and send'; $('compose-voice-state').textContent = 'recording…';
+  } catch (e) { notify(`cannot record: ${e.message || e}`); }
+}
+
+/** M§8.4 rules 1–4 and M§5.6: seal under a fresh key, PUT the ciphertext to our mailbox with a signed blob-put, then
+ *  send the audio content carrying the key; the deposit's manifest carries the blob without it. */
+async function sendVoice(gid, blob, durationMs) {
+  const plain = await blob.arrayBuffer();
+  const sealed = JSON.parse(messenger.seal_blob(b64u.encode(plain)));
+  const uri = `${blobEndpoint().replace(/\/$/, '')}/${sealed.sha256}`;
+  const auth = messenger.blob_put(sealed.sha256, sealed.size, now());
+  const r = await fetch(uri, { method: 'PUT', headers: { Authorization: `DSIP ${auth}`, 'Content-Type': 'application/octet-stream' }, body: b64u.decode(sealed.sealed) });
+  const answer = payloadOf(await r.text());
+  if (!(r.status === 200 || r.status === 201) || answer.type !== 'accepted') throw new Error(`blob upload refused: ${r.status} ${answer.reason || ''}`);
+  log(`blob ${sealed.sha256.slice(0, 12)}… (${sealed.size} B, ciphertext) uploaded to ${uri}: ${r.status}${answer.duplicate ? ' (already held)' : ''}`, 'M§5.6');
+  const content_type = blob.type || 'audio/webm';
+  lastVoice = { plain_size: plain.byteLength, sha256: sealed.sha256, size: sealed.size, content_type, duration_ms: durationMs };
+  const frame = messenger.send_audio(gid, JSON.stringify({ uri, sha256: sealed.sha256, size: sealed.size, key: sealed.key, content_type }), durationMs, 'voice-message', undefined, now());
+  await driveMailbox([{ send: frame }]);
+  log(`voice message sent: ${Math.round(durationMs / 1000)} s, ${content_type}, the key in the content and never on the mailbox`, 'M§8.2 · M§8.4');
+}
+
+/** Fetch and open a content's blob (M§8.4 rules 6–7): the sources the pinned rule orders (our mailbox's copy first),
+ *  each verified by size and SHA-256 before it is decrypted; a source with nothing to serve is tried again as the pinned
+ *  decision says (spec-gap 106). */
+async function fetchBlob(gid, m, attempt = 1) {
+  const id = m.object.id;
+  if (media[id] && media[id].state !== 'retry') return;
+  media[id] = { state: 'fetching', attempt };
+  const sources = JSON.parse(messenger.blob_sources(JSON.stringify(m.object), JSON.stringify(m.blobs || null)));
+  const tried = [];
+  for (const uri of sources) {
+    try {
+      const r = await fetch(uri);
+      if (!r.ok) { tried.push({ uri, status: r.status }); log(`blob source ${uri}: ${r.status}`, 'M§8.4'); continue; }
+      const stored = await r.arrayBuffer();
+      try {
+        const plain = messenger.open_blob(JSON.stringify(m.object), b64u.encode(stored));
+        const url = URL.createObjectURL(new Blob([b64u.decode(plain)], { type: m.object.blob?.content_type || 'audio/webm' }));
+        media[id] = { state: 'ready', url, from: uri, size: stored.byteLength };
+        log(`blob for ${short(id)} fetched from ${uri}: size and SHA-256 verified, decrypted under the content's key`, 'M§8.4 rule 7');
+        renderMessages();
+        return;
+      } catch (why) { tried.push({ uri, status: 200, size: stored.byteLength }); log(`blob source ${uri}: ${why}`, 'M§8.4 rule 7'); }
+    } catch (e) { tried.push({ uri, status: 0 }); log(`blob source ${uri}: ${e.message}`, 'M§8.4'); }
+  }
+  const d = JSON.parse(messenger.blob_fetch_decision(JSON.stringify(m.object), JSON.stringify(tried), attempt));
+  if (d.action === 'retry') {
+    const delay = Math.min(4000 << Math.min(attempt - 1, 4), 60000);
+    media[id] = { state: 'retry', attempt: attempt + 1 };
+    log(`blob for ${short(id)}: nothing served yet, trying again in ${delay / 1000} s (attempt ${attempt})`, 'spec-gap 106');
+    setTimeout(() => fetchBlob(gid, m, attempt + 1), delay);
+  } else { media[id] = { state: 'failed', why: d.reason }; log(`blob for ${short(id)} given up: ${d.reason}`, 'M§8.4'); renderMessages(); }
+}
+
 async function sendText(text) {
   if (!messenger || !activeConv || !text.trim()) return;
   try { await driveMailbox([{ send: messenger.send_text(activeConv, text.trim(), now()) }]); } catch (e) { notify(`not sent: ${e.message || e}`); }
@@ -1174,14 +1262,30 @@ function renderMessages() {
     d.className = `msg${m.mine ? ' mine' : ''}${m.from_archive ? ' archive' : ''}`;
     d.innerHTML = '<span class="who"></span><span class="text"></span><span class="seq"></span><span class="read"></span>';
     d.querySelector('.who').textContent = m.mine ? 'you' : nameOf(m.sender) || short(m.sender);
-    d.querySelector('.text').textContent = m.object.text || `(${m.object.kind})`;
+    if (m.object.kind === 'audio' && m.object.blob) {
+      const id = m.object.id, st = media[id];
+      const text = d.querySelector('.text');
+      if (st?.state === 'ready') {
+        // one player per message, kept across re-renders (replacing it mid-play aborts the playback)
+        if (!st.el) {
+          const a = document.createElement('audio'); a.controls = true; a.src = st.url; a.dataset.id = id;
+          a.onplay = () => { if (!m.mine) driveMailbox(messenger.played(m.group, id, now())).catch(() => {}); };   // M§10.4
+          st.el = a;
+        }
+        text.append(st.el);
+      } else text.textContent = st?.state === 'failed' ? `(voice message: ${st.why})` : '(voice message, fetching…)';
+      text.append(` ${Math.round((m.object.duration_ms || 0) / 1000)} s${m.object.purpose === 'voicemail' ? ' voicemail' : ''}`);
+      if (!st) setTimeout(() => fetchBlob(m.group, m), 0);
+    } else d.querySelector('.text').textContent = m.object.text || `(${m.object.kind})`;
     d.querySelector('.seq').textContent = m.seq == null ? 'pending' : `#${m.seq}${m.mine && m.delivered && Object.keys(m.delivered).length ? ' ✓✓' : ''}`;
-    d.querySelector('.read').textContent = m.mine && m.seq != null && m.seq <= theirRead ? 'read' : '';
+    const played = m.mine && m.played && Object.keys(m.played).length ? ' · played' : '';
+    d.querySelector('.read').textContent = (m.mine && m.seq != null && m.seq <= theirRead ? 'read' : '') + played;
     th.append(d);
   }
   $('thread-marks').textContent = conv ? Object.entries(marks).map(([who, id]) => `${who === identity.identity ? 'you' : nameOf(who) || short(who)} read through #${seqOf(id)}`).join(' · ') : '';
   th.scrollTop = th.scrollHeight;
   $('compose-text').disabled = !conv; $('compose-send').disabled = !conv;
+  $('compose-voice').disabled = !conv || !blobEndpoint();
   // M§10.3: the thread is on screen, so its last content is read; the machine decides whether a watermark goes out
   const last = [...thread].reverse().find((m) => m.seq != null && m.object.object === 'content');
   if (conv && last && !$('view-messages').classList.contains('hidden') && lastRead[conv.group] !== last.object.id) {
@@ -1250,6 +1354,7 @@ function renderMessages() {
   $('introduce-form').onsubmit = (e) => { e.preventDefault(); sendIntroduction($('introduce-form').dataset.to, $('introduce-purpose').value.trim()); };
   $('introduce-cancel').onclick = () => $('introduce-form').classList.add('hidden');
   $('compose').onsubmit = async (e) => { e.preventDefault(); const t = $('compose-text').value; $('compose-text').value = ''; await sendText(t); };
+  $('compose-voice').onclick = toggleVoice;
   $('btn-contact-link').onclick = newContactLink;
   $('btn-accept').onclick = () => accept(false);
   $('btn-screen').onclick = () => accept(true);
@@ -1348,5 +1453,11 @@ function renderMessages() {
     reconcileDevices,
     archiveKeys: () => (messenger ? JSON.parse(messenger.archive_keys()) : []),
     addDevice: async (did) => { if (!devices.some((d) => d.device === did)) devices.push({ device: did }); await store.set(key('devices'), devices); renderDevices(); return reconcileDevices(); },
+    // voice and blobs (round 2B)
+    recordVoice: async (ms) => { await toggleVoice(); await new Promise((r) => setTimeout(r, ms)); const done = new Promise((r) => { const t = setInterval(() => { if (!recorder && lastVoice) { clearInterval(t); r(); } }, 100); }); await toggleVoice(); await done; return lastVoice; },
+    lastVoice: () => lastVoice,
+    media: (id) => (media[id] ? { state: media[id].state, from: media[id].from, size: media[id].size, why: media[id].why } : null),
+    playAudio: async (id) => { const a = document.querySelector(`audio[data-id="${id}"]`); if (!a) return false; await a.play().catch(() => {}); return true; },
+    blobEndpoint,
   };
 })();
