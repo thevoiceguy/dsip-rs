@@ -19,11 +19,12 @@ export function checker() {
 export async function launch() {
   if (which === 'chromium') {
     return chromium.launch({ headless: true, args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
-      '--disable-features=WebRtcHideLocalIpsWithMdns', '--ignore-certificate-errors'] });
+      '--disable-features=WebRtcHideLocalIpsWithMdns', '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required'] });
   }
   return firefox.launch({ headless: true, firefoxUserPrefs: {
     'media.navigator.streams.fake': true, 'media.navigator.permission.disabled': true,
     'media.peerconnection.ice.obfuscate_host_addresses': false, 'network.websocket.allowInsecureFromHTTPS': true,
+    'media.autoplay.default': 0, 'media.autoplay.blocking_policy': 0,
   } });
 }
 

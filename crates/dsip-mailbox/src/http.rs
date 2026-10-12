@@ -119,6 +119,15 @@ pub async fn read_body<S: AsyncRead + Unpin>(req: &mut Request<S>, len: usize) -
     Ok(body)
 }
 
+/// The CORS headers every blob-endpoint response carries (a page served by a relay fetches across origins).
+pub const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, PUT, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Max-Age: 600\r\n";
+
+/// Answer a CORS preflight (`OPTIONS`) with the headers above and no body.
+pub async fn preflight<S: AsyncWrite + Unpin>(stream: &mut S) -> std::io::Result<()> {
+    stream.write_all(format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+    stream.shutdown().await
+}
+
 /// Write one response and close the connection.
 pub async fn respond<S: AsyncWrite + Unpin>(stream: &mut S, status: u16, content_type: &str, body: &[u8]) -> std::io::Result<()> {
     let reason = match status {
@@ -132,8 +141,10 @@ pub async fn respond<S: AsyncWrite + Unpin>(stream: &mut S, status: u16, content
         413 => "Content Too Large",
         _ => "Error",
     };
+    // A browser client is served from another origin (its relay's); the blob endpoint answers it (M§5.6, M§8.4 rule 5:
+    // a capability URL, the ciphertext useless without the key the content carries), so CORS allows every origin.
     let hdr = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{CORS}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(hdr.as_bytes()).await?;

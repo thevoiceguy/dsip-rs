@@ -79,8 +79,16 @@ and takes part live: a sibling's message is the identity's own on every device. 
 thread on screen reports its last content read, at most one watermark per 5 s; with "disclose read receipts" off
 (the default, M§10.5) it goes to the personal group, where siblings pick it up and a device added later finds it in
 the archive (spec-gap 68); on, it goes to the conversation and the other side's thread shows how far you read.
-Still with the Rust console only: joining by external commit when no sibling is available (M§6.8), voice and blobs,
-successor groups.
+**Round 2, part B — voice messages and blobs.** A voice message is recorded in the browser (`MediaRecorder`, Opus in
+Ogg or WebM), sealed under a fresh single-use key (AES-256-GCM, no AAD, `nonce ‖ ciphertext ‖ tag`) and uploaded to
+the identity's mailbox at `PUT {blob_endpoint}/{sha256}` with a signed `blob-put` as `Authorization: DSIP …`
+(M§8.4 rules 1–2, M§5.6; the mailbox answers cross-origin requests, since the page is served by the relay). The
+`audio` content carries the key, the deposit's manifest does not (rules 3–4). A receiver fetches from the sources the
+pinned rule orders — its own mailbox's replicated copy first, then the origin (rule 6) — verifies size and SHA-256
+before decrypting (rule 7), tries again when nothing was served yet (spec-gap 106), and plays it in the thread; a
+`played` receipt goes out under the same opt-in as `read` (M§10.4, M§10.5). Still with the Rust console only:
+joining by external commit when no sibling is available (M§6.8), successor groups, voicemail after an unanswered
+call (M§13).
 
 ## Run it locally
 
@@ -182,6 +190,8 @@ test/messaging.mjs      stage 6: two browsers on two operators enrol at two mail
 test/messaging-devices.mjs  round 2A: archive records, a second browser of the same identity added by the first (personal group,
                         conversation, archive keys re-sent) reading the history both sides in seq order, read watermarks private
                         and disclosed, three devices live, a reload
+test/messaging-voice.mjs    round 2B: a voice message recorded, sealed, uploaded with a signed blob-put, received through the
+                        mailbox's replica, verified, decrypted and played, a played receipt, a reload, a voice reply
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
@@ -230,8 +240,12 @@ sees no mark, Alice opts in and Bob sees how far she read; Alice's second browse
 by the first to the personal group and the conversation with the archive keys re-sent, shows the five earlier
 messages from archive with both sides and the right seqs and the identity's read position, sends nothing for them;
 Bob's next message reaches both of her devices, the second device's reply reaches Bob and shows as her own on the
-first, Bob's delivered marks stay one per identity; a reload keeps it all and the next message decrypts. CI runs all
-seven in Firefox and Chromium.
+first, Bob's delivered marks stay one per identity; a reload keeps it all and the next message decrypts.
+`messaging-voice.mjs`: Alice records a voice message; it is sealed (ciphertext 28 bytes longer than the recording),
+uploaded with a signed blob-put and accepted, the mailbox logs the ciphertext's hash and never sees a plaintext, the
+content carries the key and duration; Bob fetches it from the source the pinned rule orders, verifies size and hash,
+decrypts and plays it, his played receipt shows on Alice's message; after a reload the blob opens again and his voice
+reply reaches Alice. CI runs all eight in Firefox and Chromium.
 
 ## Identity
 

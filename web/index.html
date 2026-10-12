@@ -82,8 +82,12 @@
       <form id="compose" class="row">
         <input id="compose-text" placeholder="a message (MLS application message, M§6.4)" size="60" maxlength="4000" disabled>
         <button type="submit" class="primary" id="compose-send" disabled>Send</button>
+        <button type="button" id="compose-voice" disabled>Record voice</button>
+        <span id="compose-voice-state" class="muted small"></span>
       </form>
       <div id="thread-marks" class="muted small"></div>
+      <p class="muted small">A voice message is recorded here, sealed under a single-use key and uploaded to your mailbox's blob endpoint;
+      the message carries the key, the mailbox only the ciphertext (M§8.4). Played receipts follow the read-receipt setting (M§10.4).</p>
       <p class="muted small">Messages are MLS application messages in a group hubbed at the creator's mailbox; the hub orders them and
       fans them out to every member's mailbox (M§6.5), which pushes them to bound devices. A delivered receipt is sent per sync
       batch (M§10.2). The hub sees group ids, sizes and timing, never content (M§15.1).</p>

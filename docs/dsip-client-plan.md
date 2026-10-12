@@ -235,9 +235,11 @@ the app against a local relay, the way the wire demos drive the CLI).
 7. **Messaging, round 2** (after `poc-v0.12`). Part A, landed 2026-10-12: archive records for everything shown
    (M§12.2), a second browser of the identity added by its sibling to the personal group and every conversation
    with the archive keys re-sent (M§12.3, M§6.7) and reading the history, read watermarks private or disclosed
-   (M§10.3, M§10.5); headless test `messaging-devices.mjs`. Part B: voice and blobs (M§8.4, the blob endpoint, a
-   recording in the browser). Part C: joining by external commit when no sibling is available (M§6.8) and successor
-   groups (M§7.5).
+   (M§10.3, M§10.5); headless test `messaging-devices.mjs`. Part B, landed 2026-10-12: voice messages recorded in the
+   browser, sealed and uploaded to the mailbox's blob endpoint with a signed `blob-put`, fetched from the replica or the
+   origin, verified and played, with `played` receipts (M§8.4, M§5.6, M§10.4); headless test `messaging-voice.mjs`.
+   Part C: joining by external commit when no sibling is available (M§6.8), successor groups (M§7.5), voicemail after
+   an unanswered call (M§13).
 
 ## 11. Risks
 
