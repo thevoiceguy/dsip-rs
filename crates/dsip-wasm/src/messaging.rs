@@ -15,7 +15,10 @@
 //! with a signed `blob-put`, named with its key in the content and without it in the manifest; fetched from the
 //! sources the pinned rule orders and verified before it is opened), M§8.2 (`audio` content), M§10.4 (`played`, under
 //! the same opt-in as `read`), M§13.2–M§13.3 (voicemail as caller-recorded audio carrying the session; a callee
-//! leg's call event to the personal group, collapsed by session, interleaved into the peer's timeline), M§12.1–M§12.3 (archive keys, archive records written for what
+//! leg's call event to the personal group, collapsed by session, interleaved into the peer's timeline), M§9.4 (a hub
+//! that stops answering: content kept pending and retried by the pinned outbox, and past the device's threshold handed
+//! to a successor), M§7.5 (the successor created at this identity's mailbox, re-adding the dead group's roster;
+//! a successor welcome checked and converged on by the pinned tracker), M§12.1–M§12.3 (archive keys, archive records written for what
 //! is shown and read back as history by a device added later, every live key re-sent to a new sibling), M§10.3 and
 //! M§10.5 (a read watermark per conversation, disclosed only with the opt-in, else to the personal group).
 //!
@@ -40,7 +43,7 @@ use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, Resume};
+use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open as open_sealed, open_blob, seal, SealUse};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
@@ -207,6 +210,19 @@ pub struct Messenger {
     restored: Vec<Value>,
     /// M§10.5: whether read watermarks are disclosed to the conversation (opt-in) or kept in the personal group.
     read_disclosed: bool,
+    /// M§9.4: per group whose hub stopped answering, the vector-pinned outbox; `hub_timeout` is this device's threshold.
+    outages: BTreeMap<String, HubOutage>,
+    hub_timeout: i64,
+    /// When each application deposit went out, by deposit id: one with no answer at all counts as the hub down (M§9.4).
+    sent_at: BTreeMap<String, i64>,
+    /// M§7.5: the successor groups this device knows of and converged on (vector-pinned, spec-gap 61).
+    successors: SuccessorTracker,
+    /// Objects of an abandoned group's outbox, by the group they go to: the dead group until its successor exists,
+    /// then the successor until it holds its members (M§9.4: re-encrypted for the successor, spec-gap 72).
+    handover: BTreeMap<String, Vec<Value>>,
+    /// The mailbox this state was saved at; a different one at start is a move. Impl (spec-gap 122): the device
+    /// registers every group it is in at the new mailbox and syncs it from the start.
+    moved_from: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -271,7 +287,29 @@ impl Messenger {
             held_archive: serde_json::from_value(st["held_archive"].clone()).unwrap_or_default(),
             restored: st["restored"].as_array().cloned().unwrap_or_default(),
             read_disclosed: st["read_disclosed"].as_bool().unwrap_or(false),
+            outages: BTreeMap::new(),
+            hub_timeout: dsip_messaging::client::HUB_TIMEOUT_S,
+            sent_at: BTreeMap::new(),
+            successors: serde_json::from_value(st["successors"].clone()).unwrap_or_default(),
+            handover: serde_json::from_value(st["handover"].clone()).unwrap_or_default(),
+            moved_from: st["mailbox"].as_str().filter(|d| *d != mailbox_did).map(String::from),
         };
+        if let Some(t) = st["hub_timeout"].as_i64() {
+            m.hub_timeout = t;
+        }
+        if m.moved_from.is_some() {
+            // spec-gap 122: the cursors were the old mailbox's; the new one delivers from its own beginning
+            m.resume.cursor_invalid();
+        }
+        // M§9.4: an outage survives a restart; its first retry is due at once
+        for (gid, down_since) in st["outages"].as_object().into_iter().flatten() {
+            let pending: Vec<Value> = m.outbox.get(gid).into_iter().flatten().map(|i| i["id"].clone()).collect();
+            let mut o = HubOutage::new(&json!({"now": now_i, "hub_timeout": m.hub_timeout, "pending": pending, "down_since": down_since}));
+            if down_since.is_null() {
+                o = HubOutage::new(&json!({"now": now_i, "hub_timeout": m.hub_timeout}));
+            }
+            m.outages.insert(gid.clone(), o);
+        }
         // the history machine from what this device holds: its keys and the epochs it joined at
         let keys: Vec<Value> = m.archive_keys.iter().map(|(a, (_, at))| json!({"akid": a, "created_at": at})).collect();
         let joined: serde_json::Map<String, Value> = st["convs"].as_object().into_iter().flatten()
@@ -309,6 +347,8 @@ impl Messenger {
             "messages": self.messages, "grants_held": self.grants_held, "archive_keys": archive, "group_info": self.group_info,
             "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored,
             "read_disclosed": self.read_disclosed, "calls": self.calls,
+            "outages": self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
+            "hub_timeout": self.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
         }}).to_string()
     }
 
@@ -374,7 +414,100 @@ impl Messenger {
             };
             out.extend(self.receipt_sends(&gid, emissions, now_i));
         }
+        // M§9.4: a deposit with no answer at all counts as the hub unreachable
+        let silent: Vec<(String, String, String)> = self.sent_at.iter().filter(|(_, at)| now_i - **at >= NO_ANSWER_S)
+            .filter_map(|(id, _)| match self.pending.get(id) { Some(Pending::Application { gid, item }) => Some((id.clone(), gid.clone(), item.clone())), _ => None })
+            .collect();
+        self.sent_at.retain(|id, at| now_i - *at < NO_ANSWER_S && self.pending.contains_key(id));
+        for (id, gid, item) in silent {
+            self.pending.remove(&id);
+            out.extend(self.hub_unreachable(&gid, &item, true, now_i));
+        }
+        for gid in self.outages.keys().cloned().collect::<Vec<_>>() {
+            let ems = {
+                let o = self.outages.get_mut(&gid).expect("outage");
+                let dt = (now_i - o.now()).max(0);
+                o.advance(dt)
+            };
+            out.extend(self.outage_emissions(&gid, ems, now_i));
+        }
         json!(out).to_string()
+    }
+
+    /// This device's hub-outage threshold, seconds (M§9.4: the client's own; 24 h RECOMMENDED).
+    pub fn set_hub_timeout(&mut self, seconds: f64) {
+        self.hub_timeout = seconds as i64;
+    }
+
+    /// Groups whose hub is unreachable: `{group: {down_since, pending, abandoned}}` (M§9.4).
+    pub fn outages(&self) -> String {
+        let m: serde_json::Map<String, Value> = self.outages.iter().map(|(g, o)| (g.clone(), json!({"down_since": o.down_since(),
+            "pending": o.pending().len(), "abandoned": o.is_abandoned(), "successor": self.successors.successor(g)}))).collect();
+        Value::Object(m).to_string()
+    }
+
+    /// Create the successor of `dead` (M§7.5) once its hub has been unreachable past the threshold: a group for the
+    /// same conversation hubbed at this identity's mailbox, `successor_of` naming the dead group, re-adding the dead
+    /// group's last roster from `key_packages_json` (`{identity: key-packages answer}`, fetched with `successor_of`,
+    /// M§7.5 spec-gap 61). When this device already converged on a successor, that one is used. The pending items
+    /// follow once the successor holds its members (M§9.4). Frames.
+    pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
+        let now_i = now as i64;
+        self.track_rosters(now_i);
+        let decision = self.successors.step(&json!({"create": {"predecessor": dead}}));
+        let d = decision.first().cloned().unwrap_or(Value::Null);
+        if let Some(w) = d["use"].as_str() {
+            let moved = self.handover.remove(dead).unwrap_or_default();
+            self.handover.entry(w.to_string()).or_default().extend(moved);
+            let out = self.flush_handover(w, now_i);
+            return Ok(json!(out.into_iter().filter_map(|e| e.get("send").cloned()).collect::<Vec<_>>()).to_string());
+        }
+        let Some(create) = d.get("create") else { return Err(JsValue::from_str(&format!("successor refused: {}", d["refuse"]))) };
+        let (conversation, kind) = self.convs.get(dead).map(|c| (c.conversation.clone(), c.kind.clone())).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        let all: Value = serde_json::from_str(key_packages_json).unwrap_or(Value::Null);
+        let me = self.keys.identity.clone();
+        let mut kps = vec![];
+        let mut grants = vec![];
+        let peers: Vec<String> = create["roster"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|i| *i != me).map(String::from).collect();
+        for peer in &peers {
+            if let Some(answer) = all.get(peer) {
+                kps.extend(self.pick_key_packages(peer, &answer.to_string(), now_i).unwrap_or_default());
+                grants.extend(self.grants_held.get(peer).cloned());
+            }
+        }
+        let (gid, frames) = self.new_group_for(Some(conversation), &kind, Some(dead), now_i)?;
+        let peer = self.convs.get(dead).and_then(|c| c.peer.clone());
+        if let Some(c) = self.convs.get_mut(&gid) {
+            c.peer = peer;
+        }
+        let ems = self.successors.step(&json!({"created": {"group": gid, "successor_of": dead}}));
+        let moved = self.handover.remove(dead).unwrap_or_default();
+        self.handover.entry(gid.clone()).or_default().extend(moved);
+        if kind == "personal" {
+            self.personal = Some(gid.clone());
+        }
+        let op = (!kps.is_empty()).then(|| Op::Add { peer: peers.first().cloned().unwrap_or_default(), kps, grants, device: None });
+        let gi_id = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+        self.pending.insert(gi_id, Pending::GroupInfo { gid: gid.clone(), then: op });
+        if kind == "personal" {
+            // M§12.1: the personal group's successor gets an archive key of its own, as a new personal group does
+            self.pending.insert(format!("personal:{gid}"), Pending::PersonalReady { gid: gid.clone() });
+        }
+        let mut out: Vec<String> = frames;
+        for e in ems {
+            if let Some(g) = e["leave"].as_str() {
+                out.extend(self.leave_group(g, now_i));
+            }
+        }
+        Ok(json!(out).to_string())
+    }
+
+    /// The hand-over to a successor could not be done (the peers' KeyPackages could not be fetched): retried with the
+    /// §13.2 backoff (M§9.4, spec-gap 72).
+    pub fn successor_failed(&mut self, dead: &str) {
+        if let Some(o) = self.outages.get_mut(dead) {
+            o.handover_failed();
+        }
     }
 
     /// Add one device of this identity (M§12.3, M§6.7) to `gid` from its mailbox's `key-packages` answer (only the
@@ -542,6 +675,7 @@ impl Messenger {
     /// carries the manifest without the key (M§8.4 rule 4). The frame to send.
     pub fn send_audio(&mut self, gid: &str, blob_json: &str, duration_ms: f64, purpose: &str, session: Option<String>, now: f64) -> Result<String, JsValue> {
         let now_i = now as i64;
+        let gid = &self.live(gid);
         let b: Value = serde_json::from_str(blob_json).map_err(js)?;
         let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
         let mut obj = json!({"object": "content", "id": self.fresh_id(now_i), "conversation": conversation, "sender": self.keys.identity,
@@ -648,7 +782,21 @@ impl Messenger {
     /// What to send on a fresh binding: pending application items again (M§9.3, the same bytes), then a sync.
     pub fn on_bound(&mut self, now: f64) -> String {
         let mut frames = vec![];
+        if let Some(old) = self.moved_from.take() {
+            // spec-gap 122: a mailbox this identity moved to learns its groups, so hubs' fan-out is admitted (M§6.6)
+            let groups: Vec<Value> = self.convs.iter().map(|(g, c)| json!({"group": g, "state": "joined", "hub": c.hub.0, "hub_uri": c.hub.1})).collect();
+            if !groups.is_empty() {
+                let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now as i64, wire::TTL_S,
+                    json!({"subject": self.keys.identity, "groups": groups}));
+                self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+                frames.push(env.frame());
+            }
+            let _ = old;
+        }
         for (gid, items) in self.outbox.clone() {
+            if self.outages.get(&gid).is_some_and(|o| o.is_down() || o.is_abandoned()) {
+                continue; // M§9.4: the outage's own backoff re-deposits the head (tick)
+            }
             for it in items {
                 frames.push(self.deposit_item(&gid, &it, now as i64));
             }
@@ -675,8 +823,13 @@ impl Messenger {
 
     /// A `key-package-fetch` for `target` to send on a connection to `to_mailbox` (M§5.5), presenting the grant
     /// held from `target` if any (M§14.2).
-    pub fn fetch_frame(&mut self, to_mailbox: &str, target: &str, now: f64) -> String {
+    /// `successor_of` names the dead group a successor is created for: the target's mailbox serves it without a
+    /// grant when that group is registered for the target (M§7.5, spec-gap 61).
+    pub fn fetch_frame(&mut self, to_mailbox: &str, target: &str, now: f64, successor_of: Option<String>) -> String {
         let mut fields = json!({"target": target});
+        if let Some(g) = successor_of {
+            fields["successor_of"] = json!(g);
+        }
         if let Some(g) = self.grants_held.get(target) {
             fields["grant"] = json!(g);
         }
@@ -712,6 +865,7 @@ impl Messenger {
     /// `accepted` (M§9.2).
     pub fn send_text(&mut self, gid: &str, text: &str, now: f64) -> Result<String, JsValue> {
         let now_i = now as i64;
+        let gid = &self.live(gid);
         let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
         let obj = json!({"object": "content", "id": self.fresh_id(now_i), "conversation": conversation, "sender": self.keys.identity,
             "sent_at": now_i, "kind": "text", "purpose": "message", "content_type": "text/plain", "text": text});
@@ -722,12 +876,14 @@ impl Messenger {
     /// that authenticate at `now` (M§6.2).
     pub fn conversations(&self, now: f64) -> String {
         let ctx = Context::new(now as i64, &self.resolver);
-        let list: Vec<Value> = self.convs.iter().map(|(g, c)| {
+        let list: Vec<Value> = self.convs.iter().filter(|(g, _)| !self.successors.successor(g).is_some_and(|w| self.convs.contains_key(w) && w != g.as_str())).map(|(g, c)| {
             let mut members: Vec<String> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).map(|w| w.identity).collect();
             members.sort();
             members.dedup();
             json!({"group": g, "conversation": c.conversation, "kind": c.kind, "peer": c.peer, "members": members, "epoch": c.group.epoch().as_u64(),
-                   "hub": {"did": c.hub.0, "uri": c.hub.1}, "pending": self.outbox.get(g).map_or(0, Vec::len)})
+                   "hub": {"did": c.hub.0, "uri": c.hub.1}, "pending": self.outbox.get(g).map_or(0, Vec::len) + self.handover.get(g).map_or(0, Vec::len),
+                   "hub_down": self.outages.get(g).is_some_and(HubOutage::is_down),
+                   "predecessors": self.lineage(g).into_iter().filter(|x| x != g).collect::<Vec<_>>()})
         }).collect();
         json!(list).to_string()
     }
@@ -737,13 +893,16 @@ impl Messenger {
     /// [`Messenger::read_marks`].
     pub fn thread(&self, gid: &str) -> String {
         let snap = self.convs.get(gid).map(|c| c.receipts.snapshot()).unwrap_or(Value::Null);
-        let mut list: Vec<Value> = self.messages.iter().filter(|m| m["group"] == gid).map(|m| {
+        let groups = self.lineage(gid);
+        let mut list: Vec<Value> = self.messages.iter().filter(|m| m["group"].as_str().is_some_and(|g| groups.contains(g))).map(|m| {
             let mut m = m.clone();
             m["delivered"] = snap["delivered"][s_of(&m["object"]["id"])].clone();
             m["played"] = snap["played"][s_of(&m["object"]["id"])].clone();
             m
         }).collect();
-        list.sort_by_key(|m| (m["seq"].as_i64().unwrap_or(i64::MAX), s_of(&m["key"])));
+        // predecessors first, each in seq order (a successor's numbering starts afresh)
+        let order: Vec<String> = { let mut v: Vec<String> = groups.iter().cloned().collect(); v.sort_by_key(|g| (g == gid, self.lineage(g).len())); v };
+        list.sort_by_key(|m| (order.iter().position(|g| m["group"] == g.as_str()).unwrap_or(0), m["seq"].as_i64().unwrap_or(i64::MAX), s_of(&m["key"])));
         json!(list).to_string()
     }
 
@@ -873,9 +1032,14 @@ impl Messenger {
     /// A group of `kind` hubbed at this identity's mailbox (M§6.5 rule 6, M§6.6): registered with `mailbox-config`,
     /// its GroupInfo deposited. Returns the group id and the frames, GroupInfo last.
     fn new_group(&mut self, kind: &str, now: i64) -> Result<(String, Vec<String>), JsValue> {
-        let conversation = self.fresh_id(now);
+        self.new_group_for(None, kind, None, now)
+    }
+
+    /// As [`Self::new_group`], for an existing `conversation` and with `successor_of` (M§7.5).
+    fn new_group_for(&mut self, conversation: Option<String>, kind: &str, successor_of: Option<&str>, now: i64) -> Result<(String, Vec<String>), JsValue> {
+        let conversation = conversation.unwrap_or_else(|| self.fresh_id(now));
         let group_id = self.fresh_id(now).into_bytes();
-        let conv = json!({"conversation": conversation, "kind": kind, "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}, "successor_of": null});
+        let conv = json!({"conversation": conversation, "kind": kind, "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}, "successor_of": successor_of});
         let group = self.mls.create_group(&group_id, &serde_json::to_vec(&conv).map_err(js)?).map_err(|e| js(e.0))?;
         let gid = b64(group.group_id().as_slice());
         let epoch = group.epoch().as_u64();
@@ -944,13 +1108,23 @@ impl Messenger {
             // M§8.4 rule 4: the deposit's manifest names the blob without its key
             item["blobs"] = json!([{"uri": b["uri"], "sha256": b["sha256"], "size": b["size"]}]);
         }
+        if self.outages.get(gid).is_some_and(HubOutage::is_abandoned) {
+            // M§9.4: the dead group takes no more content; it goes to the successor once there is one
+            self.handover.entry(gid.to_string()).or_default().push(obj.clone());
+            return Ok(String::new());
+        }
         self.outbox.entry(gid.to_string()).or_default().push(item.clone());
+        let item_id = s_of(&item["id"]);
+        let queued = self.outages.get_mut(gid).is_some_and(|o| o.deposit(&item_id).iter().any(|e| e.get("queued").is_some()));
         if obj["object"] == "content" {
             // shown at once as ours; its seq is filled in by the hub's accepted (M§8.5)
             let key = format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""));
             self.shown.insert(key.clone());
             self.messages.push(json!({"group": gid, "key": key, "sender": self.keys.identity, "sender_device": self.keys.device.did(),
                 "object": obj, "seq": null, "mine": true, "item": item["id"]}));
+        }
+        if queued {
+            return Ok(String::new()); // M§9.4: queued behind the pending head while the hub is down
         }
         Ok(self.deposit_item(gid, &item, now))
     }
@@ -963,6 +1137,7 @@ impl Messenger {
         }
         let frame = self.hub_deposit(gid, "application", fields, now);
         let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+        self.sent_at.insert(id.clone(), now);
         self.pending.insert(id, Pending::Application { gid: gid.to_string(), item: s_of(&item["id"]) });
         frame
     }
@@ -1015,6 +1190,7 @@ impl Messenger {
                     self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
                 }
                 self.retries.remove(&gid);
+                out.extend(self.flush_handover(&gid, now)); // M§9.4: the successor holds its members: the pending items go in
                 match self.group_info_frame(&gid, now) {
                     Ok(f) => {
                         let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
@@ -1025,6 +1201,9 @@ impl Messenger {
                 }
             }
             Pending::GroupInfo { gid, then } => {
+                if then.is_none() {
+                    out.extend(self.flush_handover(&gid, now)); // a successor with nobody to add (M§9.4)
+                }
                 if let Some(op) = then {
                     match self.propose(&gid, &op, now) {
                         Ok(f) => out.push(json!({"send": f})),
@@ -1082,6 +1261,12 @@ impl Messenger {
                     }
                 }
                 out.push(json!({"ui": "sent", "group": gid, "item": item, "seq": p["seq"], "duplicate": p["duplicate"]}));
+                // M§9.4: an accepted ends an outage and flushes the queue in order
+                let ems = self.outages.get_mut(&gid).map(|o| o.answer(&item, None)).unwrap_or_default();
+                if ems.iter().any(|e| e.get("forward").is_some()) {
+                    out.push(json!({"ui": "hub_back", "group": gid}));
+                }
+                out.extend(self.outage_emissions(&gid, ems, now));
             }
             Pending::PersonalReady { .. } => {}
             Pending::KeyPackages { count } => out.push(json!({"ui": "key_packages_uploaded", "count": count})),
@@ -1092,7 +1277,7 @@ impl Messenger {
     }
 
     /// The hub or mailbox refused a deposit of ours (M§16): a commit as `CommitRetry` decides (spec-gap 58).
-    fn refused(&mut self, p: &Value, _now: i64) -> Vec<Value> {
+    fn refused(&mut self, p: &Value, now: i64) -> Vec<Value> {
         let mut out = vec![];
         let reason = s_of(&p["reason"]);
         let Some(pending) = self.pending.remove(&s_of(&p["in_reply_to"])) else {
@@ -1125,14 +1310,20 @@ impl Messenger {
             }
             Pending::GroupInfo { gid, .. } => out.push(json!({"refused": format!("group-info for {gid}: {reason}")})),
             Pending::Application { gid, item } => {
-                if reason != "mailbox.hub-unreachable" {
+                let down = is_outage(&reason);
+                if !down {
                     // M§9.4: unreachable keeps it pending; any other refusal is final
                     if let Some(items) = self.outbox.get_mut(&gid) {
                         items.retain(|i| i["id"] != item);
                     }
                     self.messages.retain(|m| m["item"] != item);
+                    if let Some(o) = self.outages.get_mut(&gid) {
+                        o.answer(&item, Some(&reason));
+                    }
+                } else {
+                    out.extend(self.hub_unreachable(&gid, &item, false, now));
                 }
-                out.push(json!({"refused": format!("message {item}: {reason}"), "group": gid, "item": item, "pending": reason == "mailbox.hub-unreachable"}));
+                out.push(json!({"refused": format!("message {item}: {reason}"), "group": gid, "item": item, "pending": down}));
             }
             Pending::PersonalReady { .. } => {}
             Pending::KeyPackages { .. } => out.push(json!({"refused": format!("key packages: {reason}")})),
@@ -1283,7 +1474,11 @@ impl Messenger {
                     json!({"subject": self.keys.identity, "groups": [{"group": group, "state": "joined"}]}));
                 self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
                 out.push(json!({"send": env.frame()}));
-                out.push(json!({"ui": "joined", "group": group, "conversation": conv["conversation"], "kind": kind, "members": members, "epoch": epoch}));
+                out.push(json!({"ui": "joined", "group": group, "conversation": conv["conversation"], "kind": kind, "members": members, "epoch": epoch,
+                    "successor_of": conv["successor_of"]}));
+                if let Some(pred) = conv["successor_of"].as_str().map(String::from) {
+                    out.extend(self.successor_welcome(&group, &pred, now));
+                }
             }
             Outcome::Object { sender, sender_device, object } => out.extend(self.object_in(&gid, item, &sender, &sender_device, object, now)),
             Outcome::Dropped(why) => out.push(json!({"ui": "dropped", "why": why})),
@@ -1418,6 +1613,160 @@ impl Messenger {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// A deposit for `gid` met an unreachable hub (or no answer): the outage starts or continues (M§9.4).
+    fn hub_unreachable(&mut self, gid: &str, item: &str, silent: bool, now: i64) -> Vec<Value> {
+        let timeout = self.hub_timeout;
+        let pending: Vec<Value> = self.outbox.get(gid).into_iter().flatten().map(|i| i["id"].clone()).collect();
+        let o = self.outages.entry(gid.to_string()).or_insert_with(|| HubOutage::new(&json!({"now": now, "hub_timeout": timeout, "pending": pending})));
+        let started = !o.is_down();
+        let ems = if silent { o.no_answer(item) } else { o.answer(item, Some("mailbox.hub-unreachable")) };
+        let mut out = vec![];
+        if started && o.is_down() {
+            out.push(json!({"ui": "hub_down", "group": gid, "hub_timeout": timeout}));
+        }
+        out.extend(self.outage_emissions(gid, ems, now));
+        out
+    }
+
+    /// Act on the outbox's emissions (M§9.4): re-deposit the head, or hand the group to its successor at the threshold.
+    fn outage_emissions(&mut self, gid: &str, ems: Vec<Value>, now: i64) -> Vec<Value> {
+        let mut out = vec![];
+        for e in ems {
+            if let Some(id) = e["forward"].as_str() {
+                if let Some(item) = self.outbox.get(gid).and_then(|v| v.iter().find(|i| i["id"] == id).cloned()) {
+                    out.push(json!({"send": self.deposit_item(gid, &item, now)}));
+                }
+            } else if let Some(d) = e["retry_in"].as_i64() {
+                out.push(json!({"ui": "hub_retry", "group": gid, "in": d}));
+            } else if e.get("successor").is_some() || e.get("handover").is_some() {
+                // M§9.4: the threshold passed: the dead group takes no more content; its pending items are re-encrypted
+                // for the successor, which the host creates once it has the members' KeyPackages (M§7.5)
+                let items = self.outbox.remove(gid).unwrap_or_default();
+                let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
+                self.messages.retain(|m| !ids.contains(&m["item"]));
+                for i in &items {
+                    self.shown.remove(&object_key(&i["obj"]));
+                }
+                self.handover.entry(gid.to_string()).or_default().extend(items.into_iter().map(|i| i["obj"].clone()));
+                self.track_rosters(now);
+                let me = self.keys.identity.clone();
+                let roster: Vec<String> = self.member_identities(gid, now).into_iter().filter(|i| *i != me).collect();
+                out.push(json!({"successor_due": {"group": gid, "peers": roster, "kind": self.convs.get(gid).map(|c| c.kind.clone()),
+                    "existing": self.successors.successor(gid)}}));
+            }
+        }
+        out
+    }
+
+    /// A welcome to a successor group (M§7.5): the pinned check (its creator, leaf 0, was in the predecessor's last
+    /// roster this device processed, and it adds nobody who was not) and convergence on the lowest `group_id`.
+    fn successor_welcome(&mut self, group: &str, pred: &str, now: i64) -> Vec<Value> {
+        let mut out = vec![];
+        let roster = self.member_identities(group, now);
+        let creator = {
+            let ctx = Context::new(now, &self.resolver);
+            self.convs.get(group).and_then(|c| member_identity(&c.group, LeafNodeIndex::new(0), &ctx).ok()).map(|w| w.identity).unwrap_or_default()
+        };
+        // the predecessor's roster as this device last processed it; the new group itself is not tracked yet
+        for gid in self.convs.keys().filter(|g| g.as_str() != group).cloned().collect::<Vec<_>>() {
+            let ids = self.member_identities(&gid, now);
+            if !ids.is_empty() {
+                self.successors.member_of(&gid, &ids);
+            }
+        }
+        let ems = self.successors.step(&json!({"welcome": {"group": group, "successor_of": pred, "creator": creator, "roster": roster}}));
+        for e in ems {
+            if e.get("join").is_some() {
+                out.push(json!({"ui": "successor", "group": group, "of": pred, "creator": creator}));
+                // M§9.4: what this device still had pending for the dead group goes to the successor, re-encrypted
+                let items = self.outbox.remove(pred).unwrap_or_default();
+                let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
+                self.messages.retain(|m| !ids.contains(&m["item"]));
+                for i in &items {
+                    self.shown.remove(&object_key(&i["obj"]));
+                }
+                let mut waiting = self.handover.remove(pred).unwrap_or_default();
+                waiting.extend(items.into_iter().map(|i| i["obj"].clone()));
+                self.handover.entry(group.to_string()).or_default().extend(waiting);
+                self.outages.remove(pred);
+                out.extend(self.flush_handover(group, now));
+            } else if let Some(g) = e["decline"].as_str().or(e["first_contact"].as_str()) {
+                let why = if e.get("first_contact").is_some() { "not a valid successor: first contact (M§7.5)" } else { "a lower successor exists (M§7.5)" };
+                out.push(json!({"ui": "successor_declined", "group": g, "of": pred, "why": why}));
+                out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
+            } else if let Some(g) = e["leave"].as_str() {
+                out.push(json!({"ui": "successor_left", "group": g, "of": pred}));
+                out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
+            }
+        }
+        out
+    }
+
+    /// The group a conversation lives in now: `gid`, or the successor this device converged on (M§7.5).
+    fn live(&self, gid: &str) -> String {
+        let mut g = gid.to_string();
+        for _ in 0..8 {
+            match self.successors.successor(&g) {
+                Some(w) if self.convs.contains_key(w) && w != g => g = w.to_string(),
+                _ => break,
+            }
+        }
+        g
+    }
+
+    /// Send what waits for `gid` (a successor) as new objects (M§9.4: re-encrypted, never the dead group's bytes).
+    fn flush_handover(&mut self, gid: &str, now: i64) -> Vec<Value> {
+        let objs = self.handover.remove(gid).unwrap_or_default();
+        let mut out = vec![];
+        for obj in objs {
+            match self.send_object(gid, &obj, now) {
+                Ok(f) if !f.is_empty() => out.push(json!({"send": f})),
+                Ok(_) => {}
+                Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default()})),
+            }
+        }
+        if !out.is_empty() {
+            out.push(json!({"ui": "handed_over", "group": gid, "items": out.len()}));
+        }
+        out
+    }
+
+    /// Record every group's roster by identity for the successor checks (M§7.5: the last roster this device processed).
+    fn track_rosters(&mut self, now: i64) {
+        for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
+            let ids = self.member_identities(&gid, now);
+            if !ids.is_empty() {
+                self.successors.member_of(&gid, &ids);
+            }
+        }
+    }
+
+    /// Stop using a group (M§7.5: a higher successor, or one that fails the check): `mailbox-config` `left`. Frames.
+    fn leave_group(&mut self, gid: &str, now: i64) -> Vec<String> {
+        if self.convs.remove(gid).is_none() {
+            return vec![];
+        }
+        self.outbox.remove(gid);
+        self.outages.remove(gid);
+        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
+            json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}));
+        self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+        vec![env.frame()]
+    }
+
+    /// The groups whose messages make up `gid`'s thread: it and the predecessors it succeeds (M§7.5: the dead group
+    /// stays readable and the conversation continues in the successor).
+    fn lineage(&self, gid: &str) -> BTreeSet<String> {
+        let mut set: BTreeSet<String> = [gid.to_string()].into();
+        loop {
+            let more: Vec<String> = self.convs.keys().filter(|g| !set.contains(*g) && self.successors.successor(g).is_some_and(|w| set.contains(w))).cloned().collect();
+            if more.is_empty() {
+                return set;
+            }
+            set.extend(more);
+        }
     }
 
     /// Keep a call event unless one for its session is held (spec-gap 63: collapsed by `session`, the first kept).
@@ -1757,6 +2106,15 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
         }
         _ => Ok(Outcome::Nothing),
     }
+}
+
+/// Seconds after which a deposit with no answer at all counts as the hub unreachable (M§9.4). Impl (spec-gap 72):
+/// the device's own answer timeout.
+const NO_ANSWER_S: i64 = 60;
+
+/// Whether a refusal of a deposit to the hub is an outage (M§9.4): unreachable, or unable to store (spec-gap 99).
+fn is_outage(reason: &str) -> bool {
+    matches!(reason, "mailbox.hub-unreachable" | "mailbox.quota-exceeded")
 }
 
 /// The key an object is shown and archived under (M§8.5): `conversation:id`, or `call:session` for a call event,

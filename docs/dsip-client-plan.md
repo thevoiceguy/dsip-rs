@@ -240,8 +240,9 @@ the app against a local relay, the way the wire demos drive the CLI).
    origin, verified and played, with `played` receipts (M§8.4, M§5.6, M§10.4); headless test `messaging-voice.mjs`.
    Part C, landed 2026-10-12: voicemail after an unanswered call and call history across devices (M§13.2, M§13.3),
    joining by external commit when no sibling adds a new device (M§6.8, spec-gap 120); headless tests
-   `messaging-voicemail.mjs` and `messaging-rejoin.mjs`. Part D: successor groups when a hub is gone for good (M§7.5),
-   after the hub-outage machine (M§9.4) and a mailbox move come to the browser.
+   `messaging-voicemail.mjs` and `messaging-rejoin.mjs`. Part D, landed 2026-10-12: hub outages (M§9.4, the pinned
+   outbox), successor groups (M§7.5, the pinned tracker) and moving mailbox (spec-gap 122); headless test
+   `messaging-successor.mjs`. Round 2's four parts are in; group conversations of more than two identities, moving a live hub (M§7.4) and removing members stay with the Rust console.
 
 ## 11. Risks
 

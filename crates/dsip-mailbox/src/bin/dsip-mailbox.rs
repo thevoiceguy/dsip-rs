@@ -1785,10 +1785,13 @@ async fn peer_task(
     let outcome = match resolved {
         Some((mailbox_did, _)) if mailbox_did == key.did() => {
             // The member's mailbox is this service: in-process (M§6.5 rule 5). The resolution is re-done when this
-            // task ends: after a quiet minute, or at once when this mailbox does not hold the group for the member
-            // (it registered the group elsewhere: its hint has moved on, or will), so the hub follows the hint.
+            // task ends: once its reuse bound has passed (spec-gap 116: HINT_REUSE_S from the resolution, however busy
+            // the task — a member that moved away keeps sending through its old groups), or at once when this mailbox
+            // refuses a delivery for the member (it registered the group elsewhere, or has moved on), so the hub
+            // follows the hint.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(HINT_REUSE_S as u64);
             loop {
-                let Ok(Some(msg)) = tokio::time::timeout(std::time::Duration::from_secs(HINT_REUSE_S as u64), rx.recv()).await else { break };
+                let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await else { break };
                 let mut st = service.lock().await;
                 match msg {
                     PeerMsg::Fanout(env) => {
@@ -1848,8 +1851,9 @@ async fn peer_task(
                         st.send_local(local);
                         route_identities(&service, &mut st, rest);
                         st.persist();
-                        if refused.as_deref() == Some("mailbox.unknown-group") {
-                            tracing::info!("{identity} has not registered {group} here: its mailbox is looked up again at the next delivery");
+                        if let Some(r) = refused {
+                            // queued at the hub and retried: looked up again first, since the member may be served elsewhere
+                            tracing::info!("{identity}'s delivery of {group} refused here ({r}): its mailbox is looked up again at the next delivery");
                             st.hinted.remove(&identity);
                             break;
                         }

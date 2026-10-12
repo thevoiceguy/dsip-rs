@@ -34,12 +34,13 @@ export class Relay {
       const rejected = /^transport\.hello-rejected: (.*)$/.exec(ev.reason || '');
       if (rejected) { this.rejected = rejected[1]; this.on.rejected?.(rejected[1]); if (rejected[1] === 'delegation-revoked') this.closedByUs = true; }
       this.on.closed?.(was);
-      if (!this.closedByUs) { setTimeout(() => this.connect(), this.backoff); this.backoff = Math.min(this.backoff * 2, 15000); }
+      // a close() between now and the retry cancels it: a replaced connection must not come back
+      if (!this.closedByUs) { this.retry = setTimeout(() => { this.retry = null; if (!this.closedByUs) this.connect(); }, this.backoff); this.backoff = Math.min(this.backoff * 2, 15000); }
     };
     ws.onerror = () => {};
   }
 
   send(frame) { if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(frame); else this.on.dropped?.(frame); }
 
-  close() { this.closedByUs = true; this.ws?.close(); }
+  close() { this.closedByUs = true; clearTimeout(this.retry); this.retry = null; this.ws?.close(); }
 }
