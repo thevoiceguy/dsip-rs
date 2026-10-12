@@ -143,8 +143,18 @@ impl Hub {
     }
 
     /// A hub restored from [`Hub::full_state`]; `None` if the value is not one.
+    ///
+    /// An identity with something queued but no clock, as in a state saved before the retention clock existed (or
+    /// re-saved by a hub that loaded one), gets a clock started at the hub's clock; otherwise a queue held then would
+    /// never be dropped (spec-gap 119). A state this hub saved always has the clocks already.
     pub fn from_full_state(v: &Value) -> Option<Hub> {
-        serde_json::from_value(v.clone()).ok()
+        let mut h: Hub = serde_json::from_value(v.clone()).ok()?;
+        let queued: Vec<String> =
+            h.pending.iter().chain(h.welcomes.iter()).filter(|(_, q)| !q.is_empty()).map(|(i, _)| i.clone()).collect();
+        for i in queued {
+            h.start_clock(&i);
+        }
+        Some(h)
     }
 
     /// The head of every unacknowledged fan-out queue, to be sent again.
@@ -383,5 +393,27 @@ impl Hub {
             self.welcomes.iter().filter(|(_, q)| !q.is_empty()).map(|(i, q)| (i.clone(), json!(q))).collect();
         json!({"epoch": self.epoch, "next_seq": self.next_seq, "roster": roster, "pending": pending,
                "group_info": self.group_info, "moved_to": self.moved_to, "welcomes": welcomes})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_state_saved_before_the_retention_clock_starts_one_on_restore() {
+        let ctx = json!({"now": 1000, "kind": "direct", "epoch": 1, "mls_retention_s": 100,
+            "roster": {"a": ["da"], "b": ["db"]}});
+        let mut h = Hub::new(&ctx);
+        h.step(&json!({"deposit": {"id": "x", "device": "da", "identity": "a", "class": "application", "epoch": 1, "digest": "d1"}}));
+        let mut old = h.full_state();
+        old.as_object_mut().unwrap().remove("waiting");
+        let mut resaved = h.full_state();
+        resaved["waiting"] = json!({});
+        assert_eq!(Hub::from_full_state(&resaved).unwrap().waiting, h.waiting);
+        let mut r = Hub::from_full_state(&old).unwrap();
+        assert!(r.step(&json!({"advance": 99})).is_empty());
+        let out = r.step(&json!({"advance": 1}));
+        assert!(out.iter().any(|e| e["dropped"]["identity"] == "b"), "{out:?}");
     }
 }
