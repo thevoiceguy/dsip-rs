@@ -933,11 +933,17 @@ async function startMessagingNow() {
   } catch (e) { log(`messaging not started: ${e.message || e}`, 'M§4'); renderMessages(); return; }
   messenger.set_grants(JSON.stringify(heldGrantFrames()));
   for (const d of Object.values(documents)) messenger.add_document(JSON.stringify(d));
-  mailboxConn = new Relay(mb.uri, messenger, {
+  // Every callback belongs to this connection: a restart replaces `mailboxConn`, and the old socket's late close or
+  // frame must not touch the state of the new one.
+  const m = messenger;
+  let conn = null;
+  const mine = () => mailboxConn === conn && messenger === m;
+  conn = new Relay(mb.uri, m, {
     bound: async (r) => {
+      if (!mine()) return;
       if (r.did !== mb.did) {   // M§4.2: the mailbox's hello must be signed under the DID the entry names
         log(`✗ mailbox at ${mb.uri} is ${short(r.did)}, not ${short(mb.did)}: not used`, 'M§4.2');
-        mailboxConn.close(); renderMessages(); return;
+        conn.close(); renderMessages(); return;
       }
       mailboxInfo = r;
       log(`← hello        mailbox ${short(r.did)} bound us (in_reply_to matched); ${r.capabilities?.mailbox?.hub ? 'a hub' : 'no hub'}, modes ${(r.capabilities?.mailbox?.modes || []).join('/')}`, 'M§4.3 · §20.5');
@@ -947,13 +953,14 @@ async function startMessagingNow() {
       publishReachability();                                               // the hint now names the mailbox too (M§4.2)
       renderMessages();
     },
-    refused: (x) => log(`✗ mailbox hello rejected: ${x.code}`, '§20.5'),
-    rejected: (code) => { log(`✗ mailbox refused our hello: ${code}`, 'M§4.3'); renderMessages(); },
-    frame: async (text) => { await driveMailbox(messenger.inbound(text, now())); },
-    closed: (was) => { if (was) { mailboxInfo = null; log(`mailbox ${mb.uri} dropped the connection; reconnecting`, '§13.2'); renderMessages(); } },
-    dropped: (f) => log(`✗ mailbox not connected: a ${payloadOf(f).type || 'frame'} was not sent`),
+    refused: (x) => { if (mine()) log(`✗ mailbox hello rejected: ${x.code}`, '§20.5'); },
+    rejected: (code) => { if (mine()) { log(`✗ mailbox refused our hello: ${code}`, 'M§4.3'); renderMessages(); } },
+    frame: async (text) => { if (mine()) await driveMailbox(m.inbound(text, now())); },
+    closed: (was) => { if (was && mine()) { mailboxInfo = null; log(`mailbox ${mb.uri} dropped the connection; reconnecting`, '§13.2'); renderMessages(); } },
+    dropped: (f) => { if (mine()) log(`✗ mailbox not connected: a ${payloadOf(f).type || 'frame'} was not sent`); },
   }, now);
-  mailboxConn.connect();
+  mailboxConn = conn;
+  conn.connect();
   log(`messaging: mailbox ${mb.uri} (${short(mb.did)})`, 'M§4.2');
 }
 
