@@ -222,6 +222,8 @@ test/messaging-rejoin.mjs   round 2C: a new device that nobody adds joins the pe
 test/messaging-successor.mjs  round 2D: a conversation hubbed at a third mailbox the test starts and kills; Bob moves to
                         mailbox B; Alice's message waits out the outage, her device creates the successor and re-adds
                         Bob without a grant; Bob checks it and joins; the message arrives; the thread is kept
+test/messaging-pending.mjs  a lost answer: the personal group's GroupInfo deposit is dropped; a reload, and a move to
+                        mailbox B, send it again and the personal group comes up (M§9.3, spec-gap 122)
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
@@ -286,8 +288,11 @@ and sees the new device; messages flow both ways, and nothing from before the jo
 test kills it. Bob moves to mailbox B and registers his groups. Alice's next message is refused as hub-unreachable and
 kept pending; past her 12 s threshold her device fetches Bob's KeyPackages from B without a grant and creates the
 successor at A; Bob checks it and joins; the pending message arrives, re-encrypted; both see one conversation whose
-thread runs from the dead group into the successor; Bob's reply arrives; a reload keeps it all. CI runs all eleven in
-Firefox and Chromium.
+thread runs from the dead group into the successor; Bob's reply arrives; a reload keeps it all.
+`messaging-pending.mjs`: the page drops its own group-info deposits while a flag is set, so neither Alice's nor Bob's
+personal group is confirmed. Deposits awaiting an answer are saved, and every binding sends them again under fresh
+envelopes (M§9.3): Alice reloads and hers comes up, once; Bob moves to mailbox B and his comes up there, still hubbed
+at A. CI runs all twelve in Firefox and Chromium.
 
 ## Identity
 
