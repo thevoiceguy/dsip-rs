@@ -4,7 +4,9 @@
 //!
 //! Spec: sections owned by this crate — T§2 (suite 0x0002, mode 1, `validate_key`), T§3 (alias normalization),
 //! T§5 (VrfInput, the VRF index — [`ecvrf_verify`], commitments, prefix and log tree hashing, the Configuration and
-//! tree heads, the implicit search tree and binary ladder).
+//! tree heads, the implicit search tree and binary ladder), and v0.14's DSIP side of stage 2 (spec-gap 124): T§7 (the
+//! query endpoint's answer, [`alias_query`]), T§8 (who may monitor, [`alias_monitor`]), T§9 (tree heads between
+//! peers, [`alias_head`]), T§10 (what a lookup result counts as, [`alias_lookup_result`]).
 //!
 //! Impl (spec-gap 104): ASCII-only alias normalization; VRF verification with `validate_key`; only suite 0x0002 and
 //! mode 1 are accepted. Pinned by `impl/vectors/alias-transparency/`; the Python reference is
@@ -362,6 +364,134 @@ pub fn base_ladder(t: u64) -> Vec<u64> {
     out
 }
 
+// ------------------------------------------------------------------------------------------------- stage 2
+
+/// Unpadded base64url as the vectors README defines it for stage 2: the URL-safe alphabet, no `=`, a length that is
+/// not 1 more than a multiple of 4. Non-zero unused bits are accepted (RFC 4648 §3.5).
+fn b64url(v: &Value) -> Option<Vec<u8>> {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::Engine;
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::RequireNone).with_decode_allow_trailing_bits(true),
+    );
+    let s = v.as_str()?;
+    if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || s.len() % 4 == 1 {
+        return None;
+    }
+    LENIENT.decode(s).ok()
+}
+
+/// The provider's answer at its log endpoint: `{"status", "answer"}`. The rate limit counts every query, so it comes
+/// first; an absent alias, a hidden one and a refused monitor request all get one `not-found`.
+///
+/// Spec: T§7 (v0.14, spec-gap 124).
+pub fn alias_query(i: &Value) -> Value {
+    let request = i["request"].as_str().unwrap_or("");
+    let yes = |k: &str| i[k] == json!(true);
+    if yes("over_limit") {
+        return json!({"status": 429, "answer": "rate-limited"});
+    }
+    if request != "search" && request != "monitor" {
+        return json!({"status": 400, "answer": "bad-request"});
+    }
+    if normalize_alias(i["alias"].as_str().unwrap_or("")).is_none() {
+        return json!({"status": 400, "answer": "alias-invalid"});
+    }
+    if request == "search" && yes("exists") && yes("visible") {
+        return json!({"status": 200, "answer": "search-response"});
+    }
+    if request == "monitor" && yes("exists") && yes("authorized") {
+        return json!({"status": 200, "answer": "monitor-response"});
+    }
+    json!({"status": 404, "answer": "not-found"})
+}
+
+/// The provider's checks of a verified `alias-monitor` payload against the alias's history (`values`, every DID it
+/// has had): `{"verdict": "accept", "label"}` or `{"verdict": "refuse", "code"}`. A former owner may monitor too.
+///
+/// Spec: T§8 (v0.14, spec-gap 124).
+pub fn alias_monitor(i: &Value) -> Value {
+    let p = &i["payload"];
+    if p["to"] != i["provider"] {
+        return json!({"verdict": "refuse", "code": "wrong-audience"});
+    }
+    let Some(label) = normalize_alias(p["alias"].as_str().unwrap_or("")) else {
+        return json!({"verdict": "refuse", "code": "alias-invalid"});
+    };
+    if !i["values"].as_array().is_some_and(|vs| vs.contains(&p["from"])) {
+        return json!({"verdict": "refuse", "code": "not-owner"});
+    }
+    json!({"verdict": "accept", "label": label})
+}
+
+/// A received `alias-log-head` claim, checked against the receiver's pinned Configuration (hex, or null) and the heads
+/// it holds: `invalid` (`malformed`, `bad-signature`), `ignored` (`unknown-log`), `fork`, `consistent` or `new`.
+///
+/// Spec: T§9 (v0.14, spec-gap 124); T§5 item 7 (`TreeHead`, `TreeHeadTBS`).
+pub fn alias_head(i: &Value) -> Value {
+    let c = &i["claim"];
+    let malformed = json!({"outcome": "invalid", "reason": "malformed"});
+    let did_ok = c["provider"].as_str().is_some_and(|p| {
+        let mut parts = p.splitn(3, ':');
+        let (scheme, method, rest) = (parts.next(), parts.next(), parts.next());
+        scheme == Some("did")
+            && method.is_some_and(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+            && rest.is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric() || b".%_:-".contains(&b)))
+    });
+    if c["type"] != "alias-log-head" || !did_ok {
+        return malformed;
+    }
+    let (Some(th), Some(root)) = (b64url(&c["tree_head"]), b64url(&c["root"])) else { return malformed };
+    if root.len() != 32 || th.len() < 10 {
+        return malformed;
+    }
+    let size = u64::from_be_bytes(th[..8].try_into().expect("8 bytes"));
+    let n = u16::from_be_bytes([th[8], th[9]]) as usize;
+    if th.len() != 10 + n || size > (1 << 53) - 1 {
+        return malformed;
+    }
+    let Some(config) = i["configuration"].as_str() else {
+        return json!({"outcome": "ignored", "reason": "unknown-log"});
+    };
+    if tree_head_valid(&hex::decode(config).unwrap_or_default(), size, &root, &th[10..]) != Ok(true) {
+        return json!({"outcome": "invalid", "reason": "bad-signature"});
+    }
+    for held in i["held"].as_array().into_iter().flatten() {
+        if held["tree_size"].as_u64() == Some(size) {
+            if b64url(&held["root"]).as_deref() != Some(&root[..]) {
+                return json!({"outcome": "fork", "tree_size": size, "held_root": held["root"], "claimed_root": c["root"]});
+            }
+            return json!({"outcome": "consistent", "tree_size": size});
+        }
+    }
+    json!({"outcome": "new", "tree_size": size})
+}
+
+/// What an alias lookup counts as: `not-found`, `unaudited` (`fork`, `unverifiable`, `pending`) or `audited`. A
+/// version whose terminal entry lies right of the rightmost distinguished entry is pending, never authority.
+///
+/// Spec: T§10 (v0.14, spec-gap 124); `[KTA]` §7.1.
+pub fn alias_lookup_result(i: &Value) -> Value {
+    if i["answer"] == "not-found" {
+        return json!({"result": "not-found"});
+    }
+    if i["fork"] == json!(true) {
+        return json!({"result": "unaudited", "reason": "fork"});
+    }
+    if i["proof"] == "unverifiable" {
+        return json!({"result": "unaudited", "reason": "unverifiable"});
+    }
+    let pending = match i["rightmost_distinguished"].as_i64() {
+        None => true,
+        Some(rd) => i["terminal_entry"].as_i64().unwrap_or(i64::MAX) > rd,
+    };
+    if pending {
+        return json!({"result": "unaudited", "reason": "pending"});
+    }
+    json!({"result": "audited"})
+}
+
 fn h(v: &Value) -> Vec<u8> {
     hex::decode(v.as_str().unwrap_or("")).unwrap_or_default()
 }
@@ -375,6 +505,10 @@ pub fn run_vector(v: &Value) -> Value {
     let i = &v["input"];
     let label = i["label"].as_str().unwrap_or("").as_bytes();
     match i["check"].as_str().unwrap_or("") {
+        "alias-query" => alias_query(i),
+        "alias-monitor" => alias_monitor(i),
+        "alias-head" => alias_head(i),
+        "alias-lookup-result" => alias_lookup_result(i),
         "alias" => match normalize_alias(i["alias"].as_str().unwrap_or("")) {
             Some(l) => json!({"label": l}),
             None => json!({"error": "not-an-alias"}),
