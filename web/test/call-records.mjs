@@ -17,6 +17,14 @@ const convWith = (p, did) => p.page.evaluate((d) => window.dsip.conversations().
 const logHas = (p, re) => until(p.page, (s) => new RegExp(s).test(document.getElementById('log').textContent), re.source, 20000);
 
 /** Kim introduces herself to `p`, `p` grants, Kim opens the conversation (C§9: the record-keeper opens it). */
+// diagnostics for a failure: page errors (a wasm panic shows here), console errors, and the step reached
+const errors = [];
+let step = 'start';
+const watch = (p) => {
+  p.page.on('pageerror', (e) => errors.push(`${p.name} pageerror: ${e.message}`));
+  p.page.on('console', (m) => { if (m.type() === 'error') errors.push(`${p.name} console: ${m.text().slice(0, 300)}`); });
+  return p;
+};
 const contactsView = (p) => p.page.click('nav button[data-view=contacts]');
 
 async function keeperOpens(p) {
@@ -34,7 +42,8 @@ async function keeperOpens(p) {
 
 try {
   // 1. Kim becomes a record-keeper: re-delegated with dsip.record, no personal group
-  kim = await person(browser, 'Kim');
+  step = '1 Kim becomes a record-keeper';
+  kim = watch(await person(browser, 'Kim'));
   await mailboxBound(kim);
   await Promise.all([kim.page.waitForEvent('load'), kim.page.evaluate(() => { window.dsip.becomeRecordKeeper(); }).catch(() => {})]);
   await ready(kim.page);
@@ -44,14 +53,17 @@ try {
   check('Kim: no personal group for a recorder device (C§5)', !(await kim.page.evaluate(() => window.dsip.personalGroup())));
 
   // 2. Alice and Bob name Kim as their record-keeper; everyone knows everyone
-  alice = await person(browser, 'Alice');
-  bob = await person(browser, 'Bob');
+  step = '2 parties name Kim';
+  alice = watch(await person(browser, 'Alice'));
+  bob = watch(await person(browser, 'Bob'));
   await mailboxBound(alice); await mailboxBound(bob);
   for (const p of [alice, bob]) await p.page.evaluate((d) => window.dsip.setRecordKeeper(d), kim.did);
+  step = '2 contacts';
   await addContact(alice, bob); await addContact(bob, alice);
   await addContact(kim, alice); await addContact(kim, bob);
 
   // 3. Kim opens the conversation with Alice only
+  step = '3 Kim opens Alice';
   await keeperOpens(alice);
   const ak = await convWith(alice, kim.did);
   check('Alice: the conversation with Kim is recorded by Kim\'s device (C§5)', ak.recorded && ak.recorders.some((r) => r.subject === kim.did), JSON.stringify(ak));
@@ -62,6 +74,7 @@ try {
   check('Alice: the thread says who records and why', /RECORDED by .*your record-keeper/.test(await alice.page.textContent('#thread-meta')));
 
   // 4. Call 1: Alice calls Bob, Bob answers, Alice hangs up. Alice's record goes out; Bob's is held.
+  step = '4 call 1';
   await contactsView(alice); await contactsView(bob);
   await placeCall(alice, bob);
   await until(bob.page, () => window.dsip.state() === 'ALERTING');
@@ -78,12 +91,14 @@ try {
   check('Bob: record for call 1 held: Kim has not opened his conversation (C§9, spec-gap 123)', (await bob.page.evaluate(() => window.dsip.heldRecords())) === 1);
 
   // 5. Kim opens Bob's conversation: the held record goes out
+  step = '5 Kim opens Bob';
   await keeperOpens(bob);
   // the log line follows the frame's hand-off to the mailbox, after the record has left the held list
   await logHas(bob, /1 held call record sent to the record-keeper/);
   check('Bob: the held record went out once the conversation existed', (await bob.page.evaluate(() => window.dsip.heldRecords())) === 0);
 
   // 6. Call 2: Bob calls Alice, Alice declines
+  step = '6 call 2';
   await contactsView(alice); await contactsView(bob);
   await placeCall(bob, alice);
   await until(alice.page, () => window.dsip.state() === 'ALERTING');
@@ -92,6 +107,7 @@ try {
   await until(bob.page, () => window.dsip.state() === null);
 
   // 7. Kim holds four records, one per leg
+  step = '7 four records at Kim';
   await until(kim.page, () => window.dsip.records().length === 4, null, 30000);
   const recs = await kim.page.evaluate(() => window.dsip.records());
   const rec = (from, sid) => recs.find((r) => r.from === from && r.record.session === sid)?.record;
@@ -117,12 +133,14 @@ try {
   await until(kim.page, () => window.dsip.records().length === 4, null, 20000);
   check('Kim: the records survive a reload', true);
 } catch (e) {
-  check('call records', false, e.message);
+  check('call records', false, `at step ${step}: ${e.message}`);
+  for (const l of errors) console.log('  ' + l);
   await dump(kim, alice, bob);
   if (kim) console.log('Kim records:', JSON.stringify(await kim.page.evaluate(() => window.dsip.records().map((r) => [r.from, r.record.session, r.record.outcome])).catch(() => null)));
   // the hub's side of it: Kim's bindings, the hints it resolved and the fan-out it stored
   if (process.env.FIXTURE) for (const l of readFileSync(`${process.env.FIXTURE}/mbx-a.log`, 'utf8').split('\n').slice(-40)) console.log('  mbx-a ' + l.replace(/\x1b\[[0-9;]*m/g, ''));
 }
+if (errors.length && !check.failures()) for (const l of errors) console.log('  (passed, but) ' + l);
 await browser.close();
 console.log(`${process.env.BROWSER || 'firefox'} call-records: ${check.failures()} failure(s)`);
 process.exit(check.failures() ? 1 : 0);
