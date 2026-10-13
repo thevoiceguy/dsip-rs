@@ -5,7 +5,8 @@
 // content. Each call leg yields one `call-record`: Bob's first is held until Kim opens his conversation, then sent.
 // Kim keeps four records with the outcomes C§9's order gives, and the two sides' evidence shares the frames the
 // relay carried unchanged (§10.2). Kim's records survive a reload.
-import { launch, person, ready, until, addContact, rowButton, placeCall, checker, dump, logOf } from './lib.mjs';
+import { readFileSync } from 'node:fs';
+import { launch, person, ready, until, addContact, rowButton, placeCall, checker, dump } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const check = checker();
@@ -78,8 +79,9 @@ try {
 
   // 5. Kim opens Bob's conversation: the held record goes out
   await keeperOpens(bob);
-  await until(bob.page, () => window.dsip.heldRecords() === 0, null, 20000);
-  check('Bob: the held record went out once the conversation existed', /1 held call record sent to the record-keeper/.test(await logOf(bob)));
+  // the log line follows the frame's hand-off to the mailbox, after the record has left the held list
+  await logHas(bob, /1 held call record sent to the record-keeper/);
+  check('Bob: the held record went out once the conversation existed', (await bob.page.evaluate(() => window.dsip.heldRecords())) === 0);
 
   // 6. Call 2: Bob calls Alice, Alice declines
   await contactsView(alice); await contactsView(bob);
@@ -117,6 +119,9 @@ try {
 } catch (e) {
   check('call records', false, e.message);
   await dump(kim, alice, bob);
+  if (kim) console.log('Kim records:', JSON.stringify(await kim.page.evaluate(() => window.dsip.records().map((r) => [r.from, r.record.session, r.record.outcome])).catch(() => null)));
+  // the hub's side of it: Kim's bindings, the hints it resolved and the fan-out it stored
+  if (process.env.FIXTURE) for (const l of readFileSync(`${process.env.FIXTURE}/mbx-a.log`, 'utf8').split('\n').slice(-40)) console.log('  mbx-a ' + l.replace(/\x1b\[[0-9;]*m/g, ''));
 }
 await browser.close();
 console.log(`${process.env.BROWSER || 'firefox'} call-records: ${check.failures()} failure(s)`);
