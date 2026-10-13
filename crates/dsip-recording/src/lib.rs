@@ -4,7 +4,8 @@
 //! Spec: sections owned by this crate — C§4 (a counterparty's consent: render, hold until
 //! acceptance, decline with `policy.recording-declined` — [`Consent`]), C§5 (a recorded
 //! conversation; a recorder is receive-only — [`conversation`]), C§6 (the recording party's checks
-//! on its recorder leg — [`recording_session`]).
+//! on its recorder leg — [`recording_session`]), C§9 (a call record's outcome and evidence, v0.13 —
+//! [`call_record_outcome`], [`call_record_evidence`]).
 //!
 //! Impl (spec-gap 107): an unregistered recording state is read as `on`; acceptance is per session
 //! and per recorder. Every rule is pinned by `impl/vectors/recording/`; the Python reference is
@@ -243,6 +244,54 @@ pub fn add_devices(i: &Value) -> Value {
     json!({"add": cands.iter().map(|k| k["device"].clone()).collect::<Vec<_>>()})
 }
 
+/// The `outcome` of one leg's call record, the first rule that applies: `answered`, `answered-elsewhere`, `failed`,
+/// `declined`, `missed` (inbound), `cancelled` (outbound, ended locally), `rejected`.
+///
+/// Spec: C§9 (v0.13, spec-gap 121); §12.7 (`session.answered-elsewhere`); §15 (a reason's category).
+pub fn call_record_outcome(i: &Value) -> &'static str {
+    let reason = i["reason"].as_str().unwrap_or("");
+    let (inbound, ended_by) = (i["direction"] == "inbound", i["ended_by"].as_str().unwrap_or(""));
+    if i["answered"] == true {
+        "answered"
+    } else if reason == "session.answered-elsewhere" {
+        "answered-elsewhere"
+    } else if ended_by == "transport" || reason.split('.').next() == Some("transport") {
+        "failed"
+    } else if reason == "user.declined" && ended_by == if inbound { "local" } else { "remote" } {
+        "declined"
+    } else if inbound {
+        "missed"
+    } else if ended_by == "local" {
+        "cancelled"
+    } else {
+        "rejected"
+    }
+}
+
+/// A call record's `evidence` matched against kept frames: each entry, in order, is `matched` when some frame's
+/// SHA-256, over its bytes exactly as kept, equals it, and `unmatched` otherwise.
+///
+/// Spec: C§9 (v0.13, spec-gap 121); §10.2 (bytes as received, never re-serialised).
+pub fn call_record_evidence(i: &Value) -> Value {
+    use sha2::{Digest, Sha256};
+    let kept: BTreeSet<String> = i["frames"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|f| Sha256::digest(f.as_bytes()).iter().map(|b| format!("{b:02x}")).collect())
+        .collect();
+    let (mut matched, mut unmatched) = (vec![], vec![]);
+    for e in i["evidence"].as_array().into_iter().flatten() {
+        if e.as_str().is_some_and(|h| kept.contains(h)) {
+            matched.push(e.clone());
+        } else {
+            unmatched.push(e.clone());
+        }
+    }
+    json!({"matched": matched, "unmatched": unmatched})
+}
+
 /// Run one `recording` vector.
 pub fn run_vector(v: &Value) -> Value {
     let i = &v["input"];
@@ -250,6 +299,8 @@ pub fn run_vector(v: &Value) -> Value {
         Some("conversation") => conversation(i),
         Some("recording-session") => recording_session(i),
         Some("add-devices") => add_devices(i),
+        Some("call-record-outcome") => json!({"outcome": call_record_outcome(i)}),
+        Some("call-record-evidence") => call_record_evidence(i),
         Some(_) => json!({"error": "unknown check"}),
         None => {
             let c = &v["context"];

@@ -37,6 +37,8 @@ try {
 
   // Bob sees a request with the purpose and the basis; grants it
   await until(bob.page, () => window.dsip.requests().length === 1);
+  // the list is drawn after the engine holds the request: wait for the drawing, not just the state
+  await until(bob.page, () => /Self-issued/.test(document.getElementById('request-list').textContent), null, 10000).catch(() => {});
   const reqText = await bob.page.textContent('#request-list');
   check('Bob: the request shows who, the purpose as a claim, and the basis', reqText.includes(alice.did) && reqText.includes('Lunch on Friday?') && reqText.includes('Self-issued'), reqText.replace(/\s+/g, ' ').slice(0, 160));
   check('Bob: an introduction never rings', !(await bob.page.isVisible('#view-incoming')) && (await state(bob)) === null);

@@ -33,6 +33,7 @@ pub const SCHEMAS: &[(&str, &str)] = &[
     schema!("archive-key"),
     schema!("recording-acceptance"),
     schema!("call-event"),
+    schema!("call-record"),
     schema!("archive-record"),
     schema!("dsip-conversation"),
     schema!("mailbox-service"),

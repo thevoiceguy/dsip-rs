@@ -38,7 +38,8 @@ pub const REACTION_MAX_BYTES: usize = 32;
 pub const MESSAGE_SCHEMAS: &[&str] =
     &["deposit", "accepted", "sync", "items", "key-packages", "key-package-fetch", "blob-put", "mailbox-config"];
 /// Content object types with schemas.
-pub const OBJECT_SCHEMAS: &[&str] = &["content", "receipt", "activity", "archive-key", "call-event", "archive-record", "recording-acceptance"];
+pub const OBJECT_SCHEMAS: &[&str] =
+    &["content", "receipt", "activity", "archive-key", "call-event", "archive-record", "recording-acceptance", "call-record"];
 
 /// Registry `dsip-deposit-class` (M§17).
 pub const DEPOSIT_CLASSES: &[&str] = &["handshake", "application", "welcome", "group-info", "ephemeral", "archive", "introduction", "grant"];
@@ -212,6 +213,7 @@ pub fn check_object(o: &Value, ctx: &Value) -> Value {
         return reject("personal-group-only", None); // M§12.1, M§13.3, Recording Profile C§5
     }
     match name {
+        "call-record" => check_call_record(o, ctx),
         "content" => check_content(o),
         "receipt" => {
             let kind = o["kind"].as_str().unwrap_or("");
@@ -235,6 +237,28 @@ pub fn check_object(o: &Value, ctx: &Value) -> Value {
         }
         _ => accept(),
     }
+}
+
+/// A leg's call record at the record-keeper: from the sender leaf's own device, in a direct conversation, with times
+/// that never decrease and `answered_at` exactly on an answered leg.
+///
+/// Spec: Recording Profile C§9 (v0.13, spec-gap 121).
+fn check_call_record(o: &Value, ctx: &Value) -> Value {
+    if o["device"] != ctx["leaf_device"] {
+        return reject("sender-mismatch", None);
+    }
+    if ctx["conversation_kind"].as_str() != Some("direct") {
+        return reject("recorder-conversation-only", None);
+    }
+    let mut times = vec![int(o, "invited_at")];
+    if o.get("answered_at").is_some() {
+        times.push(int(o, "answered_at"));
+    }
+    times.push(int(o, "ended_at"));
+    if o.get("answered_at").is_some() != (o["outcome"] == "answered") || times.windows(2).any(|w| w[0] > w[1]) {
+        return reject("call-record-invalid", None);
+    }
+    accept_effective(json!({"render": "ignore", "store": "call-record"}))
 }
 
 fn kind_body(kind: &str) -> &'static [&'static str] {
