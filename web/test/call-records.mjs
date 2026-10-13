@@ -1,4 +1,4 @@
-// Headless call-records test (Recording Profile C§9, v0.13; spec-gaps 121 and 123). Kim's identity is its
+// Headless call-records test (Recording Profile C§9, v0.13; spec-gaps 121 and 123; C§5 acceptance). Kim's identity is its
 // organisation's record-keeper: her device is re-delegated with `dsip.record`, never makes a personal group (C§5),
 // and opens a direct conversation with each party, since a party cannot add an identity whose devices are all
 // recorders. Alice and Bob name Kim as record-keeper. Their conversation with Kim is shown as recorded and takes no
@@ -132,6 +132,29 @@ try {
   await ready(kim.page);
   await until(kim.page, () => window.dsip.records().length === 4, null, 20000);
   check('Kim: the records survive a reload', true);
+
+  // 9. C§5 acceptance: Alice accepts Kim's recorder; the acceptance goes to her personal group; content may then go
+  //    to the conversation, and Kim's recorder device receives it; the acceptance survives a reload
+  step = '9 Alice accepts the recording';
+  await alice.page.click('nav button[data-view=messages]');
+  await alice.page.evaluate((g) => window.dsip.openConversation(g), ak.group);
+  check('Alice: asked to accept Kim\'s recorder before writing (C§5)', await alice.page.isVisible('#btn-accept-recording')
+    && /records this conversation on device/.test(await alice.page.textContent('#recording-ask-text')));
+  await alice.page.click('#btn-accept-recording');
+  await logHas(alice, /recording accepted: .*through the personal group/);
+  await until(alice.page, (g) => window.dsip.conversations().find((c) => c.group === g)?.may_send === true, ak.group);
+  check('Alice: accepted; the conversation takes content now', !(await alice.page.isDisabled('#compose-text'))
+    && !(await alice.page.isVisible('#btn-accept-recording')));
+  await alice.page.fill('#compose-text', 'hello Kim, recorded and accepted');
+  await alice.page.click('#compose-send');
+  await until(kim.page, (g) => window.dsip.thread(g).some((m) => m.object.text === 'hello Kim, recorded and accepted'),
+    (await convWith(kim, alice.did)).group, 20000);
+  check('Kim: her recorder device received the accepted content', true);
+  await alice.page.reload();
+  await ready(alice.page);
+  await until(alice.page, (g) => window.dsip.conversations().some((c) => c.group === g), ak.group, 20000);
+  const after = (await alice.page.evaluate(() => window.dsip.conversations())).find((c) => c.group === ak.group);
+  check('Alice: the acceptance survives a reload', after.may_send === true && after.recorders_pending.length === 0, JSON.stringify(after.recorders_pending));
 } catch (e) {
   check('call records', false, `at step ${step}: ${e.message}`);
   for (const l of errors) console.log('  ' + l);
