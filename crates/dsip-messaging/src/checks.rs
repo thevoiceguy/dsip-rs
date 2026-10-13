@@ -325,6 +325,36 @@ pub fn check_conversation_update(before: &Value, after: &Value) -> Value {
     accept_effective(json!({"moves_to": if moved { after["hub"]["did"].clone() } else { Value::Null }, "hub": after["hub"]}))
 }
 
+/// What a member's device does with an identity's pending Remove proposals: `{"action": "commit" | "wait" | "left"}`
+/// or `{"action": "ignore", "reason": "not-a-leave" | "not-own-leaves"}`. A leave proposes every leaf of the
+/// proposer's identity; another member commits it, and the leaving identity's own devices treat it as left.
+///
+/// Spec: M§7.3 "Leaving" (v0.14, spec-gap 125); RFC 9420 §12.4 (no commit removes its committer).
+pub fn leave_proposals(inp: &Value) -> Value {
+    if inp["others"].as_u64().unwrap_or(0) > 0 {
+        return json!({"action": "ignore", "reason": "not-a-leave"});
+    }
+    let who = &inp["proposer"]["identity"];
+    let leaves: BTreeSet<&str> =
+        inp["roster"].as_array().into_iter().flatten().filter(|r| &r["identity"] == who).filter_map(|r| r["device"].as_str()).collect();
+    let mut removed = BTreeSet::new();
+    for r in inp["removes"].as_array().into_iter().flatten() {
+        match r["device"].as_str() {
+            Some(d) if &r["identity"] == who && leaves.contains(d) => {
+                removed.insert(d);
+            }
+            _ => return json!({"action": "ignore", "reason": "not-own-leaves"}),
+        }
+    }
+    if removed != leaves {
+        return json!({"action": "wait"});
+    }
+    if *who == inp["me"] {
+        return json!({"action": "left"});
+    }
+    json!({"action": "commit"})
+}
+
 /// What an external commit may do, checked alike by the hub and every member.
 ///
 /// Spec: M§6.8 — a device joins by external commit only into a group its identity is already in, or its own personal

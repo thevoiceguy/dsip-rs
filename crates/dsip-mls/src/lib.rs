@@ -463,7 +463,8 @@ impl HubView {
 
     /// Validate a commit and describe it as the hub state machine's `deposit.commit` (M§6.5, M§7.3, M§7.4):
     /// `{adds: [{identity, device}], removes: [{identity, device, delegation_valid}], valid, external, moves_to?}`.
-    /// A commit that fails MLS validation or leaf authentication is `valid: false`; a valid one is merged.
+    /// A commit that fails MLS validation or leaf authentication is `valid: false`; a valid one is merged. A valid
+    /// standalone proposal is stored for the commit that covers it and described as `{proposal: true, valid: true}`.
     pub fn observe_commit(&mut self, bytes: &[u8], ctx: &Context) -> Result<Value, MlsError> {
         let msg = MlsMessageIn::tls_deserialize(&mut &bytes[..]).map_err(err("commit bytes"))?;
         let pm = msg.try_into_protocol_message().map_err(err("protocol message"))?;
@@ -472,8 +473,15 @@ impl HubView {
             Err(_) => return Ok(json!({"adds": [], "removes": [], "valid": false})),
         };
         let external = !matches!(processed.sender(), Sender::Member(_));
-        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
-            return Err(MlsError("not a commit".into()));
+        let staged = match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged) => staged,
+            ProcessedMessageContent::ProposalMessage(qp) => {
+                // M§7.3 "Leaving" (spec-gap 125): a standalone proposal is kept, so the commit that covers it by
+                // reference validates; it is not a commit, and the hub sequences it as one (no `adds`)
+                self.group.add_proposal(&self.storage, *qp).map_err(err("store proposal"))?;
+                return Ok(json!({"proposal": true, "valid": true}));
+            }
+            _ => return Err(MlsError("not a commit".into())),
         };
         let before = self.group.group_context().extensions().unknown(EXT_DSIP_CONVERSATION).map(|u| u.0.clone());
         let mut moves_to = None;

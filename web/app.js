@@ -838,6 +838,20 @@ async function flushRecords() {
   } catch (e) { log(`✗ held call records: ${e.message || e}`, 'C§9'); }
 }
 
+/** M§7.3 "Leaving": propose the removal of this identity's leaves; another member commits it. The conversation is
+ *  no longer listed, and nothing more is sent there. */
+async function leaveConversation(gid) {
+  if (!messenger) return;
+  try {
+    const out = JSON.parse(messenger.leave(gid, now()));
+    await driveMailbox(out);
+    if (activeConv === gid) activeConv = null;
+    log(`left ${short(gid)}: the removal of this identity's ${out.filter((e) => e.send).length} leaf(s) proposed; another member commits it`, 'M§7.3');
+    notify('You left the conversation');
+  } catch (e) { notify(`cannot leave: ${e.message || e}`); }
+  renderMessages();
+}
+
 /** C§5: the user accepts every recorder now in the conversation; the acceptance goes to the personal group so this
  *  identity's other devices accept them too. */
 async function acceptRecording(gid) {
@@ -1247,11 +1261,13 @@ function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
     key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
     archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5',
-    call_record: 'C§9', recording_accepted: 'C§5', receipt_withheld: 'C§5', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
+    call_record: 'C§9', recording_accepted: 'C§5', receipt_withheld: 'C§5', left: 'M§7.3', leave_proposed: 'M§7.3', leave_committing: 'M§7.3', leave_proposals: 'M§7.3', leave_proposal_refused: 'M§7.3', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
   log(`◇ ${e.ui} ${fields}`, sec);
   if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
   if (e.ui === 'joined' && e.kind === 'direct' && e.members.includes(settings.record_keeper)) setTimeout(flushRecords, 0);
+  if (e.ui === 'leave_committing') notify(`${nameOf(e.identity) || short(e.identity)} left a conversation; this device commits their removal`);
+  if (e.ui === 'left') notify('another of your devices left a conversation');
   if (e.ui === 'call_record') notify(`call record from ${nameOf(e.from) || short(e.from)}: ${e.outcome}`);
   if (e.ui === 'joined' && e.kind === 'direct') { activeConv = activeConv || e.group; notify(`${nameOf(e.members.find((m) => m !== identity.identity)) || 'someone'} opened a conversation with you`); }
   if (e.ui === 'committed' && e.device) notify(`device ${short(e.device)} added to ${e.personal ? 'the personal group' : 'a conversation'} (epoch ${e.epoch})`);
@@ -1542,9 +1558,12 @@ function renderMessages() {
   // C§5: content and receipts wait until the user accepts every recorder present; a new recorder asks again
   const ask = conv && conv.recorders_pending?.length && !messenger.is_recorder();
   $('recording-ask').classList.toggle('hidden', !ask);
+  $('btn-leave').classList.toggle('hidden', !conv || conv.kind === 'personal');
+  if (conv) $('btn-leave').onclick = () => leaveConversation(conv.group);
   if (ask) {
+    $('btn-decline-recording').onclick = () => leaveConversation(conv.group);
     $('recording-ask-text').textContent = `${conv.recorders_pending.map((r) => `${nameOf(r.subject) || short(r.subject)} records this conversation on device ${short(r.device)}`).join('; ')}. `
-      + 'Nothing you write, and no receipt, is sent here until you accept. Not accepting is staying silent (C§5).';
+      + 'Nothing you write, and no receipt, is sent here until you accept. Declining is leaving the conversation (C§5, M§7).';
     $('btn-accept-recording').onclick = () => acceptRecording(conv.group);
   }
   const th = $('thread');
@@ -1764,6 +1783,7 @@ function renderMessages() {
     records: () => (messenger ? JSON.parse(messenger.records()) : []),
     heldRecords: () => (messenger ? messenger.held_records() : 0),
     acceptRecording,
+    leaveConversation,
     personalGroup: () => messenger?.personal() || null,
     messengerSaved: () => store.get(key('messenger')),
     readMarks: (gid) => (messenger ? JSON.parse(messenger.read_marks(gid || activeConv)) : {}),
