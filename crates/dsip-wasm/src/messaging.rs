@@ -277,8 +277,9 @@ pub struct Messenger {
     /// Objects of an abandoned group's outbox, by the group they go to: the dead group until its successor exists,
     /// then the successor until it holds its members (M§9.4: re-encrypted for the successor, spec-gap 72).
     handover: BTreeMap<String, Vec<Value>>,
-    /// The mailbox this state was saved at; a different one at start is a move. Impl (spec-gap 122): the device
-    /// registers every group it is in at the new mailbox and syncs it from the start.
+    /// The mailbox this state was saved at; a different one at start is a move. Spec: M§4.1 "Moving to another
+    /// mailbox" (v0.13, spec-gap 122): the device registers every group it is in at the new mailbox and syncs it from
+    /// the start.
     moved_from: Option<String>,
 }
 
@@ -868,9 +869,9 @@ impl Messenger {
     /// export, a commit as the same MLS bytes (the hub answers a duplicate digest with its seq, M§6.5), a
     /// `mailbox-config` or archive record with the same fields. Application items go again from the outbox.
     ///
-    /// Spec: M§9.3. Impl (spec-gap 122): after a move the new mailbox's registration of every group supersedes a
-    /// pending `mailbox-config` at the old one, and an archive record goes to the new mailbox; key packages are
-    /// uploaded afresh by the host when the mailbox reports none.
+    /// Spec: M§9.3; M§4.1 step 3 (v0.13, spec-gap 122): after a move the new mailbox's registration of every group
+    /// supersedes a pending `mailbox-config` at the old one. Impl: an archive record goes to the new mailbox, the
+    /// identity's mailbox now; key packages are uploaded afresh by the host at every binding.
     fn redeposit_pending(&mut self, moved: bool, now: i64) -> Vec<String> {
         let mut frames = vec![];
         for (id, p) in self.pending.clone() {

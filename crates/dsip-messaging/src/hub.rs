@@ -52,7 +52,7 @@ pub struct Hub {
 
 /// The retention bound a hub uses when its context names none.
 ///
-/// Spec: M§4.4 (`mls_retention_s`, RECOMMENDED 2,592,000 s). Impl (spec-gap 119): it bounds the hub's queues too.
+/// Spec: M§4.4 (`mls_retention_s`, RECOMMENDED 2,592,000 s), M§6.5 (it bounds a hub's queues; v0.13, spec-gap 119).
 pub const MLS_RETENTION_S: i64 = 2_592_000;
 
 fn default_retention() -> i64 {
@@ -97,8 +97,8 @@ impl Hub {
     /// Time passes: a member identity whose clock has reached the retention bound has every queue it has here dropped,
     /// welcome included, and its welcome hold lifted; it stays in the roster.
     ///
-    /// Spec: M§6.5 rule 5, M§4.4. Impl (spec-gap 119): the clock runs while anything is queued for the identity and
-    /// restarts at every acknowledgement of a head; a returning device re-joins by external commit (M§6.8).
+    /// Spec: M§6.5 "How long a queue is kept" (v0.13, spec-gap 119): the clock runs while anything is queued for the
+    /// identity and restarts at every acknowledgement of a head; a returning device re-joins by external commit (M§6.8).
     fn advance(&mut self, n: i64) -> Vec<Value> {
         self.now += n;
         let due: Vec<String> = self.waiting.iter().filter(|(_, t)| self.now - **t >= self.retention).map(|(i, _)| i.clone()).collect();
