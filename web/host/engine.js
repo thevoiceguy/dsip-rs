@@ -9,7 +9,7 @@ export class Engine {
   constructor(Endpoint, identity, config, now) {
     this.now = now;
     this.ep = new Endpoint(JSON.stringify(identity), JSON.stringify(config), now());
-    this.on = {};                 // send(frame, meta), received(r), emission(e), rejected(code, detail), changed()
+    this.on = {};                 // send(frame, meta), frame(text, dir), received(r), emission(e), rejected(code, detail), changed()
     this.timer = null;
   }
 
@@ -23,7 +23,7 @@ export class Engine {
 
   /** A local event by name (`place_call`, `alert`, `accept`, `decline`, `cancel`, `hangup`, `update`, …). */
   async local(ev) { return this.drive(this.ep.local(JSON.stringify(ev), this.now())); }
-  async inbound(frame) { return this.drive(this.ep.inbound(frame, this.now())); }
+  async inbound(frame) { return this.drive(this.ep.inbound(frame, this.now()), frame); }
   async tick() { return this.drive(this.ep.tick(this.now())); }
 
   setSdp(sdp) { this.ep.set_sdp(sdp ?? undefined); }
@@ -40,11 +40,13 @@ export class Engine {
 
   startTimers() { this.timer ??= setInterval(() => this.tick(), 1000); }   // §12.9
 
-  async drive(eventsJson) {
+  /** `inFrame`: the inbound frame's text, handed to `on.frame` once the engine accepted it (C§9 evidence: the bytes
+   *  exactly as received, never re-serialised, §10.2); every frame sent is handed over as it goes out. */
+  async drive(eventsJson, inFrame = null) {
     const events = JSON.parse(eventsJson);
     for (const e of events) {
-      if (e.send) this.on.send?.(e.send.frame, e.send);
-      else if (e.received) await this.on.received?.(e.received);
+      if (e.send) { this.on.frame?.(e.send.frame, 'out'); this.on.send?.(e.send.frame, e.send); }
+      else if (e.received) { if (inFrame) this.on.frame?.(inFrame, 'in'); await this.on.received?.(e.received); }
       else if (e.emission) await this.on.emission?.(e.emission);
       else if (e.rejected) this.on.rejected?.(e.rejected.code, e.rejected.detail);
     }

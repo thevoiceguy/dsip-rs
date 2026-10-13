@@ -224,6 +224,8 @@ test/messaging-successor.mjs  round 2D: a conversation hubbed at a third mailbox
                         Bob without a grant; Bob checks it and joins; the message arrives; the thread is kept
 test/messaging-pending.mjs  a lost answer: the personal group's GroupInfo deposit is dropped; a reload, and a move to
                         mailbox B, send it again and the personal group comes up (M§9.3, spec-gap 122)
+test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
+                        yields a record, held until that conversation exists (spec-gaps 121, 123)
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
@@ -292,7 +294,24 @@ thread runs from the dead group into the successor; Bob's reply arrives; a reloa
 `messaging-pending.mjs`: the page drops its own group-info deposits while a flag is set, so neither Alice's nor Bob's
 personal group is confirmed. Deposits awaiting an answer are saved, and every binding sends them again under fresh
 envelopes (M§9.3): Alice reloads and hers comes up, once; Bob moves to mailbox B and his comes up there, still hubbed
-at A. CI runs all twelve in Firefox and Chromium.
+at A. `call-records.mjs`: Kim's device is re-delegated with `dsip.record` and makes no personal group (C§5). Alice and
+Bob name her as record-keeper, and she opens a conversation with Alice; Alice's client shows it as recorded by Kim and
+sends no content there. Alice calls Bob, Bob answers, Alice hangs up: Alice's record goes out, Bob's is held until
+Kim opens his conversation, then sent. Bob calls Alice and she declines. Kim holds four records (answered/local,
+answered/remote, declined/local, declined/remote), each naming its sending device and the relay. The two sides'
+evidence for a call shares the hashes of the frames the relay carried, and a reload keeps them. CI runs all thirteen
+in Firefox and Chromium.
+
+**Call records (v0.13, Recording Profile C§9).** With a record-keeper named in Settings, the client sends a
+`call-record` after every session leg. It holds the leg's frames as sent or accepted (`evidence` is the SHA-256 of
+each), the invite's and the applied answer's `issued_at`, the answer's media and the relay. `ended_by` and `reason`
+come from the frame that ended the leg (sent: `local`; received: `remote`). The Messenger derives `outcome` by the
+pinned order, checks the record as the record-keeper will, and holds it until the record-keeper has opened the
+conversation (spec-gap 123). "Make this identity a record-keeper" re-delegates the device with `dsip.record` and
+starts its messaging afresh with no personal group; its Messages screen lists the records received. A conversation
+recorded by another identity is labelled as recorded, and no content is sent there: this client has no screen to
+accept a recorder (C§5). Not done: `ended_by: transport` (a relay that drops mid-call does not end the session here)
+and the `recording` field (the browser declares no recording).
 
 ## Identity
 
