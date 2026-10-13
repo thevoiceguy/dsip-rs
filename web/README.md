@@ -304,7 +304,8 @@ Kim opens his conversation, then sent. Bob calls Alice and she declines. Kim hol
 answered/remote, declined/local, declined/remote), each naming its sending device and the relay. The two sides'
 evidence for a call shares the hashes of the frames the relay carried, and a reload keeps them. Alice is then asked
 to accept Kim's recorder; she accepts, the acceptance goes to her personal group, her message reaches Kim's
-recorder device, and after a reload the conversation stays accepted.
+recorder device, and after a reload the conversation stays accepted. Bob declines instead, which is leaving
+(M§7.3): his device proposes the removal of his leaf, Kim's device commits it, and his device finds itself removed.
 `messaging-rebind.mjs`: a second tab of the same device binds to the mailbox and syncs live, then the first tab
 closes; the mailbox must keep pushing to the second (it found the mailbox handing the binding to a connection it then
 never pushed to). CI runs all fourteen in Firefox and Chromium.
@@ -319,7 +320,9 @@ starts its messaging afresh with no personal group; its Messages screen lists th
 recorded by another identity is labelled as recorded, naming each recorder device. Until the user accepts every
 recorder present ("Accept recording"), no content and no receipt is sent there. The acceptance goes to the personal
 group as a `recording-acceptance`, so the identity's other devices accept them too, and a recorder that joins later
-asks again (C§5). Not accepting is staying silent: leaving a conversation (M§7) is not in this client. Not done: `ended_by: transport` (a relay that drops mid-call does not end the session here)
+asks again (C§5). Declining is leaving: "Leave" (also on any conversation's header) proposes the removal of every
+leaf of the identity, since MLS forbids committing one's own removal, and another member's device commits it
+(M§7.3, spec-gap 125). Not done: `ended_by: transport` (a relay that drops mid-call does not end the session here)
 and the `recording` field (the browser declares no recording).
 
 ## Identity

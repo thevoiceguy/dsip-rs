@@ -155,6 +155,23 @@ try {
   await until(alice.page, (g) => window.dsip.conversations().some((c) => c.group === g), ak.group, 20000);
   const after = (await alice.page.evaluate(() => window.dsip.conversations())).find((c) => c.group === ak.group);
   check('Alice: the acceptance survives a reload', after.may_send === true && after.recorders_pending.length === 0, JSON.stringify(after.recorders_pending));
+
+  // 10. Declining is leaving (C§5, M§7.3): Bob leaves Kim's conversation; his device proposes the removal of his
+  //     leaf, Kim's device commits it, and Bob's device finds itself removed
+  step = '10 Bob declines by leaving';
+  const bk = await convWith(bob, kim.did);
+  await bob.page.click('nav button[data-view=messages]');
+  await bob.page.evaluate((g) => window.dsip.openConversation(g), bk.group);
+  check('Bob: asked about Kim\'s recorder, with a way to decline', await bob.page.isVisible('#btn-decline-recording'));
+  await bob.page.click('#btn-decline-recording');
+  await logHas(bob, /left .*: the removal of this identity's 1 leaf\(s\) proposed/);
+  check('Bob: the conversation is no longer listed once he leaves', !(await convWith(bob, kim.did)));
+  await logHas(kim, /◇ leave_committing .*identity=/);
+  check('Kim: her device committed Bob\'s leave (MLS forbids him committing it)', true);
+  await until(kim.page, (d) => !window.dsip.conversations().find((c) => c.peer === d)?.members.includes(d), bob.did, 20000);
+  check('Kim: Bob is no longer a member', true);
+  await logHas(bob, /◇ removed /);
+  check('Bob: his device processed the commit removing it (M§7.3)', true);
 } catch (e) {
   check('call records', false, `at step ${step}: ${e.message}`);
   for (const l of errors) console.log('  ' + l);

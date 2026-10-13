@@ -2,7 +2,7 @@
 //! activity, archive sealing and a commit conflict — every protocol decision made by the
 //! vector-pinned `dsip-messaging` rules, every byte produced by OpenMLS.
 //!
-//! Spec: M§5.1, M§5.2, M§5.5, M§6.1–M§6.6, M§8.1, M§8.4, M§9.1, M§11.1, M§12.2, M§13.
+//! Spec: M§5.1, M§5.2, M§5.5, M§6.1–M§6.6, M§7.3 (leaving), M§8.1, M§8.4, M§9.1, M§11.1, M§12.2, M§13.
 
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -389,3 +389,97 @@ fn external_join_on_real_mls() {
     assert_eq!(deposit(&mut hub, 44, &carol_dev.did(), &carol, &ext, observed)[0]["error"]["reason"], "policy.blocked");
 }
 
+
+#[test]
+fn leave_on_real_mls() {
+    // M§7.3 "Leaving" (spec-gap 125): MLS forbids committing one's own removal, so Bob's phone proposes the removal of
+    // both his leaves; the hub's public view stores the proposals (across a reload) and the hub sequences them without
+    // an epoch change; Alice waits for both, then commits them by reference; Bob's laptop treats the conversation as
+    // left; the hub orders the commit as the removal of a whole identity, and Bob's phone finds itself removed.
+    use dsip_messaging::checks::leave_proposals;
+    let resolver = StaticResolver::default();
+    let ctx = Context::new(NOW, &resolver);
+    let caps = ["dsip.signaling", "dsip.messaging"];
+    let (alice, alice_dev) = device("alice", "alice-phone", &caps);
+    let (bob, bob_phone) = device("bob", "bob-phone", &caps);
+    let (_, bob_laptop) = device("bob", "bob-laptop", &caps);
+    let gid = ulid(40).into_bytes();
+    let conv = json!({"conversation": ulid(41), "kind": "group", "hub": {"did": HUB, "uri": "wss://mbx.alice.example/dsip"}, "successor_of": null});
+    let mut ag = alice_dev.create_group(&gid, &serde_json::to_vec(&conv).unwrap()).unwrap();
+    let gi = ag.export_group_info(alice_dev.provider().crypto(), &alice_dev.signer(), true).unwrap();
+    let mut view = HubView::from_group_info(&bytes(&gi)).unwrap();
+    let kps: Vec<KeyPackage> = [&bob_phone, &bob_laptop].iter()
+        .map(|d| authenticate_key_package(&d.key_package().unwrap(), alice_dev.provider(), &ctx).unwrap().0).collect();
+    let (commit, welcome, _) = ag.add_members(alice_dev.provider(), &alice_dev.signer(), &kps).unwrap();
+    view.observe_commit(&bytes(&commit), &ctx).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let mut pg = bob_phone.join(&bytes(&welcome)).unwrap();
+    let mut lg = bob_laptop.join(&bytes(&welcome)).unwrap();
+    let mut hub = Hub::new(&json!({"now": NOW, "kind": "group", "epoch": 1, "next_seq": 2,
+        "roster": {alice.clone(): [alice_dev.did()], bob.clone(): [bob_phone.did(), bob_laptop.did()]}}));
+
+    // Bob's phone proposes both of his leaves: its own by leave_group, the laptop's by propose_remove_member.
+    let laptop_idx = pg.members().find(|m| member_identity(&pg, m.index, &ctx).unwrap().device == bob_laptop.did()).unwrap().index;
+    let own = bytes(&pg.leave_group(bob_phone.provider(), &bob_phone.signer()).unwrap());
+    let other = bytes(&pg.propose_remove_member(bob_phone.provider(), &bob_phone.signer(), laptop_idx).unwrap().0);
+    for (n, p) in [(42u8, &own), (43, &other)] {
+        assert_eq!(view.observe_commit(p, &ctx).unwrap(), json!({"proposal": true, "valid": true}), "a proposal, not a commit");
+        let (_, e, _) = message_header(p).unwrap();
+        let out = hub.step(&json!({"deposit": {"id": ulid(n), "device": bob_phone.did(), "identity": bob, "class": "handshake",
+            "epoch": e, "digest": digest(p)}}));
+        assert!(out[0]["accepted"]["seq"].is_i64(), "a standalone proposal is sequenced: {out:?}");
+    }
+    // the proposals survive a restart of the hub's view
+    let mut view = HubView::load(&view.save()).unwrap();
+
+    // Each member's device stores the proposals and decides by the pinned rule.
+    let roster = |g: &MlsGroup| g.members().map(|m| member_identity(g, m.index, &ctx).unwrap())
+        .map(|w| json!({"identity": w.identity, "device": w.device})).collect::<Vec<_>>();
+    let decide = |g: &MlsGroup, me: &str| {
+        let mut removes = vec![];
+        for q in g.pending_proposals() {
+            if let Proposal::Remove(r) = q.proposal() {
+                let w = member_identity(g, r.removed(), &ctx).unwrap();
+                removes.push(json!({"identity": w.identity, "device": w.device}));
+            }
+        }
+        leave_proposals(&json!({"me": me, "proposer": {"identity": bob, "device": bob_phone.did()}, "removes": removes, "others": 0,
+            "roster": roster(g)}))
+    };
+    let store = |g: &mut MlsGroup, dev: &Device, p: &[u8]| {
+        let pm = MlsMessageIn::tls_deserialize(&mut &p[..]).unwrap().try_into_protocol_message().unwrap();
+        let ProcessedMessageContent::ProposalMessage(q) = g.process_message(dev.provider(), pm).unwrap().into_content() else {
+            panic!("not a proposal")
+        };
+        g.store_pending_proposal(dev.provider().storage(), *q).unwrap();
+    };
+    store(&mut ag, &alice_dev, &own);
+    assert_eq!(decide(&ag, &alice), json!({"action": "wait"}), "one of Bob's two leaves proposed so far");
+    store(&mut ag, &alice_dev, &other);
+    assert_eq!(decide(&ag, &alice), json!({"action": "commit"}));
+    store(&mut lg, &bob_laptop, &own);
+    store(&mut lg, &bob_laptop, &other);
+    assert_eq!(decide(&lg, &bob), json!({"action": "left"}), "Bob's own other device commits nothing");
+
+    // Alice commits the proposals by reference; the hub orders it as the removal of a whole identity.
+    let (commit, _, _) = ag.commit_to_pending_proposals(alice_dev.provider(), &alice_dev.signer()).unwrap();
+    let c = bytes(&commit);
+    let observed = view.observe_commit(&c, &ctx).unwrap();
+    assert_eq!(observed["valid"], true, "{observed}");
+    let removed: std::collections::BTreeSet<String> = observed["removes"].as_array().unwrap().iter().map(|r| r["device"].as_str().unwrap().to_string()).collect();
+    assert_eq!(removed, [bob_phone.did(), bob_laptop.did()].into_iter().collect());
+    let (_, e, _) = message_header(&c).unwrap();
+    let out = hub.step(&json!({"deposit": {"id": ulid(44), "device": alice_dev.did(), "identity": alice, "class": "handshake",
+        "epoch": e, "digest": digest(&c), "commit": observed}}));
+    assert!(out[0]["accepted"]["seq"].is_i64(), "the hub orders the leave: {out:?}");
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    assert_eq!(roster(&ag).len(), 1, "only Alice is left");
+
+    // Bob's phone processes the commit and finds itself removed.
+    let pm = MlsMessageIn::tls_deserialize(&mut &c[..]).unwrap().try_into_protocol_message().unwrap();
+    let ProcessedMessageContent::StagedCommitMessage(staged) = pg.process_message(bob_phone.provider(), pm).unwrap().into_content() else {
+        panic!("not a commit")
+    };
+    pg.merge_staged_commit(bob_phone.provider(), *staged).unwrap();
+    assert!(!pg.is_active(), "Bob's phone is no longer in the group");
+}

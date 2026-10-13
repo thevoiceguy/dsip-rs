@@ -55,6 +55,7 @@ pub fn run_vector(v: &Value) -> Value {
         "object" => checks::check_object(&inp["object"], &v["context"]),
         "conversation-ext" => checks::check_conversation_ext(&inp["extension"]),
         "external-join" => checks::check_external_join(inp),
+        "leave-proposals" => checks::leave_proposals(inp),
         "conversation-update" => checks::check_conversation_update(&inp["before"], &inp["after"]),
         "mailbox-select" => client::select_mailbox(inp),
         "mailbox-switch" => client::mailbox_switch(inp),
