@@ -108,6 +108,9 @@ try {
   await eve.page.fill('#introduce-purpose', 'Old friend');
   await eve.page.click('#introduce-form button[type=submit]');
   await until(bob.page, () => window.dsip.requests().length === 1);
+  // the request is in storage once drawn (its purpose stored) and the contact file's write has finished
+  await until(bob.page, () => document.getElementById('request-list').textContent.includes('Old friend'));
+  await bob.page.evaluate(() => window.dsip.saved());
   await bob.page.reload();
   await ready(bob.page);
   check('Bob: the request survives a reload with its purpose', (await bob.page.evaluate(() => window.dsip.requests())).length === 1 && (await bob.page.textContent('#request-list')).includes('Old friend'));

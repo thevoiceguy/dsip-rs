@@ -317,8 +317,11 @@ function renderRelay(text, state) {
 
 // ---------------------------------------------------------------- persistence
 
-async function persist() {
-  await store.set(key('engine.contacts'), engine.contactsFile());
+let lastPersist = Promise.resolve();
+/** The engine's contact file to storage; the write in flight is kept so a caller can wait for it. */
+function persist() {
+  lastPersist = store.set(key('engine.contacts'), engine.contactsFile());
+  return lastPersist;
 }
 
 function renderLinks() {
@@ -1721,6 +1724,7 @@ function renderMessages() {
     contacts: () => contacts.map((c) => c.did),
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
     requests: () => engine.requests(),
+    saved: () => lastPersist,   // resolves once the latest contact-file write is in storage
     links: () => links.map((l) => l.url),
     note: () => $('call-note').textContent,
     mode: () => $('call-mode').textContent,

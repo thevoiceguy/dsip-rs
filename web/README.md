@@ -224,6 +224,8 @@ test/messaging-successor.mjs  round 2D: a conversation hubbed at a third mailbox
                         Bob without a grant; Bob checks it and joins; the message arrives; the thread is kept
 test/messaging-pending.mjs  a lost answer: the personal group's GroupInfo deposit is dropped; a reload, and a move to
                         mailbox B, send it again and the personal group comes up (M§9.3, spec-gap 122)
+test/messaging-rebind.mjs  a device binds again while its old connection is still open (a reload, or a second
+                        tab); the connection that syncs live keeps being pushed to after the old one closes (M§5.4)
 test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
                         yields a record, held until that conversation exists (spec-gaps 121, 123)
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
@@ -299,8 +301,10 @@ Bob name her as record-keeper, and she opens a conversation with Alice; Alice's 
 sends no content there. Alice calls Bob, Bob answers, Alice hangs up: Alice's record goes out, Bob's is held until
 Kim opens his conversation, then sent. Bob calls Alice and she declines. Kim holds four records (answered/local,
 answered/remote, declined/local, declined/remote), each naming its sending device and the relay. The two sides'
-evidence for a call shares the hashes of the frames the relay carried, and a reload keeps them. CI runs all thirteen
-in Firefox and Chromium.
+evidence for a call shares the hashes of the frames the relay carried, and a reload keeps them.
+`messaging-rebind.mjs`: a second tab of the same device binds to the mailbox and syncs live, then the first tab
+closes; the mailbox must keep pushing to the second (it found the mailbox handing the binding to a connection it then
+never pushed to). CI runs all fourteen in Firefox and Chromium.
 
 **Call records (v0.13, Recording Profile C§9).** With a record-keeper named in Settings, the client sends a
 `call-record` after every session leg. It holds the leg's frames as sent or accepted (`evidence` is the SHA-256 of

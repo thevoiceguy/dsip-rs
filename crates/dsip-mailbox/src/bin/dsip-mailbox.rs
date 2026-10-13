@@ -1194,6 +1194,9 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
                 },
                 inbound = ws.next() => match inbound {
                     Some(Ok(WsMessage::Text(t))) => {
+                        if is_live_sync(&t) {
+                            take_binding(&service, &device, &tx).await;
+                        }
                         let replies = handle(&service, t.to_string(), &device, &identity).await;
                         for frame in replies {
                             ws.send(WsMessage::Text(frame.into())).await?;
@@ -1223,6 +1226,28 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
         }
     }
     result
+}
+
+/// Whether a frame is a `sync` asking for live push (M§5.4). Only the shape is read here; `handle` verifies it.
+fn is_live_sync(frame: &str) -> bool {
+    Envelope::from_frame(frame).ok().and_then(|e| wire::payload_of(&e)).is_some_and(|p| p["type"] == "sync" && p["live"] == json!(true))
+}
+
+/// The connection that syncs live is the device's binding (M§5.4: live push belongs to a connection). A second
+/// connection that does so (the device reloaded while its old connection was still closing) takes the binding at
+/// once, and the old one becomes the standby, whose end changes nothing. A short-lived second connection that never
+/// syncs (a KeyPackage fetch at its own mailbox) stays a standby. Without this, the old connection's end would mark
+/// the device not live and hand the binding to a connection that had already synced, which would never be pushed to.
+async fn take_binding(service: &Arc<Mutex<Service>>, device: &str, tx: &mpsc::UnboundedSender<String>) {
+    let mut st = service.lock().await;
+    if !st.standby.get(device).is_some_and(|t| t.same_channel(tx)) {
+        return;
+    }
+    st.standby.remove(device);
+    if let Some(old) = st.bound.insert(device.to_string(), tx.clone()).filter(|t| !t.is_closed()) {
+        st.standby.insert(device.to_string(), old);
+    }
+    tracing::info!("bound {device} on its later connection, which synced live");
 }
 
 /// Verify one frame and run it through the state machines; returns frames for this connection.
