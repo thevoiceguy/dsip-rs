@@ -120,6 +120,7 @@ pub const MESSAGE_TYPES: &[&str] = &[
     "publish", "subscribe", "notify", "unpublish", "error", "hello",
     "provenance", "key-rotation", "reachability-hint", // v0.7: §22.3, §7.5, DHT Hints Profile
     "delegation-revocation",                           // v0.8: §7.4 (spec-gap 57)
+    "alias-monitor",                                   // v0.14: Alias Transparency T§8 (spec-gap 124)
 ];
 
 /// `dsip-integrity-mode` registered values (§22.2). Unknown values resolve to `metadata-only`.
