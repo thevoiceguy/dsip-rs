@@ -227,7 +227,8 @@ test/messaging-pending.mjs  a lost answer: the personal group's GroupInfo deposi
 test/messaging-rebind.mjs  a device binds again while its old connection is still open (a reload, or a second
                         tab); the connection that syncs live keeps being pushed to after the old one closes (M§5.4)
 test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
-                        yields a record, held until that conversation exists (spec-gaps 121, 123)
+                        yields a record, held until that conversation exists (spec-gaps 121, 123); a party accepts
+                        the recorder before writing there (C§5)
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
@@ -301,7 +302,9 @@ Bob name her as record-keeper, and she opens a conversation with Alice; Alice's 
 sends no content there. Alice calls Bob, Bob answers, Alice hangs up: Alice's record goes out, Bob's is held until
 Kim opens his conversation, then sent. Bob calls Alice and she declines. Kim holds four records (answered/local,
 answered/remote, declined/local, declined/remote), each naming its sending device and the relay. The two sides'
-evidence for a call shares the hashes of the frames the relay carried, and a reload keeps them.
+evidence for a call shares the hashes of the frames the relay carried, and a reload keeps them. Alice is then asked
+to accept Kim's recorder; she accepts, the acceptance goes to her personal group, her message reaches Kim's
+recorder device, and after a reload the conversation stays accepted.
 `messaging-rebind.mjs`: a second tab of the same device binds to the mailbox and syncs live, then the first tab
 closes; the mailbox must keep pushing to the second (it found the mailbox handing the binding to a connection it then
 never pushed to). CI runs all fourteen in Firefox and Chromium.
@@ -313,8 +316,10 @@ come from the frame that ended the leg (sent: `local`; received: `remote`). The 
 pinned order, checks the record as the record-keeper will, and holds it until the record-keeper has opened the
 conversation (spec-gap 123). "Make this identity a record-keeper" re-delegates the device with `dsip.record` and
 starts its messaging afresh with no personal group; its Messages screen lists the records received. A conversation
-recorded by another identity is labelled as recorded, and no content is sent there: this client has no screen to
-accept a recorder (C§5). Not done: `ended_by: transport` (a relay that drops mid-call does not end the session here)
+recorded by another identity is labelled as recorded, naming each recorder device. Until the user accepts every
+recorder present ("Accept recording"), no content and no receipt is sent there. The acceptance goes to the personal
+group as a `recording-acceptance`, so the identity's other devices accept them too, and a recorder that joins later
+asks again (C§5). Not accepting is staying silent: leaving a conversation (M§7) is not in this client. Not done: `ended_by: transport` (a relay that drops mid-call does not end the session here)
 and the `recording` field (the browser declares no recording).
 
 ## Identity

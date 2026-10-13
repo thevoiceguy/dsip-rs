@@ -289,6 +289,9 @@ pub struct Messenger {
     records_held: Vec<Value>,
     /// As a record-keeper: the records received, `{group, from, device, received_at, record}`, one per session leg.
     records: Vec<Value>,
+    /// Recorder devices this identity accepted, by conversation id: this device's acceptances and its siblings', from
+    /// the `recording-acceptance` objects in the personal group (C§5: the union).
+    recording_accepted: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[wasm_bindgen]
@@ -363,6 +366,7 @@ impl Messenger {
             recorder: dsip_core::delegation::capabilities(&delegation).iter().any(|c| c == "dsip.record"),
             records_held: st["records_held"].as_array().cloned().unwrap_or_default(),
             records: st["records"].as_array().cloned().unwrap_or_default(),
+            recording_accepted: serde_json::from_value(st["recording_accepted"].clone()).unwrap_or_default(),
         };
         if let Some(t) = st["hub_timeout"].as_i64() {
             m.hub_timeout = t;
@@ -420,7 +424,7 @@ impl Messenger {
             "outages": self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
             "hub_timeout": self.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
             "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
-            "records_held": self.records_held, "records": self.records,
+            "records_held": self.records_held, "records": self.records, "recording_accepted": self.recording_accepted,
         }}).to_string()
     }
 
@@ -749,6 +753,32 @@ impl Messenger {
         Ok(json!(frames).to_string())
     }
 
+    /// The user accepted the recording of `gid` (C§5): every recorder now in it is accepted for this conversation, and
+    /// a `recording-acceptance` goes to the personal group so this identity's other devices accept them too. Returns
+    /// `{accepted: [device], frames}`; content may then be sent there. A recorder that joins later asks again.
+    ///
+    /// Spec: C§5 "Acceptance is the person's, not one device's".
+    pub fn accept_recording(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
+        let now_i = now as i64;
+        let gid = &self.live(gid);
+        let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        let rec = self.recording_of(&self.leaves_of(gid, now_i), &conversation);
+        let devices: Vec<String> = rec["pending"].as_array().into_iter().flatten().filter_map(|r| r["device"].as_str().map(String::from)).collect();
+        if devices.is_empty() {
+            return Err(JsValue::from_str("no recorder to accept in this conversation"));
+        }
+        self.recording_accepted.entry(conversation.clone()).or_default().extend(devices.iter().cloned());
+        let mut frames = vec![];
+        if let Some(personal) = self.personal.clone() {
+            let obj = json!({"object": "recording-acceptance", "conversation": conversation, "recorders": devices, "accepted_at": now_i});
+            let f = self.send_object(&personal, &obj, now_i)?;
+            if !f.is_empty() {
+                frames.push(f);
+            }
+        }
+        Ok(json!({"accepted": devices, "frames": frames}).to_string())
+    }
+
     /// How many of this device's call records wait for the conversation with the record-keeper (C§9).
     pub fn held_records(&self) -> usize {
         self.records_held.len()
@@ -1059,18 +1089,20 @@ impl Messenger {
         self.send_object(gid, &obj, now_i)
     }
 
-    /// Conversations: `[{group, conversation, kind, peer, members, epoch, hub, pending}]`; members are the leaves
-    /// that authenticate at `now` (M§6.2).
+    /// Conversations: `[{group, conversation, kind, peer, members, epoch, hub, pending, recorded, recorders, may_send,
+    /// recorders_pending}]`; members are the leaves that authenticate at `now` (M§6.2); `pending` counts items not yet
+    /// accepted by the hub; `recorders_pending` lists the recorders the user has still to accept (C§5).
     pub fn conversations(&self, now: f64) -> String {
         let ctx = Context::new(now as i64, &self.resolver);
         let list: Vec<Value> = self.convs.iter().filter(|(g, _)| !self.successors.successor(g).is_some_and(|w| self.convs.contains_key(w) && w != g.as_str())).map(|(g, c)| {
             let leaves: Vec<_> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect();
-            let recording = self.recording_of(&leaves);
+            let recording = self.recording_of(&leaves, &c.conversation);
             let mut members: Vec<String> = leaves.into_iter().map(|w| w.identity).collect();
             members.sort();
             members.dedup();
             json!({"group": g, "conversation": c.conversation, "kind": c.kind, "peer": c.peer, "members": members, "epoch": c.group.epoch().as_u64(),
                    "recorded": recording["recorded"], "recorders": recording["recorders"], "may_send": recording["may_send"],
+                   "recorders_pending": recording["pending"],
                    "hub": {"did": c.hub.0, "uri": c.hub.1}, "pending": self.outbox.get(g).map_or(0, Vec::len) + self.handover.get(g).map_or(0, Vec::len),
                    "hub_down": self.outages.get(g).is_some_and(HubOutage::is_down),
                    "predecessors": self.lineage(g).into_iter().filter(|x| x != g).collect::<Vec<_>>()})
@@ -1287,12 +1319,24 @@ impl Messenger {
 
     /// Encrypt an application object and deposit it; pending until accepted (M§9.2).
     /// Whether a conversation is recorded and by whom, from its members' leaves (C§5, the pinned `conversation`
-    /// check). Impl: this client has no acceptance screen, so it accepts only its own identity's recorders, which C§5
-    /// says need none; content never goes to a conversation recorded by another identity (spec-gap 123).
-    fn recording_of(&self, leaves: &[dsip_messaging::mls_wire::LeafIdentity]) -> Value {
+    /// check), with the recorders accepted: this identity's own (C§5: they need none) and those its devices accepted
+    /// for this conversation. `pending` lists the recorders still to accept: a new one asks again.
+    fn recording_of(&self, leaves: &[dsip_messaging::mls_wire::LeafIdentity], conversation: &str) -> Value {
         let leaves_json: Vec<Value> = leaves.iter().map(|w| json!({"device": w.device, "subject": w.identity, "capabilities": w.capabilities})).collect();
-        let accepted: Vec<&str> = leaves.iter().filter(|w| w.is_recorder() && w.identity == self.keys.identity).map(|w| w.device.as_str()).collect();
-        dsip_recording::conversation(&json!({"leaves": leaves_json, "accepted": accepted}))
+        let mine = self.recording_accepted.get(conversation);
+        let accepted: Vec<&str> = leaves.iter().filter(|w| w.is_recorder())
+            .filter(|w| w.identity == self.keys.identity || mine.is_some_and(|m| m.contains(&w.device))).map(|w| w.device.as_str()).collect();
+        let mut out = dsip_recording::conversation(&json!({"leaves": leaves_json, "accepted": accepted}));
+        let pending: Vec<Value> = out["recorders"].as_array().into_iter().flatten()
+            .filter(|r| !r["device"].as_str().is_some_and(|d| accepted.contains(&d))).cloned().collect();
+        out["pending"] = json!(pending);
+        out
+    }
+
+    /// The members' leaves of a group this device is in, authenticated at `now` (M§6.2).
+    fn leaves_of(&self, gid: &str, now: i64) -> Vec<dsip_messaging::mls_wire::LeafIdentity> {
+        let ctx = Context::new(now, &self.resolver);
+        self.convs.get(gid).map(|c| c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect()).unwrap_or_default()
     }
 
     /// Content may go to `gid` (C§5): this device is not a recorder, which never speaks, and every recorder in the
@@ -1301,11 +1345,9 @@ impl Messenger {
         if self.recorder {
             return Err(JsValue::from_str("this device is a recorder: it never sends content (C§5)"));
         }
-        let ctx = Context::new(now, &self.resolver);
-        let c = self.convs.get(gid).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        let leaves: Vec<_> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect();
-        if self.recording_of(&leaves)["may_send"] != json!(true) {
-            return Err(JsValue::from_str("this conversation is recorded by another identity and its recorder is not accepted here: no content is sent (C§5)"));
+        let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        if self.recording_of(&self.leaves_of(gid, now), &conversation)["may_send"] != json!(true) {
+            return Err(JsValue::from_str("this conversation is recorded and a recorder is not accepted: no content is sent (C§5)"));
         }
         Ok(())
     }
@@ -1750,6 +1792,13 @@ impl Messenger {
                 out.push(json!({"ui": "call_event", "session": object["session"], "peer": object["peer"], "outcome": object["outcome"],
                     "from_device": sender_device, "collapsed": !fresh}));
             }
+            Some("recording-acceptance") => {
+                // C§5: each device accepts the union of its own acceptances and those in its personal group
+                let conv = s_of(&object["conversation"]);
+                let devices: Vec<String> = object["recorders"].as_array().into_iter().flatten().filter_map(|d| d.as_str().map(String::from)).collect();
+                self.recording_accepted.entry(conv.clone()).or_default().extend(devices.iter().cloned());
+                out.push(json!({"ui": "recording_accepted", "conversation": conv, "recorders": devices, "from_device": sender_device}));
+            }
             Some("call-record") if self.recorder => {
                 // C§9: a record-keeper keeps one record per session leg (the sending device's)
                 let fresh = !self.records.iter().any(|r| r["record"]["session"] == object["session"] && r["device"] == sender_device);
@@ -2040,6 +2089,11 @@ impl Messenger {
             } else {
                 gid.to_string()
             };
+            if target == gid && self.may_send_content(gid, now).is_err() {
+                // C§5: no receipts into a recorded conversation until its recorders are accepted (nor ever from a recorder)
+                out.push(json!({"ui": "receipt_withheld", "group": gid, "kind": kind}));
+                continue;
+            }
             let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).unwrap_or_default();
             let mut obj = json!({"object": "receipt", "id": self.fresh_id(now), "conversation": conversation, "sender": self.keys.identity,
                 "sent_at": now, "kind": kind});

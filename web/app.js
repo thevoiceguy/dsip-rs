@@ -838,6 +838,18 @@ async function flushRecords() {
   } catch (e) { log(`✗ held call records: ${e.message || e}`, 'C§9'); }
 }
 
+/** C§5: the user accepts every recorder now in the conversation; the acceptance goes to the personal group so this
+ *  identity's other devices accept them too. */
+async function acceptRecording(gid) {
+  if (!messenger) return;
+  try {
+    const out = JSON.parse(messenger.accept_recording(gid, now()));
+    await driveMailbox(out.frames.map((f) => ({ send: f })));
+    log(`recording accepted: ${out.accepted.map(short).join(', ')}${out.frames.length ? '; your other devices are told through the personal group' : ''}`, 'C§5');
+  } catch (e) { notify(`${e.message || e}`); }
+  renderMessages();
+}
+
 /** Make this identity a record-keeper: its device re-delegated with `dsip.record` (C§5, C§9). */
 async function becomeRecordKeeper() {
   if (!identity.controller_seed_hex) return notify('only a device holding the identity key can re-delegate itself (§7.4)');
@@ -1235,7 +1247,7 @@ function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
     key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
     archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5',
-    call_record: 'C§9', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
+    call_record: 'C§9', recording_accepted: 'C§5', receipt_withheld: 'C§5', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
   log(`◇ ${e.ui} ${fields}`, sec);
   if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
@@ -1525,8 +1537,16 @@ function renderMessages() {
   const recorders = (conv?.recorders || []).map((r) => `${r.subject === identity.identity ? 'you' : nameOf(r.subject) || short(r.subject)} (device ${short(r.device)})`);
   const keeperConv = conv && conv.peer && conv.peer === settings.record_keeper;
   $('thread-meta').textContent = conv ? `group ${conv.group} · hub ${short(conv.hub.did)} (${conv.hub.did === mb?.did ? 'our mailbox' : 'their mailbox'}) · epoch ${conv.epoch}`
-    + (conv.recorded ? ` · ⏺ RECORDED by ${recorders.join(', ')} (C§5)${keeperConv ? ': your record-keeper; call records go here, nothing else (C§9)' : conv.may_send ? '' : '; nothing you write is sent here: this client cannot accept a recorder'}` : '') : '';
+    + (conv.recorded ? ` · ⏺ RECORDED by ${recorders.join(', ')} (C§5)${keeperConv ? ': your record-keeper; call records go here (C§9)' : ''}` : '') : '';
   $('thread-meta').classList.toggle('warn', !!conv?.recorded);
+  // C§5: content and receipts wait until the user accepts every recorder present; a new recorder asks again
+  const ask = conv && conv.recorders_pending?.length && !messenger.is_recorder();
+  $('recording-ask').classList.toggle('hidden', !ask);
+  if (ask) {
+    $('recording-ask-text').textContent = `${conv.recorders_pending.map((r) => `${nameOf(r.subject) || short(r.subject)} records this conversation on device ${short(r.device)}`).join('; ')}. `
+      + 'Nothing you write, and no receipt, is sent here until you accept. Not accepting is staying silent (C§5).';
+    $('btn-accept-recording').onclick = () => acceptRecording(conv.group);
+  }
   const th = $('thread');
   th.innerHTML = '';
   const timeline = conv ? JSON.parse(messenger.timeline(conv.group)) : [];
@@ -1743,6 +1763,7 @@ function renderMessages() {
     isRecorder: () => !!messenger?.is_recorder(),
     records: () => (messenger ? JSON.parse(messenger.records()) : []),
     heldRecords: () => (messenger ? messenger.held_records() : 0),
+    acceptRecording,
     personalGroup: () => messenger?.personal() || null,
     messengerSaved: () => store.get(key('messenger')),
     readMarks: (gid) => (messenger ? JSON.parse(messenger.read_marks(gid || activeConv)) : {}),
