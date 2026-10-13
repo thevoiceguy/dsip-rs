@@ -354,6 +354,7 @@ async function onReceived(r) {
     // what the request will show: the stated purpose (a claim) and the introducer's §18.1 basis
     purposes[m.id] = { purpose: p.purpose || '', basis: verification_basis(r.identity, JSON.stringify((p.identity && p.identity.claims) || [])) };
     await store.set(key('purposes'), purposes);
+    renderContacts();   // the request is listed now, with its purpose and basis
     return;
   }
   if (m.type === 'error') log(`   error ${m.reason || ''}${p.detail ? ': ' + (typeof p.detail === 'string' ? p.detail : JSON.stringify(p.detail)) : ''}`, '§15');
