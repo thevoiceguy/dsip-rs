@@ -127,8 +127,9 @@ enum Op {
 /// A deposit awaiting the hub's answer, by deposit id (M§9.2).
 #[derive(Clone)]
 enum Pending {
-    /// A commit staged in the group: merged on `accepted`, discarded on refusal (M§6.5).
-    Commit { gid: String, op: Option<Op> },
+    /// A commit staged in the group: merged on `accepted`, discarded on refusal (M§6.5). `fields` are the deposit's,
+    /// re-deposited as the same MLS bytes when the answer is lost (M§9.3).
+    Commit { gid: String, op: Option<Op>, fields: Value },
     /// A GroupInfo for the hub (M§6.5 rule 6); `then` is proposed once it is accepted.
     GroupInfo { gid: String, then: Option<Op> },
     /// An application message of this device's own, in the outbox until accepted (M§9.2).
@@ -137,10 +138,66 @@ enum Pending {
     PersonalReady { gid: String },
     /// A KeyPackage upload (M§5.5).
     KeyPackages { count: usize },
-    /// A `mailbox-config` (M§6.6).
-    Config,
-    /// An archive record deposited to our mailbox (M§12.2); acknowledged, nothing else to do.
-    Archive,
+    /// A `mailbox-config` (M§6.6) with these fields.
+    Config { fields: Value },
+    /// An archive record deposited to our mailbox (M§12.2) with these fields; acknowledged, nothing else to do.
+    Archive { fields: Value },
+}
+
+impl Op {
+    fn to_json(&self) -> Value {
+        match self {
+            Op::Add { peer, kps, grants, device } => {
+                json!({"add": {"peer": peer, "kps": kps.iter().map(|k| b64(k)).collect::<Vec<_>>(), "grants": grants, "device": device}})
+            }
+            Op::Rejoin => json!("rejoin"),
+        }
+    }
+
+    fn from_json(v: &Value) -> Option<Op> {
+        if v == "rejoin" {
+            return Some(Op::Rejoin);
+        }
+        let a = v.get("add")?;
+        Some(Op::Add {
+            peer: s_of(&a["peer"]),
+            kps: a["kps"].as_array()?.iter().map(unb64).collect(),
+            grants: serde_json::from_value(a["grants"].clone()).unwrap_or_default(),
+            device: a["device"].as_str().map(String::from),
+        })
+    }
+}
+
+impl Pending {
+    /// What survives a restart: everything but application items, which the outbox holds (M§9.2), and key package
+    /// uploads, made afresh.
+    fn to_json(&self) -> Option<Value> {
+        Some(match self {
+            Pending::Commit { gid, op, fields } => json!({"commit": {"gid": gid, "op": op.as_ref().map(Op::to_json), "fields": fields}}),
+            Pending::GroupInfo { gid, then } => json!({"group_info": {"gid": gid, "then": then.as_ref().map(Op::to_json)}}),
+            Pending::PersonalReady { gid } => json!({"personal_ready": gid}),
+            Pending::Config { fields } => json!({"config": fields}),
+            Pending::Archive { fields } => json!({"archive": fields}),
+            Pending::Application { .. } | Pending::KeyPackages { .. } => return None,
+        })
+    }
+
+    fn from_json(v: &Value) -> Option<Pending> {
+        let op = |o: &Value| if o.is_null() { None } else { Op::from_json(o) };
+        if let Some(c) = v.get("commit") {
+            return Some(Pending::Commit { gid: s_of(&c["gid"]), op: op(&c["op"]), fields: c["fields"].clone() });
+        }
+        if let Some(g) = v.get("group_info") {
+            return Some(Pending::GroupInfo { gid: s_of(&g["gid"]), then: op(&g["then"]) });
+        }
+        if let Some(g) = v.get("personal_ready") {
+            return Some(Pending::PersonalReady { gid: s_of(g) });
+        }
+        if let Some(f) = v.get("config") {
+            return Some(Pending::Config { fields: f.clone() });
+        }
+        v.get("archive").map(|f| Pending::Archive { fields: f.clone() })
+    }
 }
 
 /// What processing one inbound item produced.
@@ -268,7 +325,8 @@ impl Messenger {
             personal: st["personal"].as_str().map(String::from),
             resume: Resume::new(if st["resume"].is_object() { &st["resume"] } else { &Value::Null }),
             own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
-            pending: BTreeMap::new(),
+            // M§9.3: deposits awaiting an answer are sent again at the next binding (redeposit_pending)
+            pending: st["pending"].as_object().into_iter().flatten().filter_map(|(id, p)| Some((id.clone(), Pending::from_json(p)?))).collect(),
             outbox: serde_json::from_value(st["outbox"].clone()).unwrap_or_default(),
             messages: st["messages"].as_array().cloned().unwrap_or_default(),
             shown: st["messages"].as_array().into_iter().flatten().map(|m| s_of(&m["key"])).collect(),
@@ -349,6 +407,7 @@ impl Messenger {
             "read_disclosed": self.read_disclosed, "calls": self.calls,
             "outages": self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
             "hub_timeout": self.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
+            "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
         }}).to_string()
     }
 
@@ -782,17 +841,17 @@ impl Messenger {
     /// What to send on a fresh binding: pending application items again (M§9.3, the same bytes), then a sync.
     pub fn on_bound(&mut self, now: f64) -> String {
         let mut frames = vec![];
+        let moved = self.moved_from.is_some();
         if let Some(old) = self.moved_from.take() {
             // spec-gap 122: a mailbox this identity moved to learns its groups, so hubs' fan-out is admitted (M§6.6)
             let groups: Vec<Value> = self.convs.iter().map(|(g, c)| json!({"group": g, "state": "joined", "hub": c.hub.0, "hub_uri": c.hub.1})).collect();
             if !groups.is_empty() {
-                let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now as i64, wire::TTL_S,
-                    json!({"subject": self.keys.identity, "groups": groups}));
-                self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+                let env = self.config_env(json!({"subject": self.keys.identity, "groups": groups}), now as i64);
                 frames.push(env.frame());
             }
             let _ = old;
         }
+        frames.extend(self.redeposit_pending(moved, now as i64));
         for (gid, items) in self.outbox.clone() {
             if self.outages.get(&gid).is_some_and(|o| o.is_down() || o.is_abandoned()) {
                 continue; // M§9.4: the outage's own backoff re-deposits the head (tick)
@@ -803,6 +862,46 @@ impl Messenger {
         }
         frames.push(self.sync_frame(true, now));
         json!(frames).to_string()
+    }
+
+    /// Deposits whose answer a binding that ended took with it, sent again under fresh envelopes: a GroupInfo as a new
+    /// export, a commit as the same MLS bytes (the hub answers a duplicate digest with its seq, M§6.5), a
+    /// `mailbox-config` or archive record with the same fields. Application items go again from the outbox.
+    ///
+    /// Spec: M§9.3. Impl (spec-gap 122): after a move the new mailbox's registration of every group supersedes a
+    /// pending `mailbox-config` at the old one, and an archive record goes to the new mailbox; key packages are
+    /// uploaded afresh by the host when the mailbox reports none.
+    fn redeposit_pending(&mut self, moved: bool, now: i64) -> Vec<String> {
+        let mut frames = vec![];
+        for (id, p) in self.pending.clone() {
+            let frame = match &p {
+                Pending::GroupInfo { gid, .. } if self.convs.contains_key(gid) && !self.outages.get(gid).is_some_and(|o| o.is_down() || o.is_abandoned()) => {
+                    self.group_info_frame(gid, now).ok()
+                }
+                Pending::Commit { gid, fields, .. } if self.convs.contains_key(gid) => Some(self.hub_deposit(gid, "handshake", fields.clone(), now)),
+                Pending::Config { fields } if !moved => Some(wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S, fields.clone()).frame()),
+                Pending::Archive { fields } => {
+                    let gid = s_of(&fields["ref_group"]);
+                    Some(wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &self.mailbox.0, now, &gid, "archive", fields.clone()).frame())
+                }
+                Pending::GroupInfo { .. } | Pending::Commit { .. } | Pending::Config { .. } | Pending::KeyPackages { .. } => None,
+                Pending::Application { .. } | Pending::PersonalReady { .. } => continue,
+            };
+            self.pending.remove(&id);
+            if let Some(f) = frame {
+                let nid = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+                self.pending.insert(nid, p);
+                frames.push(f);
+            }
+        }
+        frames
+    }
+
+    /// A `mailbox-config` to this device's mailbox (M§6.6), pending until answered.
+    fn config_env(&mut self, fields: Value, now: i64) -> Envelope {
+        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S, fields.clone());
+        self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config { fields });
+        env
     }
 
     /// Create this identity's personal group at its mailbox (M§7.1): the `mailbox-config` that registers it and the
@@ -1047,9 +1146,7 @@ impl Messenger {
             group, conversation, kind: kind.to_string(), hub: (self.mailbox.0.clone(), self.mailbox.1.clone()), peer: None,
             receipts: self.new_receipts(now), joined_epoch: epoch, batch: vec![],
         });
-        let config = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
-            json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined", "hub": self.mailbox.0}]}));
-        self.pending.insert(wire::payload_of(&config).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+        let config = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined", "hub": self.mailbox.0}]}), now);
         let gi = self.group_info_frame(&gid, now)?;
         Ok((gid, vec![config.frame(), gi]))
     }
@@ -1091,9 +1188,9 @@ impl Messenger {
         if !grants.is_empty() {
             fields["grants"] = json!(grants);
         }
-        let frame = self.hub_deposit(gid, "handshake", fields, now);
+        let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
         let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-        self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()) });
+        self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
         Ok(frame)
     }
 
@@ -1147,7 +1244,7 @@ impl Messenger {
         let mut out = vec![];
         let Some(pending) = self.pending.remove(&s_of(&p["in_reply_to"])) else { return out };
         match pending {
-            Pending::Commit { gid, op: Some(Op::Rejoin) } => {
+            Pending::Commit { gid, op: Some(Op::Rejoin), .. } => {
                 // M§6.8: the external commit is already applied locally (OpenMLS stores it merged)
                 let Some(c) = self.convs.get(&gid) else { return out };
                 let (epoch, kind, conversation) = (c.group.epoch().as_u64(), c.kind.clone(), c.conversation.clone());
@@ -1161,9 +1258,7 @@ impl Messenger {
                     self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
                 }
                 self.retries.remove(&gid);
-                let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
-                    json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined"}]}));
-                self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+                let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined"}]}), now);
                 out.push(json!({"send": env.frame()}));
                 out.push(json!({"ui": "joined", "group": gid, "conversation": conversation, "kind": kind, "members": members, "epoch": epoch,
                     "external": true, "seq": p["seq"]}));
@@ -1174,7 +1269,7 @@ impl Messenger {
                     out.push(json!({"send": f}));
                 }
             }
-            Pending::Commit { gid, op } => {
+            Pending::Commit { gid, op, .. } => {
                 if let Some(c) = self.convs.get_mut(&gid) {
                     if let Err(e) = c.group.merge_pending_commit(self.mls.provider()) {
                         out.push(json!({"error": format!("merge commit: {e:?}")}));
@@ -1270,8 +1365,8 @@ impl Messenger {
             }
             Pending::PersonalReady { .. } => {}
             Pending::KeyPackages { count } => out.push(json!({"ui": "key_packages_uploaded", "count": count})),
-            Pending::Config => {}
-            Pending::Archive => out.push(json!({"ui": "archived", "duplicate": p["duplicate"]})),
+            Pending::Config { .. } => {}
+            Pending::Archive { .. } => out.push(json!({"ui": "archived", "duplicate": p["duplicate"]})),
         }
         out
     }
@@ -1285,7 +1380,7 @@ impl Messenger {
             return out;
         };
         match pending {
-            Pending::Commit { gid, op } => {
+            Pending::Commit { gid, op, .. } => {
                 let mut retry = self.retries.remove(&gid).map(|(r, _)| r).unwrap_or_else(|| CommitRetry::new(&json!({})));
                 for action in retry.answer(Some(&reason)) {
                     if action.get("discard").is_some() {
@@ -1327,8 +1422,8 @@ impl Messenger {
             }
             Pending::PersonalReady { .. } => {}
             Pending::KeyPackages { .. } => out.push(json!({"refused": format!("key packages: {reason}")})),
-            Pending::Config => out.push(json!({"refused": format!("mailbox-config: {reason}")})),
-            Pending::Archive => out.push(json!({"refused": format!("archive record: {reason}")})),
+            Pending::Config { .. } => out.push(json!({"refused": format!("mailbox-config: {reason}")})),
+            Pending::Archive { .. } => out.push(json!({"refused": format!("archive record: {reason}")})),
         }
         out
     }
@@ -1470,9 +1565,7 @@ impl Messenger {
                 }
                 self.history.step(&json!({"joined": {"group": group, "epoch": epoch}}));
                 // M§6.6: confirm the pending registration
-                let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
-                    json!({"subject": self.keys.identity, "groups": [{"group": group, "state": "joined"}]}));
-                self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+                let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": group, "state": "joined"}]}), now);
                 out.push(json!({"send": env.frame()}));
                 out.push(json!({"ui": "joined", "group": group, "conversation": conv["conversation"], "kind": kind, "members": members, "epoch": epoch,
                     "successor_of": conv["successor_of"]}));
@@ -1498,9 +1591,7 @@ impl Messenger {
                 out.push(json!({"ui": "removed", "group": gid, "by": by, "conversation": c.map(|c| c.conversation)}));
                 let decision = registration_on_removal(&json!({"me": self.keys.identity, "remaining_identities": remaining}));
                 if decision["left"] == json!(true) {
-                    let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
-                        json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}));
-                    self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+                    let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}), now);
                     out.push(json!({"send": env.frame()}));
                 }
             }
@@ -1599,9 +1690,10 @@ impl Messenger {
             }
         }
         let bytes = commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?;
-        let frame = self.hub_deposit(gid, "handshake", json!({"mls": b64(&bytes)}), now);
+        let fields = json!({"mls": b64(&bytes)});
+        let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
         let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-        self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(Op::Rejoin) });
+        self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(Op::Rejoin), fields });
         Ok(frame)
     }
 
@@ -1750,9 +1842,7 @@ impl Messenger {
         }
         self.outbox.remove(gid);
         self.outages.remove(gid);
-        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
-            json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}));
-        self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config);
+        let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}), now);
         vec![env.frame()]
     }
 
@@ -1862,9 +1952,9 @@ impl Messenger {
             let nonce: [u8; 12] = KeyPair::generate().seed()[..12].try_into().expect("12 bytes");
             let group_bytes = dsip_core::b64::decode(gid).unwrap_or_default();
             let sealed = seal(&key, &nonce, &serde_json::to_vec(&record).unwrap_or_default(), SealUse::Archive { group: &group_bytes, seq: seq as u64 });
-            let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &self.mailbox.0, now, gid, "archive",
-                json!({"archive": b64(&sealed), "akid": akid, "ref_group": gid, "ref_seq": seq}));
-            self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Archive);
+            let fields = json!({"archive": b64(&sealed), "akid": akid, "ref_group": gid, "ref_seq": seq});
+            let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &self.mailbox.0, now, gid, "archive", fields.clone());
+            self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Archive { fields });
             out.push(json!({"send": env.frame()}));
             out.push(json!({"ui": "archive", "group": gid, "seq": seq, "akid": akid, "object": obj["object"]}));
         }

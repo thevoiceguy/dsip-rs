@@ -62,7 +62,9 @@ try {
   await until(bob.page, () => /◇ receipt_sent .*kind=played/.test(document.getElementById('log').textContent), null, 20000);
   check('Bob: a played receipt went out, receipts being disclosed (M§10.4, M§10.5)', true);
   await until(alice.page, (g) => { const m = window.dsip.thread(g).find((x) => x.object.kind === 'audio'); return m && m.played && Object.keys(m.played).length === 1; }, aConv.group, 20000);
-  check('Alice: her voice message shows played by Bob', /played/.test(await alice.page.textContent('#thread')));
+  // the thread re-renders after the receipt is applied: wait for the text, not just the state
+  const shown = await until(alice.page, () => /played/.test(document.getElementById('thread').textContent), null, 10000).then(() => true, () => false);
+  check('Alice: her voice message shows played by Bob', shown);
 
   // 4. Bob answers with a voice message after a reload; Alice opens it
   await bob.page.reload();

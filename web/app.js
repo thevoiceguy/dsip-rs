@@ -85,19 +85,31 @@ function renderHeader() {
   $('me-did').textContent = identity.identity;
 }
 
+// The lists are rebuilt only when what they show changed: they are asked to render on many events, and a button
+// replaced under a click would swallow it.
+let shownContacts = null, shownRequests = null;
 function renderContacts() {
-  const ul = $('contact-list');
-  ul.innerHTML = '';
-  if (!contacts.length) ul.innerHTML = '<li class="muted small">no contacts yet: paste a DID above</li>';
   const file = JSON.parse(engine.contactsFile());     // grants by id → {identity, scope, valid_until}
-  for (const c of contacts) {
-    const li = document.createElement('li');
+  const rows = contacts.map((c) => {
     const held = Object.values(file.grants_held || {}).some((g) => g.identity === c.did);
     const issued = Object.values(file.grants_issued || {}).some((g) => g.identity === c.did);
     const pending = Object.values(file.pending_sent || {}).includes(c.did);
     const asked = Object.values(file.requests || {}).some(([who]) => who === c.did);
     const status = held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them'
       : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant';
+    return { c, status };
+  });
+  const key = JSON.stringify(rows.map(({ c, status }) => [c.name, c.did, c.numbers, status]));
+  if (key !== shownContacts) { shownContacts = key; renderContactRows(rows); }
+  renderRequests();
+}
+
+function renderContactRows(rows) {
+  const ul = $('contact-list');
+  ul.innerHTML = '';
+  if (!rows.length) ul.innerHTML = '<li class="muted small">no contacts yet: paste a DID above</li>';
+  for (const { c, status } of rows) {
+    const li = document.createElement('li');
     li.innerHTML = `<span class="name"></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
     li.querySelector('.name').textContent = c.name || '(unnamed)';
     li.querySelector('.did').textContent = c.did;
@@ -107,7 +119,13 @@ function renderContacts() {
       b('Message', '', () => messagePeer(c.did)), b('Introduce', '', () => introduce(c.did)), b('Remove', 'ghost', () => removeContact(c.did)));
     ul.append(li);
   }
+}
+
+function renderRequests() {
   const reqs = engine.requests();
+  const key = JSON.stringify(reqs.map(([id, who]) => [id, who, nameOf(who), purposes[id]?.purpose, purposes[id]?.basis]));
+  if (key === shownRequests) return;
+  shownRequests = key;
   const rl = $('request-list');
   rl.innerHTML = reqs.length ? '' : '<li class="muted small">none</li>';
   for (const [id, who] of reqs) {

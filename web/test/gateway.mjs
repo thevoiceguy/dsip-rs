@@ -6,7 +6,7 @@
 // Alice's own number attested (N§4); Carol presents Carrier B's binding of Alice's number and Bob is warned that the
 // number moved (N§5); a did:web name whose document is not hosted cannot bind.
 import { readFileSync } from 'node:fs';
-import { launch, person, enrolled, identityFile, until, state, logOf, addContact, rowButton, checker, dump } from './lib.mjs';
+import { launch, person, enrolled, identityFile, until, state, logOf, addContact, rowButton, placeCall, checker, dump } from './lib.mjs';
 
 const F = process.env.FIXTURE;
 if (!F) { console.log('FIXTURE=<dir of the gateway fixture> (web/test/run.sh makes it)'); process.exit(2); }
@@ -85,7 +85,7 @@ try {
 
   // 4. a direct DSIP call carries Alice's own number as a claim; Bob verifies it against her document (N§4)
   await addContact(alice, bob);
-  await rowButton(alice, bob, 'Call');
+  await placeCall(alice, bob);
   await incomingAt(bob);
   check('Bob: Alice\'s own number attested for her identity (N§4)', /^☎ \+15551234567 · number attested by Carrier Example for this identity \(N§4\)$/.test(await bob.page.evaluate(() => window.dsip.inNumbers())), await bob.page.evaluate(() => window.dsip.inNumbers()));
   check('Bob: no warning (no stored contact lists the number)', (await bob.page.evaluate(() => window.dsip.inWarning())) === '');
@@ -94,6 +94,7 @@ try {
   await ended(alice, bob);
 
   // 5. N§5: Bob stores Alice with her number; Carol presents Carrier B's binding of that number: Bob is warned
+  await bob.page.waitForSelector('#view-contacts:not(.hidden)');   // back from the declined call before the form is used
   await bob.page.fill('#contact-name', 'Alice');
   await bob.page.fill('#contact-did', ALICE);
   await bob.page.fill('#contact-number', '+15551234567');
@@ -101,7 +102,7 @@ try {
   await until(bob.page, (did) => window.dsip.contacts().includes(did), ALICE);
   await carol.page.evaluate((b) => window.dsip.setBinding(b), read('carol.jws').trim());
   await addContact(carol, bob);
-  await rowButton(carol, bob, 'Call');
+  await placeCall(carol, bob);
   await incomingAt(bob);
   check('Bob: Carol\'s number attested by Carrier B', /\+15551234567 · number attested by Carrier B for this identity/.test(await bob.page.evaluate(() => window.dsip.inNumbers())), await bob.page.evaluate(() => window.dsip.inNumbers()));
   check('Bob: warned that the number moved to another identity (N§5)', /^⚠ \+15551234567 now belongs to a different identity \(number attested by Carrier B since \d{4}-\d{2}-\d{2}\)\. Your contact "Alice" is did:web:alice\.example\. \(N§5\)$/.test(await bob.page.evaluate(() => window.dsip.inWarning())), await bob.page.evaluate(() => window.dsip.inWarning()));

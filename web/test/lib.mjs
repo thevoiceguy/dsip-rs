@@ -101,3 +101,13 @@ export async function dump(...people) {
     for (const l of lines.slice(-(process.env.DUMP_ALL ? 999 : 14))) console.log('   ' + l);
   }
 }
+
+/** Click Call in `other`'s contact row on `p`. The contact list re-renders on many events, and a click that lands
+ *  mid-render places no call, so confirm one started and click once more if not. */
+export async function placeCall(p, other) {
+  await rowButton(p, other, 'Call');
+  if (!(await until(p.page, () => window.dsip.state() !== null, null, 3000).then(() => true, () => false))) {
+    console.log(`  note: ${p.name}'s Call click placed no call; clicking again`);
+    await rowButton(p, other, 'Call');
+  }
+}
