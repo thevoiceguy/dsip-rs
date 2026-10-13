@@ -281,6 +281,14 @@ pub struct Messenger {
     /// mailbox" (v0.13, spec-gap 122): the device registers every group it is in at the new mailbox and syncs it from
     /// the start.
     moved_from: Option<String>,
+    /// Whether this device's delegation carries `dsip.record` (C§5): a recorder device, receive-only, never in its
+    /// identity's personal group; as a record-keeper it keeps the `call-record`s parties send it (C§9).
+    recorder: bool,
+    /// This device's call records not yet handed to the conversation with its record-keeper, oldest first (C§9: held
+    /// until that conversation exists, spec-gap 123).
+    records_held: Vec<Value>,
+    /// As a record-keeper: the records received, `{group, from, device, received_at, record}`, one per session leg.
+    records: Vec<Value>,
 }
 
 #[wasm_bindgen]
@@ -352,6 +360,9 @@ impl Messenger {
             successors: serde_json::from_value(st["successors"].clone()).unwrap_or_default(),
             handover: serde_json::from_value(st["handover"].clone()).unwrap_or_default(),
             moved_from: st["mailbox"].as_str().filter(|d| *d != mailbox_did).map(String::from),
+            recorder: dsip_core::delegation::capabilities(&delegation).iter().any(|c| c == "dsip.record"),
+            records_held: st["records_held"].as_array().cloned().unwrap_or_default(),
+            records: st["records"].as_array().cloned().unwrap_or_default(),
         };
         if let Some(t) = st["hub_timeout"].as_i64() {
             m.hub_timeout = t;
@@ -409,6 +420,7 @@ impl Messenger {
             "outages": self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
             "hub_timeout": self.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
             "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
+            "records_held": self.records_held, "records": self.records,
         }}).to_string()
     }
 
@@ -679,6 +691,79 @@ impl Messenger {
         Ok(json!([self.send_object(&personal, &obj, now as i64)?]).to_string())
     }
 
+    /// One leg's `call-record` for this identity's record-keeper `keeper` (C§9), built from what the host saw of the
+    /// leg: `leg_json` is `{session, direction, peer, relay?, invited_at, answered, answered_at?, ended_by, reason?,
+    /// media?, evidence?}`. The outcome is the pinned order (`call-record-outcome`); `answered_at` goes in exactly when
+    /// it is `answered`; `ended_at` is now. A record the record-keeper would drop (`check: "object"`) is never sent.
+    /// The record is held, then everything held goes to the conversation with `keeper` if it exists
+    /// ([`Messenger::flush_records`]). Returns `{record, frames}`.
+    ///
+    /// Spec: C§9 (v0.13, spec-gaps 121 and 123).
+    pub fn call_record(&mut self, keeper: &str, leg_json: &str, now: f64) -> Result<String, JsValue> {
+        let leg: Value = serde_json::from_str(leg_json).map_err(js)?;
+        let outcome = dsip_recording::call_record_outcome(&json!({"direction": leg["direction"], "answered": leg["answered"] == json!(true),
+            "ended_by": leg["ended_by"], "reason": leg["reason"]}));
+        let mut rec = json!({"object": "call-record", "session": leg["session"], "device": self.keys.device.did(), "direction": leg["direction"],
+            "peer": leg["peer"], "invited_at": leg["invited_at"], "outcome": outcome, "ended_by": leg["ended_by"]});
+        let mut last = leg["invited_at"].as_i64().unwrap_or(0);
+        if outcome == "answered" {
+            rec["answered_at"] = leg["answered_at"].clone();
+            last = last.max(leg["answered_at"].as_i64().unwrap_or(0));
+        }
+        // C§9: the times never decrease; an invite or answer stamped by a peer's clock ahead of ours ends no earlier
+        rec["ended_at"] = json!((now as i64).max(last));
+        for k in ["relay", "reason"] {
+            if leg[k].as_str().is_some_and(|v| !v.is_empty()) {
+                rec[k] = leg[k].clone();
+            }
+        }
+        for k in ["media", "evidence"] {
+            if leg[k].as_array().is_some_and(|a| !a.is_empty()) {
+                rec[k] = leg[k].clone();
+            }
+        }
+        let v = check_object(&rec, &json!({"conversation_kind": "direct", "leaf_device": self.keys.device.did()}));
+        if v["verdict"] != "accept" {
+            return Err(JsValue::from_str(&format!("call record not sent: {}", v["code"].as_str().unwrap_or("invalid"))));
+        }
+        self.records_held.push(rec.clone());
+        let frames: Value = serde_json::from_str(&self.flush_records(keeper, now)?).map_err(js)?;
+        Ok(json!({"record": rec, "frames": frames}).to_string())
+    }
+
+    /// The held call records, sent to the direct conversation with `keeper` when there is one (C§9: the record-keeper
+    /// opens it, spec-gap 123); frames to send, `[]` while there is none.
+    pub fn flush_records(&mut self, keeper: &str, now: f64) -> Result<String, JsValue> {
+        let Some(gid) = self.convs.iter().find(|(_, c)| c.kind == "direct" && c.peer.as_deref() == Some(keeper)).map(|(g, _)| g.clone()) else {
+            return Ok("[]".into());
+        };
+        let gid = self.live(&gid);
+        let mut frames = vec![];
+        while let Some(rec) = self.records_held.first().cloned() {
+            let f = self.send_object(&gid, &rec, now as i64)?;
+            self.records_held.remove(0);
+            if !f.is_empty() {
+                frames.push(f);
+            }
+        }
+        Ok(json!(frames).to_string())
+    }
+
+    /// How many of this device's call records wait for the conversation with the record-keeper (C§9).
+    pub fn held_records(&self) -> usize {
+        self.records_held.len()
+    }
+
+    /// As a record-keeper: the records received (C§9), `[{group, from, device, received_at, record}]`.
+    pub fn records(&self) -> String {
+        json!(self.records).to_string()
+    }
+
+    /// Whether this device is a recorder (its delegation carries `dsip.record`, C§5).
+    pub fn is_recorder(&self) -> bool {
+        self.recorder
+    }
+
     /// The call log, one entry per session (M§13.3).
     pub fn calls(&self) -> String {
         json!(self.calls).to_string()
@@ -738,6 +823,7 @@ impl Messenger {
         let gid = &self.live(gid);
         let b: Value = serde_json::from_str(blob_json).map_err(js)?;
         let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        self.may_send_content(gid, now_i)?;
         let mut obj = json!({"object": "content", "id": self.fresh_id(now_i), "conversation": conversation, "sender": self.keys.identity,
             "sent_at": now_i, "kind": "audio", "purpose": purpose, "duration_ms": duration_ms as i64,
             "blob": {"uri": b["uri"], "sha256": b["sha256"], "size": b["size"], "key": b["key"], "alg": "A256GCM",
@@ -967,6 +1053,7 @@ impl Messenger {
         let now_i = now as i64;
         let gid = &self.live(gid);
         let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        self.may_send_content(gid, now_i)?;
         let obj = json!({"object": "content", "id": self.fresh_id(now_i), "conversation": conversation, "sender": self.keys.identity,
             "sent_at": now_i, "kind": "text", "purpose": "message", "content_type": "text/plain", "text": text});
         self.send_object(gid, &obj, now_i)
@@ -977,10 +1064,13 @@ impl Messenger {
     pub fn conversations(&self, now: f64) -> String {
         let ctx = Context::new(now as i64, &self.resolver);
         let list: Vec<Value> = self.convs.iter().filter(|(g, _)| !self.successors.successor(g).is_some_and(|w| self.convs.contains_key(w) && w != g.as_str())).map(|(g, c)| {
-            let mut members: Vec<String> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).map(|w| w.identity).collect();
+            let leaves: Vec<_> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect();
+            let recording = self.recording_of(&leaves);
+            let mut members: Vec<String> = leaves.into_iter().map(|w| w.identity).collect();
             members.sort();
             members.dedup();
             json!({"group": g, "conversation": c.conversation, "kind": c.kind, "peer": c.peer, "members": members, "epoch": c.group.epoch().as_u64(),
+                   "recorded": recording["recorded"], "recorders": recording["recorders"], "may_send": recording["may_send"],
                    "hub": {"did": c.hub.0, "uri": c.hub.1}, "pending": self.outbox.get(g).map_or(0, Vec::len) + self.handover.get(g).map_or(0, Vec::len),
                    "hub_down": self.outages.get(g).is_some_and(HubOutage::is_down),
                    "predecessors": self.lineage(g).into_iter().filter(|x| x != g).collect::<Vec<_>>()})
@@ -1196,6 +1286,30 @@ impl Messenger {
     }
 
     /// Encrypt an application object and deposit it; pending until accepted (M§9.2).
+    /// Whether a conversation is recorded and by whom, from its members' leaves (C§5, the pinned `conversation`
+    /// check). Impl: this client has no acceptance screen, so it accepts only its own identity's recorders, which C§5
+    /// says need none; content never goes to a conversation recorded by another identity (spec-gap 123).
+    fn recording_of(&self, leaves: &[dsip_messaging::mls_wire::LeafIdentity]) -> Value {
+        let leaves_json: Vec<Value> = leaves.iter().map(|w| json!({"device": w.device, "subject": w.identity, "capabilities": w.capabilities})).collect();
+        let accepted: Vec<&str> = leaves.iter().filter(|w| w.is_recorder() && w.identity == self.keys.identity).map(|w| w.device.as_str()).collect();
+        dsip_recording::conversation(&json!({"leaves": leaves_json, "accepted": accepted}))
+    }
+
+    /// Content may go to `gid` (C§5): this device is not a recorder, which never speaks, and every recorder in the
+    /// conversation is accepted.
+    fn may_send_content(&self, gid: &str, now: i64) -> Result<(), JsValue> {
+        if self.recorder {
+            return Err(JsValue::from_str("this device is a recorder: it never sends content (C§5)"));
+        }
+        let ctx = Context::new(now, &self.resolver);
+        let c = self.convs.get(gid).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        let leaves: Vec<_> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect();
+        if self.recording_of(&leaves)["may_send"] != json!(true) {
+            return Err(JsValue::from_str("this conversation is recorded by another identity and its recorder is not accepted here: no content is sent (C§5)"));
+        }
+        Ok(())
+    }
+
     fn send_object(&mut self, gid: &str, obj: &Value, now: i64) -> Result<String, JsValue> {
         let (provider, signer) = (self.mls.provider(), self.mls.signer());
         let c = self.convs.get_mut(gid).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
@@ -1635,6 +1749,14 @@ impl Messenger {
                 let fresh = self.record_call(&object);
                 out.push(json!({"ui": "call_event", "session": object["session"], "peer": object["peer"], "outcome": object["outcome"],
                     "from_device": sender_device, "collapsed": !fresh}));
+            }
+            Some("call-record") if self.recorder => {
+                // C§9: a record-keeper keeps one record per session leg (the sending device's)
+                let fresh = !self.records.iter().any(|r| r["record"]["session"] == object["session"] && r["device"] == sender_device);
+                if fresh {
+                    self.records.push(json!({"group": gid, "from": sender, "device": sender_device, "received_at": now, "record": object}));
+                }
+                out.push(json!({"ui": "call_record", "from": sender, "session": object["session"], "outcome": object["outcome"], "fresh": fresh}));
             }
             Some("receipt") => {
                 if let Some(c) = self.convs.get_mut(gid) {
@@ -2132,6 +2254,7 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
         _ => None,
     };
     let external = matches!(processed.sender(), Sender::NewMemberCommit);
+    let from_recorder = who.as_ref().is_some_and(|w| w.is_recorder());
     let (mut sender, sender_device) = who.map(|w| (w.identity, w.device)).unwrap_or_default();
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app) => {
@@ -2139,10 +2262,17 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
             if let Some(device) = lapsed_leaf {
                 return Ok(Outcome::Unauthenticated(format!("{} from {device}: its delegation no longer verifies", obj["id"])));
             }
-            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender});
+            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender, "leaf_device": sender_device});
             let verdict = check_object(&obj, &octx);
             if verdict["verdict"] != "accept" {
                 return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
+            }
+            if from_recorder && obj["object"] == "content" {
+                // C§5: content from a recorder leaf is treated as from an unauthenticated leaf: not rendered, not archived
+                return Ok(Outcome::Unauthenticated(format!("{} from recorder {sender_device}", obj["id"])));
+            }
+            if verdict["effective"]["store"] == "call-record" {
+                return Ok(Outcome::Object { sender, sender_device, object: obj }); // C§9: kept, never rendered
             }
             if verdict["effective"]["render"] == "ignore" {
                 return Ok(Outcome::Nothing);
@@ -2217,16 +2347,19 @@ fn object_key(obj: &Value) -> String {
     format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""))
 }
 
-/// Re-issue this identity's delegation to its device with `dsip.messaging` beside the capabilities it has (M§4.3,
-/// §7.4), signed by the identity key this browser holds. The identity JSON with the new delegation, or an error
-/// when the identity key is not here (a device enrolled from a file holds only its own key).
-pub fn redelegate(identity_json: &str, now: i64) -> Result<String, JsValue> {
+/// Re-issue this identity's delegation to its device with `dsip.messaging`, and `extra` when given (`dsip.record` for
+/// a record-keeper, C§9), beside the capabilities it has (M§4.3, §7.4), signed by the identity key this browser
+/// holds. The identity JSON with the new delegation, or an error when the identity key is not here (a device enrolled
+/// from a file holds only its own key).
+pub fn redelegate(identity_json: &str, now: i64, extra: Option<&str>) -> Result<String, JsValue> {
     let mut id: Value = serde_json::from_str(identity_json).map_err(js)?;
     let controller = KeyPair::from_seed(unhex(id["controller_seed_hex"].as_str().ok_or_else(|| JsValue::from_str("no identity key on this device"))?)?);
     let old = Envelope::from_frame(id["delegation"].as_str().unwrap_or("")).map_err(|v| JsValue::from_str(&format!("{:?}", v.code)))?;
     let mut caps = dsip_core::delegation::capabilities(&old);
-    if !caps.iter().any(|c| c == "dsip.messaging") {
-        caps.push("dsip.messaging".into());
+    for c in ["dsip.messaging"].into_iter().chain(extra) {
+        if !caps.iter().any(|x| x == c) {
+            caps.push(c.into());
+        }
     }
     let caps_ref: Vec<&str> = caps.iter().map(String::as_str).collect();
     let payload = dsip_core::delegation::delegation_payload(&controller.did(), id["device"].as_str().unwrap_or(""), now - 60, now + 365 * 86_400, &caps_ref);

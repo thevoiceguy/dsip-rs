@@ -74,6 +74,10 @@
       <ul id="conv-list" class="list"><li class="muted small">none yet: open a contact and choose Message</li></ul>
       <h3>Requests <span class="muted small">introductions delivered through the mailbox (M§14.1)</span></h3>
       <ul id="msg-request-list" class="list"><li class="muted small">none</li></ul>
+      <div id="records-pane" class="hidden">
+        <h3>Call records <span class="muted small">kept as your organisation's record-keeper (C§9)</span></h3>
+        <ul id="record-list" class="list"><li class="muted small">none yet</li></ul>
+      </div>
     </div>
     <div class="thread-pane">
       <div class="row"><strong id="thread-title">no conversation open</strong> <code id="thread-did" class="did"></code></div>
@@ -174,6 +178,12 @@
   <h3>Policy</h3>
   <div class="row"><label class="small"><input type="checkbox" id="set-first-contact"> require first contact: refuse calls from identities that hold no grant (§19.4)</label></div>
   <div class="row"><label class="small"><input type="checkbox" id="set-read-disclosed"> disclose read receipts: tell the other side how far you have read (M§10.3); off, your read position goes only to your own devices (M§10.5)</label></div>
+  <h3>Call records</h3>
+  <p class="muted small">When your organisation names a record-keeper, this device sends it a record after every call: who, when,
+  how it ended, and the hashes of the call's signed messages. Never media or content (Recording Profile C§9). The record-keeper
+  opens the conversation the records go to; until it has, they wait here.</p>
+  <div class="row"><label>record-keeper</label><input id="set-record-keeper" size="44" placeholder="did:web:records.acme.example"> <button id="set-record-keeper-save">Save</button> <span id="record-keeper-status" class="muted small"></span></div>
+  <div class="row"><button id="btn-become-keeper">Make this identity a record-keeper</button> <span class="muted small">re-delegates this device with <code>dsip.record</code>: a recorder that never speaks and keeps the records parties send (C§5, C§9)</span></div>
   <h3>Phone number</h3>
   <p class="muted small">A binding your carrier issued (Number Attestation Profile N§3): your calls present the number with it, and a callee
   verifies it against your identity's document. Your identity must be <code>did:web</code> and its document must list the number.</p>

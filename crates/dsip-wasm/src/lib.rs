@@ -520,9 +520,10 @@ pub fn voicemail_offer(entry_json: &str, can_send: bool, outcome_type: &str, rea
         "outcome": {"type": outcome_type, "reason": reason}})).to_string()
 }
 
-/// Re-issue this identity's delegation with `dsip.messaging` (M§4.3) when the identity key is on this device: the
-/// identity JSON with the new delegation (see [`messaging::redelegate`]).
+/// Re-issue this identity's delegation with `dsip.messaging` (M§4.3), and `extra` when given (`dsip.record` for a
+/// record-keeper, C§9), when the identity key is on this device: the identity JSON with the new delegation (see
+/// [`messaging::redelegate`]).
 #[wasm_bindgen]
-pub fn redelegate(identity_json: &str, now: f64) -> Result<String, JsValue> {
-    messaging::redelegate(identity_json, now as i64)
+pub fn redelegate(identity_json: &str, now: f64, extra: Option<String>) -> Result<String, JsValue> {
+    messaging::redelegate(identity_json, now as i64, extra.as_deref())
 }

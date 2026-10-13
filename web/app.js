@@ -161,6 +161,9 @@ function renderSettings() {
   $('set-device').textContent = identity.device;
   $('set-first-contact').checked = !!settings.first_contact_required;
   $('set-read-disclosed').checked = !!settings.read_disclosed;
+  $('set-record-keeper').value = settings.record_keeper || '';
+  $('record-keeper-status').textContent = settings.record_keeper ? `records go to ${nameOf(settings.record_keeper) || short(settings.record_keeper)}${messenger?.held_records() ? `; ${messenger.held_records()} held until it opens the conversation` : ''}` : 'none: no call records are sent';
+  $('btn-become-keeper').disabled = !identity.controller_seed_hex || !!messenger?.is_recorder();
   $('set-relay').value = settings.relay || '';
   $('set-relay').placeholder = served.relay || `wss://${location.host}/dsip`;
   $('set-ice').value = settings.ice ? JSON.stringify(settings.ice) : '';
@@ -314,8 +317,11 @@ function renderRelay(text, state) {
 
 // ---------------------------------------------------------------- persistence
 
-async function persist() {
-  await store.set(key('engine.contacts'), engine.contactsFile());
+let lastPersist = Promise.resolve();
+/** The engine's contact file to storage; the write in flight is kept so a caller can wait for it. */
+function persist() {
+  lastPersist = store.set(key('engine.contacts'), engine.contactsFile());
+  return lastPersist;
 }
 
 function renderLinks() {
@@ -440,6 +446,7 @@ async function onEmission(e) {
     if (e.ui === 'missed_call') notify(`Missed call from ${nameOf(call?.peer) || short(call?.peer)}`);
     if (e.ui === 'ended') {
       const peer = call?.peer;
+      if (call && legs.has(call.sid)) legs.get(call.sid).uiReason = e.reason;   // C§9: a leg that ended without a frame
       const refused = e.reason === 'policy.first-contact-required' && peer;
       // §12.7: a forked invite answered on another device ends this leg; §12.11: never a missed call
       const elsewhere = e.reason === 'session.answered-elsewhere';
@@ -622,7 +629,7 @@ function openCallRelay(uri, sid) {
     let settled = false;
     const done = (r) => { if (!settled) { settled = true; resolve(r); } };
     const r = new Relay(uri, engine.ep, {
-      bound: (info) => { log(`← hello        their relay ${short(info.did)} bound us for this call (in_reply_to matched)`, '§13.2 · §20.5'); done(r); },
+      bound: (info) => { r.did = info.did; log(`← hello        their relay ${short(info.did)} bound us for this call (in_reply_to matched)`, '§13.2 · §20.5'); done(r); },
       refused: (x) => { log(`✗ their relay's hello rejected: ${x.code}`, '§20.5'); r.close(); done(null); },
       rejected: (code) => { log(`✗ their relay refused our hello: ${code}`, '§13.2'); r.close(); done(null); },
       frame: (text) => engine.inbound(text),
@@ -761,6 +768,104 @@ async function joinAvailable() {
   }
   renderMessages();
   return joined;
+}
+
+// ---------------------------------------------------------------- call records (Recording Profile C§9)
+
+/** What this device saw of each session leg, by session id: every frame of the session sent or accepted, exactly as
+ *  it went (for `evidence`), the invite's and the applied answer's `issued_at`, the answer's media and the relay. */
+const legs = new Map();
+const TERMINAL = ['bye', 'cancel', 'reject'];
+
+function legFrame(text, dir) {
+  const p = payloadOf(text);
+  const sid = p.type === 'invite' ? p.id : p.session;
+  if (!sid) return;
+  let leg = legs.get(sid);
+  if (!leg) {
+    if (p.type !== 'invite') return;
+    const via = callRelays.get(sid)?.did;
+    leg = { session: sid, direction: dir === 'out' ? 'outbound' : 'inbound', peer: dir === 'out' ? p.to : p.from, invited_at: p.issued_at,
+      relay: via || relayInfo?.did || null, frames: [], answered: false };
+    legs.set(sid, leg);
+  }
+  leg.frames.push({ text, dir, type: p.type, reason: p.reason });
+  if (p.type === 'answer' && leg.answered_at == null) {
+    leg.answered_at = p.issued_at;
+    leg.media = (p.media || []).map((m) => m.type).filter(Boolean);
+  }
+}
+
+/** After each engine step: a leg whose session became active was answered here; one that ended is recorded. */
+function legsChanged() {
+  for (const leg of [...legs.values()]) {
+    const st = engine.state(leg.session);
+    if (st === 'ACTIVE') leg.answered = true;
+    if (st === 'ENDED' || st === null) { legs.delete(leg.session); recordLeg(leg); }
+  }
+}
+
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+/** C§9: one `call-record` per leg to the record-keeper named in Settings. `ended_by` and `reason` come from the frame
+ *  that ended the leg (the last bye, cancel or reject, else the last error), sent (`local`) or received (`remote`);
+ *  a leg that ended without one ended here (a timer, glare). `evidence` is the SHA-256 of each frame's text. The
+ *  Messenger derives the outcome and holds the record until the record-keeper's conversation exists. */
+async function recordLeg(leg) {
+  const keeper = settings.record_keeper;
+  if (!keeper) return;
+  if (!messenger) { log(`no call record for ${short(leg.session)}: messaging is not running (C§9)`, 'C§9'); return; }
+  const end = [...leg.frames].reverse().find((f) => TERMINAL.includes(f.type)) || [...leg.frames].reverse().find((f) => f.type === 'error');
+  const evidence = [];
+  for (const f of leg.frames) evidence.push(hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(f.text))));
+  const input = { session: leg.session, direction: leg.direction, peer: leg.peer, relay: leg.relay || undefined, invited_at: leg.invited_at,
+    answered: leg.answered, answered_at: leg.answered_at, ended_by: end ? (end.dir === 'out' ? 'local' : 'remote') : 'local',
+    reason: end ? end.reason : leg.uiReason, media: leg.answered ? leg.media : undefined, evidence };
+  try {
+    const out = JSON.parse(messenger.call_record(keeper, JSON.stringify(input), now()));
+    if (out.frames.length) await driveMailbox(out.frames.map((f) => ({ send: f })));
+    else await store.set(key('messenger'), JSON.parse(messenger.save()));
+    log(`call record for ${short(leg.session)}: ${out.record.outcome}, ended ${out.record.ended_by}${out.record.reason ? ` (${out.record.reason})` : ''}, ${evidence.length} frame hashes; ${out.frames.length ? 'sent to the record-keeper' : `held (${messenger.held_records()}): no conversation with the record-keeper yet`}`, 'C§9');
+  } catch (e) { log(`✗ call record for ${short(leg.session)}: ${e.message || e}`, 'C§9'); }
+}
+
+/** Records held while no conversation with the record-keeper existed go out once it does (C§9, spec-gap 123). */
+async function flushRecords() {
+  if (!messenger || !settings.record_keeper || !messenger.held_records()) return;
+  try {
+    const frames = JSON.parse(messenger.flush_records(settings.record_keeper, now()));
+    if (frames.length) { await driveMailbox(frames.map((f) => ({ send: f }))); log(`${frames.length} held call record${frames.length === 1 ? '' : 's'} sent to the record-keeper`, 'C§9'); }
+  } catch (e) { log(`✗ held call records: ${e.message || e}`, 'C§9'); }
+}
+
+/** Make this identity a record-keeper: its device re-delegated with `dsip.record` (C§5, C§9). */
+async function becomeRecordKeeper() {
+  if (!identity.controller_seed_hex) return notify('only a device holding the identity key can re-delegate itself (§7.4)');
+  identity = JSON.parse(redelegate(JSON.stringify(identity), now(), 'dsip.record'));
+  await store.set(key('identity'), identity);
+  // C§5: a recorder is never in its identity's personal group, so its messaging starts afresh: no group made before
+  // it was a recorder (its personal group included) is carried over
+  await store.del(key('messenger'));
+  log('delegation re-issued with dsip.record: this device is a recorder and keeps call records (C§5, C§9); its messaging starts afresh; reloading', 'C§9');
+  location.reload();
+}
+
+function renderRecords() {
+  const keeper = !!messenger?.is_recorder();
+  $('records-pane').classList.toggle('hidden', !keeper);
+  if (!keeper) return;
+  const recs = JSON.parse(messenger.records());
+  const key = JSON.stringify(recs.map((r) => [r.device, r.record.session]));
+  if ($('record-list').dataset.shown === key) return;
+  $('record-list').dataset.shown = key;
+  $('record-list').innerHTML = recs.length ? '' : '<li class="muted small">none yet</li>';
+  for (const r of recs) {
+    const c = r.record, li = document.createElement('li');
+    li.className = 'record'; li.dataset.session = c.session; li.dataset.outcome = c.outcome;
+    const secs = c.answered_at ? ` · ${c.ended_at - c.answered_at} s` : '';
+    li.textContent = `${nameOf(r.from) || short(r.from)} ${c.direction === 'outbound' ? '→' : '←'} ${nameOf(c.peer) || short(c.peer)} · ${c.outcome}${secs} · ended ${c.ended_by}${c.reason ? ` (${c.reason})` : ''} · ${new Date(c.invited_at * 1000).toLocaleTimeString()} · ${(c.evidence || []).length} hashes · device ${short(r.device)}`;
+    $('record-list').append(li);
+  }
 }
 
 /** M§13.3: a callee leg ended; the pinned decision says whether this device records a call event in the personal
@@ -951,6 +1056,13 @@ async function revoke(device) {
   renderDevices();
 }
 
+async function setRecordKeeper(did) {
+  settings.record_keeper = did || undefined;
+  await saveSettings(); renderSettings();
+  log(did ? `record-keeper: ${did}; a call record goes to it after every call (C§9)` : 'no record-keeper: no call records are sent', 'C§9');
+  flushRecords();
+}
+
 async function saveSettings() { await store.set(key('settings'), settings); }
 
 // ---------------------------------------------------------------- relay
@@ -999,10 +1111,11 @@ async function startEngine() {
       (via || relay).send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}${via ? ` via ${via.url}` : ''}`, '§12.4');
       if (meta.type === 'reject' && payloadOf(frame).reason === 'policy.first-contact-required') log(`refused a call from ${short(meta.to)} without ringing: first contact required`, '§19.4');
     },
+    frame: legFrame,
     received: onReceived,
     emission: onEmission,
     rejected: (code, detail) => log(`✗ inbound rejected: ${code} ${detail || ''}`, '§10.2'),
-    changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); messenger?.set_grants(JSON.stringify(heldGrantFrames())); },
+    changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); messenger?.set_grants(JSON.stringify(heldGrantFrames())); legsChanged(); },
   };
   engine.startTimers();
   connect();
@@ -1069,7 +1182,8 @@ async function startMessagingNow() {
       log(`← hello        mailbox ${short(r.did)} bound us (in_reply_to matched); ${r.capabilities?.mailbox?.hub ? 'a hub' : 'no hub'}, modes ${(r.capabilities?.mailbox?.modes || []).join('/')}`, 'M§4.3 · §20.5');
       await driveMailbox(messenger.on_bound(now()));                      // pending items again, then sync live (M§9.3, M§5.4)
       await driveMailbox([messenger.key_packages_frame(2, now())]);        // M§5.5: fresh KeyPackages on every bind
-      if (!messenger.personal()) {
+      if (messenger.is_recorder()) log('this device is a recorder: it never joins its identity\'s personal group (C§5)', 'C§5');
+      else if (!messenger.personal()) {
         // M§7.1: the identity's first messaging device creates the personal group; a device that knows of siblings
         // (the identity file it was enrolled from listed them) waits to be added by one of them (M§12.3)
         const siblings = devices.filter((d) => d.device !== identity.device);
@@ -1081,6 +1195,7 @@ async function startMessagingNow() {
         }
       }
       publishReachability();                                               // the hint now names the mailbox too (M§4.2)
+      flushRecords();                                                      // C§9: records held while the conversation did not exist
       renderMessages();
       reconcileDevices();                                                  // M§12.3: siblings this browser knows of join the groups
     },
@@ -1120,10 +1235,12 @@ function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
     key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
     archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5',
-    hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
+    call_record: 'C§9', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
   log(`◇ ${e.ui} ${fields}`, sec);
   if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
+  if (e.ui === 'joined' && e.kind === 'direct' && e.members.includes(settings.record_keeper)) setTimeout(flushRecords, 0);
+  if (e.ui === 'call_record') notify(`call record from ${nameOf(e.from) || short(e.from)}: ${e.outcome}`);
   if (e.ui === 'joined' && e.kind === 'direct') { activeConv = activeConv || e.group; notify(`${nameOf(e.members.find((m) => m !== identity.identity)) || 'someone'} opened a conversation with you`); }
   if (e.ui === 'committed' && e.device) notify(`device ${short(e.device)} added to ${e.personal ? 'the personal group' : 'a conversation'} (epoch ${e.epoch})`);
   else if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
@@ -1404,7 +1521,12 @@ function renderMessages() {
   const conv = convs.find((c) => c.group === activeConv);
   $('thread-title').textContent = conv ? (conv.peer ? nameOf(conv.peer) || '(unnamed)' : conv.kind) : 'no conversation open';
   $('thread-did').textContent = conv?.peer || '';
-  $('thread-meta').textContent = conv ? `group ${conv.group} · hub ${short(conv.hub.did)} (${conv.hub.did === mb?.did ? 'our mailbox' : 'their mailbox'}) · epoch ${conv.epoch}` : '';
+  // C§5: a recorded conversation says who records; C§9: with the record-keeper, only call records go there
+  const recorders = (conv?.recorders || []).map((r) => `${r.subject === identity.identity ? 'you' : nameOf(r.subject) || short(r.subject)} (device ${short(r.device)})`);
+  const keeperConv = conv && conv.peer && conv.peer === settings.record_keeper;
+  $('thread-meta').textContent = conv ? `group ${conv.group} · hub ${short(conv.hub.did)} (${conv.hub.did === mb?.did ? 'our mailbox' : 'their mailbox'}) · epoch ${conv.epoch}`
+    + (conv.recorded ? ` · ⏺ RECORDED by ${recorders.join(', ')} (C§5)${keeperConv ? ': your record-keeper; call records go here, nothing else (C§9)' : conv.may_send ? '' : '; nothing you write is sent here: this client cannot accept a recorder'}` : '') : '';
+  $('thread-meta').classList.toggle('warn', !!conv?.recorded);
   const th = $('thread');
   th.innerHTML = '';
   const timeline = conv ? JSON.parse(messenger.timeline(conv.group)) : [];
@@ -1448,8 +1570,10 @@ function renderMessages() {
   }
   $('thread-marks').textContent = conv ? Object.entries(marks).map(([who, id]) => `${who === identity.identity ? 'you' : nameOf(who) || short(who)} read through #${seqOf(id)}`).join(' · ') : '';
   th.scrollTop = th.scrollHeight;
-  $('compose-text').disabled = !conv; $('compose-send').disabled = !conv;
-  $('compose-voice').disabled = !conv || !blobEndpoint();
+  const canWrite = conv && conv.may_send !== false && !messenger.is_recorder();   // C§5: a recorder never speaks; nor does content reach one not accepted
+  $('compose-text').disabled = !canWrite; $('compose-send').disabled = !canWrite;
+  $('compose-voice').disabled = !canWrite || !blobEndpoint();
+  renderRecords();
   // M§10.3: the thread is on screen, so its last content is read; the machine decides whether a watermark goes out
   const last = [...thread].reverse().find((m) => m.seq != null && m.object.object === 'content');
   if (conv && last && !$('view-messages').classList.contains('hidden') && lastRead[conv.group] !== last.object.id) {
@@ -1531,6 +1655,8 @@ function renderMessages() {
   $('btn-reject-update').onclick = rejectUpdate;
   $('set-name-save').onclick = async () => { identity.display_name = $('set-name').value.trim(); await store.set(key('identity'), identity); location.reload(); };
   $('set-first-contact').onchange = async (e) => { settings.first_contact_required = e.target.checked; await saveSettings(); location.reload(); };
+  $('set-record-keeper-save').onclick = () => setRecordKeeper($('set-record-keeper').value.trim());
+  $('btn-become-keeper').onclick = becomeRecordKeeper;
   $('set-read-disclosed').onchange = async (e) => { settings.read_disclosed = e.target.checked; await saveSettings(); if (messenger) { messenger.set_read_disclosed(settings.read_disclosed, now()); await store.set(key('messenger'), JSON.parse(messenger.save())); } log(`read receipts ${settings.read_disclosed ? 'disclosed to the conversation' : 'kept to your own devices'}`, 'M§10.5'); };
   $('set-network-save').onclick = async () => {
     settings.relay = $('set-relay').value.trim();
@@ -1598,6 +1724,7 @@ function renderMessages() {
     contacts: () => contacts.map((c) => c.did),
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
     requests: () => engine.requests(),
+    saved: () => lastPersist,   // resolves once the latest contact-file write is in storage
     links: () => links.map((l) => l.url),
     note: () => $('call-note').textContent,
     mode: () => $('call-mode').textContent,
@@ -1611,6 +1738,11 @@ function renderMessages() {
     openConversation: (gid) => { activeConv = gid; renderMessages(); },
     messagePeer,
     sendText,
+    setRecordKeeper,
+    becomeRecordKeeper,
+    isRecorder: () => !!messenger?.is_recorder(),
+    records: () => (messenger ? JSON.parse(messenger.records()) : []),
+    heldRecords: () => (messenger ? messenger.held_records() : 0),
     personalGroup: () => messenger?.personal() || null,
     messengerSaved: () => store.get(key('messenger')),
     readMarks: (gid) => (messenger ? JSON.parse(messenger.read_marks(gid || activeConv)) : {}),
