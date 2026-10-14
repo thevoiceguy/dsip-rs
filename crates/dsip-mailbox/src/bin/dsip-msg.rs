@@ -2937,7 +2937,15 @@ impl Client {
                 }
             }
             Outcome::Removed { by, remaining } => {
-                let c = self.convs.remove(&gid);
+                self.resume.removed(&gid); // spec-gap 127: a member may add this identity back with a new welcome
+                let mut c = self.convs.remove(&gid);
+                if let Some(c) = c.as_mut() {
+                    // spec-gap 127: the group's MLS state goes too, so a welcome back into the same group id can be joined
+                    let _ = c.group.delete(self.mls.provider().storage());
+                }
+                // and the seq gaps it tracked there: a welcome back starts counting afresh from its own seq (spec-gap 83)
+                self.gaps.remove(&gid);
+                self.held_items.remove(&gid);
                 let kind = c.as_ref().map(|c| c.kind.clone()).unwrap_or_default();
                 println!("REMOVED from {} kind={kind} by={by}", c.map(|c| c.conversation).unwrap_or_default());
                 if self.active.as_deref() == Some(gid.as_str()) {

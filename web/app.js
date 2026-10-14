@@ -1273,6 +1273,9 @@ function onMessagingUi(e) {
   if (e.ui === 'committed' && e.device) notify(`device ${short(e.device)} added to ${e.personal ? 'the personal group' : 'a conversation'} (epoch ${e.epoch})`);
   else if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
   if (e.ui === 'epoch' && e.added?.length) notify(`${e.added.map((a) => { const [who, dev] = a.split('#'); return `${who === identity.identity ? 'your' : `${nameOf(who) || short(who)}'s`} device ${short(dev)}`; }).join(', ')} joined (epoch ${e.epoch})`);
+  if (e.ui === 'roster') notify(rosterLine(e));
+  if (e.ui === 'joined' && e.kind === 'group') { activeConv = activeConv || e.group; notify(`you were added to a group with ${e.members.filter((m) => m !== identity.identity).map((m) => nameOf(m) || short(m)).join(', ')}`); }
+  if (e.ui === 'removed' && !e.left) notify(`${e.by ? nameOf(e.by) || short(e.by) : 'a member'} removed you from a conversation`);
   if (e.ui === 'hub_down') notify(`the hub of a conversation is unreachable: messages wait (M§9.4)`);
   if (e.ui === 'hub_back') notify('the hub answers again: pending messages sent');
   if (e.ui === 'successor') { if (activeConv === e.of) activeConv = e.group; notify(`the conversation continues in a successor group (its old hub is gone, M§7.5)`); }
@@ -1361,6 +1364,69 @@ async function messagePeer(did) {
     activeConv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === did)?.group || activeConv;
   } catch (e) { notify(`cannot message ${nameOf(did) || short(did)}: ${e.message || e}`); log(`✗ ${e.message || e}`, 'M§7.2'); }
   renderMessages();
+}
+
+/** Our own other devices' KeyPackages for a new group (M§7.2, M§7.3: they join in the same commit), or null. */
+async function ownForNewGroup() {
+  try { return await fetchOwnKeyPackages(); } catch (e) { log(`own devices: none added (${e.message})`, 'M§7.2'); return null; }
+}
+
+/** Create a group conversation (M§7.3) with `dids`: each one's mailbox found and its KeyPackages fetched with the grant
+ *  we hold (M§14.2), our own other devices' too, the group created at our mailbox and every add in one commit. */
+async function createGroup(dids) {
+  if (!messenger || !mailboxInfo) return notify('messaging is not connected');
+  messenger.set_grants(JSON.stringify(heldGrantFrames()));
+  try {
+    const targets = {};
+    for (const did of dids) {
+      const mb = await peerMailbox(did);
+      if (!mb) throw new Error(`no mailbox found for ${nameOf(did) || short(did)}`);
+      targets[did] = await fetchFromMailbox(mb, did);
+      log(`key packages of ${short(did)}: ${(targets[did].key_packages || []).length} one-time${targets[did].last_resort ? ' + last resort' : ''}`, 'M§5.5');
+    }
+    const own = await ownForNewGroup();
+    const before = new Set(JSON.parse(messenger.conversations(now())).map((c) => c.group));
+    await driveMailbox(messenger.create_group(JSON.stringify(targets), own ? JSON.stringify(own) : undefined, now()));
+    activeConv = JSON.parse(messenger.conversations(now())).find((c) => !before.has(c.group))?.group || activeConv;
+    log(`group with ${dids.map((d) => nameOf(d) || short(d)).join(', ')} created at our mailbox (hub); the adds go out once the hub holds it`, 'M§7.3 · M§6.5');
+  } catch (e) { notify(`cannot create the group: ${e.message || e}`); log(`✗ ${e.message || e}`, 'M§7.3'); }
+  show('messages');
+  renderMessages();
+}
+
+/** Add the identity `did` to the group conversation `gid` (M§7.3): its KeyPackages fetched with our grant, one commit. */
+async function addMember(gid, did) {
+  if (!messenger || !mailboxInfo) return;
+  messenger.set_grants(JSON.stringify(heldGrantFrames()));
+  try {
+    const mb = await peerMailbox(did);
+    if (!mb) throw new Error(`no mailbox found for ${nameOf(did) || short(did)}`);
+    const kps = await fetchFromMailbox(mb, did);
+    await driveMailbox([{ send: messenger.add_member(gid, did, JSON.stringify(kps), now()) }]);
+    log(`adding ${short(did)} to ${short(gid)}`, 'M§7.3');
+  } catch (e) { notify(`cannot add ${nameOf(did) || short(did)}: ${e.message || e}`); }
+  renderMessages();
+}
+
+/** Remove the member identity `did` from `gid`, every device of it (M§7.3; members check the commit, spec-gap 126). */
+async function removeMember(gid, did) {
+  if (!messenger) return;
+  try {
+    await driveMailbox([{ send: messenger.remove_member(gid, did, now()) }]);
+    log(`removing ${short(did)} from ${short(gid)}: every device of it`, 'M§7.3');
+  } catch (e) { notify(`cannot remove ${nameOf(did) || short(did)}: ${e.message || e}`); }
+  renderMessages();
+}
+
+/** One roster change as members see it (M§7.3: attributed to the committing identity). */
+function rosterLine(r) {
+  const who = (d) => (d === identity.identity ? 'you' : nameOf(d) || short(d));
+  const by = r.by ? who(r.by) : 'a device that no longer authenticates';
+  const parts = [];
+  if (r.added.length) parts.push(`${by} added ${r.added.map(who).join(', ')}`);
+  if (r.removed.length) parts.push(`${by} removed ${r.removed.map(who).join(', ')}`);
+  for (const l of r.left) parts.push(`${who(l)} left${r.by && r.by !== l ? ` (removal committed by ${by})` : ''}`);
+  return parts.join('; ');
 }
 
 /** M§9.4 → M§7.5: a group's hub has been unreachable past the threshold. Fetch the KeyPackages of the other
@@ -1518,6 +1584,12 @@ async function sendText(text) {
   try { await driveMailbox([{ send: messenger.send_text(activeConv, text.trim(), now()) }]); } catch (e) { notify(`not sent: ${e.message || e}`); }
 }
 
+/** A group conversation's name: its other members (M§7.3). */
+function groupName(c) {
+  const others = c.members.filter((m) => m !== identity.identity);
+  return others.length ? `group: ${others.map((m) => nameOf(m) || short(m)).join(', ')}` : 'group (only you)';
+}
+
 function renderMessages() {
   const mb = mailboxOf();
   const status = !mb ? 'no mailbox: set one under Settings → Network (the operator may serve a default)'
@@ -1532,7 +1604,7 @@ function renderMessages() {
     const li = document.createElement('li');
     li.className = c.group === activeConv ? 'active' : '';
     li.innerHTML = '<span class="name"></span> <code class="did"></code> <span class="muted small meta"></span>';
-    li.querySelector('.name').textContent = c.peer ? nameOf(c.peer) || '(unnamed)' : c.kind;
+    li.querySelector('.name').textContent = c.peer ? nameOf(c.peer) || '(unnamed)' : c.kind === 'group' ? groupName(c) : c.kind;
     li.querySelector('.did').textContent = c.peer || c.group;
     li.querySelector('.meta').textContent = `${c.members.length} identit${c.members.length === 1 ? 'y' : 'ies'}, epoch ${c.epoch}${c.pending ? `, ${c.pending} pending` : ''}${c.hub_down ? ', hub unreachable' : ''}${c.predecessors?.length ? ', continued from a group whose hub is gone' : ''}`;
     li.onclick = () => { activeConv = c.group; renderMessages(); };
@@ -1547,7 +1619,23 @@ function renderMessages() {
     if (next) activeConv = next.group;
   }
   const conv = convs.find((c) => c.group === activeConv);
-  $('thread-title').textContent = conv ? (conv.peer ? nameOf(conv.peer) || '(unnamed)' : conv.kind) : 'no conversation open';
+  $('thread-title').textContent = conv ? (conv.peer ? nameOf(conv.peer) || '(unnamed)' : conv.kind === 'group' ? groupName(conv) : conv.kind) : 'no conversation open';
+  // M§7.3: a group's members, each removable by any member identity; any contact not in it can be added
+  const isGroup = conv?.kind === 'group';
+  $('group-members').classList.toggle('hidden', !isGroup);
+  if (isGroup) {
+    const ml = $('group-member-list'); ml.innerHTML = '';
+    for (const m of conv.members) {
+      const span = document.createElement('span'); span.className = 'member';
+      span.textContent = m === identity.identity ? 'you ' : `${nameOf(m) || short(m)} `;
+      if (m !== identity.identity) { const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Remove'; b.dataset.member = m; b.onclick = () => removeMember(conv.group, m); span.append(b); }
+      ml.append(span, ' ');
+    }
+    const sel = $('add-member-select'); sel.innerHTML = '';
+    for (const c of contacts.filter((c) => !conv.members.includes(c.did))) { const o = document.createElement('option'); o.value = c.did; o.textContent = c.name || short(c.did); sel.append(o); }
+    $('btn-add-member').disabled = !sel.options.length;
+    $('btn-add-member').onclick = () => sel.value && addMember(conv.group, sel.value);
+  }
   $('thread-did').textContent = conv?.peer || '';
   // C§5: a recorded conversation says who records; C§9: with the record-keeper, only call records go there
   const recorders = (conv?.recorders || []).map((r) => `${r.subject === identity.identity ? 'you' : nameOf(r.subject) || short(r.subject)} (device ${short(r.device)})`);
@@ -1574,7 +1662,12 @@ function renderMessages() {
   const marks = conv ? JSON.parse(messenger.read_marks(conv.group)) : {};
   const seqOf = (id) => thread.find((m) => m.object.id === id)?.seq ?? -1;
   const theirRead = Math.max(-1, ...Object.entries(marks).filter(([who]) => who !== identity.identity).map(([, id]) => seqOf(id)));
+  // M§7.3: roster changes, each before the first message the hub ordered after it
+  const roster = conv ? JSON.parse(messenger.roster_log(conv.group)) : [];
+  const rosterDiv = (r) => { const d = document.createElement('div'); d.className = 'msg roster muted small'; d.textContent = rosterLine(r); d.dataset.epoch = r.epoch; return d; };
+  let ri = 0;
   for (const m of timeline) {
+    while (ri < roster.length && m.seq != null && m.group === roster[ri].group && roster[ri].seq != null && roster[ri].seq < m.seq) th.append(rosterDiv(roster[ri++]));
     const d = document.createElement('div');
     if (m.call) {
       // M§13.3: this identity's call events for the peer, interleaved by the pinned rule
@@ -1607,6 +1700,7 @@ function renderMessages() {
     d.querySelector('.read').textContent = (m.mine && m.seq != null && m.seq <= theirRead ? 'read' : '') + played;
     th.append(d);
   }
+  while (ri < roster.length) th.append(rosterDiv(roster[ri++]));
   $('thread-marks').textContent = conv ? Object.entries(marks).map(([who, id]) => `${who === identity.identity ? 'you' : nameOf(who) || short(who)} read through #${seqOf(id)}`).join(' · ') : '';
   th.scrollTop = th.scrollHeight;
   const canWrite = conv && conv.may_send !== false && !messenger.is_recorder();   // C§5: a recorder never speaks; nor does content reach one not accepted
@@ -1682,6 +1776,18 @@ function renderMessages() {
   $('introduce-cancel').onclick = () => $('introduce-form').classList.add('hidden');
   $('compose').onsubmit = async (e) => { e.preventDefault(); const t = $('compose-text').value; $('compose-text').value = ''; await sendText(t); };
   $('compose-voice').onclick = () => toggleVoice();
+  $('btn-new-group').onclick = () => {
+    const ul = $('group-picker-list'); ul.innerHTML = '';
+    for (const c of contacts) { const li = document.createElement('li'); li.innerHTML = '<label><input type="checkbox"> <span></span></label>'; li.querySelector('input').value = c.did; li.querySelector('span').textContent = c.name || short(c.did); ul.append(li); }
+    if (!contacts.length) ul.innerHTML = '<li class="muted small">no contacts yet</li>';
+    $('group-picker').classList.remove('hidden');
+  };
+  $('btn-cancel-group').onclick = () => $('group-picker').classList.add('hidden');
+  $('btn-create-group').onclick = () => {
+    const dids = [...document.querySelectorAll('#group-picker-list input:checked')].map((i) => i.value);
+    $('group-picker').classList.add('hidden');
+    if (dids.length) createGroup(dids);
+  };
   $('btn-voicemail').onclick = leaveVoicemail;
   $('btn-contact-link').onclick = newContactLink;
   $('btn-accept').onclick = () => accept(false);
@@ -1784,6 +1890,11 @@ function renderMessages() {
     heldRecords: () => (messenger ? messenger.held_records() : 0),
     acceptRecording,
     leaveConversation,
+    createGroup,
+    addMember,
+    removeMember,
+    rosterLog: (gid) => (messenger ? JSON.parse(messenger.roster_log(gid || activeConv)) : []),
+    rosterLines: () => [...document.querySelectorAll('#thread .msg.roster')].map((d) => d.textContent),
     personalGroup: () => messenger?.personal() || null,
     messengerSaved: () => store.get(key('messenger')),
     readMarks: (gid) => (messenger ? JSON.parse(messenger.read_marks(gid || activeConv)) : {}),

@@ -1363,8 +1363,9 @@ fn dispatch(
             let recipient = s_of(&p["recipient"]);
             if class == "welcome" && st.serves(&recipient) {
                 let ctx = ctx_of(resolver, &st.seen, &st.supported, &st.revocations);
+                // M§14.2: the deposit carries a grant from each identity it adds; the one for this mailbox is its owner's
                 let grant = p["grants"].as_array().into_iter().flatten().filter_map(Value::as_str)
-                    .find_map(|g| grant_payload(g, &ctx)).unwrap_or(Value::Null);
+                    .filter_map(|g| grant_payload(g, &ctx)).find(|g| g["from"] == recipient.as_str()).unwrap_or(Value::Null);
                 // spec-gap 66: the welcome's own bytes tell a retried delivery from a new invitation
                 let w_digest = p["mls"].as_str().and_then(dsip_core::b64::decode).map(|b| digest(&b));
                 let mut w = json!({"id": id, "from": device, "adder_identity": identity,

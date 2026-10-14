@@ -53,4 +53,6 @@ video { width:100%; background:#000; border-radius:8px; aspect-ratio: 4/3; }
 .thread .msg.archive .who::after { content: " (history)"; opacity: .6; }
 .thread .msg .read { font-size: .75rem; opacity: .6; margin-left: .4rem; }
 .thread .msg.call { font-style: italic; opacity: .75; text-align: center; }
+.thread .msg.roster { font-style: italic; text-align: center; }
+#group-members .member { margin-right: .5em; }
 .thread .msg audio { vertical-align: middle; height: 2rem; max-width: 16rem; }

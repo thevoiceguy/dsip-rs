@@ -236,6 +236,12 @@ impl<P: OpenMlsProvider> Device<P> {
     ///
     /// Spec: M§6.6, M§6.7. The caller authenticates every member afterwards ([`authenticate_members`]).
     pub fn join(&self, welcome: &[u8]) -> Result<MlsGroup, MlsError> {
+        self.join_from(welcome).map(|(g, _)| g)
+    }
+
+    /// As [`Device::join`], with the leaf index of the member whose commit added this device: the GroupInfo's signer
+    /// (RFC 9420 §12.4.3.1), so the joiner can attribute its own add (M§7.3).
+    pub fn join_from(&self, welcome: &[u8]) -> Result<(MlsGroup, LeafNodeIndex), MlsError> {
         let msg = MlsMessageIn::tls_deserialize(&mut &welcome[..]).map_err(err("welcome bytes"))?;
         let MlsMessageBodyIn::Welcome(w) = msg.extract() else { return Err(MlsError("not a welcome".into())) };
         let config = MlsGroupJoinConfig::builder()
@@ -243,10 +249,9 @@ impl<P: OpenMlsProvider> Device<P> {
             .max_past_epochs(PAST_EPOCHS)
             .use_ratchet_tree_extension(true)
             .build();
-        StagedWelcome::new_from_welcome(&self.provider, &config, w, None)
-            .map_err(err("stage welcome"))?
-            .into_group(&self.provider)
-            .map_err(err("join"))
+        let staged = StagedWelcome::new_from_welcome(&self.provider, &config, w, None).map_err(err("stage welcome"))?;
+        let sender = staged.welcome_sender_index();
+        Ok((staged.into_group(&self.provider).map_err(err("join"))?, sender))
     }
 
     /// A group this device already holds in its provider's storage, if any.

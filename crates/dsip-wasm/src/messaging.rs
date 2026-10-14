@@ -124,6 +124,8 @@ enum Op {
     Rejoin,
     /// Commit the pending Remove proposals by which `identity` leaves (M§7.3 "Leaving", spec-gap 125).
     Leave { identity: String },
+    /// Remove every leaf of another member identity (M§7.3: any member identity MAY remove another).
+    Remove { identity: String },
 }
 
 /// A deposit awaiting the hub's answer, by deposit id (M§9.2).
@@ -156,6 +158,7 @@ impl Op {
             }
             Op::Rejoin => json!("rejoin"),
             Op::Leave { identity } => json!({"leave": identity}),
+            Op::Remove { identity } => json!({"remove": identity}),
         }
     }
 
@@ -165,6 +168,9 @@ impl Op {
         }
         if let Some(i) = v.get("leave").and_then(Value::as_str) {
             return Some(Op::Leave { identity: i.to_string() });
+        }
+        if let Some(i) = v.get("remove").and_then(Value::as_str) {
+            return Some(Op::Remove { identity: i.to_string() });
         }
         let a = v.get("add")?;
         Some(Op::Add {
@@ -210,12 +216,14 @@ impl Pending {
 
 /// What processing one inbound item produced.
 enum Outcome {
-    Joined { members: Vec<String>, group: String, conv: Value, epoch: u64 },
+    /// A welcome joined; `by` is the identity whose commit added this device (the GroupInfo's signer).
+    Joined { members: Vec<String>, group: String, conv: Value, epoch: u64, by: String },
     NotForDevice,
     Object { sender: String, sender_device: String, object: Value },
     Dropped(String),
     Unauthenticated(String),
-    Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String>, hub: Option<Value> },
+    /// A commit merged; `left` names the identities it removed by their own Remove proposals (M§7.3 "Leaving").
+    Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String>, left: Vec<String>, hub: Option<Value> },
     Removed { by: String, remaining: Vec<String> },
     /// A proposal stored for the next commit (M§7.3 "Leaving"): the proposer's identity's pending proposals in this
     /// epoch, Remove ones as `{identity, device}` and the count of others, with the group's roster.
@@ -306,6 +314,9 @@ pub struct Messenger {
     /// Groups this identity is leaving (M§7.3): nothing is sent there and they are not listed; the device proposes its
     /// identity's removal again at each new epoch until a commit removes it.
     leaving: BTreeSet<String>,
+    /// Each group's roster changes by identity, oldest first: `{seq, epoch, by, added, removed, left}` (M§7.3: every
+    /// roster change rendered, attributed to the committing identity).
+    roster_log: BTreeMap<String, Vec<Value>>,
 }
 
 #[wasm_bindgen]
@@ -382,6 +393,7 @@ impl Messenger {
             records: st["records"].as_array().cloned().unwrap_or_default(),
             recording_accepted: serde_json::from_value(st["recording_accepted"].clone()).unwrap_or_default(),
             leaving: serde_json::from_value(st["leaving"].clone()).unwrap_or_default(),
+            roster_log: serde_json::from_value(st["roster_log"].clone()).unwrap_or_default(),
         };
         if let Some(t) = st["hub_timeout"].as_i64() {
             m.hub_timeout = t;
@@ -440,6 +452,7 @@ impl Messenger {
             "hub_timeout": self.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
             "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
             "records_held": self.records_held, "records": self.records, "recording_accepted": self.recording_accepted, "leaving": self.leaving,
+            "roster_log": self.roster_log,
         }}).to_string()
     }
 
@@ -1141,6 +1154,67 @@ impl Messenger {
         Ok(json!(frames).to_string())
     }
 
+    /// Create a group conversation (M§7.3, `kind: group`) with the identities of `targets_json`, `{identity: its
+    /// mailbox's key-packages answer}`, plus this identity's own other devices from `own_json` (or null): every device
+    /// the vector-pinned rule picks, added in one commit once the group is hubbed at this identity's mailbox, with the
+    /// grants held from them (M§14.2). Returns the frames to send.
+    pub fn create_group(&mut self, targets_json: &str, own_json: Option<String>, now: f64) -> Result<String, JsValue> {
+        let now_i = now as i64;
+        let targets: serde_json::Map<String, Value> = serde_json::from_str(targets_json).map_err(js)?;
+        if targets.is_empty() {
+            return Err(JsValue::from_str("a group needs at least one other identity"));
+        }
+        let (mut kps, mut grants) = (vec![], vec![]);
+        for (target, answer) in &targets {
+            kps.extend(self.pick_key_packages(target, &answer.to_string(), now_i)?);
+            grants.extend(self.grants_held.get(target).cloned());
+        }
+        if let Some(own) = own_json {
+            let me = self.keys.identity.clone();
+            kps.extend(self.pick_key_packages(&me, &own, now_i).unwrap_or_default());
+        }
+        let (gid, frames) = self.new_group("group", now_i)?;
+        let peer = targets.keys().next().cloned().unwrap_or_default();
+        let op = Op::Add { peer, kps, grants, device: None };
+        if let Some(id) = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])) {
+            self.pending.insert(id, Pending::GroupInfo { gid, then: Some(op) });
+        }
+        Ok(json!(frames).to_string())
+    }
+
+    /// Add `target`'s devices to the group conversation `gid` from its mailbox's `key-packages` answer (M§7.3: any
+    /// member identity MAY add another, holding its grant, M§14.2): the commit to deposit.
+    pub fn add_member(&mut self, gid: &str, target: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
+        let now_i = now as i64;
+        if self.member_identities(gid, now_i).iter().any(|i| i == target) {
+            return Err(JsValue::from_str(&format!("{target} is a member already")));
+        }
+        let kps = self.pick_key_packages(target, key_packages_json, now_i)?;
+        let grants: Vec<String> = self.grants_held.get(target).cloned().into_iter().collect();
+        self.propose(gid, &Op::Add { peer: target.to_string(), kps, grants, device: None }, now_i)
+    }
+
+    /// Remove the member identity `target` from the conversation `gid`, every leaf of it (M§7.3: any member identity
+    /// MAY remove another; this identity leaves with [`Messenger::leave`] instead): the commit to deposit.
+    pub fn remove_member(&mut self, gid: &str, target: &str, now: f64) -> Result<String, JsValue> {
+        if target == self.keys.identity {
+            return Err(JsValue::from_str("this identity leaves instead (M§7.3: no commit removes its committer)"));
+        }
+        if self.personal.as_deref() == Some(gid) {
+            return Err(JsValue::from_str("the personal group holds this identity's devices only (M§7.1)"));
+        }
+        self.propose(gid, &Op::Remove { identity: target.to_string() }, now as i64)
+    }
+
+    /// The roster changes of a conversation and its predecessors, oldest first: `[{group, seq, epoch, by, added,
+    /// removed, left}]` (M§7.3: rendered, attributed to the committing identity).
+    pub fn roster_log(&self, gid: &str) -> String {
+        let groups = self.lineage(gid);
+        let list: Vec<Value> = self.roster_log.iter().filter(|(g, _)| groups.contains(*g))
+            .flat_map(|(g, es)| es.iter().map(move |e| { let mut e = e.clone(); e["group"] = json!(g); e })).collect();
+        json!(list).to_string()
+    }
+
     /// A text message to a conversation (M§8.1 `content`, kind `text`): the deposit to send, pending until the hub's
     /// `accepted` (M§9.2).
     pub fn send_text(&mut self, gid: &str, text: &str, now: f64) -> Result<String, JsValue> {
@@ -1373,7 +1447,21 @@ impl Messenger {
             self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
             return Ok(frame);
         }
-        let Op::Add { kps, grants, .. } = op else { unreachable!("Rejoin and Leave are handled above") };
+        if let Op::Remove { identity } = op {
+            // M§7.3: another identity is removed whole, every leaf of it (the rule every member checks, spec-gap 126)
+            let leaves: Vec<LeafNodeIndex> = c.group.members()
+                .filter(|m| member_identity(&c.group, m.index, &ctx).ok().is_some_and(|w| &w.identity == identity)).map(|m| m.index).collect();
+            if leaves.is_empty() {
+                return Err(JsValue::from_str(&format!("{identity} is not a member")));
+            }
+            let (commit, _, _) = c.group.remove_members(provider, &signer, &leaves).map_err(|e| js(format!("{e:?}")))?;
+            let fields = json!({"mls": b64(&commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?)});
+            let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
+            let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+            self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
+            return Ok(frame);
+        }
+        let Op::Add { kps, grants, .. } = op else { unreachable!("Rejoin, Leave and Remove are handled above") };
         let mut packages = vec![];
         for bytes in kps {
             let (kp, _) = authenticate_key_package(bytes, provider, &ctx).map_err(|e| js(e.0))?;
@@ -1511,6 +1599,11 @@ impl Messenger {
                 }
             }
             Pending::Commit { gid, op, .. } => {
+                let before_ids = self.member_identities(&gid, now);
+                let left: Vec<String> = match &op {
+                    Some(Op::Leave { identity }) => vec![identity.clone()],
+                    _ => vec![],
+                };
                 if let Some(c) = self.convs.get_mut(&gid) {
                     if let Err(e) = c.group.merge_pending_commit(self.mls.provider()) {
                         out.push(json!({"error": format!("merge commit: {e:?}")}));
@@ -1520,6 +1613,10 @@ impl Messenger {
                     let (added, device) = match &op { Some(Op::Add { peer, device, .. }) => (Some(peer.clone()), device.clone()), _ => (None, None) };
                     out.push(json!({"ui": "committed", "group": gid, "epoch": epoch, "seq": p["seq"], "added": added, "device": device,
                         "personal": self.personal.as_deref() == Some(gid.as_str())}));
+                }
+                if let Some(epoch) = self.convs.get(&gid).map(|c| c.group.epoch().as_u64()) {
+                    let me = self.keys.identity.clone();
+                    out.extend(self.log_roster(&gid, (p["seq"].clone(), epoch), &me, &before_ids, &left, now));
                 }
                 if let Some(seq) = p["seq"].as_i64() {
                     self.resume.sent(&gid, seq);
@@ -1681,6 +1778,8 @@ impl Messenger {
                 Op::Rejoin => !self.convs.contains_key(&gid),
                 // M§7.3: the proposals lapsed with the epoch the conflict moved past; the leaver proposes again
                 Op::Leave { .. } => false,
+                // M§7.3: still needed while any leaf of the identity remains
+                Op::Remove { identity } => self.member_identities(&gid, now).contains(identity),
                 Op::Add { peer, device, .. } => {
                     let ctx = self.ctx(now);
                     self.convs.get(&gid).is_some_and(|c| !c.group.members().any(|m| member_identity(&c.group, m.index, &ctx).ok()
@@ -1787,6 +1886,7 @@ impl Messenger {
                 }
             }
         }
+        let before_ids = self.member_identities(&gid, now);
         let outcome = {
             let ctx = Context::new(now, &self.resolver);
             let me = self.keys.identity.clone();
@@ -1796,7 +1896,7 @@ impl Messenger {
         // committed: the delivery state records the item with its MLS effect (the host saves both together)
         self.resume.commit(item, matches!(outcome, Outcome::NotForDevice));
         match outcome {
-            Outcome::Joined { members, group, conv, epoch } => {
+            Outcome::Joined { members, group, conv, epoch, by } => {
                 let joined = self.mls.load_group(&dsip_core::b64::decode(&group).unwrap_or_default())?.ok_or_else(|| MlsError("joined group not stored".into()))?;
                 let kind = s_of(&conv["kind"]);
                 let peer = members.iter().find(|m| **m != self.keys.identity).cloned();
@@ -1814,6 +1914,15 @@ impl Messenger {
                 out.push(json!({"send": env.frame()}));
                 out.push(json!({"ui": "joined", "group": group, "conversation": conv["conversation"], "kind": kind, "members": members, "epoch": epoch,
                     "successor_of": conv["successor_of"]}));
+                if kind != "personal" && by != self.keys.identity {
+                    // M§7.3: the joiner renders its own add, attributed to the identity whose commit added it
+                    let entry = json!({"seq": item["seq"], "epoch": epoch, "by": by, "added": [self.keys.identity], "removed": [], "left": []});
+                    self.roster_log.entry(group.clone()).or_default().push(entry.clone());
+                    let mut ui = entry;
+                    ui["ui"] = json!("roster");
+                    ui["group"] = json!(group);
+                    out.push(ui);
+                }
                 if let Some(pred) = conv["successor_of"].as_str().map(String::from) {
                     out.extend(self.successor_welcome(&group, &pred, now));
                 }
@@ -1822,10 +1931,11 @@ impl Messenger {
             Outcome::Dropped(why) => out.push(json!({"ui": "dropped", "why": why})),
             Outcome::Unauthenticated(what) => out.push(json!({"ui": "unauthenticated", "what": what})),
             Outcome::NotForDevice => out.push(json!({"ui": "sibling_welcome", "cursor": item["cursor"]})),
-            Outcome::Epoch { epoch, by, added, removed, hub } => {
+            Outcome::Epoch { epoch, by, added, removed, left, hub } => {
                 if let (Some(h), Some(c)) = (hub, self.convs.get_mut(&gid)) {
                     c.hub = (s_of(&h["did"]), s_of(&h["uri"]));
                 }
+                out.extend(self.log_roster(&gid, (item["seq"].clone(), epoch), &by, &before_ids, &left, now));
                 out.push(json!({"ui": "epoch", "group": gid, "epoch": epoch, "by": by, "added": added, "removed": removed}));
                 if self.leaving.contains(&gid) {
                     // M§7.3: a proposal lapses with its epoch; still a member, the leave is proposed again
@@ -1833,12 +1943,20 @@ impl Messenger {
                 }
             }
             Outcome::Removed { by, remaining } => {
-                self.leaving.remove(&gid);
-                let c = self.convs.remove(&gid);
+                let was_leaving = self.leaving.remove(&gid);
+                self.resume.removed(&gid); // spec-gap 127: a member may add this identity back with a new welcome
+                let mut c = self.convs.remove(&gid);
+                if let Some(c) = c.as_mut() {
+                    // spec-gap 127: the group's MLS state goes too, so a welcome back into the same group id can be joined
+                    let _ = c.group.delete(self.mls.provider().storage());
+                }
+                // and the seq gaps it tracked there: a welcome back starts counting afresh from its own seq (spec-gap 83)
+                self.gaps.remove(&gid);
+                self.held_items.remove(&gid);
                 if self.personal.as_deref() == Some(gid.as_str()) {
                     self.personal = None;
                 }
-                out.push(json!({"ui": "removed", "group": gid, "by": by, "conversation": c.map(|c| c.conversation)}));
+                out.push(json!({"ui": "removed", "group": gid, "by": by, "conversation": c.map(|c| c.conversation), "left": was_leaving}));
                 let decision = registration_on_removal(&json!({"me": self.keys.identity, "remaining_identities": remaining}));
                 if decision["left"] == json!(true) {
                     let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}), now);
@@ -1983,6 +2101,25 @@ impl Messenger {
     }
 
     /// The identities with a verified leaf in `gid`, sorted.
+    /// Record a merged commit's roster change by identity, from the member identities before it, and say so to the UI
+    /// (M§7.3: every roster change rendered, attributed to the committing identity). Nothing when no identity came or
+    /// went (a device of a member added or removed, a path update).
+    fn log_roster(&mut self, gid: &str, (seq, epoch): (Value, u64), by: &str, before: &[String], left: &[String], now: i64) -> Vec<Value> {
+        let after = self.member_identities(gid, now);
+        let added: Vec<&String> = after.iter().filter(|i| !before.contains(i)).collect();
+        let gone: Vec<&String> = before.iter().filter(|i| !after.contains(i)).collect();
+        if added.is_empty() && gone.is_empty() {
+            return vec![];
+        }
+        let (left, removed): (Vec<&String>, Vec<&String>) = gone.into_iter().partition(|i| left.contains(i));
+        let entry = json!({"seq": seq, "epoch": epoch, "by": by, "added": added, "removed": removed, "left": left});
+        self.roster_log.entry(gid.to_string()).or_default().push(entry.clone());
+        let mut ui = entry;
+        ui["ui"] = json!("roster");
+        ui["group"] = json!(gid);
+        vec![ui]
+    }
+
     fn member_identities(&self, gid: &str, now: i64) -> Vec<String> {
         let ctx = Context::new(now, &self.resolver);
         let mut ids: Vec<String> = self.convs.get(gid).map(|c| c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok())
@@ -2395,7 +2532,7 @@ impl Conv {
 /// (M§6.5, M§7.3, M§7.4, M§6.8/spec-gap 62 for an external join); an application message's object checked (M§8.1).
 fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &str)>, class: &str, bytes: &[u8], ctx: &Context, me: &str) -> Result<Outcome, MlsError> {
     if class == "welcome" {
-        let joined = match mls.join(bytes) {
+        let (joined, adder) = match mls.join_from(bytes) {
             Ok(g) => g,
             Err(e) if e.0.contains("NoMatchingKeyPackage") => return Ok(Outcome::NotForDevice),
             Err(e) => return Err(e),
@@ -2403,7 +2540,8 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
         let members: Vec<String> = authenticate_members(&joined, ctx)?.into_iter().map(|m| m.identity).collect();
         let conv: Value = serde_json::from_slice(&conversation_extension(&joined).ok_or_else(|| MlsError("no dsip_conversation".into()))?)
             .map_err(mls_err("dsip_conversation"))?;
-        return Ok(Outcome::Joined { members, group: b64(joined.group_id().as_slice()), conv, epoch: joined.epoch().as_u64() });
+        let by = member_identity(&joined, adder, ctx).map(|w| w.identity).unwrap_or_default();
+        return Ok(Outcome::Joined { members, group: b64(joined.group_id().as_slice()), conv, epoch: joined.epoch().as_u64(), by });
     }
     let Some((group, conversation, kind)) = group else { return Ok(Outcome::Nothing) };
     let msg = MlsMessageIn::tls_deserialize_exact(bytes).map_err(mls_err("mls bytes"))?;
@@ -2476,6 +2614,7 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
                 .filter_map(|a| dsip_mls::authenticate_leaf_node(a.add_proposal().key_package().leaf_node(), ctx).ok())
                 .map(|w| format!("{}#{}", w.identity, w.device))).collect();
             let removed_leaves: Vec<LeafNodeIndex> = staged.remove_proposals().map(|r| r.remove_proposal().removed()).collect();
+            let left = left_identities(group, &staged, ctx);
             let removed: Vec<String> = removed_leaves.iter().map(|i| match member_identity(group, *i, ctx) {
                 Ok(w) => format!("{}#{}", w.identity, w.device),
                 Err(_) => format!("unverified#{}", group.public_group().leaf(*i).and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
@@ -2495,7 +2634,7 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
             if !group.is_active() {
                 return Ok(Outcome::Removed { by: sender, remaining });
             }
-            Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed, hub })
+            Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed, left, hub })
         }
         ProcessedMessageContent::ProposalMessage(qp) => {
             // M§7.3 "Leaving" (spec-gap 125): stored for the commit that covers it; the decision is the caller's
@@ -2520,6 +2659,19 @@ fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &s
         }
         _ => Ok(Outcome::Nothing),
     }
+}
+
+/// The identities a staged commit removes by their own Remove proposals: a leave (M§7.3 "Leaving"), told apart from a
+/// removal by another member when the roster change is rendered.
+fn left_identities(group: &MlsGroup, staged: &StagedCommit, ctx: &Context) -> Vec<String> {
+    let mut out: Vec<String> = staged.remove_proposals().filter_map(|q| {
+        let removed = member_identity(group, q.remove_proposal().removed(), ctx).ok()?.identity;
+        let Sender::Member(by) = q.sender() else { return None };
+        (member_identity(group, *by, ctx).ok()?.identity == removed).then_some(removed)
+    }).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Seconds after which a deposit with no answer at all counts as the hub unreachable (M§9.4). Impl (spec-gap 72):

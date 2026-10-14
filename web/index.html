@@ -72,6 +72,12 @@
     <div class="conv-pane">
       <h3>Conversations</h3>
       <ul id="conv-list" class="list"><li class="muted small">none yet: open a contact and choose Message</li></ul>
+      <button type="button" id="btn-new-group" title="a group conversation of several identities, hubbed at your mailbox (M§7.3)">New group…</button>
+      <div id="group-picker" class="hidden">
+        <div class="muted small">Members (contacts; each one's KeyPackages are fetched from their mailbox with the grant you hold, M§14.2):</div>
+        <ul id="group-picker-list" class="list"></ul>
+        <button type="button" id="btn-create-group" class="primary">Create group</button> <button type="button" id="btn-cancel-group">Cancel</button>
+      </div>
       <h3>Requests <span class="muted small">introductions delivered through the mailbox (M§14.1)</span></h3>
       <ul id="msg-request-list" class="list"><li class="muted small">none</li></ul>
       <div id="records-pane" class="hidden">
@@ -82,6 +88,8 @@
     <div class="thread-pane">
       <div class="row"><strong id="thread-title">no conversation open</strong> <code id="thread-did" class="did"></code> <button id="btn-leave" class="hidden" title="propose your identity's removal; another member commits it (M§7.3)">Leave</button></div>
       <div id="thread-meta" class="muted small"></div>
+      <div id="group-members" class="row small hidden"><span class="muted">Members:</span> <span id="group-member-list"></span>
+        <select id="add-member-select"></select> <button type="button" id="btn-add-member" title="any member identity may add another (M§7.3)">Add</button></div>
       <div id="recording-ask" class="row hidden"><span id="recording-ask-text" class="small warn"></span> <button id="btn-accept-recording">Accept recording</button> <button id="btn-decline-recording">Decline and leave</button></div>
       <div id="thread" class="thread"></div>
       <form id="compose" class="row">

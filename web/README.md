@@ -226,6 +226,9 @@ test/messaging-pending.mjs  a lost answer: the personal group's GroupInfo deposi
                         mailbox B, send it again and the personal group comes up (M§9.3, spec-gap 122)
 test/messaging-rebind.mjs  a device binds again while its old connection is still open (a reload, or a second
                         tab); the connection that syncs live keeps being pushed to after the old one closes (M§5.4)
+test/messaging-group.mjs  group conversations (M§7.3): Alice creates a group with Bob and Carol, all write; she
+                        removes Carol and adds her back into the same group (spec-gap 127); Bob leaves; every
+                        roster change is rendered to every member, attributed, and survives a reload
 test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
                         yields a record, held until that conversation exists (spec-gaps 121, 123); a party accepts
                         the recorder before writing there (C§5)
@@ -308,7 +311,10 @@ recorder device, and after a reload the conversation stays accepted. Bob decline
 (M§7.3): his device proposes the removal of his leaf, Kim's device commits it, and his device finds itself removed.
 `messaging-rebind.mjs`: a second tab of the same device binds to the mailbox and syncs live, then the first tab
 closes; the mailbox must keep pushing to the second (it found the mailbox handing the binding to a connection it then
-never pushed to). CI runs all fourteen in Firefox and Chromium.
+never pushed to). `messaging-group.mjs`: a group of three made from "New group…"; a removal, a re-add into the same
+group and a leave, each rendered to every member as a line attributed to the identity that committed it (M§7.3), every
+commit checked against the roster rules before it is merged (spec-gap 126). CI runs all fifteen in Firefox and
+Chromium.
 
 **Call records (v0.13, Recording Profile C§9).** With a record-keeper named in Settings, the client sends a
 `call-record` after every session leg. It holds the leg's frames as sent or accepted (`evidence` is the SHA-256 of
