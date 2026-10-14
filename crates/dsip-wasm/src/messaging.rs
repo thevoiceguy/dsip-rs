@@ -126,6 +126,8 @@ enum Op {
     Leave { identity: String },
     /// Remove every leaf of another member identity (M§7.3: any member identity MAY remove another).
     Remove { identity: String },
+    /// Move the group to another hub, `{did, uri}`: a commit changing `dsip_conversation.hub` and nothing else (M§7.4).
+    MoveHub { hub: Value },
 }
 
 /// A deposit awaiting the hub's answer, by deposit id (M§9.2).
@@ -159,6 +161,7 @@ impl Op {
             Op::Rejoin => json!("rejoin"),
             Op::Leave { identity } => json!({"leave": identity}),
             Op::Remove { identity } => json!({"remove": identity}),
+            Op::MoveHub { hub } => json!({"move_hub": hub}),
         }
     }
 
@@ -171,6 +174,9 @@ impl Op {
         }
         if let Some(i) = v.get("remove").and_then(Value::as_str) {
             return Some(Op::Remove { identity: i.to_string() });
+        }
+        if let Some(h) = v.get("move_hub") {
+            return Some(Op::MoveHub { hub: h.clone() });
         }
         let a = v.get("add")?;
         Some(Op::Add {
@@ -274,6 +280,12 @@ pub struct Messenger {
     held_items: BTreeMap<String, Vec<Value>>,
     /// Membership changes refused by the hub and waiting for a sync before re-proposal (spec-gap 58).
     retries: BTreeMap<String, (CommitRetry, Op)>,
+    /// The hub that answered a deposit `mailbox.unknown-group`, by group: after the sync, a different hub means the
+    /// group moved (M§7.4 "A member that missed the move").
+    unknown_at: BTreeMap<String, String>,
+    /// Application items refused `mailbox.unknown-group`, by group, held until the sync shows whether the group moved:
+    /// re-encrypted and re-sent to the new hub if it did, refused for good if not (M§7.4).
+    moved_items: BTreeMap<String, Vec<String>>,
     /// Introductions delivered through the mailbox, by id (M§14.1: requests, never messages).
     requests: BTreeMap<String, Value>,
     want_live: bool,
@@ -375,6 +387,8 @@ impl Messenger {
             gaps: BTreeMap::new(),
             held_items: serde_json::from_value(st["held_items"].clone()).unwrap_or_default(),
             retries: BTreeMap::new(),
+            unknown_at: BTreeMap::new(),
+            moved_items: BTreeMap::new(),
             requests: serde_json::from_value(st["requests"].clone()).unwrap_or_default(),
             want_live: false,
             gap_timeout: 60,
@@ -1206,6 +1220,19 @@ impl Messenger {
         self.propose(gid, &Op::Remove { identity: target.to_string() }, now as i64)
     }
 
+    /// Move the conversation `gid` to this identity's own mailbox as its hub (M§7.4: while the hub is alive, any member
+    /// MAY move the group): the commit to deposit at the current hub. On `accepted` this device's mailbox follows and
+    /// the new hub is bootstrapped with the GroupInfo and `handover_seq`.
+    pub fn move_hub(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
+        let gid = self.live(gid);
+        let c = self.convs.get(&gid).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
+        if c.hub.0 == self.mailbox.0 {
+            return Err(JsValue::from_str("the conversation is already hubbed at this identity's mailbox"));
+        }
+        let hub = json!({"did": self.mailbox.0, "uri": self.mailbox.1});
+        self.propose(&gid, &Op::MoveHub { hub }, now as i64)
+    }
+
     /// The roster changes of a conversation and its predecessors, oldest first: `[{group, seq, epoch, by, added,
     /// removed, left}]` (M§7.3: rendered, attributed to the committing identity).
     pub fn roster_log(&self, gid: &str) -> String {
@@ -1319,8 +1346,10 @@ impl Messenger {
                 out.extend(self.apply_restored(now_i));
                 if p["next"].is_string() {
                     out.push(json!({"send": self.sync_frame(false, now)}));
-                } else {
-                    // caught up: membership changes refused for a conflict are re-proposed while still needed
+                } else if p["in_reply_to"].is_string() {
+                    // caught up: membership changes refused for a conflict are re-proposed while still needed, and what a
+                    // moved group's old hub refused goes to the new one (M§7.4). Only the answer to a sync says so: a live
+                    // push (no in_reply_to, M§5.4) can arrive first, from before the winning commit or the move
                     out.extend(self.after_sync(now_i));
                 }
             }
@@ -1415,10 +1444,48 @@ impl Messenger {
 
     /// The GroupInfo deposit for the hub (M§6.5 rule 6).
     fn group_info_frame(&mut self, gid: &str, now: i64) -> Result<String, JsValue> {
+        self.group_info_frame_at(gid, None, now)
+    }
+
+    /// As [`Self::group_info_frame`]; `handover_seq` bootstraps a group's new hub, which continues the numbering after
+    /// the seq the old hub gave the moving commit (M§7.4).
+    fn group_info_frame_at(&mut self, gid: &str, handover_seq: Option<i64>, now: i64) -> Result<String, JsValue> {
         let c = self.convs.get(gid).ok_or_else(|| JsValue::from_str("group"))?;
         let gi = c.group.export_group_info(self.mls.provider().crypto(), &self.mls.signer(), true).map_err(|e| js(format!("{e:?}")))?;
         let bytes = gi.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?;
-        Ok(self.hub_deposit(gid, "group-info", json!({"mls": b64(&bytes)}), now))
+        let mut fields = json!({"mls": b64(&bytes)});
+        if let Some(h) = handover_seq {
+            fields["handover_seq"] = json!(h);
+        }
+        Ok(self.hub_deposit(gid, "group-info", fields, now))
+    }
+
+    /// The group moved to `hub` (`{did, uri}`) by the commit at `seq`: deposits go there from now on, and this
+    /// identity's mailbox is told, so it admits the new hub's fan-out and forwards to it (M§7.4 "Member mailboxes follow
+    /// their owner's devices"). The same `did` at a new `uri` is not a move: no `handover_seq`, nothing logged.
+    fn hub_moved(&mut self, gid: &str, hub: &Value, (seq, epoch): (i64, u64), by: &str, now: i64) -> Vec<Value> {
+        let (did, uri) = (s_of(&hub["did"]), s_of(&hub["uri"]));
+        let Some(c) = self.convs.get_mut(gid) else { return vec![] };
+        let moved = c.hub.0 != did;
+        c.hub = (did.clone(), uri.clone());
+        let mut g = json!({"group": gid, "state": "joined", "hub": did});
+        if uri.starts_with("wss://") {
+            g["hub_uri"] = json!(uri);
+        }
+        let mut out = vec![];
+        if moved {
+            g["handover_seq"] = json!(seq);
+            // rendered in the thread like a roster change, attributed to the committing identity
+            let entry = json!({"seq": seq, "epoch": epoch, "by": by, "added": [], "removed": [], "left": [], "hub": did});
+            self.roster_log.entry(gid.to_string()).or_default().push(entry.clone());
+            let mut ui = entry;
+            ui["ui"] = json!("hub_moved");
+            ui["group"] = json!(gid);
+            out.push(ui);
+        }
+        let env = self.config_env(json!({"subject": self.keys.identity, "groups": [g]}), now);
+        out.insert(0, json!({"send": env.frame()}));
+        out
     }
 
     /// A deposit to a group's hub through this device's mailbox, the delegation in the header (M§5.1, M§5.2).
@@ -1461,7 +1528,16 @@ impl Messenger {
             self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
             return Ok(frame);
         }
-        let Op::Add { kps, grants, .. } = op else { unreachable!("Rejoin, Leave and Remove are handled above") };
+        if let Op::MoveHub { hub } = op {
+            // M§7.4: a GroupContextExtensions commit changing the hub and nothing else, ordered by the old hub
+            let commit = self.mls.move_hub_commit(&mut c.group, hub).map_err(|e| js(e.0))?;
+            let fields = json!({"mls": b64(&commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?)});
+            let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
+            let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+            self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
+            return Ok(frame);
+        }
+        let Op::Add { kps, grants, .. } = op else { unreachable!("Rejoin, Leave, Remove and MoveHub are handled above") };
         let mut packages = vec![];
         for bytes in kps {
             let (kp, _) = authenticate_key_package(bytes, provider, &ctx).map_err(|e| js(e.0))?;
@@ -1623,8 +1699,17 @@ impl Messenger {
                     self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
                 }
                 self.retries.remove(&gid);
+                self.unknown_at.remove(&gid);
+                // M§7.4: the committer's mailbox follows on `accepted`, and the new hub is bootstrapped by the GroupInfo
+                // carrying the seq the old hub gave the moving commit
+                let mut handover_seq = None;
+                if let (Some(Op::MoveHub { hub }), Some(seq), Some(epoch)) = (&op, p["seq"].as_i64(), self.convs.get(&gid).map(|c| c.group.epoch().as_u64())) {
+                    let me = self.keys.identity.clone();
+                    out.extend(self.hub_moved(&gid, hub, (seq, epoch), &me, now));
+                    handover_seq = Some(seq);
+                }
                 out.extend(self.flush_handover(&gid, now)); // M§9.4: the successor holds its members: the pending items go in
-                match self.group_info_frame(&gid, now) {
+                match self.group_info_frame_at(&gid, handover_seq, now) {
                     Ok(f) => {
                         let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
                         self.pending.insert(id, Pending::GroupInfo { gid, then: None });
@@ -1733,6 +1818,12 @@ impl Messenger {
                     } else if let Some(r) = action.get("surface") {
                         out.push(json!({"refused": format!("commit in {gid}: {}", r.as_str().unwrap_or(""))}));
                     } else if action.get("sync").is_some() {
+                        if reason == "mailbox.unknown-group" {
+                            // M§7.4: the group may have moved; the sync shows whether it did
+                            if let Some(c) = self.convs.get(&gid) {
+                                self.unknown_at.insert(gid.clone(), c.hub.0.clone());
+                            }
+                        }
                         out.push(json!({"ui": "conflict", "group": gid, "reason": reason}));
                         if let Some(op) = op.clone() {
                             self.retries.insert(gid.clone(), (retry.clone(), op));
@@ -1744,6 +1835,14 @@ impl Messenger {
             Pending::GroupInfo { gid, .. } => out.push(json!({"refused": format!("group-info for {gid}: {reason}")})),
             // M§7.3: a refused proposal (a stale epoch) is proposed again at the next epoch
             Pending::Proposal { gid } => out.push(json!({"ui": "leave_proposal_refused", "group": gid, "reason": reason})),
+            Pending::Application { gid, item } if reason == "mailbox.unknown-group" && self.convs.contains_key(&gid) => {
+                // M§7.4 "A member that missed the move": sync; re-encrypted and re-sent to the new hub if the group moved
+                let hub = self.convs.get(&gid).map(|c| c.hub.0.clone()).unwrap_or_default();
+                self.unknown_at.insert(gid.clone(), hub);
+                self.moved_items.entry(gid.clone()).or_default().push(item.clone());
+                out.push(json!({"ui": "moved_check", "group": gid, "item": item}));
+                out.push(json!({"sync": true}));
+            }
             Pending::Application { gid, item } => {
                 let down = is_outage(&reason);
                 if !down {
@@ -1780,13 +1879,16 @@ impl Messenger {
                 Op::Leave { .. } => false,
                 // M§7.3: still needed while any leaf of the identity remains
                 Op::Remove { identity } => self.member_identities(&gid, now).contains(identity),
+                // M§7.4: still needed while the group is hubbed elsewhere
+                Op::MoveHub { hub } => self.convs.get(&gid).is_some_and(|c| c.hub.0 != s_of(&hub["did"])),
                 Op::Add { peer, device, .. } => {
                     let ctx = self.ctx(now);
                     self.convs.get(&gid).is_some_and(|c| !c.group.members().any(|m| member_identity(&c.group, m.index, &ctx).ok()
                         .is_some_and(|w| &w.identity == peer && device.as_ref().is_none_or(|d| &w.device == d))))
                 }
             };
-            for action in retry.synced(needed, false) {
+            let moved = self.hub_moved_since(&gid);
+            for action in retry.synced(needed, moved) {
                 if action.get("done").is_some() {
                     out.push(json!({"ui": "no_longer_needed", "group": gid}));
                 } else if let Some(r) = action.get("surface") {
@@ -1802,7 +1904,48 @@ impl Messenger {
                 }
             }
         }
+        for (gid, items) in std::mem::take(&mut self.moved_items) {
+            let moved = self.hub_moved_since(&gid);
+            for item in items {
+                if moved {
+                    // M§7.4: re-encrypted at the current epoch and re-sent to the new hub
+                    match self.reencrypt_item(&gid, &item, now) {
+                        Some(f) => out.push(json!({"send": f})),
+                        None => out.push(json!({"refused": format!("message {item}: no longer in the outbox"), "group": gid, "item": item})),
+                    }
+                } else {
+                    // spec-gap 60: no move, so mailbox.unknown-group is final
+                    if let Some(items) = self.outbox.get_mut(&gid) {
+                        items.retain(|i| i["id"] != item);
+                    }
+                    self.messages.retain(|m| m["item"] != item);
+                    out.push(json!({"refused": format!("message {item}: mailbox.unknown-group"), "group": gid, "item": item, "pending": false}));
+                }
+            }
+        }
+        let waiting: BTreeSet<String> = self.retries.keys().cloned().collect();
+        self.unknown_at.retain(|g, _| waiting.contains(g));
         out
+    }
+
+    /// Whether the group's hub is no longer the one that answered `mailbox.unknown-group` (M§7.4, spec-gap 60).
+    fn hub_moved_since(&self, gid: &str) -> bool {
+        match (self.unknown_at.get(gid), self.convs.get(gid)) {
+            (Some(at), Some(c)) => c.hub.0 != *at,
+            _ => false,
+        }
+    }
+
+    /// An outbox item encrypted afresh at the group's current epoch and deposited to its current hub (M§7.4).
+    fn reencrypt_item(&mut self, gid: &str, item_id: &str, now: i64) -> Option<String> {
+        let obj = self.outbox.get(gid)?.iter().find(|i| i["id"] == item_id)?["obj"].clone();
+        let (provider, signer) = (self.mls.provider(), self.mls.signer());
+        let c = self.convs.get_mut(gid)?;
+        let bytes = c.group.create_message(provider, &signer, &serde_json::to_vec(&obj).ok()?).ok()?.tls_serialize_detached().ok()?;
+        let item = self.outbox.get_mut(gid)?.iter_mut().find(|i| i["id"] == item_id)?;
+        item["mls"] = json!(b64(&bytes));
+        let item = item.clone();
+        Some(self.deposit_item(gid, &item, now))
     }
 
     fn gap_of_from(&mut self, gid: &str, first_seq: i64) -> &mut GapTracker {
@@ -1932,8 +2075,9 @@ impl Messenger {
             Outcome::Unauthenticated(what) => out.push(json!({"ui": "unauthenticated", "what": what})),
             Outcome::NotForDevice => out.push(json!({"ui": "sibling_welcome", "cursor": item["cursor"]})),
             Outcome::Epoch { epoch, by, added, removed, left, hub } => {
-                if let (Some(h), Some(c)) = (hub, self.convs.get_mut(&gid)) {
-                    c.hub = (s_of(&h["did"]), s_of(&h["uri"]));
+                if let Some(h) = hub {
+                    // M§7.4: a device that processes the moving commit tells its mailbox
+                    out.extend(self.hub_moved(&gid, &h, (item["seq"].as_i64().unwrap_or(0), epoch), &by, now));
                 }
                 out.extend(self.log_roster(&gid, (item["seq"].clone(), epoch), &by, &before_ids, &left, now));
                 out.push(json!({"ui": "epoch", "group": gid, "epoch": epoch, "by": by, "added": added, "removed": removed}));

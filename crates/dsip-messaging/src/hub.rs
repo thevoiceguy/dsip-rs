@@ -5,7 +5,8 @@
 //! retry before later items), M§6.8 (external joins), M§7.3 (membership rules), M§9.3
 //! (idempotent re-deposit), M§11.2 (ephemeral activity is forwarded, never sequenced), M§7.4 (a commit with `moves_to`
 //! is the group's last here: later deposits are refused `mailbox.unknown-group` while the queues drain; spec-gap 60),
-//! M§4.4 (`mls_retention_s` bounds what is kept for a member that acknowledges nothing; spec-gap 119).
+//! M§4.4 (`mls_retention_s` bounds what is kept for a member that acknowledges nothing; spec-gap 119), and a group that
+//! comes back to a hub it left (spec-gap 128).
 //!
 //! Impl: MLS is abstracted — a deposit event carries the epoch, a digest of the MLS bytes, and for
 //! a commit its adds, removes, validity and whether it is external. Refusals without a
@@ -181,6 +182,9 @@ impl Hub {
     fn deposit(&mut self, d: &Value) -> Vec<Value> {
         let class = s(&d["class"]);
         let ident = s(&d["identity"]);
+        if self.moved_to.is_some() && class == "group-info" && d.get("handover_seq").is_some() {
+            return self.returned(d);
+        }
         if self.moved_to.is_some() {
             // M§7.4: after ordering the commit that moved the group, the old hub refuses further deposits for it
             return Self::error(d, "mailbox.unknown-group");
@@ -298,6 +302,31 @@ impl Hub {
                 }
             }
         }
+        out
+    }
+
+    /// The group comes back to this hub, which it left: `view` is the epoch and roster of the GroupInfo the daemon read
+    /// (it names this hub); numbering goes on from `handover_seq` + 1, never reusing a seq this hub gave, and what was
+    /// ordered before the group left keeps draining.
+    ///
+    /// Spec: M§7.4, M§12.2. Impl (spec-gap 128): the spec has the old hub refuse every later deposit and never says a
+    /// group may come back; a member's handover `group-info` that names this hub again returns it.
+    fn returned(&mut self, d: &Value) -> Vec<Value> {
+        let roster: BTreeMap<String, BTreeSet<String>> = d["view"]["roster"].as_object().into_iter().flatten()
+            .map(|(i, devs)| (i.clone(), devs.as_array().into_iter().flatten().map(s).collect())).collect();
+        if !roster.contains_key(&s(&d["identity"])) {
+            return Self::error(d, "policy.blocked");
+        }
+        let Some(handover) = d["handover_seq"].as_i64().filter(|h| *h >= self.next_seq) else {
+            return Self::error(d, "policy.blocked"); // M§12.2: (group, seq) is unique
+        };
+        self.moved_to = None;
+        self.epoch = d["view"]["epoch"].as_i64().unwrap_or(self.epoch);
+        self.roster = roster;
+        self.next_seq = handover + 1;
+        self.group_info = true;
+        let mut out = vec![json!({"accepted": {"to": d["device"], "in_reply_to": d["id"]}})];
+        out.extend(self.roster.keys().map(|i| json!({"fanout": {"to": i, "class": "group-info"}})));
         out
     }
 

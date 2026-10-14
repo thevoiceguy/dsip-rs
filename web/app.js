@@ -1244,7 +1244,7 @@ async function driveMailbox(result) {
     if (typeof e === 'string') { mailboxConn.send(e); log(`→ ${payloadOf(e).type?.padEnd(12)} to mailbox${payloadOf(e).class ? ` (${payloadOf(e).class})` : ''}`, 'M§5'); continue; }
     if (e.send === '') continue;   // M§9.4: queued behind an unreachable hub, or kept for a successor
     if (e.send) { mailboxConn.send(e.send); const p = payloadOf(e.send); log(`→ ${(p.type || '').padEnd(12)} to ${p.to === mailboxOf()?.did ? 'mailbox' : 'hub ' + short(p.to)}${p.class ? ` (${p.class})` : ''}`, 'M§5'); }
-    else if (e.sync) { const f = messenger.sync_frame(false, now()); mailboxConn.send(f); log('→ sync         after a refused commit (M§6.5, spec-gap 58)', 'M§6.5'); }
+    else if (e.sync) { const f = messenger.sync_frame(false, now()); mailboxConn.send(f); log('→ sync         after a refused deposit (M§6.5 spec-gap 58; M§7.4 a group that moved)', 'M§6.5'); }
     else if (e.ui) onMessagingUi(e);
     else if (e.refused) { log(`✗ refused: ${e.refused}`, 'M§16'); notify(`Messaging: ${e.refused}`); }
     else if (e.error) log(`✗ messaging error: ${e.error}`, 'M§5');
@@ -1261,7 +1261,7 @@ function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
     key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
     archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5',
-    call_record: 'C§9', recording_accepted: 'C§5', receipt_withheld: 'C§5', left: 'M§7.3', leave_proposed: 'M§7.3', leave_committing: 'M§7.3', leave_proposals: 'M§7.3', leave_proposal_refused: 'M§7.3', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5' }[e.ui] || 'M§';
+    call_record: 'C§9', recording_accepted: 'C§5', receipt_withheld: 'C§5', left: 'M§7.3', leave_proposed: 'M§7.3', leave_committing: 'M§7.3', leave_proposals: 'M§7.3', leave_proposal_refused: 'M§7.3', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5', hub_moved: 'M§7.4', moved_check: 'M§7.4' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
   log(`◇ ${e.ui} ${fields}`, sec);
   if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
@@ -1273,7 +1273,7 @@ function onMessagingUi(e) {
   if (e.ui === 'committed' && e.device) notify(`device ${short(e.device)} added to ${e.personal ? 'the personal group' : 'a conversation'} (epoch ${e.epoch})`);
   else if (e.ui === 'committed' && e.added) notify(`conversation with ${nameOf(e.added) || short(e.added)} is up (epoch ${e.epoch})`);
   if (e.ui === 'epoch' && e.added?.length) notify(`${e.added.map((a) => { const [who, dev] = a.split('#'); return `${who === identity.identity ? 'your' : `${nameOf(who) || short(who)}'s`} device ${short(dev)}`; }).join(', ')} joined (epoch ${e.epoch})`);
-  if (e.ui === 'roster') notify(rosterLine(e));
+  if (e.ui === 'roster' || e.ui === 'hub_moved') notify(rosterLine(e));
   if (e.ui === 'joined' && e.kind === 'group') { activeConv = activeConv || e.group; notify(`you were added to a group with ${e.members.filter((m) => m !== identity.identity).map((m) => nameOf(m) || short(m)).join(', ')}`); }
   if (e.ui === 'removed' && !e.left) notify(`${e.by ? nameOf(e.by) || short(e.by) : 'a member'} removed you from a conversation`);
   if (e.ui === 'hub_down') notify(`the hub of a conversation is unreachable: messages wait (M§9.4)`);
@@ -1418,10 +1418,22 @@ async function removeMember(gid, did) {
   renderMessages();
 }
 
-/** One roster change as members see it (M§7.3: attributed to the committing identity). */
+/** Move the conversation `gid` to our own mailbox as its hub (M§7.4); on `accepted` our mailbox follows and the new
+ *  hub is bootstrapped with the GroupInfo and `handover_seq`. */
+async function moveHub(gid) {
+  if (!messenger) return;
+  try {
+    await driveMailbox([{ send: messenger.move_hub(gid, now()) }]);
+    log(`moving ${short(gid)} to our mailbox as its hub`, 'M§7.4');
+  } catch (e) { notify(`cannot move the conversation: ${e.message || e}`); }
+  renderMessages();
+}
+
+/** One roster change as members see it (M§7.3: attributed to the committing identity), or a hub move (M§7.4). */
 function rosterLine(r) {
   const who = (d) => (d === identity.identity ? 'you' : nameOf(d) || short(d));
   const by = r.by ? who(r.by) : 'a device that no longer authenticates';
+  if (r.hub) return `${by} moved the conversation's hub to ${r.hub === mailboxOf()?.did ? 'your mailbox' : `mailbox ${short(r.hub)}`}`;
   const parts = [];
   if (r.added.length) parts.push(`${by} added ${r.added.map(who).join(', ')}`);
   if (r.removed.length) parts.push(`${by} removed ${r.removed.map(who).join(', ')}`);
@@ -1648,6 +1660,9 @@ function renderMessages() {
   $('recording-ask').classList.toggle('hidden', !ask);
   $('btn-leave').classList.toggle('hidden', !conv || conv.kind === 'personal');
   if (conv) $('btn-leave').onclick = () => leaveConversation(conv.group);
+  // M§7.4: any member may move the group to another hub; this client offers its own mailbox
+  $('btn-move-hub').classList.toggle('hidden', !conv || conv.kind === 'personal' || conv.hub.did === mb?.did);
+  if (conv) $('btn-move-hub').onclick = () => moveHub(conv.group);
   if (ask) {
     $('btn-decline-recording').onclick = () => leaveConversation(conv.group);
     $('recording-ask-text').textContent = `${conv.recorders_pending.map((r) => `${nameOf(r.subject) || short(r.subject)} records this conversation on device ${short(r.device)}`).join('; ')}. `
@@ -1893,6 +1908,7 @@ function renderMessages() {
     createGroup,
     addMember,
     removeMember,
+    moveHub,
     rosterLog: (gid) => (messenger ? JSON.parse(messenger.roster_log(gid || activeConv)) : []),
     rosterLines: () => [...document.querySelectorAll('#thread .msg.roster')].map((d) => d.textContent),
     personalGroup: () => messenger?.personal() || null,
