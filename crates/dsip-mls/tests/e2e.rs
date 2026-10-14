@@ -538,3 +538,45 @@ fn roster_rules_enforced_by_members_on_real_mls() {
     assert_eq!(described["removes"].as_array().unwrap().iter().filter(|r| r["identity"] == json!(bob)).count(), 2);
     assert_eq!(check_roster_change(&described)["verdict"], "accept", "removing all of Bob is any member's to do");
 }
+
+#[test]
+fn readd_after_removal_on_real_mls() {
+    // spec-gap 127: Alice removes Carol, then adds her back into the same group. Carol's device deletes the group's MLS
+    // state on removal, so the new welcome (same group id) joins; joining names Alice as the adder (the GroupInfo's
+    // signer, M§7.3), and Carol reads what Alice sends after.
+    let resolver = StaticResolver::default();
+    let ctx = Context::new(NOW, &resolver);
+    let caps = ["dsip.signaling", "dsip.messaging"];
+    let (alice, alice_dev) = device("alice", "alice-phone", &caps);
+    let (_, carol_dev) = device("carol", "carol-phone", &caps);
+    let gid = ulid(60).into_bytes();
+    let conv = json!({"conversation": ulid(61), "kind": "group", "hub": {"did": HUB, "uri": "wss://mbx.alice.example/dsip"}, "successor_of": null});
+    let mut ag = alice_dev.create_group(&gid, &serde_json::to_vec(&conv).unwrap()).unwrap();
+    let kp = |d: &Device| authenticate_key_package(&d.key_package().unwrap(), alice_dev.provider(), &ctx).unwrap().0;
+    let (_, welcome, _) = ag.add_members(alice_dev.provider(), &alice_dev.signer(), &[kp(&carol_dev)]).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let mut cg = carol_dev.join(&bytes(&welcome)).unwrap();
+
+    let carol_idx = ag.members().find(|m| member_identity(&ag, m.index, &ctx).unwrap().device == carol_dev.did()).unwrap().index;
+    let (commit, _, _) = ag.remove_members(alice_dev.provider(), &alice_dev.signer(), &[carol_idx]).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let pm = MlsMessageIn::tls_deserialize(&mut &bytes(&commit)[..]).unwrap().try_into_protocol_message().unwrap();
+    let ProcessedMessageContent::StagedCommitMessage(staged) = cg.process_message(carol_dev.provider(), pm).unwrap().into_content() else {
+        panic!("not a commit")
+    };
+    cg.merge_staged_commit(carol_dev.provider(), *staged).unwrap();
+    assert!(!cg.is_active(), "Carol is out");
+
+    let (_, welcome, _) = ag.add_members(alice_dev.provider(), &alice_dev.signer(), &[kp(&carol_dev)]).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    cg.delete(carol_dev.provider().storage()).unwrap();
+    let (mut cg, adder) = carol_dev.join_from(&bytes(&welcome)).unwrap();
+    assert_eq!(member_identity(&cg, adder, &ctx).unwrap().identity, alice, "the adder is the GroupInfo's signer");
+
+    let msg = ag.create_message(alice_dev.provider(), &alice_dev.signer(), b"welcome back").unwrap();
+    let pm = MlsMessageIn::tls_deserialize(&mut &bytes(&msg)[..]).unwrap().try_into_protocol_message().unwrap();
+    let ProcessedMessageContent::ApplicationMessage(app) = cg.process_message(carol_dev.provider(), pm).unwrap().into_content() else {
+        panic!("not an application message")
+    };
+    assert_eq!(app.into_bytes(), b"welcome back");
+}

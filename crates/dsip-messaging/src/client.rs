@@ -1020,6 +1020,13 @@ impl Resume {
         self.joined.insert(group.to_string());
     }
 
+    /// A commit removed this device's identity from `group`: no longer joined, so a welcome adding it back is a join.
+    ///
+    /// Spec: M§7.3, M§8.5. Impl (spec-gap 127): the seq positions stay, so items already processed remain duplicates.
+    pub fn removed(&mut self, group: &str) {
+        self.joined.remove(group);
+    }
+
     /// Forget the cursor after `mailbox.cursor-invalid`; seq positions and joined groups are kept.
     pub fn cursor_invalid(&mut self) {
         self.cursor = None;
@@ -1061,6 +1068,10 @@ impl Resume {
         }
         if let Some(e) = ev.get("rejoined") {
             self.rejoined(e["group"].as_str().unwrap_or(""), e["seq"].as_i64().unwrap_or(0));
+            return vec![];
+        }
+        if let Some(e) = ev.get("removed") {
+            self.removed(e["group"].as_str().unwrap_or(""));
             return vec![];
         }
         if ev.get("restart").is_some() {

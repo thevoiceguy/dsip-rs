@@ -242,7 +242,12 @@ the app against a local relay, the way the wire demos drive the CLI).
    joining by external commit when no sibling adds a new device (M§6.8, spec-gap 120); headless tests
    `messaging-voicemail.mjs` and `messaging-rejoin.mjs`. Part D, landed 2026-10-12: hub outages (M§9.4, the pinned
    outbox), successor groups (M§7.5, the pinned tracker) and moving mailbox (spec-gap 122); headless test
-   `messaging-successor.mjs`. Round 2's four parts are in; group conversations of more than two identities, moving a live hub (M§7.4) and removing members stay with the Rust console.
+   `messaging-successor.mjs`. Round 2's four parts are in; moving a live hub (M§7.4) stays with the Rust console.
+8. **Group conversations** (after `poc-v0.14`). A group of any number of identities created from "New group…", members
+   added and removed by any member identity, leaving (M§7.3, spec-gap 125); every roster change rendered in the thread
+   and attributed to the committing identity (a joiner names its adder from the welcome's GroupInfo signer); every
+   commit checked against the roster rules before it is merged (spec-gap 126); a removed identity added back into the
+   same group (spec-gap 127). Headless test `messaging-group.mjs`.
 
 ## 11. Risks
 
