@@ -483,3 +483,58 @@ fn leave_on_real_mls() {
     pg.merge_staged_commit(bob_phone.provider(), *staged).unwrap();
     assert!(!pg.is_active(), "Bob's phone is no longer in the group");
 }
+
+#[test]
+fn roster_rules_enforced_by_members_on_real_mls() {
+    // M§7.3 (spec-gap 126): a member checks every commit's roster change itself before merging. Carol stages three
+    // commits in turn; Alice describes each from the real staged commit: removing one of Bob's two devices and adding
+    // a device of Bob's are refused, removing all of Bob is accepted.
+    use dsip_messaging::checks::check_roster_change;
+    let resolver = StaticResolver::default();
+    let ctx = Context::new(NOW, &resolver);
+    let caps = ["dsip.signaling", "dsip.messaging"];
+    let (_, alice_dev) = device("alice", "alice-phone", &caps);
+    let (bob, bob_phone) = device("bob", "bob-phone", &caps);
+    let (_, bob_laptop) = device("bob", "bob-laptop", &caps);
+    let (_, bob_desk) = device("bob", "bob-desk", &caps);
+    let (carol, carol_dev) = device("carol", "carol-phone", &caps);
+    let gid = ulid(50).into_bytes();
+    let conv = json!({"conversation": ulid(51), "kind": "group", "hub": {"did": HUB, "uri": "wss://mbx.alice.example/dsip"}, "successor_of": null});
+    let mut ag = alice_dev.create_group(&gid, &serde_json::to_vec(&conv).unwrap()).unwrap();
+    let kps: Vec<KeyPackage> = [&bob_phone, &bob_laptop, &carol_dev].iter()
+        .map(|d| authenticate_key_package(&d.key_package().unwrap(), alice_dev.provider(), &ctx).unwrap().0).collect();
+    let (_, welcome, _) = ag.add_members(alice_dev.provider(), &alice_dev.signer(), &kps).unwrap();
+    ag.merge_pending_commit(alice_dev.provider()).unwrap();
+    let mut cg = carol_dev.join(&bytes(&welcome)).unwrap();
+
+    let index_of = |g: &MlsGroup, did: &str| g.members().find(|m| member_identity(g, m.index, &ctx).unwrap().device == did).unwrap().index;
+    let mut verdict_at_alice = |commit: &[u8]| {
+        let pm = MlsMessageIn::tls_deserialize(&mut &commit[..]).unwrap().try_into_protocol_message().unwrap();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = ag.process_message(alice_dev.provider(), pm).unwrap().into_content() else {
+            panic!("not a commit")
+        };
+        check_roster_change(&dsip_mls::roster_change(&ag, &staged, &ctx, &carol))
+    };
+
+    let laptop = index_of(&cg, &bob_laptop.did());
+    let (c, _, _) = cg.remove_members(carol_dev.provider(), &carol_dev.signer(), &[laptop]).unwrap();
+    assert_eq!(verdict_at_alice(&bytes(&c))["code"], "roster-removes-part-of-identity");
+    cg.clear_pending_commit(carol_dev.provider().storage()).unwrap();
+
+    let desk = authenticate_key_package(&bob_desk.key_package().unwrap(), carol_dev.provider(), &ctx).unwrap().0;
+    let (c, _, _) = cg.add_members(carol_dev.provider(), &carol_dev.signer(), &[desk]).unwrap();
+    assert_eq!(verdict_at_alice(&bytes(&c))["code"], "roster-adds-other-devices", "Bob's devices are Bob's to add");
+    cg.clear_pending_commit(carol_dev.provider().storage()).unwrap();
+
+    let phone = index_of(&cg, &bob_phone.did());
+    let (c, _, _) = cg.remove_members(carol_dev.provider(), &carol_dev.signer(), &[phone, laptop]).unwrap();
+    let described = {
+        let pm = MlsMessageIn::tls_deserialize(&mut &bytes(&c)[..]).unwrap().try_into_protocol_message().unwrap();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = ag.process_message(alice_dev.provider(), pm).unwrap().into_content() else {
+            panic!("not a commit")
+        };
+        dsip_mls::roster_change(&ag, &staged, &ctx, &carol)
+    };
+    assert_eq!(described["removes"].as_array().unwrap().iter().filter(|r| r["identity"] == json!(bob)).count(), 2);
+    assert_eq!(check_roster_change(&described)["verdict"], "accept", "removing all of Bob is any member's to do");
+}

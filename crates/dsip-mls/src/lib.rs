@@ -346,6 +346,42 @@ pub fn external_commit(group: &MlsGroup, staged: &StagedCommit, ctx: &Context) -
     Ok(json!({"joiner": joiner, "adds": [joiner], "removes": removes}))
 }
 
+/// Describe a staged commit the way [`dsip_messaging::checks::check_roster_change`] takes it: `{committer, roster,
+/// adds, removes}`, read before the commit is merged. `roster` holds the leaves that authenticate; a removed leaf that
+/// no longer does is `{identity: "", device: <its credential>, delegation_valid: false}`, and an added leaf that does
+/// not authenticate is left out (M§6.2 refuses it on its own).
+///
+/// Spec: M§7.3 — members enforce the roster rules themselves, the hub's check being defense in depth (spec-gap 126).
+pub fn roster_change(group: &MlsGroup, staged: &StagedCommit, ctx: &Context, committer: &str) -> Value {
+    let roster: Vec<Value> = group
+        .members()
+        .filter_map(|m| member_identity(group, m.index, ctx).ok())
+        .map(|w| json!({"identity": w.identity, "device": w.device}))
+        .collect();
+    let adds: Vec<Value> = staged
+        .add_proposals()
+        .filter_map(|a| authenticate_leaf_node(a.add_proposal().key_package().leaf_node(), ctx).ok())
+        .map(|w| json!({"identity": w.identity, "device": w.device}))
+        .collect();
+    let removes: Vec<Value> = staged
+        .remove_proposals()
+        .map(|r| {
+            let index = r.remove_proposal().removed();
+            match member_identity(group, index, ctx) {
+                Ok(w) => json!({"identity": w.identity, "device": w.device}),
+                Err(_) => {
+                    let device = group.public_group().leaf(index)
+                        .and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
+                        .map(|b| String::from_utf8_lossy(b.identity()).into_owned())
+                        .unwrap_or_default();
+                    json!({"identity": "", "device": device, "delegation_valid": false})
+                }
+            }
+        })
+        .collect();
+    json!({"committer": committer, "roster": roster, "adds": adds, "removes": removes})
+}
+
 /// What a staged commit does to `dsip_conversation`, given the value before it: `None` when it leaves it unchanged,
 /// otherwise the `conversation-update` verdict (`effective.moves_to`, `effective.hub`, or a rejection).
 ///

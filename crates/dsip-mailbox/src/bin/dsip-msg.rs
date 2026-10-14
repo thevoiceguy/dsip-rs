@@ -3169,6 +3169,11 @@ fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &st
                 sender = described["joiner"]["identity"].as_str().unwrap_or("").to_string();
                 joined_externally.push(format!("{}#{}", sender, described["joiner"]["device"].as_str().unwrap_or("")));
             }
+            let rc = dsip_messaging::checks::check_roster_change(&dsip_mls::roster_change(group, &staged, ctx, &sender));
+            if rc["verdict"] != "accept" {
+                // M§7.3 (spec-gap 126): every member enforces the roster rules itself; a commit failing them is not merged
+                return Ok(Outcome::Dropped(format!("commit refused: {}", rc["code"])));
+            }
             let added: Vec<String> = joined_externally.into_iter().chain(staged
                 .add_proposals()
                 .filter_map(|a| dsip_mls::authenticate_leaf_node(a.add_proposal().key_package().leaf_node(), ctx).ok())

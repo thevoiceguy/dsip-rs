@@ -355,6 +355,32 @@ pub fn leave_proposals(inp: &Value) -> Value {
     json!({"action": "commit"})
 }
 
+/// The roster rules every member checks on a commit the hub ordered, and the hub checks as defense in depth:
+/// `committer` (an identity, empty when its leaf no longer authenticates), `roster [{identity, device}]` (the leaves
+/// before the commit), `adds` and `removes` (`[{identity, device, delegation_valid?}]`).
+///
+/// Spec: M§7.3 — adding or removing devices of an identity is reserved to that identity's own devices, except that any
+/// member MAY remove a leaf whose delegation no longer verifies; members MUST enforce it themselves. Impl
+/// (spec-gap 126): another identity's leaves are removed all together or each lapsed, and a member does not merge a
+/// commit that fails (as M§6.8, spec-gap 62).
+pub fn check_roster_change(inp: &Value) -> Value {
+    let me = &inp["committer"];
+    let roster: Vec<&Value> = inp["roster"].as_array().into_iter().flatten().collect();
+    if inp["adds"].as_array().into_iter().flatten().any(|a| a["identity"] != *me && roster.iter().any(|r| r["identity"] == a["identity"])) {
+        return reject("roster-adds-other-devices", None);
+    }
+    let removes: Vec<&Value> = inp["removes"].as_array().into_iter().flatten().collect();
+    for who in removes.iter().map(|r| &r["identity"]).filter(|w| *w != me) {
+        let rs: Vec<&&Value> = removes.iter().filter(|r| r["identity"] == *who).collect();
+        let whole = roster.iter().filter(|r| r["identity"] == *who).all(|r| rs.iter().any(|x| x["device"] == r["device"]));
+        let lapsed = rs.iter().all(|r| r["delegation_valid"] == Value::Bool(false));
+        if !(whole || lapsed) {
+            return reject("roster-removes-part-of-identity", None);
+        }
+    }
+    accept()
+}
+
 /// What an external commit may do, checked alike by the hub and every member.
 ///
 /// Spec: M§6.8 — a device joins by external commit only into a group its identity is already in, or its own personal

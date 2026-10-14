@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::checks::check_external_join;
+use crate::checks::{check_external_join, check_roster_change};
 
 /// Hub state for one group.
 #[derive(Serialize, Deserialize)]
@@ -251,30 +251,13 @@ impl Hub {
         if !commit["valid"].as_bool().unwrap_or(true) {
             return Self::error(d, "policy.blocked");
         }
+        let roster: Vec<Value> = self.roster.iter().flat_map(|(i, devs)| devs.iter().map(move |dev| json!({"identity": i, "device": dev}))).collect();
+        let v = check_roster_change(&json!({"committer": ident, "roster": roster, "adds": commit["adds"], "removes": commit["removes"]}));
+        if v["verdict"] != "accept" {
+            return Self::error(d, "policy.blocked"); // M§7.3: the rule every member checks too (spec-gap 126)
+        }
         let adds: Vec<&Value> = commit["adds"].as_array().into_iter().flatten().collect();
         let removes: Vec<&Value> = commit["removes"].as_array().into_iter().flatten().collect();
-        // M§7.3: another member identity's devices are that identity's own business
-        if adds.iter().any(|a| {
-            let x = s(&a["identity"]);
-            self.roster.contains_key(&x) && x != ident
-        }) {
-            return Self::error(d, "policy.blocked");
-        }
-        let mut by_ident: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
-        for r in &removes {
-            by_ident.entry(s(&r["identity"])).or_default().push(r);
-        }
-        for (x, rs) in &by_ident {
-            if *x == ident {
-                continue;
-            }
-            let removed: BTreeSet<String> = rs.iter().map(|r| s(&r["device"])).collect();
-            let whole = self.roster.get(x).is_none_or(|devs| devs.is_subset(&removed));
-            let lapsed = rs.iter().all(|r| r["delegation_valid"] == Value::Bool(false));
-            if !(whole || lapsed) {
-                return Self::error(d, "policy.blocked");
-            }
-        }
         let mut out = self.sequence(d, &targets);
         let before = self.roster.clone();
         for r in &removes {
