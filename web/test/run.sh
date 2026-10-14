@@ -39,11 +39,12 @@ NPORT=${NODE_PORT:-8099}; NODE=http://127.0.0.1:$NPORT
 LISTEN_B=${LISTEN_B:-127.0.0.1:8444}
 TURN_SECRET=${TURN_SECRET:-$(openssl rand -hex 16)}
 # --- the mailboxes (stage 6): A is relay A's operator default; B is another operator's, set in Bob's settings. Each
-# serves the identities that enrol by binding; each finds the other's members through the node's hints.
+# serves the identities that enrol by binding; each finds the other's members through the node's hints. The cap is
+# for both browsers' runs together (every test makes fresh identities: about 35 at A per browser), with room to grow.
 MBX_A=${MAILBOX_A:-127.0.0.1:9443}; MBX_B=${MAILBOX_B:-127.0.0.1:9444}
 rm -rf "$D/mbx-a" "$D/mbx-b"   # fresh mailboxes: enrolment is bounded, and a reused DEMO_DIR would fill it
-$B/dsip-mailbox --listen "$MBX_A" --state "$D/mbx-a" --serve-any 64 --hints-node $NODE --ca "$D/mbx-ca.pem" >"$D/mbx-a.log" 2>&1 & MBXA=$!
-$B/dsip-mailbox --listen "$MBX_B" --state "$D/mbx-b" --serve-any 64 --hints-node $NODE --ca "$D/mbx-ca.pem" >"$D/mbx-b.log" 2>&1 & MBXB=$!
+$B/dsip-mailbox --listen "$MBX_A" --state "$D/mbx-a" --serve-any 256 --hints-node $NODE --ca "$D/mbx-ca.pem" >"$D/mbx-a.log" 2>&1 & MBXA=$!
+$B/dsip-mailbox --listen "$MBX_B" --state "$D/mbx-b" --serve-any 256 --hints-node $NODE --ca "$D/mbx-ca.pem" >"$D/mbx-b.log" 2>&1 & MBXB=$!
 for i in $(seq 1 80); do [ -s "$D/mbx-a/service.did" ] && [ -s "$D/mbx-b/service.did" ] && grep -q "mailbox did:key" "$D/mbx-a.log" && grep -q "mailbox did:key" "$D/mbx-b.log" && break; sleep 0.25; done
 [ -s "$D/mbx-a/service.did" ] && [ -s "$D/mbx-b/service.did" ] || { echo "the mailboxes did not start"; cat "$D/mbx-a.log" "$D/mbx-b.log"; exit 1; }
 cat "$D/mbx-a/cert.pem" "$D/mbx-b/cert.pem" > "$D/mbx-ca.pem"
