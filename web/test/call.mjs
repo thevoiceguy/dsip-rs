@@ -1,7 +1,7 @@
 // Headless call test: two browsers (two storage contexts, so two identities) call each other through a relay that
 // serves the client. Drives the screens through the DOM, like a person would; reads state through `window.dsip`.
 // Run by test/run.sh (which starts the relay); helpers and env in lib.mjs.
-import { launch, person, until, state, checker, dump, which, URL } from './lib.mjs';
+import { launch, openPage, person, until, state, checker, dump, which, URL } from './lib.mjs';
 
 const check = checker();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -9,6 +9,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await launch();
 let alice, bob;
 try {
+  // the welcome screen makes nothing until a choice: no identity stored while it waits (§7.3)
+  {
+    const { ctx, page } = await openPage(browser, 'Undecided');
+    const stored = await page.evaluate(() => new Promise((res) => {
+      const r = indexedDB.open('dsip', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('kv');
+      r.onsuccess = () => { const g = r.result.transaction('kv').objectStore('kv').get('identity'); g.onsuccess = () => res(g.result ?? null); g.onerror = () => res('error'); };
+      r.onerror = () => res('error');
+    }));
+    check('welcome: no identity is made or stored before the person chooses', stored === null, JSON.stringify(stored)?.slice(0, 80));
+    await ctx.close();
+  }
   alice = await person(browser, 'Alice');
   bob = await person(browser, 'Bob');
   check('two identities, both bound to the relay', alice.did !== bob.did && alice.did.startsWith('did:key:'), `${alice.did.slice(0, 24)}… / ${bob.did.slice(0, 24)}…`);

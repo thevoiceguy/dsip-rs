@@ -109,7 +109,8 @@ and the CI job that builds `dsip-wasm` grows a headless-browser test of the app'
 
 ## 4. The flows a person sees
 
-1. **First run.** Open the URL. The app makes an identity (`did:key`), shows its DID and a plain explanation of what
+1. **First run.** Open the URL. The person chooses: an identity file they already have (this browser becomes another
+   of its devices), or a new identity (`did:key`), made only then. The app shows its DID and a plain explanation of what
    it is, offers to name it, and offers the export of the identity key with a warning that it is the only copy.
 2. **Connect.** The app binds to the relay that served it (`hello`, the relay's capabilities, the anti-splicing
    check, §13.2). The relay's DID and its limits are shown in settings, not hidden.
