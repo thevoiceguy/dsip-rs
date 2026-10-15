@@ -254,8 +254,9 @@ the app against a local relay, the way the wire demos drive the CLI).
    mailbox refused the new hub's fan-out with `mailbox.unknown-group` for good), a commit refused `mailbox.unknown-group`
    was never re-proposed after a move, and an application message refused that way was dropped where the spec says
    to sync and re-send to the new hub. The re-send is decided only on the answer to the sync, not on a live push that
-   can arrive first (M§5.4). It also found spec-gap 128: a group could not move back to a hub it had left. Headless
-   test `messaging-hub-move.mjs`.
+   can arrive first (M§5.4). It also found spec-gap 128: a group could not move back to a hub it had left. CI then found
+   spec-gap 129: a member could reach the new hub before the committer's GroupInfo had set it up, and the new hub's
+   `mailbox.unknown-group` was taken as final, dropping the message. Headless test `messaging-hub-move.mjs`.
 
 ## 11. Risks
 

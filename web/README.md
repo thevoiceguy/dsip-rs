@@ -231,7 +231,8 @@ test/messaging-group.mjs  group conversations (M§7.3): Alice creates a group wi
                         roster change is rendered to every member, attributed, and survives a reload
 test/messaging-hub-move.mjs  moving a live hub (M§7.4): Bob hosts Alice's conversation at his mailbox, both mailboxes
                         follow, text flows; Alice moves it back while Bob's page holds its pushes, so his message
-                        meets the old hub and is re-sent to the new one; the group returns to a hub it left (spec-gap 128)
+                        meets the old hub and is re-sent to the new one; the group returns to a hub it left (spec-gap 128);
+                        Alice reaches a new hub before the GroupInfo that sets it up and waits for it (spec-gap 129)
 test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
                         yields a record, held until that conversation exists (spec-gaps 121, 123); a party accepts
                         the recorder before writing there (C§5)
@@ -319,7 +320,9 @@ group and a leave, each rendered to every member as a line attributed to the ide
 commit checked against the roster rules before it is merged (spec-gap 126). `messaging-hub-move.mjs`: "Host here" moves
 a conversation's hub to the member's own mailbox (M§7.4); every member's device tells its mailbox the new hub and
 `handover_seq`, so the mailbox admits the new hub's fan-out; a device that writes before it has seen a move syncs on
-`mailbox.unknown-group` and re-sends to the new hub; and a group can move back to a hub it left (spec-gap 128). CI runs
+`mailbox.unknown-group` and re-sends to the new hub; a group can move back to a hub it left (spec-gap 128); and a
+member that reaches the new hub before the committer's GroupInfo has set it up retries the same deposit with the
+§13.2 backoff until the hub hosts the group (spec-gap 129). CI runs
 all sixteen in Firefox and Chromium.
 
 **Call records (v0.13, Recording Profile C§9).** With a record-keeper named in Settings, the client sends a

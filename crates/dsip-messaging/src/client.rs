@@ -296,6 +296,103 @@ impl HubOutage {
     }
 }
 
+/// How long a member waits for the hub a group moved to, from the move, seconds.
+///
+/// Spec: M§7.4. Impl (spec-gap 129): the same bound as the mailbox's `handover_wait` (300 s RECOMMENDED).
+pub const ARRIVAL_WAIT_S: i64 = 300;
+
+/// A member reaching the hub a group moved to before the committer's `group-info` has set it up.
+///
+/// Spec: M§7.4 — the new hub initializes from the latest `group-info`, and a member that processed the move deposits
+/// there; §13.2 — the backoff. Impl (spec-gap 129): `moved` names the new hub (the device processed the moving commit,
+/// or its own move was accepted). Until that hub accepts a deposit, its `mailbox.unknown-group` is not final: the same
+/// deposit is retried with the §13.2 backoff, for at most `arrival_wait` from the move; the first such refusal at or
+/// past the bound emits `expired`, once. Every other answer, and any answer from another hub, emits nothing: the caller
+/// handles it as usual (M§7.4 sync, M§9.4 outage, M§6.5). A later `moved` starts afresh.
+#[derive(Debug, Clone)]
+pub struct MoveArrival {
+    now: i64,
+    wait: i64,
+    state: &'static str,
+    hub: Option<String>,
+    since: Option<i64>,
+    attempt: i64,
+}
+
+impl MoveArrival {
+    /// A machine from a vector `context`: `now`, `arrival_wait` (default [`ARRIVAL_WAIT_S`]).
+    pub fn new(ctx: &Value) -> MoveArrival {
+        MoveArrival {
+            now: ctx["now"].as_i64().unwrap_or(0),
+            wait: ctx["arrival_wait"].as_i64().unwrap_or(ARRIVAL_WAIT_S),
+            state: "none",
+            hub: None,
+            since: None,
+            attempt: 0,
+        }
+    }
+
+    /// The group moved to `hub`: wait for it to host the group.
+    pub fn moved(&mut self, hub: &str) -> Vec<Value> {
+        (self.state, self.hub, self.since, self.attempt) = ("arriving", Some(hub.to_string()), Some(self.now), 0);
+        vec![]
+    }
+
+    /// `hub` answered a deposit for the group; `reason` is `None` for `accepted`.
+    pub fn answer(&mut self, hub: &str, reason: Option<&str>) -> Vec<Value> {
+        if self.state != "arriving" || self.hub.as_deref() != Some(hub) {
+            return vec![];
+        }
+        match reason {
+            None => {
+                self.state = "hosted";
+                vec![]
+            }
+            Some("mailbox.unknown-group") if self.now - self.since.unwrap_or(self.now) >= self.wait => {
+                self.state = "expired";
+                vec![json!({"expired": {}})]
+            }
+            Some("mailbox.unknown-group") => {
+                self.attempt += 1;
+                vec![json!({"retry_in": (HUB_RETRY_INITIAL_S << (self.attempt - 1).min(30)).min(HUB_RETRY_MAX_S)})]
+            }
+            Some(_) => vec![],
+        }
+    }
+
+    /// Time passes.
+    pub fn advance(&mut self, n: i64) -> Vec<Value> {
+        self.now += n;
+        vec![]
+    }
+
+    /// The machine's clock, seconds.
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+
+    /// Set the clock (a host driving the machine from its own clock).
+    pub fn set_now(&mut self, now: i64) {
+        self.now = now;
+    }
+
+    /// Apply one trace event (`moved`, `answer`, `advance`).
+    pub fn step(&mut self, ev: &Value) -> Vec<Value> {
+        if let Some(m) = ev.get("moved") {
+            return self.moved(m["hub"].as_str().unwrap_or(""));
+        }
+        if let Some(a) = ev.get("answer") {
+            return self.answer(a["hub"].as_str().unwrap_or(""), a["reason"].as_str());
+        }
+        self.advance(ev["advance"].as_i64().unwrap_or(0))
+    }
+
+    /// Snapshot compared by the vectors.
+    pub fn snapshot(&self) -> Value {
+        json!({"state": self.state, "hub": self.hub, "attempt": self.attempt, "waited": self.since.map(|s| self.now - s)})
+    }
+}
+
 fn s(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()
 }

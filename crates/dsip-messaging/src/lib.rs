@@ -97,6 +97,10 @@ pub fn run_vector(v: &Value) -> Value {
             let mut o = client::HubOutage::new(&v["context"]);
             trace(inp, |ev| (o.step(ev), o.snapshot()))
         }
+        "move-arrival-trace" => {
+            let mut a = client::MoveArrival::new(&v["context"]);
+            trace(inp, |ev| (a.step(ev), a.snapshot()))
+        }
         "history-trace" => {
             let mut h = client::History::new(&v["context"]);
             trace(inp, |ev| (h.step(ev), h.snapshot()))

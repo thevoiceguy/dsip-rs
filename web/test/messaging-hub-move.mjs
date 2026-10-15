@@ -5,7 +5,9 @@
 // admits hub B's fan-out and forwards her deposits there: text flows both ways after the move, and both threads say who
 // moved it. Then Alice moves it back, while Bob's page holds what his mailbox pushes: he writes before he has seen the
 // move, the old hub answers `mailbox.unknown-group`, he syncs, finds the group moved, and his message is re-encrypted
-// and re-sent to the new hub (M§7.4 "A member that missed the move"). A reload keeps the hub and the lines.
+// and re-sent to the new hub (M§7.4 "A member that missed the move"). A reload keeps the hub and the lines. Last, Bob
+// moves it to his mailbox again while his page holds the group-info that sets hub B up: Alice reaches hub B first, its
+// `mailbox.unknown-group` means "not yet", and the same deposit goes again once hub B hosts the group (spec-gap 129).
 import { readFileSync } from 'node:fs';
 import { launch, ready, until, addContact, rowButton, checker, dump, logOf, sleep } from './lib.mjs';
 
@@ -48,6 +50,19 @@ const holder = () => {
     },
   });
   window.__releaseItems = async () => { localStorage.removeItem('test-hold-items'); const h = window.__held.splice(0); for (const [fn, ev] of h) await fn(ev); return h.length; };
+  // While localStorage['test-hold-gi'] is set, outgoing group-info deposits are held; window.__releaseGi() sends them.
+  window.__heldGi = [];
+  const send = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    try {
+      if (localStorage.getItem('test-hold-gi') && typeof data === 'string') {
+        const p = atob(JSON.parse(data).payload.replace(/-/g, '+').replace(/_/g, '/'));
+        if (p.includes('"deposit"') && p.includes('"group-info"')) { window.__heldGi.push([this, data]); return; }
+      }
+    } catch { /* not an envelope */ }
+    return send.call(this, data);
+  };
+  window.__releaseGi = () => { localStorage.removeItem('test-hold-gi'); const h = window.__heldGi.splice(0); for (const [ws, d] of h) send.call(ws, d); return h.length; };
 };
 async function holdingPerson(name) {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
@@ -145,6 +160,27 @@ try {
   await say(bob, bConv.group, 'after the reload');
   await sees(alice, aConv.group, 'after the reload');
   check('Alice: a message after the reload decrypts', true);
+
+  // 6. Bob moves the hub to his mailbox again, and his page holds the group-info that sets hub B up: Alice, who saw
+  //    the move, deposits there first. Hub B's mailbox.unknown-group is "not yet": she retries until it hosts the
+  //    group (M§7.4, spec-gap 129)
+  await bob.page.evaluate(() => localStorage.setItem('test-hold-gi', '1'));
+  await bob.page.click('nav button[data-view=messages]');
+  await bob.page.evaluate((g) => window.dsip.openConversation(g), bConv.group);
+  await bob.page.click('#btn-move-hub');
+  await hubIs(alice, aConv.group, MAILBOX_B_DID);
+  await until(bob.page, () => window.__heldGi.length > 0);
+  await alice.page.click('nav button[data-view=messages]');
+  await alice.page.evaluate((g) => window.dsip.openConversation(g), aConv.group);
+  await alice.page.fill('#compose-text', 'before hub B was set up');
+  await alice.page.click('#compose-send');
+  await until(alice.page, () => /◇ hub_arriving /.test(document.getElementById('log').textContent), null, 30000);
+  check('Alice: hub B, not set up yet, answered mailbox.unknown-group and she waits for it (spec-gap 129)',
+    !(await alice.page.evaluate(() => window.dsip.thread().some((m) => m.mine && m.object.text === 'before hub B was set up' && m.seq != null))));
+  check('Bob: the held group-info is sent', (await bob.page.evaluate(() => window.__releaseGi())) >= 1);
+  await until(alice.page, (t) => window.dsip.thread().some((m) => m.mine && m.object.text === t && m.seq != null), 'before hub B was set up', 30000);
+  await sees(bob, bConv.group, 'before hub B was set up');
+  check('Alice: the same deposit went again once hub B hosted the group, and Bob reads it (M§9.3)', true);
 } catch (err) {
   check.fail(`exception: ${err.message}`);
   for (const p of [alice, bob]) if (p) console.log(`  ${p.name} log tail: ${(await logOf(p).catch(() => '')).split('\n').slice(-25).join('\n    ')}`);

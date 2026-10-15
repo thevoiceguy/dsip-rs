@@ -43,7 +43,7 @@ use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, Resume, SuccessorTracker};
+use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open as open_sealed, open_blob, seal, SealUse};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
@@ -189,6 +189,15 @@ impl Op {
 }
 
 impl Pending {
+    /// The group a deposit was for, if any.
+    fn gid(&self) -> Option<&str> {
+        match self {
+            Pending::Commit { gid, .. } | Pending::GroupInfo { gid, .. } | Pending::Application { gid, .. } | Pending::PersonalReady { gid }
+            | Pending::Proposal { gid } => Some(gid),
+            Pending::KeyPackages { .. } | Pending::Config { .. } | Pending::Archive { .. } => None,
+        }
+    }
+
     /// What survives a restart: everything but application items, which the outbox holds (M§9.2), and key package
     /// uploads, made afresh.
     fn to_json(&self) -> Option<Value> {
@@ -286,6 +295,13 @@ pub struct Messenger {
     /// Application items refused `mailbox.unknown-group`, by group, held until the sync shows whether the group moved:
     /// re-encrypted and re-sent to the new hub if it did, refused for good if not (M§7.4).
     moved_items: BTreeMap<String, Vec<String>>,
+    /// M§7.4 (spec-gap 129): per group that moved, the vector-pinned wait for its new hub to host it, and the deposits
+    /// it answered `mailbox.unknown-group` before then, due again at a time (the same bytes, M§9.3).
+    arrivals: BTreeMap<String, MoveArrival>,
+    arrival_due: Vec<(i64, Pending)>,
+    /// The hub each group deposit was addressed to, by deposit id: an answer is judged against that hub, not the
+    /// group's current one (M§7.4 — the old hub's refusal can arrive after the move was processed).
+    to_hub: BTreeMap<String, String>,
     /// Introductions delivered through the mailbox, by id (M§14.1: requests, never messages).
     requests: BTreeMap<String, Value>,
     want_live: bool,
@@ -389,6 +405,9 @@ impl Messenger {
             retries: BTreeMap::new(),
             unknown_at: BTreeMap::new(),
             moved_items: BTreeMap::new(),
+            arrivals: BTreeMap::new(),
+            arrival_due: vec![],
+            to_hub: BTreeMap::new(),
             requests: serde_json::from_value(st["requests"].clone()).unwrap_or_default(),
             want_live: false,
             gap_timeout: 60,
@@ -540,6 +559,13 @@ impl Messenger {
         for (id, gid, item) in silent {
             self.pending.remove(&id);
             out.extend(self.hub_unreachable(&gid, &item, true, now_i));
+        }
+        // M§7.4 (spec-gap 129): deposits the new hub refused before it hosted the group, due again
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.arrival_due).into_iter().partition(|(at, _)| *at <= now_i);
+        self.arrival_due = later;
+        self.to_hub.retain(|id, _| self.pending.contains_key(id));
+        for (_, pending) in due {
+            out.extend(self.redeposit(pending, now_i));
         }
         for gid in self.outages.keys().cloned().collect::<Vec<_>>() {
             let ems = {
@@ -1474,6 +1500,10 @@ impl Messenger {
         }
         let mut out = vec![];
         if moved {
+            // spec-gap 129: until the new hub accepts a deposit, its mailbox.unknown-group means "not set up yet"
+            let a = self.arrivals.entry(gid.to_string()).or_insert_with(|| MoveArrival::new(&json!({"now": now})));
+            a.set_now(now);
+            a.moved(&did);
             g["handover_seq"] = json!(seq);
             // rendered in the thread like a roster change, attributed to the committing identity
             let entry = json!({"seq": seq, "epoch": epoch, "by": by, "added": [], "removed": [], "left": [], "hub": did});
@@ -1494,7 +1524,11 @@ impl Messenger {
         if let Some(bytes) = fields["mls"].as_str().and_then(dsip_core::b64::decode) {
             self.own.insert(digest(&bytes));
         }
-        wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &hub, now, gid, class, fields).frame()
+        let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &hub, now, gid, class, fields);
+        if let Some(p) = wire::payload_of(&env) {
+            self.to_hub.insert(s_of(&p["id"]), hub);
+        }
+        env.frame()
     }
 
     /// Stage a commit for `op` and deposit it (M§6.5); merged on `accepted`.
@@ -1640,7 +1674,15 @@ impl Messenger {
     /// The hub or mailbox accepted a deposit of ours (M§5.3).
     fn accepted(&mut self, p: &Value, now: i64) -> Vec<Value> {
         let mut out = vec![];
-        let Some(pending) = self.pending.remove(&s_of(&p["in_reply_to"])) else { return out };
+        let id = s_of(&p["in_reply_to"]);
+        let hub = self.to_hub.remove(&id);
+        let Some(pending) = self.pending.remove(&id) else { return out };
+        if let (Some(gid), Some(hub)) = (pending.gid(), hub) {
+            if let Some(a) = self.arrivals.get_mut(gid) {
+                a.set_now(now);
+                a.answer(&hub, None); // M§7.4 (spec-gap 129): an accepted shows the new hub hosts the group
+            }
+        }
         match pending {
             Pending::Proposal { gid } => {
                 if let Some(seq) = p["seq"].as_i64() {
@@ -1798,10 +1840,32 @@ impl Messenger {
     fn refused(&mut self, p: &Value, now: i64) -> Vec<Value> {
         let mut out = vec![];
         let reason = s_of(&p["reason"]);
-        let Some(pending) = self.pending.remove(&s_of(&p["in_reply_to"])) else {
+        let id = s_of(&p["in_reply_to"]);
+        let hub = self.to_hub.remove(&id);
+        let Some(pending) = self.pending.remove(&id) else {
             out.push(json!({"error": format!("{reason} {}", p["detail"])}));
             return out;
         };
+        if matches!(pending, Pending::Commit { .. } | Pending::Application { .. }) {
+            let gid = pending.gid().unwrap_or_default().to_string();
+            let ems = match (self.arrivals.get_mut(&gid), &hub) {
+                (Some(a), Some(hub)) => {
+                    a.set_now(now);
+                    a.answer(hub, Some(&reason))
+                }
+                _ => vec![],
+            };
+            if let Some(d) = ems.iter().find_map(|e| e["retry_in"].as_i64()) {
+                // M§7.4 (spec-gap 129): the hub the group moved to is not set up yet: the same deposit again later
+                self.sent_at.remove(&id);
+                self.arrival_due.push((now + d, pending));
+                out.push(json!({"ui": "hub_arriving", "group": gid, "in": d}));
+                return out;
+            }
+            if ems.iter().any(|e| e.get("expired").is_some()) {
+                out.push(json!({"ui": "hub_arrival_expired", "group": gid}));
+            }
+        }
         match pending {
             Pending::Commit { gid, op, .. } => {
                 let mut retry = self.retries.remove(&gid).map(|(r, _)| r).unwrap_or_else(|| CommitRetry::new(&json!({})));
@@ -2271,6 +2335,26 @@ impl Messenger {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// A deposit the group's new hub refused before it hosted the group, made again to the group's hub: an application
+    /// item's same bytes under a fresh envelope (M§9.3), a commit's same MLS bytes (M§7.4, spec-gap 129).
+    fn redeposit(&mut self, pending: Pending, now: i64) -> Vec<Value> {
+        match pending {
+            Pending::Application { gid, item } => {
+                match self.outbox.get(&gid).and_then(|v| v.iter().find(|i| i["id"] == item).cloned()) {
+                    Some(item) => vec![json!({"send": self.deposit_item(&gid, &item, now)})],
+                    None => vec![],
+                }
+            }
+            Pending::Commit { gid, op, fields } if self.convs.contains_key(&gid) => {
+                let frame = self.hub_deposit(&gid, "handshake", fields.clone(), now);
+                let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
+                self.pending.insert(id, Pending::Commit { gid, op, fields });
+                vec![json!({"send": frame})]
+            }
+            _ => vec![],
+        }
     }
 
     /// A deposit for `gid` met an unreachable hub (or no answer): the outage starts or continues (M§9.4).
