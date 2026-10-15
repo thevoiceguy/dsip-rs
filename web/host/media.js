@@ -11,6 +11,9 @@ export class Media {
     this.pc = new RTCPeerConnection({ iceServers });
     this.on = on;                       // {candidate(entry|null), track(stream), state(str)}
     this.localStream = null;
+    // every remote track joins one stream: a track added later by an update (video added to an audio call) arrives
+    // with a stream of its own, and showing that stream instead would drop the audio
+    this.remoteStream = new MediaStream();
     this.pendingRemote = [];
     this.pc.onicecandidate = ({ candidate }) => {
       // Firefox marks the end of each m-section with an empty candidate string; the binding carries real candidates
@@ -20,7 +23,11 @@ export class Media {
         ? { candidate: candidate.candidate, sdp_mid: candidate.sdpMid ?? '0', sdp_m_line_index: candidate.sdpMLineIndex ?? 0 }
         : null);
     };
-    this.pc.ontrack = (ev) => this.on.track?.(ev.streams[0]);
+    this.pc.ontrack = (ev) => {
+      for (const t of this.remoteStream.getTracks()) if (t.kind === ev.track.kind && t !== ev.track) this.remoteStream.removeTrack(t);
+      if (!this.remoteStream.getTracks().includes(ev.track)) this.remoteStream.addTrack(ev.track);
+      this.on.track?.(this.remoteStream);
+    };
     this.pc.onconnectionstatechange = () => this.on.state?.(this.pc.connectionState);
   }
 
@@ -67,8 +74,10 @@ export class Media {
   async addVideo() {
     if (this.localStream?.getVideoTracks().length) return;
     const v = await navigator.mediaDevices.getUserMedia({ video: true });
-    v.getTracks().forEach((t) => { this.pc.addTrack(t, v); this.localStream?.addTrack(t); });
     if (!this.localStream) this.localStream = v;
+    // the camera joins the stream the audio is in, so the far side sees one stream with both
+    else v.getTracks().forEach((t) => this.localStream.addTrack(t));
+    v.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream));
   }
 
   /** Leave screening (§14.4 step 3): capture audio (and video if asked) and send on the transceivers that were

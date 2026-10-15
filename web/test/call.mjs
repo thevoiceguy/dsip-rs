@@ -78,6 +78,26 @@ try {
   check('video call: both sides receive audio and video', JSON.stringify(await alice.page.evaluate(() => window.dsip.remoteKinds())) === '["audio","video"]');
   await bob.page.click('#btn-hangup');
   await until(alice.page, () => window.dsip.state() === null);
+
+  // an audio call moved to video by an update (§12.9, B§2): the video joins the audio, it does not replace it, on
+  // both sides (a person reported two-way video and no audio after "Add video")
+  await bob.page.click('#contact-list li button:text("Call")');
+  await alice.page.waitForSelector('#view-incoming:not(.hidden)');
+  await alice.page.click('#btn-accept');
+  await until(alice.page, () => window.dsip.state() === 'ACTIVE');
+  await until(bob.page, () => window.dsip.state() === 'ACTIVE');
+  await until(alice.page, () => window.dsip.remoteKinds().includes('audio'));
+  await bob.page.click('#btn-add-video');
+  await alice.page.waitForSelector('#btn-answer-update:not(.hidden)', { timeout: 15000 });
+  check('Alice: while Bob\'s video offer waits, "Add video" is not offered (one update at a time, §12.8)', !(await alice.page.isVisible('#btn-add-video')));
+  await alice.page.click('#btn-answer-update');
+  await until(alice.page, () => window.dsip.remoteKinds().includes('video'));
+  await until(bob.page, () => window.dsip.remoteKinds().includes('video'));
+  const kinds = async (p) => JSON.stringify(await p.page.evaluate(() => window.dsip.remoteKinds()));
+  check('moved to video: Alice receives audio and video', (await kinds(alice)) === '["audio","video"]', await kinds(alice));
+  check('moved to video: Bob receives audio and video', (await kinds(bob)) === '["audio","video"]', await kinds(bob));
+  await bob.page.click('#btn-hangup');
+  await until(alice.page, () => window.dsip.state() === null);
   await until(bob.page, () => window.dsip.state() === null);
 
   // export and import: a third browser imports Alice's identity file and is Alice

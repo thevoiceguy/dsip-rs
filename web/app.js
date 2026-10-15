@@ -149,7 +149,8 @@ function renderCall() {
   const st = engine.state(call.sid);
   $('call-state').textContent = st || '';
   $('call-title').textContent = { INVITING: 'Calling', PROCEEDING: 'Ringing', ACTIVE: 'In call', ENDED: 'Call ended' }[st] || (call.role === 'responder' ? 'Answering' : 'Calling');
-  $('btn-add-video').classList.toggle('hidden', !(st === 'ACTIVE' && !call.screening && !call.media?.localStream?.getVideoTracks().length));
+  // §12.8: one outstanding update per session in either direction: while theirs waits, accepting it is the way to video
+  $('btn-add-video').classList.toggle('hidden', !(st === 'ACTIVE' && !call.screening && !call.pendingUpdate && !call.media?.localStream?.getVideoTracks().length));
   $('btn-escalate').classList.toggle('hidden', !(st === 'ACTIVE' && call.screening));
   $('btn-answer-update').classList.toggle('hidden', !call.pendingUpdate);
   $('btn-reject-update').classList.toggle('hidden', !call.pendingUpdate);
@@ -499,7 +500,7 @@ function httpOrigin(wss) { return wss.replace(/^wss:/, 'https:').replace(/\/dsip
 async function newMedia() {
   return new Media(await iceServers(), {
     candidate: (entry) => { call.pendingLocal.push(entry); if (engine.state(call.sid) === 'ACTIVE') flushLocalCandidates(); },
-    track: (stream) => { $('remote').srcObject = stream; },
+    track: (stream) => { if ($('remote').srcObject !== stream) $('remote').srcObject = stream; },
     state: async (s) => {
       log(`webrtc: ${s}`, 'B§');
       if (!call) return;
