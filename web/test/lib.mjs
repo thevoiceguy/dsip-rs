@@ -31,6 +31,7 @@ export async function launch() {
 /** A fresh browser context (fresh storage, so a fresh identity) with a page at `url`, on the welcome screen. */
 export async function openPage(browser, name, url = URL) {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, permissions: which === 'chromium' ? ['camera', 'microphone'] : [] });
+  await ctx.addInitScript(heartbeat);
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.log(`  [${name}] page error: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') console.log(`  [${name}] console: ${m.text()}`); });
@@ -68,6 +69,23 @@ export async function enrolled(browser, name, file, pass, url = URL) {
   return { ctx, page, did, name };
 }
 
+/** A page timer every 250 ms: the longest gap between ticks says how long the main thread was ever held (pageDiag). */
+function heartbeat() {
+  window.__beat = Date.now(); window.__maxGap = 0;
+  setInterval(() => { const n = Date.now(); window.__maxGap = Math.max(window.__maxGap, n - window.__beat); window.__beat = n; }, 250);
+}
+
+/** What the page is doing, for a failure report: whether it answers at all within 5 s (a held main thread does not),
+ *  how long since its timer last ran, the longest gap so far, and the log's last lines. */
+export async function pageDiag(page) {
+  const probe = page.evaluate(() => ({
+    readyState: document.readyState, since_beat_ms: window.__beat ? Date.now() - window.__beat : null, max_gap_ms: window.__maxGap ?? null,
+    focused: document.activeElement?.id || document.activeElement?.tagName || null, view: document.querySelector('main > section:not(.hidden)')?.id || null,
+    log_tail: (document.getElementById('log')?.textContent || '').trim().split('\n').slice(-4).map((l) => l.trim().slice(0, 160)),
+  })).catch((e) => ({ evaluate_error: e.message.split('\n')[0] }));
+  return Promise.race([probe, sleep(5000).then(() => ({ unresponsive: 'the page did not answer an evaluate within 5 s: its main thread is held' }))]);
+}
+
 /** The contacts screen is up and the relay is bound (after a reload too). */
 export async function ready(page) {
   await page.waitForSelector('#view-contacts:not(.hidden)');
@@ -82,7 +100,10 @@ export const logOf = (p) => p.page.textContent('#log');
 export async function addContact(p, other) {
   await p.page.fill('#contact-name', other.name);
   await p.page.fill('#contact-did', other.did);
-  await p.page.click('#contact-add button[type=submit]');
+  // a click that never completes has been seen in Firefox CI right after a first mailbox bind: report the page's state
+  try { await p.page.click('#contact-add button[type=submit]'); } catch (e) {
+    throw new Error(`${e.message.split('\n')[0]} (${p.name} adding ${other.name}); page: ${JSON.stringify(await pageDiag(p.page))}`);
+  }
   await p.page.waitForFunction((did) => window.dsip.contacts().includes(did), other.did);
 }
 
