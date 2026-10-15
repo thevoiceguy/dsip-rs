@@ -1787,7 +1787,12 @@ function renderMessages() {
   for (const b of document.querySelectorAll('nav button[data-view]')) b.onclick = () => { if (!call) { show(b.dataset.view); if (b.dataset.view === 'messages') renderMessages(); } else notify('finish the call first'); };
   $('btn-log-toggle').onclick = () => $('log-panel').classList.toggle('hidden');
   $('me-did').onclick = () => navigator.clipboard?.writeText(identity.identity).then(() => notify('your DID is on the clipboard'));
-  $('contact-add').onsubmit = async (e) => { e.preventDefault(); await addContact($('contact-name').value, $('contact-did').value, $('contact-number').value); $('contact-name').value = ''; $('contact-did').value = ''; $('contact-number').value = ''; };
+  // the form is read and cleared before the save is awaited: clearing after it wiped whatever was typed meanwhile
+  $('contact-add').onsubmit = async (e) => {
+    e.preventDefault();
+    const [name, did, number] = ['contact-name', 'contact-did', 'contact-number'].map((id) => { const v = $(id).value; $(id).value = ''; return v; });
+    await addContact(name, did, number);
+  };
   $('call-number').onsubmit = (e) => { e.preventDefault(); callNumber($('call-tn').value); };
   $('set-did-web-use').onclick = () => useDidWeb($('set-did-web').value);
   $('btn-did-doc').onclick = downloadDidDocument;
