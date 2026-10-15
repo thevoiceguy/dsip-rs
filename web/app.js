@@ -1754,12 +1754,13 @@ function renderMessages() {
 
   const fresh = !identity;
   if (fresh) {
-    identity = JSON.parse(create_identity(null, null, '', now()));
-    $('welcome-did').textContent = identity.identity;
-    $('welcome-device').textContent = identity.device;
+    // §7.3: no key is made until the person chooses: a new identity here, or an existing one from its file
     show('welcome');
     await new Promise((resolve) => {
-      $('welcome-continue').onclick = async () => { identity.display_name = $('welcome-name').value.trim(); await store.set(key('identity'), identity); resolve(); };
+      $('welcome-continue').onclick = async () => {
+        identity = JSON.parse(create_identity(null, null, $('welcome-name').value.trim(), now()));
+        await store.set(key('identity'), identity); resolve();
+      };
       $('welcome-import').onclick = () => $('import-file').click();
       $('import-file').onchange = async (e) => { const f = e.target.files[0]; if (f) await importFromText(await f.text()); };
     });

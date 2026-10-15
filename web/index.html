@@ -26,18 +26,20 @@
 
 <!-- first run: the identity is made here, and the person is told what it is -->
 <section id="view-welcome" class="view hidden">
-  <h2>This is your identity</h2>
-  <p>DSIP has no accounts. Your identity is a key this browser just made; the DID below is its name, and it is what
-  people call. Nothing about it is sent anywhere until you call or introduce yourself.</p>
-  <div class="row"><label>identity</label><code id="welcome-did" class="did"></code></div>
-  <div class="row"><label>device</label><code id="welcome-device" class="did"></code> <span class="muted small">this browser; it signs for the identity under a delegation (§7.4)</span></div>
-  <div class="row"><label>your name</label><input id="welcome-name" placeholder="Alice" maxlength="80"> <span class="muted small">shown to people you call as a claim, never as proof (§18.2)</span></div>
-  <p class="warn small">The identity key exists only in this browser. Export it (Settings) and keep the file: without it,
-  the identity is gone when this browser's storage is.</p>
+  <h2>Your identity</h2>
+  <p>DSIP has no accounts. An identity is a key pair; its DID is the name people call. Use an identity you already
+  have (its exported file makes this browser another of its devices), or create a new one here. Nothing is made or
+  sent until you choose.</p>
   <div class="row">
-    <button id="welcome-continue" class="primary">Continue</button>
-    <button id="welcome-import" class="ghost">I have an identity file</button>
+    <button id="welcome-import" class="primary">I have an identity file</button>
   </div>
+  <h3>Or create a new identity</h3>
+  <div class="row"><label>your name</label><input id="welcome-name" placeholder="Alice" maxlength="80"> <span class="muted small">shown to people you call as a claim, never as proof (§18.2)</span></div>
+  <div class="row">
+    <button id="welcome-continue">Create a new identity</button>
+  </div>
+  <p class="warn small">A new identity's key exists only in this browser. Export it (Settings) and keep the file: without
+  it, the identity is gone when this browser's storage is.</p>
 </section>
 
 <section id="view-contacts" class="view hidden">
