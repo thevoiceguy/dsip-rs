@@ -870,7 +870,10 @@ async function becomeRecordKeeper() {
   identity = JSON.parse(redelegate(JSON.stringify(identity), now(), 'dsip.record'));
   await store.set(key('identity'), identity);
   // C§5: a recorder is never in its identity's personal group, so its messaging starts afresh: no group made before
-  // it was a recorder (its personal group included) is carried over
+  // it was a recorder (its personal group included) is carried over. Messaging stops first, so a mailbox answer still
+  // being handled (the personal group's, on a first bind) cannot save the old state back before the reload
+  clearTimeout(messagingStart); messagingStart = null;
+  mailboxConn?.close(); mailboxConn = null; mailboxInfo = null; messenger = null;
   await store.del(key('messenger'));
   log('delegation re-issued with dsip.record: this device is a recorder and keeps call records (C§5, C§9); its messaging starts afresh; reloading', 'C§9');
   location.reload();
@@ -1240,6 +1243,7 @@ async function startMessagingNow() {
  *  and render events, then save its state (MLS and delivery state together, spec-gap 44). */
 async function driveMailbox(result) {
   const list = typeof result === 'string' ? JSON.parse(result) : result;
+  const m = messenger;
   for (const e of list) {
     if (typeof e === 'string') { mailboxConn.send(e); log(`→ ${payloadOf(e).type?.padEnd(12)} to mailbox${payloadOf(e).class ? ` (${payloadOf(e).class})` : ''}`, 'M§5'); continue; }
     if (e.send === '') continue;   // M§9.4: queued behind an unreachable hub, or kept for a successor
@@ -1253,7 +1257,8 @@ async function driveMailbox(result) {
     else if (e.successor_due) successorDue(e.successor_due);
     for (let i = waiters.length - 1; i >= 0; i--) if (waiters[i].pred(e)) waiters.splice(i, 1)[0].resolve(e);
   }
-  await store.set(key('messenger'), JSON.parse(messenger.save()));
+  // a messenger stopped meanwhile (messaging restarted, or the device became a recorder) is not saved over its successor
+  if (m && m === messenger) await store.set(key('messenger'), JSON.parse(m.save()));
   renderMessages();
 }
 

@@ -45,6 +45,8 @@ try {
   step = '1 Kim becomes a record-keeper';
   kim = watch(await person(browser, 'Kim'));
   await mailboxBound(kim);
+  // her first bind made her personal group: becoming a recorder must leave it behind (C§5), whenever the mailbox answers
+  await until(kim.page, () => !!window.dsip.personalGroup(), null, 20000);
   await Promise.all([kim.page.waitForEvent('load'), kim.page.evaluate(() => { window.dsip.becomeRecordKeeper(); }).catch(() => {})]);
   await ready(kim.page);
   await mailboxBound(kim);
