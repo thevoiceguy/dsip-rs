@@ -229,6 +229,10 @@ test/messaging-rebind.mjs  a device binds again while its old connection is stil
 test/messaging-group.mjs  group conversations (M§7.3): Alice creates a group with Bob and Carol, all write; she
                         removes Carol and adds her back into the same group (spec-gap 127); Bob leaves; every
                         roster change is rendered to every member, attributed, and survives a reload
+test/messaging-hub-move.mjs  moving a live hub (M§7.4): Bob hosts Alice's conversation at his mailbox, both mailboxes
+                        follow, text flows; Alice moves it back while Bob's page holds its pushes, so his message
+                        meets the old hub and is re-sent to the new one; the group returns to a hub it left (spec-gap 128);
+                        Alice reaches a new hub before the GroupInfo that sets it up and waits for it (spec-gap 129)
 test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
                         yields a record, held until that conversation exists (spec-gaps 121, 123); a party accepts
                         the recorder before writing there (C§5)
@@ -313,8 +317,13 @@ recorder device, and after a reload the conversation stays accepted. Bob decline
 closes; the mailbox must keep pushing to the second (it found the mailbox handing the binding to a connection it then
 never pushed to). `messaging-group.mjs`: a group of three made from "New group…"; a removal, a re-add into the same
 group and a leave, each rendered to every member as a line attributed to the identity that committed it (M§7.3), every
-commit checked against the roster rules before it is merged (spec-gap 126). CI runs all fifteen in Firefox and
-Chromium.
+commit checked against the roster rules before it is merged (spec-gap 126). `messaging-hub-move.mjs`: "Host here" moves
+a conversation's hub to the member's own mailbox (M§7.4); every member's device tells its mailbox the new hub and
+`handover_seq`, so the mailbox admits the new hub's fan-out; a device that writes before it has seen a move syncs on
+`mailbox.unknown-group` and re-sends to the new hub; a group can move back to a hub it left (spec-gap 128); and a
+member that reaches the new hub before the committer's GroupInfo has set it up retries the same deposit with the
+§13.2 backoff until the hub hosts the group (spec-gap 129). CI runs
+all sixteen in Firefox and Chromium.
 
 **Call records (v0.13, Recording Profile C§9).** With a record-keeper named in Settings, the client sends a
 `call-record` after every session leg. It holds the leg's frames as sent or accepted (`evidence` is the SHA-256 of

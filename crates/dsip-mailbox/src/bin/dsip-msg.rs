@@ -49,7 +49,7 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, Resume, SuccessorTracker};
+use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
@@ -416,6 +416,8 @@ struct Client {
     gap_timeout: i64,
     /// The outbox per group while its hub cannot be reached (M§9.4; spec-gap 72).
     outages: BTreeMap<String, HubOutage>,
+    /// M§7.4 (spec-gap 129): per group that moved, the vector-pinned wait for the new hub to host it.
+    arrivals: BTreeMap<String, MoveArrival>,
     /// Pending items per group, oldest first: `{id, mls, obj, extra}`, kept durably until accepted (M§9.2).
     pending: BTreeMap<String, Vec<Value>>,
     hub_timeout: i64,
@@ -898,15 +900,36 @@ impl Client {
 
     /// Deposit to a group's hub through this device's mailbox and wait for the hub's answer (M§5.2, M§9.2). The
     /// delegation rides in the header because a hub reached by forwarding has not seen it (M§5.1).
+    ///
+    /// A hub the group just moved to that answers `mailbox.unknown-group` before the committer's GroupInfo has set it
+    /// up is waited for as the vector-pinned [`MoveArrival`] decides: the same bytes again after the §13.2 backoff
+    /// (M§7.4, spec-gap 129).
     async fn hub_deposit(&mut self, group: &str, class: &str, fields: Value) -> Result<Value> {
         let hub = self.conv(group)?.hub.0.clone();
         if let Some(bytes) = fields["mls"].as_str().and_then(dsip_core::b64::decode) {
             self.own.insert(digest(&bytes));
         }
-        let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], &hub, now_s(), group, class, fields);
-        let id = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)).context("deposit id")?;
-        self.send(&env).await?;
-        let reply = self.await_reply(&id).await?;
+        let reply = loop {
+            let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], &hub, now_s(), group, class, fields.clone());
+            let id = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)).context("deposit id")?;
+            self.send(&env).await?;
+            let reply = self.await_reply(&id).await?;
+            let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("").to_string());
+            let ems = match self.arrivals.get_mut(group) {
+                Some(a) => {
+                    a.set_now(now_s());
+                    a.answer(&hub, reason.as_deref())
+                }
+                None => vec![],
+            };
+            match ems.iter().find_map(|e| e["retry_in"].as_i64()) {
+                Some(d) => {
+                    println!("ARRIVING {group}: {hub} does not host the group yet; again in {d}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(d as u64)).await;
+                }
+                None => break reply,
+            }
+        };
         if let Some(seq) = reply["seq"].as_i64() {
             // The hub's `accepted` seq marks this device's own copy as processed (spec-gap 47), for the gap
             // tracker as much as for the resume state — otherwise its own items look like a gap (spec-gap 69).
@@ -1290,6 +1313,10 @@ impl Client {
         if moved {
             g["handover_seq"] = json!(seq);
             println!("HUB-MOVED {} to {did} at seq={seq}", c.conversation);
+            // spec-gap 129: until the new hub accepts a deposit, its mailbox.unknown-group means "not set up yet"
+            let a = self.arrivals.entry(group.to_string()).or_insert_with(|| MoveArrival::new(&json!({"now": now_s()})));
+            a.set_now(now_s());
+            a.moved(&did);
         }
         let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
             json!({"subject": self.identity, "groups": [g]}));
@@ -3343,6 +3370,7 @@ async fn main() -> Result<()> {
         heartbeat: args.heartbeat.map(|n| (n, 0)),
         gap_timeout: args.gap_timeout,
         outages: BTreeMap::new(),
+        arrivals: BTreeMap::new(),
         pending: BTreeMap::new(),
         hub_timeout: args.hub_timeout,
         own: HashSet::new(),

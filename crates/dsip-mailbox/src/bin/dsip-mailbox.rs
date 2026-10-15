@@ -1607,10 +1607,20 @@ fn hub_deposit(
     };
 
     let mut refreshed = None;
+    let mut returning = None;
     if class == "group-info" {
         // Bootstrap or refresh the public view (M§6.5 rule 6).
         match HubView::from_group_info(&bytes) {
-            Ok(view) if st.hubs.contains_key(&group) => refreshed = Some(view), // applied once the hub accepts it
+            Ok(view) if st.hubs.contains_key(&group) => {
+                // spec-gap 128: a handover group-info whose GroupInfo names this hub again brings back a group that left;
+                // the hub machine gets its epoch and roster (and refuses it unless the group had moved away)
+                if let Some(h) = p["handover_seq"].as_i64() {
+                    if view.conversation().is_some_and(|c| c["hub"]["did"] == json!(st.key.did())) {
+                        returning = Some((h, json!({"epoch": view.epoch(), "roster": view.roster(&ctx).unwrap_or(json!({}))})));
+                    }
+                }
+                refreshed = Some(view); // applied once the hub accepts it
+            }
             Ok(view) => {
                 let conv = view.conversation().unwrap_or(Value::Null);
                 if conv["hub"]["did"] != json!(st.key.did()) {
@@ -1644,6 +1654,10 @@ fn hub_deposit(
         return vec![Out::Device(device.to_string(), env)];
     };
     let mut deposit = json!({"id": id, "device": device, "identity": identity, "class": class, "digest": digest(&bytes)});
+    if let Some((h, view)) = returning {
+        deposit["handover_seq"] = json!(h);
+        deposit["view"] = view;
+    }
     if let Ok((_, epoch, _)) = message_header(&bytes) {
         deposit["epoch"] = json!(epoch);
     }
@@ -1662,6 +1676,9 @@ fn hub_deposit(
     }
     let hub = st.hubs.get_mut(&group).expect("hub");
     let emissions = hub.step(&json!({"deposit": deposit}));
+    if deposit.get("view").is_some() && emissions.iter().any(|e| e.get("accepted").is_some()) {
+        tracing::info!("group {group} came back to this hub at seq {} (spec-gap 128)", deposit["handover_seq"].as_i64().unwrap_or(0) + 1);
+    }
     if let Some(view) = refreshed.filter(|_| emissions.iter().any(|e| e.get("accepted").is_some())) {
         st.conversations.insert(group.clone(), view.conversation().unwrap_or(Value::Null));
         st.views.insert(group.clone(), view);

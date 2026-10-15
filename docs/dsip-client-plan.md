@@ -248,6 +248,15 @@ the app against a local relay, the way the wire demos drive the CLI).
    and attributed to the committing identity (a joiner names its adder from the welcome's GroupInfo signer); every
    commit checked against the roster rules before it is merged (spec-gap 126); a removed identity added back into the
    same group (spec-gap 127). Headless test `messaging-group.mjs`.
+9. **Moving a hub** (after `poc-v0.14`). The last of round 2's leftovers: "Host here" moves a conversation's hub to the
+   member's own mailbox (M§7.4) from the browser, which until then only the Rust console could do. Building it found
+   three browser bugs against M§7.4, now fixed: a device that processed a moving commit never told its mailbox (so the
+   mailbox refused the new hub's fan-out with `mailbox.unknown-group` for good), a commit refused `mailbox.unknown-group`
+   was never re-proposed after a move, and an application message refused that way was dropped where the spec says
+   to sync and re-send to the new hub. The re-send is decided only on the answer to the sync, not on a live push that
+   can arrive first (M§5.4). It also found spec-gap 128: a group could not move back to a hub it had left. CI then found
+   spec-gap 129: a member could reach the new hub before the committer's GroupInfo had set it up, and the new hub's
+   `mailbox.unknown-group` was taken as final, dropping the message. Headless test `messaging-hub-move.mjs`.
 
 ## 11. Risks
 
