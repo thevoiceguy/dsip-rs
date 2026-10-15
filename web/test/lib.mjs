@@ -119,6 +119,10 @@ export async function dump(...people) {
     if (!p) continue;
     const lines = (await p.page.textContent('#log').catch(() => '')).trim().split('\n');
     console.log(`--- ${p.name} (${await p.page.evaluate(() => window.dsip.state()).catch(() => '?')}) note: ${await p.page.evaluate(() => window.dsip.note()).catch(() => '')}`);
+    // whether this page's main thread was ever held, and for how long (the heartbeat of openPage): a hung click
+    // with a long max_gap_ms is the page; with a short one it is the browser or the driver
+    const d = await pageDiag(p.page);
+    console.log(`    page: ${d.unresponsive || d.evaluate_error || `max_gap_ms=${d.max_gap_ms} since_beat_ms=${d.since_beat_ms} view=${d.view} focused=${d.focused}`}`);
     for (const l of lines.slice(-(process.env.DUMP_ALL ? 999 : 14))) console.log('   ' + l);
   }
 }
