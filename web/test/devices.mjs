@@ -50,7 +50,12 @@ try {
   await until(alice.page, () => window.dsip.state() === 'ACTIVE');
   await until(bob.page, () => window.dsip.state() === 'ACTIVE');
   await until(bob2.page, () => window.dsip.state() === null);
-  check('device 2 stops when device 1 answers, no missed call', !(await incoming(bob2)) && !/missed_call/.test(await logOf(bob2)) && /another of your devices/.test(await bob2.page.evaluate(() => window.dsip.note())));
+  // the state clears first; the incoming screen and the note follow (each waited for, so a slow render is not a failure)
+  const gone = await bob2.page.waitForSelector('#view-incoming', { state: 'hidden', timeout: 5000 }).then(() => true, () => false);
+  const noted = await until(bob2.page, () => /another of your devices/.test(window.dsip.note()), null, 5000).then(() => true, () => false);
+  check('device 2 stops when device 1 answers: the incoming screen is gone', gone);
+  check('device 2: ended as answered elsewhere (§12.7)', noted, await bob2.page.evaluate(() => window.dsip.note()));
+  check('device 2: no missed call', !/missed_call/.test(await logOf(bob2)));
   await bob.page.click('#btn-hangup');
   await until(alice.page, () => window.dsip.state() === null);
   await until(bob.page, () => window.dsip.state() === null);
