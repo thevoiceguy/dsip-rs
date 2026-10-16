@@ -284,6 +284,9 @@ pub enum Emission {
         reason: Option<String>,
         /// Originating leg.
         from: String,
+        /// The attempt it belongs to: what a host needs to find the initiator when no frame is in hand (an outcome
+        /// reached on a clock advance, spec-gap 132). Not part of the vector emission shape.
+        session: String,
     },
 }
 
@@ -344,7 +347,7 @@ impl Emission {
                 json!({ "deliver": o })
             }
             Emission::Dequeue { to, msg_type, why } => json!({"dequeue": {"to": to, "type": msg_type, "why": why}}),
-            Emission::Forward { msg_type, status, reason, from } => {
+            Emission::Forward { msg_type, status, reason, from, .. } => {
                 let mut o = Map::new();
                 o.insert("type".into(), msg_type.clone().into());
                 if let Some(s) = status {
