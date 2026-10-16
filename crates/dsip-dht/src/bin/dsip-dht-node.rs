@@ -31,10 +31,10 @@ struct Args {
     /// DID document JSON files for did:web subjects.
     #[arg(long)]
     did_document: Vec<PathBuf>,
-    /// Re-announce interval in seconds.
+    /// Re-announce interval in seconds; housekeeping (saving peers, redialing) runs at least this often too.
     #[arg(long, default_value_t = 60)]
     republish: u64,
-    /// File that keeps learned peers across restarts (read at start, rewritten every re-announce).
+    /// File that keeps learned peers across restarts (read at start, rewritten every housekeeping tick).
     #[arg(long)]
     peers_file: Option<PathBuf>,
 }
@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
         bootstrap: args.bootstrap.clone(),
         resolver,
         republish_interval: Duration::from_secs(args.republish),
+        maintain_interval: Duration::from_secs(args.republish.clamp(1, 60)),
         peers_file: args.peers_file.clone(),
         ..NodeConfig::default()
     };

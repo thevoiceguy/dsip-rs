@@ -72,7 +72,8 @@ pub struct Numbers {
 pub struct Limits {
     /// Requests per client IP per minute (a token bucket of this size, refilled evenly); 0 turns it off.
     pub http_per_ip_per_min: u32,
-    /// Take the client IP from the first `X-Forwarded-For` entry: only behind a reverse proxy that sets it.
+    /// Take the client IP from the first `X-Forwarded-For` entry on loopback connections (the co-located relay's
+    /// proxy sets it, replacing any the client sent); other connections are limited by their own address.
     pub trust_forwarded_for: bool,
 }
 
@@ -208,18 +209,27 @@ pub fn router(node: Arc<Node>) -> Router {
         .with_state(node)
 }
 
+/// The address a request is limited as: the connection's, or with `trust` the first `X-Forwarded-For` entry — but only
+/// on a loopback connection, the co-located relay that proxies `/dsip/v1/` and sets the header. Honouring it from
+/// anyone else would let a client name any address and dodge its bucket.
+///
+/// Spec: none (infrastructure).
+pub fn client_ip(trust: bool, peer: Option<IpAddr>, forwarded_for: Option<&str>) -> Option<IpAddr> {
+    let forwarded = forwarded_for.and_then(|v| v.split(',').next()).and_then(|v| v.trim().parse::<IpAddr>().ok());
+    match (trust, peer) {
+        (true, Some(p)) if p.is_loopback() => forwarded.or(Some(p)),
+        _ => peer,
+    }
+}
+
 /// The per-IP rate limit (429) and the request counters, around every route.
 ///
 /// Spec: DHT Reachability Hints Profile §10 (a node MAY limit request rates, answering 429).
 async fn limit_and_count(State(node): State<Arc<Node>>, req: Request, next: axum::middleware::Next) -> Response {
     let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str().to_string()).unwrap_or_else(|| "other".into());
-    let forwarded = if node.limits.trust_forwarded_for {
-        req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse::<IpAddr>().ok())
-    } else {
-        None
-    };
-    let ip = forwarded.or_else(|| req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()));
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+    let header = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let ip = client_ip(node.limits.trust_forwarded_for, peer, header);
     let resp = if route != "/metrics" && ip.is_some_and(|ip| !node.admit(ip)) {
         (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "60")], "rate-limited").into_response()
     } else {

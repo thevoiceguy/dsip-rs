@@ -49,3 +49,19 @@ async fn forwarded_clients_get_their_own_buckets_only_when_trusted() {
                    "trusted: another client; untrusted: the same socket address, already spent");
     }
 }
+
+#[test]
+fn forwarded_for_is_honoured_only_from_loopback() {
+    use std::net::IpAddr;
+    let lo: IpAddr = "127.0.0.1".parse().unwrap();
+    let far: IpAddr = "198.51.100.7".parse().unwrap();
+    let client: IpAddr = "192.0.2.1".parse().unwrap();
+    // the co-located relay: its client's address
+    assert_eq!(dsip_node::client_ip(true, Some(lo), Some("192.0.2.1, 10.0.0.1")), Some(client));
+    // anyone else naming an address: limited as itself
+    assert_eq!(dsip_node::client_ip(true, Some(far), Some("192.0.2.1")), Some(far));
+    // not trusted, or no header, or a header that is not an address: the connection's
+    assert_eq!(dsip_node::client_ip(false, Some(lo), Some("192.0.2.1")), Some(lo));
+    assert_eq!(dsip_node::client_ip(true, Some(lo), None), Some(lo));
+    assert_eq!(dsip_node::client_ip(true, Some(lo), Some("nonsense")), Some(lo));
+}

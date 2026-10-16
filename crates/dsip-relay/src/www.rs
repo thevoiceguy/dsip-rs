@@ -98,8 +98,9 @@ pub enum First<S> {
     Served,
 }
 
-/// Peek the request head and either wrap for WebSocket or answer the request here.
-pub async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, routes: &Routes) -> std::io::Result<First<S>> {
+/// Peek the request head and either wrap for WebSocket or answer the request here. `client` is the connection's
+/// address, passed to the hints node as `X-Forwarded-For` on a proxied request.
+pub async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, routes: &Routes, client: std::net::IpAddr) -> std::io::Result<First<S>> {
     let mut head = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
     loop {
@@ -124,7 +125,7 @@ pub async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, routes: 
     let path = target.split('?').next().unwrap_or("/");
     if path.starts_with("/dsip/v1/") {
         if let Some(upstream) = &routes.node_proxy {
-            let r = proxy(&mut stream, upstream, &text, head).await;
+            let r = proxy(&mut stream, upstream, &text, head, client).await;
             let _ = stream.shutdown().await;
             return r.map(|()| First::Served);
         }
@@ -160,11 +161,32 @@ pub async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, routes: 
     Ok(First::Served)
 }
 
+/// The request head sent to the hints node: the client's request line and headers, with `Host` and `Connection` ours,
+/// and `X-Forwarded-For` set to the connection's address — replacing any the client sent, so a client cannot name
+/// someone else's address to the node's per-client limit (the node trusts the header only from loopback).
+///
+/// Spec: none (infrastructure).
+fn upstream_head(head: &str, upstream: &str, client: std::net::IpAddr) -> String {
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or("GET / HTTP/1.1");
+    let mut out = format!("{request_line}\r\nHost: {upstream}\r\nConnection: close\r\nX-Forwarded-For: {client}\r\n");
+    for l in lines {
+        let k = l.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        if l.is_empty() || matches!(k.as_str(), "host" | "connection" | "keep-alive" | "upgrade" | "x-forwarded-for" | "forwarded") {
+            continue;
+        }
+        out.push_str(l);
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
+    out
+}
+
 /// Forward one request (head already read, body possibly partly read) to the hints node and copy its answer back.
 ///
 /// Impl: HTTP/1.1 with `Connection: close` both ways, so neither side needs to parse past the headers: the node
 /// answers one request and closes, and the client sees the answer end with the connection.
-async fn proxy<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, upstream: &str, text: &str, head: Vec<u8>) -> std::io::Result<()> {
+async fn proxy<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, upstream: &str, text: &str, head: Vec<u8>, client: std::net::IpAddr) -> std::io::Result<()> {
     let body_at = head.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(head.len());
     let content_length: usize = text
         .lines()
@@ -179,18 +201,7 @@ async fn proxy<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, upstream: &str
         }
         body.extend_from_slice(&chunk[..n]);
     }
-    let mut lines = text[..text.len().min(String::from_utf8_lossy(&head[..body_at]).len())].lines();
-    let request_line = lines.next().unwrap_or("GET / HTTP/1.1");
-    let mut out = format!("{request_line}\r\nHost: {upstream}\r\nConnection: close\r\n");
-    for l in lines {
-        let k = l.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
-        if l.is_empty() || matches!(k.as_str(), "host" | "connection" | "keep-alive" | "upgrade") {
-            continue;
-        }
-        out.push_str(l);
-        out.push_str("\r\n");
-    }
-    out.push_str("\r\n");
+    let out = upstream_head(&text[..text.len().min(String::from_utf8_lossy(&head[..body_at]).len())], upstream, client);
     let mut up = match tokio::net::TcpStream::connect(upstream).await {
         Ok(s) => s,
         Err(e) => {
@@ -228,4 +239,19 @@ fn resolve(www: &Path, path: &str) -> Option<(PathBuf, &'static str)> {
         _ => "application/octet-stream",
     };
     Some((full, ct))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_node_sees_the_connections_address_never_the_clients_claim() {
+        let head = "POST /dsip/v1/hints HTTP/1.1\r\nHost: relay.example\r\nX-Forwarded-For: 203.0.113.9\r\nForwarded: for=203.0.113.9\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n";
+        let out = upstream_head(head, "127.0.0.1:8090", "192.0.2.1".parse().unwrap());
+        assert!(out.starts_with("POST /dsip/v1/hints HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nConnection: close\r\nX-Forwarded-For: 192.0.2.1\r\n"), "{out}");
+        assert!(out.contains("Content-Length: 4\r\n"), "{out}");
+        assert!(!out.contains("203.0.113.9") && !out.contains("keep-alive") && !out.contains("relay.example"), "{out}");
+        assert!(out.ends_with("\r\n\r\n"));
+    }
 }
