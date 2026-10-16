@@ -89,11 +89,29 @@ try {
   await until(alice.page, () => window.dsip.state() === null || window.dsip.state() === 'ENDED', null, 30000);
   check('no hint: the call used our own relay and ended there', (await alice.page.evaluate(() => window.dsip.callRelays())).length === 0 && /ended/.test(await alice.page.evaluate(() => window.dsip.note())), await alice.page.evaluate(() => window.dsip.note()));
 
-  // 7. a reload keeps Bob's relay and republishes his hint
+  // 7. a reload keeps Bob's relay and republishes his hint. The page's re-sign timers (⅔ of the hint's 3600 s) are
+  // counted from outside the client: the relay and the mailbox bind together, and overlapping publishes once left a
+  // timer nothing cleared, which multiplied until an open tab flooded the nodes.
+  await bob.ctx.addInitScript(() => {
+    const live = new Set(), RESIGN_MS = 2400 * 1000;
+    const [st, si, ct, ci] = [window.setTimeout, window.setInterval, window.clearTimeout, window.clearInterval];
+    window.setTimeout = function (fn, ms, ...a) { const id = st.call(window, (...x) => { live.delete(id); return typeof fn === 'function' ? fn(...x) : undefined; }, ms, ...a); if (ms === RESIGN_MS) live.add(id); return id; };
+    window.setInterval = function (fn, ms, ...a) { const id = si.call(window, fn, ms, ...a); if (ms === RESIGN_MS) live.add(id); return id; };
+    window.clearTimeout = (id) => { live.delete(id); return ct.call(window, id); };
+    window.clearInterval = (id) => { live.delete(id); return ci.call(window, id); };
+    window.__resignTimers = () => live.size;
+  });
+  // a node as slow as one across the WAN: the publish for the relay is still in flight when the mailbox binds
+  await bob.ctx.route('**/dsip/v1/hints', async (r) => { if (r.request().method() === 'POST') await sleep(1500); await r.continue(); });
   await bob.page.reload();
   await bob.page.waitForSelector('#view-contacts:not(.hidden)');
   await until(bob.page, () => window.dsip.relay() && /hint published → .*accepted/.test(document.getElementById('log').textContent), null, 20000);
   check('after a reload Bob is bound to relay B again and his hint is re-published', (await bob.page.evaluate(() => window.dsip.network())).includes(`relay: ${RELAY_B} (yours)`));
+  await until(bob.page, () => window.dsip.mailbox() && /hint published → .* \+ mailbox seq/.test(document.getElementById('log').textContent), null, 20000);
+  await sleep(4000);   // any publish still in flight finishes and arms its timer
+  const timers = await bob.page.evaluate(() => window.__resignTimers());
+  const publishes = (await bob.page.textContent('#log')).split('\n').filter((l) => /hint published →/.test(l)).length;
+  check('one re-sign timer after the relay and the mailbox bound together (overlapping publishes never leave a second)', timers === 1, `${timers} timer(s), ${publishes} publish line(s)`);
 } catch (err) {
   check.fail(`exception: ${err.stack || err}`);
   await dump(alice, bob);

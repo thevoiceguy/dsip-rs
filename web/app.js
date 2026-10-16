@@ -41,6 +41,7 @@ let served = {};      // the operator's defaults, `config.json` beside this page
 const callRelays = new Map();   // session → a Relay opened to the peer's own relay for that call (their hint named it, §8.1)
 let ice = null;       // {servers, until}: ICE servers in effect, from Settings, the operator, or the relay's /turn (short-lived)
 let hintTimer = null; // re-signs the published reachability hint at ⅔ of its life
+let hintBusy = false, hintAgain = false; // a publish is in flight; another was asked for meanwhile
 let hintSeq = 0;      // the last `seq` this browser published (§8.3: newer wins; a re-sign within the same second must still be newer)
 let messenger = null; // the wasm messaging device (stage 6), when a mailbox is configured
 let mailboxConn = null, mailboxInfo = null;   // the Relay to this identity's mailbox, and its verified hello
@@ -644,9 +645,20 @@ function openCallRelay(uri, sid) {
 }
 
 /** Publish our reachability hint on the nodes (DHT Hints Profile §10 `POST /dsip/v1/hints`): signed by this
- *  device under its delegation, naming our relay, `seq` = now, ttl the profile's maximum; re-signed at ⅔ of it. */
+ *  device under its delegation, naming our relay, `seq` = now, ttl the profile's maximum; re-signed at ⅔ of it.
+ *  Impl: one publish at a time. The relay and the mailbox bind together, and two overlapping publishes each armed a
+ *  re-sign timer, one of which nothing cleared; every later overlap leaked another, until a tab left open flooded the
+ *  nodes. A request during a publish runs once more after it, so the last hint names the latest relay and mailbox. */
 async function publishReachability() {
-  clearInterval(hintTimer); hintTimer = null;
+  if (hintBusy) { hintAgain = true; return; }
+  hintBusy = true;
+  try {
+    do { hintAgain = false; await publishReachabilityOnce(); } while (hintAgain);
+  } finally { hintBusy = false; }
+}
+
+async function publishReachabilityOnce() {
+  clearTimeout(hintTimer); hintTimer = null;
   if (!publishHint() || !relay?.bound) return;
   // Impl: `seq` is the issue time, as the CLI's, but never at or below the last one this browser published: a relay
   // changed within the same second would otherwise tie with the held record and lose to it (§8.3, same seq, live).
@@ -668,7 +680,7 @@ async function publishReachability() {
       log(`hint published → ${n}: ${uri}${endpoints.length > 1 ? ' + mailbox' : ''} seq ${seq} for ${HINT_TTL_S} s: ${text}`, '§8.3 · profile §10');
     } catch (e) { log(`hint not published: ${n} did not answer (${e.message})`, '§8.5'); }
   }
-  hintTimer = setInterval(publishReachability, (HINT_TTL_S * 2 / 3) * 1000);
+  clearTimeout(hintTimer); hintTimer = setTimeout(publishReachability, (HINT_TTL_S * 2 / 3) * 1000);
 }
 
 async function accept(screening) {
