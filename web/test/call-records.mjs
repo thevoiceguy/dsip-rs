@@ -6,7 +6,7 @@
 // Kim keeps four records with the outcomes C§9's order gives, and the two sides' evidence shares the frames the
 // relay carried unchanged (§10.2). Kim's records survive a reload.
 import { readFileSync } from 'node:fs';
-import { launch, person, ready, until, addContact, rowButton, placeCall, checker, dump } from './lib.mjs';
+import { launch, person, ready, until, addContact, rowButton, placeCall, checker, dump, submit } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const check = checker();
@@ -31,7 +31,7 @@ async function keeperOpens(p) {
   await contactsView(kim); await contactsView(p);
   await rowButton(kim, p, 'Introduce');
   await kim.page.fill('#introduce-purpose', 'Call records for Acme (C§9)');
-  await kim.page.click('#introduce-form button[type=submit]');
+  await submit(kim.page, 'introduce-form');
   await until(p.page, () => window.dsip.requests().length === 1);
   await p.page.click('#request-list button:text-is("Grant")');
   await until(kim.page, (did) => window.dsip.contactStatus(did) === 'they granted you', p.did);

@@ -1,6 +1,6 @@
 // Headless first-contact test (stage 2): a stranger's call is refused until introduced; introductions, requests with
 // their purpose, grants, screening with escalation, a contact link that grants at once, and an ignored introduction.
-import { launch, person, ready, until, state, logOf, addContact, rowButton, checker, dump, which } from './lib.mjs';
+import { launch, person, ready, until, state, logOf, addContact, rowButton, checker, dump, which, submit } from './lib.mjs';
 
 const check = checker();
 const browser = await launch();
@@ -31,7 +31,7 @@ try {
   await alice.page.waitForSelector('#introduce-form:not(.hidden)');
   check('Alice: the introduce form names Bob', (await alice.page.textContent('#introduce-did')) === bob.did);
   await alice.page.fill('#introduce-purpose', 'Lunch on Friday?');
-  await alice.page.click('#introduce-form button[type=submit]');
+  await submit(alice.page, 'introduce-form');
   await until(alice.page, (did) => window.dsip.contactStatus(did) === 'introduction sent, waiting', bob.did);
   check('Alice: contact shows the introduction pending', true);
 
@@ -94,7 +94,7 @@ try {
   await addContact(dave, bob);
   await rowButton(dave, bob, 'Introduce');
   await dave.page.fill('#introduce-purpose', 'Selling something');
-  await dave.page.click('#introduce-form button[type=submit]');
+  await submit(dave.page, 'introduce-form');
   await until(bob.page, () => window.dsip.requests().length === 1);
   await bob.page.click('#request-list button:text-is("Ignore")');
   await until(dave.page, () => /introduction of yours was declined/.test(document.getElementById('log').textContent));
@@ -106,7 +106,7 @@ try {
   await addContact(eve, bob);
   await rowButton(eve, bob, 'Introduce');
   await eve.page.fill('#introduce-purpose', 'Old friend');
-  await eve.page.click('#introduce-form button[type=submit]');
+  await submit(eve.page, 'introduce-form');
   await until(bob.page, () => window.dsip.requests().length === 1);
   // the request is in storage once drawn (its purpose stored) and the contact file's write has finished
   await until(bob.page, () => document.getElementById('request-list').textContent.includes('Old friend'));

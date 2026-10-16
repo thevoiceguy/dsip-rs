@@ -8,7 +8,7 @@
 // re-encrypted into it and arrives; the thread keeps the dead group's history; replies flow.
 import { spawn } from 'node:child_process';
 import { readFileSync, appendFileSync, rmSync, existsSync } from 'node:fs';
-import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep } from './lib.mjs';
+import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit } from './lib.mjs';
 
 const { MAILBOX_A_DID, MAILBOX_B, MAILBOX_B_DID, FIXTURE, MAILBOX_BIN, NODE_URL } = process.env;
 const MBX_C = '127.0.0.1:9445';
@@ -50,7 +50,7 @@ try {
   await addContact(alice, bob); await addContact(bob, alice);
   await rowButton(bob, alice, 'Introduce');
   await bob.page.fill('#introduce-purpose', 'successor test');
-  await bob.page.click('#introduce-form button[type=submit]');
+  await submit(bob.page, 'introduce-form');
   await until(alice.page, () => window.dsip.requests().length === 1);
   await alice.page.click('#request-list button:text-is("Grant")');
   await until(bob.page, (did) => window.dsip.contactStatus(did) === 'they granted you', alice.did);

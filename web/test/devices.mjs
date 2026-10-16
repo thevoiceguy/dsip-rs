@@ -2,7 +2,7 @@
 // own device key; a call forks to both and the one that does not answer ends without a missed call (either way
 // round); the device list; a revocation signed by the identity key, handed to the relay, which ends the revoked
 // device's binding and refuses its hello, after a reload too, and the next call rings only the remaining device.
-import { launch, person, enrolled, ready, until, state, logOf, addContact, rowButton, checker, dump, sleep } from './lib.mjs';
+import { launch, person, enrolled, ready, until, state, logOf, addContact, rowButton, checker, dump, sleep, submit } from './lib.mjs';
 
 const check = checker();
 const browser = await launch();
@@ -64,7 +64,7 @@ try {
   bob.page.on('dialog', (d) => d.accept('lost'));
   await bob.page.click('nav button[data-view=settings]');
   await bob.page.fill('#device-did', dev2);
-  await bob.page.click('#device-add button[type=submit]');
+  await submit(bob.page, 'device-add');
   await until(bob.page, (d) => window.dsip.devices().includes(d), dev2);
   const row = bob.page.locator('#device-list li', { has: bob.page.locator(`code.did:text-is("${dev2}")`) });
   await row.locator('button:text-is("Revoke")').click();

@@ -9,7 +9,7 @@
 // moves it to his mailbox again while his page holds the group-info that sets hub B up: Alice reaches hub B first, its
 // `mailbox.unknown-group` means "not yet", and the same deposit goes again once hub B hosts the group (spec-gap 129).
 import { readFileSync } from 'node:fs';
-import { launch, ready, until, addContact, rowButton, checker, dump, logOf, sleep } from './lib.mjs';
+import { launch, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit } from './lib.mjs';
 
 const URL = process.env.URL || 'https://127.0.0.1:8443/';
 const RELAY_B = process.env.RELAY_B || 'wss://127.0.0.1:8444/dsip';
@@ -89,7 +89,7 @@ try {
   await addContact(alice, bob); await addContact(bob, alice);
   await rowButton(alice, bob, 'Introduce');
   await alice.page.fill('#introduce-purpose', 'hub move');
-  await alice.page.click('#introduce-form button[type=submit]');
+  await submit(alice.page, 'introduce-form');
   await until(bob.page, () => window.dsip.requests().length === 1);
   await bob.page.click('#request-list button:text-is("Grant")');
   await until(alice.page, (did) => window.dsip.contactStatus(did) === 'they granted you', bob.did);

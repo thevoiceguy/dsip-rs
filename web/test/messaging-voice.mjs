@@ -5,7 +5,7 @@
 // SHA-256, decrypts and plays it; with receipts disclosed a played receipt reaches Alice (M§10.4). A second message
 // after a reload still opens; the mailbox never holds plaintext.
 import { readFileSync } from 'node:fs';
-import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep } from './lib.mjs';
+import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const FIXTURE = process.env.FIXTURE;
@@ -27,7 +27,7 @@ try {
   await addContact(alice, bob); await addContact(bob, alice);
   await rowButton(alice, bob, 'Introduce');
   await alice.page.fill('#introduce-purpose', 'voice test');
-  await alice.page.click('#introduce-form button[type=submit]');
+  await submit(alice.page, 'introduce-form');
   await until(bob.page, () => window.dsip.requests().length === 1);
   await bob.page.click('#request-list button:text-is("Grant")');
   await until(alice.page, (did) => window.dsip.contactStatus(did) === 'they granted you', bob.did);

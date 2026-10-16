@@ -3,7 +3,7 @@
 // (M§12.3); nobody adds it, so it joins her personal group and the conversation by external commit from the GroupInfo
 // her mailbox delivered. The hub and Bob check the joiner's identity already had a leaf there; Bob sees Alice's new
 // device join; messages flow both ways. No archive key came with the join, so no history is shown (M§6.8).
-import { launch, person, enrolled, ready, until, addContact, rowButton, checker, dump, logOf } from './lib.mjs';
+import { launch, person, enrolled, ready, until, addContact, rowButton, checker, dump, logOf, submit } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const check = checker();
@@ -29,7 +29,7 @@ try {
   await addContact(alice, bob); await addContact(bob, alice);
   await rowButton(alice, bob, 'Introduce');
   await alice.page.fill('#introduce-purpose', 'rejoin test');
-  await alice.page.click('#introduce-form button[type=submit]');
+  await submit(alice.page, 'introduce-form');
   await until(bob.page, () => window.dsip.requests().length === 1);
   await bob.page.click('#request-list button:text-is("Grant")');
   await until(alice.page, (did) => window.dsip.contactStatus(did) === 'they granted you', bob.did);

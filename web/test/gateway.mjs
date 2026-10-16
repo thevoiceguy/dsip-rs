@@ -6,7 +6,7 @@
 // Alice's own number attested (N§4); Carol presents Carrier B's binding of Alice's number and Bob is warned that the
 // number moved (N§5); a did:web name whose document is not hosted cannot bind.
 import { readFileSync } from 'node:fs';
-import { launch, person, enrolled, identityFile, until, state, logOf, addContact, rowButton, placeCall, checker, dump } from './lib.mjs';
+import { launch, person, enrolled, identityFile, until, state, logOf, addContact, rowButton, placeCall, checker, dump, submit } from './lib.mjs';
 
 const F = process.env.FIXTURE;
 if (!F) { console.log('FIXTURE=<dir of the gateway fixture> (web/test/run.sh makes it)'); process.exit(2); }
@@ -36,7 +36,7 @@ try {
   // a number with no nodes and no gateway: the client says what it needs (`none` overrides the operator's nodes)
   await mallory.page.evaluate(() => window.dsip.setNumbers({ nodes: null }));
   await mallory.page.fill('#call-tn', '+15552000001');
-  await mallory.page.click('#call-number button[type=submit]');
+  await submit(mallory.page, 'call-number');
   check('calling a number needs nodes or a gateway in Settings', /needs nodes or a gateway/.test(await mallory.page.evaluate(() => window.dsip.note())));
   await hold(alice, { gateway: GWA }); await hold(bob); await hold(carol); await hold(mallory, { gateway: GWA });
 
@@ -52,7 +52,7 @@ try {
   // 1. Alice calls Bob's number: through gateway A (attested A under its delegate certificate), the trunk, gateway B
   //    (PASSporT verified, routed by Bob's published binding), to Bob
   await alice.page.fill('#call-tn', 'tel:+15552000001');
-  await alice.page.click('#call-number button[type=submit]');
+  await submit(alice.page, 'call-number');
   await incomingAt(bob);
   check('Alice: the number is the invite\'s destination through the gateway (N§4.1)', /tel:\+15552000001 through the gateway/.test(await alice.page.evaluate(() => window.dsip.numberLine())) && /presenting \+15551234567/.test(await alice.page.evaluate(() => window.dsip.numberLine())));
   check('Bob: a PSTN caller with the verified attestation (G§5, N§4.1)', /PSTN caller \+15551234567/.test(await bob.page.textContent('#in-caller')) && (await bob.page.textContent('#in-basis')) === 'Gateway attested by gw-b.example · STIR attestation A (verified)', await bob.page.textContent('#in-basis'));
@@ -67,7 +67,7 @@ try {
 
   // 2. Mallory has no binding: the gateway presents its own identity; the crossing is downgraded (G§7)
   await mallory.page.fill('#call-tn', '+15552000001');
-  await mallory.page.click('#call-number button[type=submit]');
+  await submit(mallory.page, 'call-number');
   await incomingAt(bob);
   check('Bob: the crossing carried no attestation', (await bob.page.textContent('#in-basis')) === 'Gateway attested by gw-b.example · no attestation', await bob.page.textContent('#in-basis'));
   await until(mallory.page, () => /could not be asserted/.test(window.dsip.downgrade()), null, 30000);
@@ -79,7 +79,7 @@ try {
 
   // 3. a number nobody published: gateway B finds no route; identity.unknown
   await alice.page.fill('#call-tn', '+15552000777');
-  await alice.page.click('#call-number button[type=submit]');
+  await submit(alice.page, 'call-number');
   await ended(alice);
   check('Alice: a number nobody published is refused identity.unknown', /identity\.unknown/.test(await alice.page.evaluate(() => window.dsip.note())), await alice.page.evaluate(() => window.dsip.note()));
 
@@ -98,7 +98,7 @@ try {
   await bob.page.fill('#contact-name', 'Alice');
   await bob.page.fill('#contact-did', ALICE);
   await bob.page.fill('#contact-number', '+15551234567');
-  await bob.page.click('#contact-add button[type=submit]');
+  await submit(bob.page, 'contact-add');
   await until(bob.page, (did) => window.dsip.contacts().includes(did), ALICE);
   await carol.page.evaluate((b) => window.dsip.setBinding(b), read('carol.jws').trim());
   await addContact(carol, bob);
