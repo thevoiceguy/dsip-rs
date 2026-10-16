@@ -169,7 +169,7 @@ pub fn status(st: &State, now: i64, detail: bool) -> Value {
             "refused": s.refused.iter().map(|((r, c), n)| json!({"reason": r, "detail": c, "count": n})).collect::<Vec<_>>(),
         },
         "held": {
-            "frames": st.frames.len(), "attempts": attempts, "invites": invites, "initiators": st.initiators.len(),
+            "frames": st.frames.len(), "attempts": attempts, "invites": invites,
             "reject_frames": st.reject_frames.len(), "intro_keys": st.intro_log.len(),
             "publications": st.records.len(), "revocations": st.revocations.len(),
         },
@@ -232,7 +232,7 @@ pub fn metrics(st: &State, now: i64) -> String {
         m.counter("dsip_relay_refused_total", "Refusals, by reason token and detail code.", &[("reason", r), ("detail", c)], *n);
     }
     let (attempts, invites) = st.tracker.held();
-    for (what, n) in [("frames", st.frames.len()), ("attempts", attempts), ("invites", invites), ("initiators", st.initiators.len()),
+    for (what, n) in [("frames", st.frames.len()), ("attempts", attempts), ("invites", invites),
         ("reject_frames", st.reject_frames.len()), ("intro_keys", st.intro_log.len())] {
         m.gauge("dsip_relay_held", "Entries held in memory, by table.", &[("table", what)], n as i64);
     }
