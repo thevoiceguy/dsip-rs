@@ -17,6 +17,7 @@ pub mod agent;
 pub mod conn;
 pub mod identity;
 pub mod resolver;
+pub mod status;
 pub mod tls;
 /// Inbound verification (re-exported from `dsip-endpoint`, where it is shared with the WASM build).
 pub use dsip_endpoint::verify;

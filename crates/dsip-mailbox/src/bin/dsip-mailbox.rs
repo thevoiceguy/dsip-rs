@@ -23,6 +23,9 @@
 //! head of every unacknowledged fan-out queue at once, and after that any head left unacknowledged is re-sent with
 //! backoff; a member mailbox acknowledges a redelivery as a duplicate.
 
+#[path = "dsip-mailbox/status.rs"]
+mod status;
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -124,6 +127,10 @@ struct Args {
     /// `--listen` address is not one a peer can dial.
     #[arg(long)]
     host: Vec<String>,
+    /// Serve `GET /status` (JSON; `?detail=1` adds each owner's storage and each hub) and `GET /metrics`
+    /// (Prometheus) on this address, plain HTTP. Keep it on loopback (`dsipctl mailbox-status`).
+    #[arg(long)]
+    status_listen: Option<SocketAddr>,
 }
 
 /// The advertised `blob_endpoint` (M§4.3): the listen port on the first `--host`, else on the listen address.
@@ -235,6 +242,11 @@ struct Service {
     welcomes_sent: HashMap<String, (String, String, i64)>,
     /// Fault injection: peer mailbox DID whose fan-out is dropped (`--drop-fanout-to`).
     drop_fanout_to: Option<String>,
+    /// `--release-idle` and `--mls-retention`, as the status page reports them.
+    release_idle: bool,
+    mls_retention: i64,
+    /// Counters for the status page (`--status-listen`).
+    stats: status::Stats,
 }
 
 /// What goes out on a connection to a peer service.
@@ -916,6 +928,9 @@ async fn main() -> Result<()> {
         replicate_later: vec![],
         welcomes_sent: HashMap::new(),
         drop_fanout_to: args.drop_fanout_to.clone(),
+        release_idle: args.release_idle,
+        mls_retention: args.mls_retention,
+        stats: status::Stats::new(now_s()),
     }));
     std::fs::create_dir_all(args.state.join("blobs"))?;
     // Bound before the state is reloaded: a connection waits in the backlog until the accept loop starts.
@@ -932,6 +947,14 @@ async fn main() -> Result<()> {
                 st.ensure_owner(&id);
             }
         }
+    }
+    if let Some(addr) = args.status_listen {
+        let service = service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dsip_transport::status::serve(addr, move |p| status::render(service.clone(), p)).await {
+                tracing::warn!("status port {addr}: {e}");
+            }
+        });
     }
     let retry_service = service.clone();
     tokio::spawn(async move {
@@ -970,7 +993,10 @@ async fn main() -> Result<()> {
                         tracing::info!("{peer}: {e}");
                     }
                 }
-                Err(e) => tracing::info!("{peer}: TLS handshake failed: {e}"),
+                Err(e) => {
+                    service.lock().await.stats.tls_failed();
+                    tracing::info!("{peer}: TLS handshake failed: {e}");
+                }
             }
         });
     }
@@ -996,6 +1022,7 @@ async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>)
                 (path.clone(), valid_name && path.exists())
             };
             let verdict = dsip_messaging::mailbox::blob_get(&json!({"path_sha256": sha, "stored": if stored { vec![sha.clone()] } else { vec![] }}));
+            service.lock().await.stats.blob("GET", if verdict["status"] == 200 { 200 } else { 404 });
             if verdict["status"] == 200 {
                 let body = std::fs::read(&path)?;
                 http::respond(&mut req.stream, 200, "application/octet-stream", &body).await?;
@@ -1088,6 +1115,7 @@ async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>)
                     wire::error(&st.key, &to, now, in_reply_to, verdict["reason"].as_str().unwrap_or("policy.blocked"), None)
                 }
             };
+            st.stats.blob("PUT", status);
             drop(st);
             http::respond(&mut req.stream, status, "application/json", env.frame().as_bytes()).await?;
             Ok(())
@@ -1222,6 +1250,7 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     {
         let mut st = service.lock().await;
+        st.stats.bound();
         // A device may hold a second, short-lived connection beside its binding (a KeyPackage fetch at its own mailbox):
         // that connection gets its replies on itself and changes nothing about the binding, its live push included.
         let second = st.bound.get(&device).is_some_and(|t| !t.is_closed());
@@ -1332,6 +1361,7 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
             Ok(i) => i,
             Err(r) => {
                 tracing::info!("refused frame from {sender}: {r}");
+                st.stats.refused(r.token(), &r.code);
                 let env = wire::error(&st.key, sender, now, None, r.token(), Some(&r.code));
                 return vec![env.frame()];
             }
@@ -1339,7 +1369,10 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
     };
     st.seen.insert(inb.payload()["id"].as_str().unwrap_or(""), now, now);
     let signer = inb.device().to_string();
+    st.stats.frame_in(inb.payload()["type"].as_str().unwrap_or(""));
     let outs = dispatch(service, &mut st, &inb, &frame, sender, bound_identity, &resolver, now);
+    let envs: Vec<&Envelope> = outs.iter().map(|o| match o { Out::Device(_, e) | Out::Identity(_, e) => e }).collect();
+    st.stats.refusals_in(&envs);
     let mut replies = vec![];
     for out in outs {
         match out {
