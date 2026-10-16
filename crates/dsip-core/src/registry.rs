@@ -81,6 +81,8 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("mailbox.unsupported-mode", &["error"]),
     ("mailbox.blob-mismatch", &["error"]),
     ("mailbox.hub-unreachable", &["error"]), // v0.8 (spec-gap 72): the mailbox could not reach the group's hub (M§9.4)
+    ("mailbox.not-served", &["error"]), // v0.16 (spec-gap 130): an owner operation the mailbox will not serve (M§4.1)
+    ("mailbox.not-enrolled", &["error"]), // v0.16 (spec-gap 130): a release for a configured identity (M§4.1)
 ];
 
 /// `dsip-answered-by` registered values. Unknown values render as `service`.

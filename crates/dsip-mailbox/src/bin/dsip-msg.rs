@@ -1323,6 +1323,16 @@ impl Client {
         self.send(&env).await
     }
 
+    /// End this identity's enrolment at its mailbox (M§4.1, M§5.7; spec-gap 130): the mailbox answers `accepted` and
+    /// deletes everything it holds for the identity. A device SHOULD send it only once its identity no longer advertises
+    /// the mailbox; this console leaves that to its operator.
+    async fn release(&mut self) -> Result<()> {
+        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
+            json!({"subject": self.identity, "release": true}));
+        println!("RELEASE sent to {}", self.mailbox.0);
+        self.send(&env).await
+    }
+
     /// Sync and process everything stored, until the mailbox has no more (M§5.4).
     async fn sync_all(&mut self) -> Result<()> {
         self.sync(false).await?;
@@ -3602,6 +3612,7 @@ async fn command(client: &mut Client, cmd: &str, rest: &str) -> Result<()> {
     match cmd {
         "" => Ok(()),
         "kp" => client.upload_key_packages(rest.trim().parse().unwrap_or(2)).await,
+        "release" => client.release().await,
         "introduce" | "introduce-plain" => {
             // introduce <did> <purpose…>: sealed to the recipient's key agreement key; introduce-plain: not sealed
             let (target, purpose) = rest.trim().split_once(' ').context("usage: introduce <did> <purpose>")?;
