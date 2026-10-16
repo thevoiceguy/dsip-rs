@@ -266,7 +266,9 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
             kcfg.set_query_timeout(cfg.query_timeout);
             kcfg.set_record_ttl(Some(Duration::from_secs(6 * 3600)));
             kcfg.set_publication_interval(None); // we re-announce ourselves (republish_interval)
-            kcfg.set_replication_interval(Some(Duration::from_secs(120)));
+            // libp2p re-sends every stored record to the peers now closest to it on this interval: the cost that grows
+            // with what a node holds, so it follows the republish setting rather than a fixed two minutes
+            kcfg.set_replication_interval(Some(cfg.republish_interval));
             let store = kad::store::MemoryStore::new(key.public().to_peer_id());
             let mut kad = kad::Behaviour::with_config(key.public().to_peer_id(), store, kcfg);
             kad.set_mode(Some(if cfg.server { kad::Mode::Server } else { kad::Mode::Client }));
