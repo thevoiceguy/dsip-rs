@@ -40,6 +40,13 @@ Edit `/etc/dsip-node/config.toml`; every key is explained in `config.example.tom
 a key (`dsip-node --help`), and a misspelt key is an error.
 - **Join an overlay:** add its bootstrap nodes to `[overlay] bootstrap`, as `/dns4/<name>/tcp/4610/p2p/<PeerId>`.
 - **Find your node's PeerId:** `curl localhost:8080/dsip/v1/node`, or look in the log at start.
+- **Size the record store:** overlay records live in `overlay-records.redb` in the state directory. A browser's
+  device-signed hint takes about 2.9 KB on disk, so the default `[overlay] max_records = 1000000` needs about 3 GB.
+  Memory is the store's page cache, `store_cache_mb` (default 256), however many records it holds. Past
+  `max_records` new keys are refused. `/dsip/v1/node` shows `records` against `max_records`, plus `replicated` and
+  `pruned` from the paced pass that re-announces the store once per `republish_secs` (default 1200). A node upgraded
+  from an `overlay-records.jsonl` imports it once, then renames it `.imported`. Measured with
+  `cargo run --release -p dsip-dht --example store_stress -- --records 1000000 --dir <disk path>`.
 - **Behind a reverse proxy on the same host** (dsip-relay's `--node-proxy`, or a TLS proxy): set `[limits]
   trust_x_forwarded_for = true`, so rate limits apply per client, not per proxy. The header is honoured only on
   loopback connections; anything else is limited by its own address.

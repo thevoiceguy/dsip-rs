@@ -58,6 +58,12 @@ struct Args {
     /// Limit loopback connections by their `X-Forwarded-For` client (the co-located relay's proxy sets it).
     #[arg(long)]
     trust_x_forwarded_for: bool,
+    /// The most overlay records held [default: 1000000].
+    #[arg(long)]
+    max_records: Option<usize>,
+    /// Memory for the record store's page cache, MB [default: 256].
+    #[arg(long)]
+    store_cache_mb: Option<usize>,
     /// Seconds between re-announcing held records [default: 1200].
     #[arg(long)]
     republish_secs: Option<u64>,
@@ -111,6 +117,9 @@ async fn main() -> Result<()> {
             bootstrap: overlay_bootstrap,
             peers_file: state.as_ref().map(StateDir::overlay_peers),
             records_file: state.as_ref().map(StateDir::overlay_records),
+            records_db: state.as_ref().map(StateDir::overlay_db),
+            max_records: a.max_records.or(cfg.overlay.max_records).unwrap_or(dsip_dht::store::DEFAULT_MAX_RECORDS),
+            store_cache_bytes: a.store_cache_mb.or(cfg.overlay.store_cache_mb).map(|mb| mb << 20).unwrap_or(dsip_dht::store::DEFAULT_CACHE_BYTES),
             ban_secs: a.ban_secs.or(cfg.limits.ban_secs).unwrap_or(600),
             ban_ip: a.ban_ip || cfg.limits.ban_ip.unwrap_or(false),
             republish_interval: Duration::from_secs(a.republish_secs.or(cfg.overlay.republish_secs).unwrap_or(1200).max(1)),

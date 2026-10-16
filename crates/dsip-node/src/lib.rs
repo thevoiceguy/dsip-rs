@@ -284,6 +284,9 @@ async fn metrics(State(node): State<Arc<Node>>) -> Response {
         if let Ok(s) = h.stats().await {
             gauge("dsip_node_overlay_peers", "Peers in the overlay routing table.", "gauge", vec![(String::new(), s.routing_peers as f64)]);
             gauge("dsip_node_overlay_records", "Overlay records held.", "gauge", vec![(String::new(), s.stored as f64)]);
+            gauge("dsip_node_overlay_max_records", "The bound on overlay records held (max_records).", "gauge", vec![(String::new(), s.max_records as f64)]);
+            gauge("dsip_node_overlay_replicated_total", "Records the paced pass re-announced.", "counter", vec![(String::new(), s.replicated as f64)]);
+            gauge("dsip_node_overlay_pruned_total", "Records the paced pass deleted because they no longer verify.", "counter", vec![(String::new(), s.pruned as f64)]);
             gauge("dsip_node_overlay_puts_accepted_total", "Inbound overlay PUTs stored.", "counter", vec![(String::new(), s.puts_accepted as f64)]);
             gauge("dsip_node_overlay_puts_rejected_total", "Inbound overlay PUTs refused, by reason.", "counter",
                   s.puts_rejected.iter().map(|(r, n)| (format!("{{reason=\"{r}\"}}"), *n as f64)).collect());
@@ -436,7 +439,8 @@ async fn overlay_post(State(node): State<Arc<Node>>, body: String) -> Response {
 /// Spec: none (infrastructure).
 async fn node_info(State(node): State<Arc<Node>>) -> Json<Value> {
     let overlay = match &node.overlay {
-        Some(h) => h.stats().await.ok().map(|s| json!({"peers": s.routing_peers, "records": s.stored})),
+        Some(h) => h.stats().await.ok().map(|s| json!({"peers": s.routing_peers, "records": s.stored, "max_records": s.max_records,
+                                                        "replicated": s.replicated, "pruned": s.pruned})),
         None => None,
     };
     let mainline = match &node.mainline {

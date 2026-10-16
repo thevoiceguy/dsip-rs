@@ -32,6 +32,8 @@ repository = "https://github.com/thevoiceguy/DSIP"
 rust-version = "1.85"
 
 [workspace.dependencies]
+redb = "2.6"
+flate2 = "1"
 x509-parser = "0.17"
 toml = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "json", "matched-path"] }

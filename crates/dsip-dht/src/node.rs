@@ -29,6 +29,7 @@ use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{Context, Envelope};
 
 use crate::record::{evaluate, key_for, select, Hint};
+use crate::store::DiskStore;
 use crate::PROTOCOL;
 
 /// Verification failures one peer may cause per [`REJECTION_WINDOW`] before its PUTs are dropped unverified.
@@ -80,10 +81,16 @@ pub struct NodeConfig {
     /// Where held records are kept across restarts: one JSON line `{"frame", "republish"}` per record.
     ///
     /// Spec: DHT profile §4 — a record is verified at every hop, a node's own disk included.
-    /// Impl: rewritten every maintenance tick; at start every line is evaluated again (signature, expiry, §8.3
-    /// against what is already restored) and only what verifies is stored. `republish` marks the records this
-    /// node publishes itself, which it keeps re-announcing; the others it only serves.
+    /// Impl: the record store before [`NodeConfig::records_db`]: read once at start, every line evaluated again
+    /// (signature, expiry, §8.3 against what is already held) and what verifies imported into the store, then renamed
+    /// `<name>.imported`. `republish` marks the records this node publishes itself.
     pub records_file: Option<std::path::PathBuf>,
+    /// The record store's file ([`crate::store::DiskStore`]); without one the store lives in memory.
+    pub records_db: Option<std::path::PathBuf>,
+    /// The most records the store holds; past it new keys are refused (replacing a held key is always allowed).
+    pub max_records: usize,
+    /// The store's page cache in bytes: what bounds the node's memory for records, however many it holds.
+    pub store_cache_bytes: usize,
     /// Ban a peer for this long once it spends its [`REJECTION_BUDGET`] (0: only the budget's own window): its PUTs
     /// are dropped unverified for the whole ban and it leaves the routing table. Its connection is NOT closed.
     ///
@@ -111,6 +118,9 @@ impl Default for NodeConfig {
             server: true,
             peers_file: None,
             records_file: None,
+            records_db: None,
+            max_records: crate::store::DEFAULT_MAX_RECORDS,
+            store_cache_bytes: crate::store::DEFAULT_CACHE_BYTES,
             ban_secs: 0,
             ban_ip: false,
         }
@@ -140,6 +150,15 @@ pub struct Stats {
     pub banned: usize,
     /// Connections refused because they came from a banned IP.
     pub refused_connections: u64,
+    /// Records the paced pass re-announced since start.
+    #[serde(default)]
+    pub replicated: u64,
+    /// Records the paced pass deleted because they no longer verify (expired, or changed on disk).
+    #[serde(default)]
+    pub pruned: u64,
+    /// The bound on records held.
+    #[serde(default)]
+    pub max_records: usize,
 }
 
 /// Result of a GET.
@@ -227,7 +246,7 @@ impl Handle {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    kad: kad::Behaviour<kad::store::MemoryStore>,
+    kad: kad::Behaviour<DiskStore>,
     identify: identify::Behaviour,
     gate: IpGate,
 }
@@ -244,7 +263,7 @@ struct PendingPut {
     reply: oneshot::Sender<Result<PublishOutcome>>,
 }
 
-fn now_s() -> i64 {
+pub(crate) fn now_s() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
@@ -256,6 +275,10 @@ fn peer_of(addr: &Multiaddr) -> Option<PeerId> {
 pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
     let peer_id = cfg.keypair.public().to_peer_id();
     let resolver = cfg.resolver.clone();
+    let mut store = Some(
+        DiskStore::open(cfg.records_db.as_deref(), peer_id, cfg.resolver.clone(), cfg.max_records, cfg.store_cache_bytes)
+            .with_context(|| format!("record store {}", cfg.records_db.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "(memory)".into())))?,
+    );
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(cfg.keypair.clone())
         .with_tokio()
         .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)?
@@ -266,10 +289,10 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
             kcfg.set_query_timeout(cfg.query_timeout);
             kcfg.set_record_ttl(Some(Duration::from_secs(6 * 3600)));
             kcfg.set_publication_interval(None); // we re-announce ourselves (republish_interval)
-            // libp2p re-sends every stored record to the peers now closest to it on this interval: the cost that grows
-            // with what a node holds, so it follows the republish setting rather than a fixed two minutes
-            kcfg.set_replication_interval(Some(cfg.republish_interval));
-            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+            // libp2p's replication job copies every stored record into memory on each run: off. The node replicates
+            // with its own paced pass over the store instead (the maintenance tick below).
+            kcfg.set_replication_interval(None);
+            let store = store.take().expect("built once");
             let mut kad = kad::Behaviour::with_config(key.public().to_peer_id(), store, kcfg);
             kad.set_mode(Some(if cfg.server { kad::Mode::Server } else { kad::Mode::Client }));
             let identify = identify::Behaviour::new(identify::Config::new(PROTOCOL.into(), key.public()));
@@ -291,7 +314,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
     let records_file = cfg.records_file.clone();
     // records kept before a restart, verified again before they are served or re-announced
     let mut restored_held: HashMap<Vec<u8>, (String, i64)> = HashMap::new();
-    if let Some(f) = &records_file {
+    if let Some(f) = records_file.as_ref().filter(|f| f.exists()) {
         let ctx = Context::new(now_s(), &cfg.resolver);
         let (mut kept, mut dropped) = (0usize, 0usize);
         for line in std::fs::read_to_string(f).unwrap_or_default().lines() {
@@ -309,18 +332,39 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
             let record = Record { key: RecordKey::new(&key), value: frame.clone().into_bytes(), publisher: None, expires: None };
             let _ = swarm.behaviour_mut().kad.store_mut().put(record);
             if v["republish"] == true {
-                restored_held.insert(key, (frame, h.expires_at));
+                swarm.behaviour_mut().kad.store_mut().set_held(&key, true);
             }
             kept += 1;
         }
         if kept + dropped > 0 {
-            tracing::info!("restored {kept} record(s) from {}, dropped {dropped} that no longer verify", f.display());
+            tracing::info!("imported {kept} record(s) from {} into the record store, dropped {dropped} that no longer verify", f.display());
+        }
+        if cfg.records_db.is_some() {
+            let _ = std::fs::rename(f, f.with_extension("jsonl.imported"));
+        }
+    }
+    {
+        let st = swarm.behaviour_mut().kad.store_mut();
+        let ctx = Context::new(now_s(), &cfg.resolver);
+        for key in st.held_keys() {
+            let frame = st.raw(&key).map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default();
+            match evaluate(&frame, &ctx, None).hint {
+                Some(h) => { restored_held.insert(key, (frame, h.expires_at)); }
+                None => st.set_held(&key, false),
+            }
+        }
+        if !st.is_empty() {
+            tracing::info!("record store: {} record(s) held, {} published by this node (bound {})", st.len(), restored_held.len(), st.max_records());
         }
     }
 
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let republish_interval = cfg.republish_interval;
     let maintain_interval = cfg.maintain_interval;
+    // the paced pass runs every second over this share of the store, so a full pass takes one republish interval and
+    // a node holding a million records re-announces about 830 a second, holding as many in memory, not a burst a minute
+    const PASS_TICK: Duration = Duration::from_secs(1);
+    let pass_share = (PASS_TICK.as_secs_f64() / republish_interval.as_secs_f64().max(1.0)).min(1.0);
     let (ban_secs, ban_ip) = (cfg.ban_secs, cfg.ban_ip);
     tokio::spawn(async move {
         let mut listen_addrs: Vec<Multiaddr> = vec![];
@@ -337,6 +381,12 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
         republish.tick().await;
         let mut maintain = tokio::time::interval(maintain_interval);
         maintain.tick().await;
+        // where the paced pass resumes (the last key it re-announced; None: from the start)
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut credit = 0f64;
+        let mut pass = tokio::time::interval(PASS_TICK);
+        pass.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        pass.tick().await;
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => match event {
@@ -473,6 +523,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         let key = key_for(&h.subject);
                         let record = Record { key: RecordKey::new(&key), value: frame.clone().into_bytes(), publisher: None, expires: None };
                         let _ = swarm.behaviour_mut().kad.store_mut().put(record.clone());
+                        swarm.behaviour_mut().kad.store_mut().set_held(&key, true);
                         held.insert(key.clone(), (frame.clone(), h.expires_at));
                         // Impl: Quorum::All, not One. libp2p-kad ends a put as soon as its quorum is met,
                         // so with One the record reached only the first wave of closest peers (on the WAN
@@ -499,7 +550,8 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                     Some(Command::Addrs(reply)) => { let _ = reply.send(listen_addrs.clone()); }
                     Some(Command::Stats(reply)) => {
                         let mut s = stats.clone();
-                        s.stored = swarm.behaviour_mut().kad.store_mut().records().count();
+                        s.stored = swarm.behaviour_mut().kad.store_mut().len();
+                        s.max_records = swarm.behaviour_mut().kad.store_mut().max_records();
                         s.routing_peers = swarm.behaviour_mut().kad.kbuckets().map(|b| b.num_entries()).sum();
                         s.banned = bans.len();
                         s.refused_connections = swarm.behaviour().gate.refused;
@@ -516,6 +568,38 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         }
                     }
                 }
+                _ = pass.tick() => {
+                    // The paced pass (spec DHT profile §4: verified before it is forwarded): the next share of the store
+                    // is verified, and re-announced to the peers now closest to it, or deleted if it no longer verifies.
+                    // A full pass takes one republish interval, one second's share in memory at a time; the
+                    // maintenance tick makes what it wrote durable.
+                    // a fraction of a record carries over, so a small store keeps the same pace as a large one
+                    let total = swarm.behaviour_mut().kad.store_mut().len();
+                    credit += total as f64 * pass_share;
+                    let share = credit.floor() as usize;
+                    if share == 0 {
+                        continue;
+                    }
+                    credit -= share as f64;
+                    let batch = swarm.behaviour_mut().kad.store_mut().batch_after(cursor.as_deref(), share);
+                    cursor = if batch.len() < share { None } else { batch.last().map(|(k, _)| k.clone()) };
+                    let now = now_s();
+                    let ctx = Context::new(now, &resolver);
+                    for (key, value) in batch {
+                        if held.contains_key(&key) {
+                            continue; // re-announced on the republish tick
+                        }
+                        let frame = String::from_utf8_lossy(&value).into_owned();
+                        if evaluate(&frame, &ctx, None).hint.is_none() {
+                            swarm.behaviour_mut().kad.store_mut().remove(&RecordKey::new(&key));
+                            stats.pruned += 1;
+                            continue;
+                        }
+                        let record = Record { key: RecordKey::new(&key), value, publisher: None, expires: None };
+                        let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::All);
+                        stats.replicated += 1;
+                    }
+                }
                 _ = maintain.tick() => {
                     let in_table: usize = swarm.behaviour_mut().kad.kbuckets().map(|b| b.num_entries()).sum();
                     if in_table == 0 {
@@ -525,7 +609,11 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         save_peers(f, &mut swarm);
                     }
                     let now = now_s();
-                    held.retain(|_, (_, exp)| *exp > now);
+                    let lapsed: Vec<Vec<u8>> = held.iter().filter(|(_, (_, exp))| *exp <= now).map(|(k, _)| k.clone()).collect();
+                    for k in lapsed {
+                        held.remove(&k);
+                        swarm.behaviour_mut().kad.store_mut().set_held(&k, false);
+                    }
                     rejections.retain(|_, (start, _)| start.elapsed() < REJECTION_WINDOW);
                     let t = std::time::Instant::now();
                     let expired: Vec<PeerId> = bans.iter().filter(|(_, until)| **until <= t).map(|(p, _)| *p).collect();
@@ -534,9 +622,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         tracing::info!("ban on {p} ended");
                     }
                     swarm.behaviour_mut().gate.expire(t);
-                    if let Some(f) = &records_file {
-                        save_records(f, &mut swarm, &held);
-                    }
+                    swarm.behaviour_mut().kad.store_mut().flush();
                 }
             }
         }
@@ -625,19 +711,6 @@ impl libp2p::swarm::NetworkBehaviour for IpGate {
         _: &mut std::task::Context<'_>,
     ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
         std::task::Poll::Pending
-    }
-}
-
-/// Write every record the store holds as a JSON line, marking the ones this node re-announces itself.
-fn save_records(path: &std::path::Path, swarm: &mut libp2p::Swarm<Behaviour>, held: &HashMap<Vec<u8>, (String, i64)>) {
-    let mut lines = vec![];
-    for r in swarm.behaviour_mut().kad.store_mut().records() {
-        let frame = String::from_utf8_lossy(&r.value).into_owned();
-        lines.push(serde_json::json!({"frame": frame, "republish": held.contains_key(r.key.as_ref())}).to_string());
-    }
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|_| std::fs::rename(&tmp, path)).is_err() {
-        tracing::warn!("could not save records to {}", path.display());
     }
 }
 

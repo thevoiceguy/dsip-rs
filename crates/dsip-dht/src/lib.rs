@@ -24,6 +24,8 @@
 pub mod control;
 #[cfg(feature = "node")]
 pub mod node;
+#[cfg(feature = "node")]
+pub mod store;
 pub mod record;
 
 /// Kademlia protocol name for the DSIP hints overlay.

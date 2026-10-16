@@ -56,8 +56,8 @@ $B/dsip answer --identity "$D/bob" --relay wss://127.0.0.1:$RELAY_PORT/dsip --ca
 grep -q '^hint .*pkarr published' "$D/bob.log" || fail "Bob did not publish"
 for _ in $(seq 100); do [ "$(info | field 'd["overlay"]["peers"]')" -ge 2 ] && break; sleep 0.2; done
 echo "  node A: PeerId ${PEER1:0:16}…, $(info | field 'd["overlay"]["peers"]') overlay peers, Bob's packet and hint held"
-sleep 61  # one republish tick: peers, records and Mainline nodes reach the state directory
-[ -s "$D/a-state/overlay-records.jsonl" ] && [ -s "$D/a-state/overlay-peers" ] || fail "A's state was not written"
+sleep 61  # one housekeeping tick: peers and Mainline nodes reach the state directory (records are in the store as they arrive)
+[ -s "$D/a-state/overlay-records.redb" ] && [ -s "$D/a-state/overlay-peers" ] || fail "A's state was not written"
 
 echo; echo "════════ 2. A restarts with an EMPTY state directory (as before stage 2)"
 kill $A; wait $A 2>/dev/null || true
@@ -83,7 +83,7 @@ P=$(info | field 'd["overlay"]["peers"]')
 [ "$PEER3" = "$PEER1" ] || fail "the PeerId changed: $PEER3"
 [ "$P" -ge 2 ] || fail "A did not rejoin its peers"
 echo "  PeerId ${PEER3:0:16}… (kept), $P overlay peers after ${T} s"
-grep -E "^pkarr: restored|restored .* record" "$D/a.log" | tail -2 | sed 's/^.*dsip_dht::node: //; s/^/  /' | cut -c1-140
+grep -E "^pkarr: restored|restored .* record|record store: " "$D/a.log" | tail -2 | sed 's/^.*dsip_dht::node: //; s/^/  /' | cut -c1-140
 [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$HA/$ZBOB)" = 200 ] || fail "A did not serve Bob's packet from its state"
 N=$(curl -s "http://127.0.0.1:$HA/dsip/v1/hints/$BOB" | field 'len(d["hints"])')
 [ "$N" = 1 ] || fail "A did not serve Bob's overlay hint after the restart"
