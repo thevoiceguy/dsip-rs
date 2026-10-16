@@ -26,7 +26,10 @@ enabled = true
 port = 6881
 # Store and answer for others (needs a reachable UDP port), not only query.
 server = true
-# Empty: the public bootstrap nodes.
+# Empty: the library's public bootstrap nodes. A list REPLACES them, so list your own other nodes (host:6881) and
+# keep a public one that answers: on the WAN testbed (2026-10-16) router.bittorrent.com did not reply, and a node
+# whose saved routing nodes had dwindled to one stale entry could not rejoin until its peers were listed here.
+# e.g. bootstrap = ["<other-node>:6881", "dht.libtorrent.org:25401", "relay.pkarr.org:6881"]
 bootstrap = []
 
 [http]
