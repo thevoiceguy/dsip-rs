@@ -136,8 +136,6 @@ struct State {
     tracker: Relay,
     /// Per (session, leg): the leg's reject frame, forwarded if chosen as the attempt outcome.
     reject_frames: HashMap<(String, String), String>,
-    /// Per session: the initiator device connection.
-    initiators: HashMap<String, String>,
     /// Every verified frame within the retention window, by envelope id (served for queued deliveries).
     frames: HashMap<String, (String, i64)>,
     /// §19.4 rate limiting: key (sender identity or recipient) → recent introduction times.
@@ -326,10 +324,31 @@ impl State {
         self.frames.retain(|_, (_, deadline)| *deadline > now);
         let delta = now - self.tracker.now;
         if delta > 0 {
-            self.tracker.step(&RelayEvent::Advance { advance: delta })
+            let em = self.tracker.step(&RelayEvent::Advance { advance: delta });
+            self.forget(now);
+            em
         } else {
             vec![]
         }
+    }
+
+    /// This binary's own tables follow what the tracker and the authority still hold, at most once a second (spec-gap
+    /// 131: the relay's memory follows live traffic). Nothing here is observable: a reject frame is kept only while its
+    /// attempt is (the outcome is chosen from it), an introduction rate-limit key only while it has a time inside the
+    /// window, a publication record and its statements only while the publication is the stream's current one.
+    ///
+    /// Spec: none (infrastructure).
+    fn forget(&mut self, now: i64) {
+        let tracker = &self.tracker;
+        self.reject_frames.retain(|(sid, _), _| tracker.attempt_initiator(sid).is_some());
+        let window = self.intro_window;
+        self.intro_log.retain(|_, log| {
+            log.retain(|t| *t + window > now);
+            !log.is_empty()
+        });
+        let current: HashSet<&str> = self.authority.publications.values().map(|p| p.publication.as_str()).collect();
+        self.records.retain(|id, _| current.contains(id.as_str()));
+        self.statements.retain(|id, _| current.contains(id.as_str()));
     }
 
     /// Act on tracker emissions for a frame that just arrived (or `None` on bind/advance).
@@ -447,9 +466,6 @@ impl State {
         // Keep the frame within retention so queued deliveries and mid-attempt legs can be served.
         let deadline = p["expires_at"].as_i64().unwrap_or(now_s()).min(now_s() + self.offline_retention);
         self.frames.insert(id.clone(), (inbound.frame.clone(), deadline));
-        if t == "invite" {
-            self.initiators.insert(sid.clone(), sender.to_string());
-        }
         if t == "reject" && self.tracker.attempt_initiator(&sid).is_some_and(|i| i != sender) {
             self.reject_frames.insert((sid.clone(), sender.to_string()), inbound.frame.clone());
         }
@@ -538,7 +554,6 @@ async fn main() -> Result<()> {
         identities: HashMap::new(),
         tracker: Relay::with_retention(now_s(), args.offline_retention),
         reject_frames: HashMap::new(),
-        initiators: HashMap::new(),
         frames: HashMap::new(),
         intro_log: HashMap::new(),
         intro_limit: args.intro_limit,
@@ -765,6 +780,9 @@ async fn serve(
     st.devices.remove(&device);
     if let Some(set) = st.identities.get_mut(&identity) {
         set.remove(&device);
+        if set.is_empty() {
+            st.identities.remove(&identity);
+        }
     }
     let _ = st.tracker.step(&RelayEvent::Relay(RelayAction::Unbind { device: device.clone(), identity: identity.clone() }));
     if st.identities.get(&identity).is_none_or(|s| s.is_empty()) {
