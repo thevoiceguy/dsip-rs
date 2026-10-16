@@ -1,5 +1,5 @@
 //! `dsip-events` — the rules of the DSIP Device Events Profile (draft `device-events/0.1`,
-//! `v0.15/dsip-device-events-profile-v0.15-draft.md`, cited `E§n`). Pure: no SNMP stack, no network.
+//! `v0.16/dsip-device-events-profile-v0.16-draft.md`, cited `E§n`). Pure: no SNMP stack, no network.
 //!
 //! Spec: sections owned by this crate — E§3 (a received notification becomes an event: RFC 3584 §3.1
 //! translation, the community never carried, the syslog severity table — [`normalize_trap`],

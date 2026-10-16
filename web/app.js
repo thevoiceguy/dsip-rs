@@ -1252,7 +1252,11 @@ async function driveMailbox(result) {
     else if (e.sync) { const f = messenger.sync_frame(false, now()); mailboxConn.send(f); log('→ sync         after a refused deposit (M§6.5 spec-gap 58; M§7.4 a group that moved)', 'M§6.5'); }
     else if (e.ui) onMessagingUi(e);
     else if (e.refused) { log(`✗ refused: ${e.refused}`, 'M§16'); notify(`Messaging: ${e.refused}`); }
-    else if (e.error) log(`✗ messaging error: ${e.error}`, 'M§5');
+    else if (e.error?.startsWith('mailbox.not-served')) {
+      // M§4.1 (spec-gap 130): the mailbox enrols no more identities; nothing here will be kept until one has room
+      log(`✗ the mailbox does not serve this identity: it has no room for another one (mailbox.not-served)`, 'M§4.1');
+      notify('Messaging: this mailbox has no room for your identity. Choose another mailbox in Settings.');
+    } else if (e.error) log(`✗ messaging error: ${e.error}`, 'M§5');
     else if (e.rejected) log(`✗ mailbox frame rejected: ${e.rejected.code}${e.rejected.reason ? ' ' + e.rejected.reason : ''}`, '§10.2');
     else if (e.drop) log(`· mailbox: ${e.drop}`);
     else if (e.successor_due) successorDue(e.successor_due);

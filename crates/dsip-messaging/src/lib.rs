@@ -1,5 +1,5 @@
 //! `dsip-messaging` — the protocol rules of the DSIP Messaging Profile 1.0 (v0.8 draft,
-//! `v0.15/dsip-messaging-profile-v0.15.md`, cited `M§n`). Pure: no MLS library, no network.
+//! `v0.16/dsip-messaging-profile-v0.16.md`, cited `M§n`). Pure: no MLS library, no network.
 //! MLS is abstracted to what a hub or mailbox can observe, as relay traces abstract signatures.
 //!
 //! Spec: sections owned by this crate — M§5 (profile messages: the two-layer model, lifetimes,
@@ -7,7 +7,8 @@
 //! receipts, activity, archive keys — [`checks`]), M§6.5–M§6.8 and M§7.3 (hub ordering,
 //! sequencing, fan-out order, membership rules, external joins — [`hub`]), M§4.4, M§5.4–M§5.7,
 //! M§6.6, M§12.2, M§14.2 (mailbox modes, sync and push, KeyPackage directory, group registration,
-//! archive first-wins, first-contact authorization — [`mailbox`]), M§6.5 (client seq gaps), M§5.4/M§8.5 (durable delivery state across restarts), M§7.2/M§7.5
+//! archive first-wins, first-contact authorization — [`mailbox`]), M§4.1 (whom a mailbox serves, release and idle
+//! expiry of an enrolment — [`enrolment`]), M§6.5 (client seq gaps), M§5.4/M§8.5 (durable delivery state across restarts), M§7.2/M§7.5
 //! (conversation convergence), M§10 and M§11.2 (receipts, watermarks, activity) and M§13.2
 //! (voicemail offer — [`client`]), M§6.2/M§6.3/M§8.4/M§11.1/M§12.2 (the MLS layer: extension
 //! encoding, the leaf authentication service, AES-GCM formats — [`mls_wire`]).
@@ -21,6 +22,7 @@
 
 pub mod checks;
 pub mod client;
+pub mod enrolment;
 pub mod first_contact;
 pub mod hub;
 pub mod mailbox;
@@ -100,6 +102,10 @@ pub fn run_vector(v: &Value) -> Value {
         "move-arrival-trace" => {
             let mut a = client::MoveArrival::new(&v["context"]);
             trace(inp, |ev| (a.step(ev), a.snapshot()))
+        }
+        "enrolment-trace" => {
+            let mut e = enrolment::Enrolment::new(&v["context"]);
+            trace(inp, |ev| (e.step(ev), e.snapshot()))
         }
         "history-trace" => {
             let mut h = client::History::new(&v["context"]);

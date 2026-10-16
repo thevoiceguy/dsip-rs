@@ -43,6 +43,7 @@ use dsip_mailbox::store::{write_atomically, Item, Store};
 use dsip_mailbox::verify::{delegated_identity, verify_frame};
 use dsip_mailbox::{http, wire, HELLO_TIMEOUT_S};
 use dsip_messaging::client::select_mailbox;
+use dsip_messaging::enrolment::Enrolment;
 use dsip_messaging::hub::Hub;
 use dsip_messaging::mailbox::Mailbox;
 use dsip_mls::{digest, message_header, HubView};
@@ -110,6 +111,11 @@ struct Args {
     /// RECOMMENDED 2,592,000; spec-gap 119).
     #[arg(long, default_value_t = dsip_messaging::hub::MLS_RETENTION_S)]
     mls_retention: i64,
+    /// End the enrolment of an enrolled identity once none of its devices has completed a verified `hello` within
+    /// `--mls-retention` (M§4.1 idle expiry, a MAY; spec-gap 130): everything held for it is deleted and its place in
+    /// `--serve-any` is freed. Configured `--owner` identities never expire.
+    #[arg(long)]
+    release_idle: bool,
     /// Fault injection for demos: never deliver hub fan-out to this peer mailbox (a hub that dies before delivering).
     #[arg(long)]
     drop_fanout_to: Option<String>,
@@ -167,8 +173,12 @@ struct Service {
     configured: Vec<String>,
     /// `--serve-any`: how many identities may enrol beyond the configured owners (spec-gap 115).
     serve_any: Option<usize>,
-    /// Identities that enrolled by binding (spec-gap 115), in order; saved with the state.
-    enrolled: Vec<String>,
+    /// Whom this service serves beyond `configured`, and when each enrolment ends (M§4.1; spec-gaps 115, 130): the
+    /// vector-pinned machine decides, this host acts on what it emits. Its entries are saved with the state.
+    enrolment: Enrolment,
+    /// The identities each stored blob was uploaded or replicated for (spec-gap 130): a blob is deleted when the last
+    /// of them is released. A blob stored before this index existed belongs to no one and is kept.
+    blob_owners: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// The served owners' state, by identity.
     owned: BTreeMap<String, Owned>,
     /// The mailbox machine that answers for recipients this service does not serve: first contact for them is
@@ -264,7 +274,8 @@ impl Service {
             "format": 2,
             "service": self.key.did(),
             "owners": owners,
-            "enrolled": self.enrolled,
+            "enrolment": self.enrolment.entries(),
+            "blob_owners": self.blob_owners,
             "drop_box": self.drop_box.full_state(),
             "hubs": self.hubs.iter().map(|(g, h)| (g.clone(), h.full_state())).collect::<serde_json::Map<_, _>>(),
             "views": self.views.iter().map(|(g, v)| (g.clone(), serde_json::from_slice(&v.save()).unwrap_or(Value::Null)))
@@ -336,7 +347,13 @@ impl Service {
                 let store: Store = serde_json::from_value(o["store"].clone()).with_context(|| format!("saved store of {id}"))?;
                 self.owned.insert(id.clone(), Owned { mailbox, store });
             }
-            self.enrolled = v["enrolled"].as_array().into_iter().flatten().map(s_of).collect();
+            let entries: Vec<(String, i64)> = match v["enrolment"].as_array() {
+                Some(a) => a.iter().map(|e| (s_of(&e[0]), e[1].as_i64().unwrap_or(0))).collect(),
+                // a state saved before spec-gap 130 lists the enrolled identities only: each counts as seen now
+                None => v["enrolled"].as_array().into_iter().flatten().map(|e| (s_of(e), now_s())).collect(),
+            };
+            self.enrolment.restore_entries(entries);
+            self.blob_owners = serde_json::from_value(v["blob_owners"].clone()).unwrap_or_default();
             if let Some(d) = Mailbox::from_full_state(&v["drop_box"]) {
                 self.drop_box = d;
             }
@@ -452,6 +469,15 @@ impl Service {
         if behind > 0 {
             self.drop_box.step(&json!({"advance": behind}));
         }
+        // M§4.1 (spec-gap 130): with --release-idle, an enrolled identity with no registered device is released
+        let behind = now - self.enrolment.now();
+        if behind > 0 {
+            for e in self.enrolment.advance(behind) {
+                if let Some(id) = e["released"]["identity"].as_str() {
+                    self.end_enrolment(id, "idle");
+                }
+            }
+        }
     }
 
     /// Whether this service serves `identity`: configured, or enrolled (spec-gap 115).
@@ -471,24 +497,53 @@ impl Service {
         self.owned.get_mut(identity).expect("owner")
     }
 
-    /// spec-gap 115: an identity this service does not serve enrols with its first owner operation (`sync`,
-    /// `key-packages`, `mailbox-config`) on a verified binding — a device delegated by it with `dsip.messaging`
-    /// (M§4.3) — while the operator's cap has room; a service identity (bound as itself) never does. Returns whether
-    /// `identity` is served afterwards.
-    fn enrol_if_room(&mut self, identity: &str, device: &str) -> bool {
-        if self.serves(identity) {
-            return true;
+    /// An owner operation (`sync`, `key-packages`, `mailbox-config`) on a verified binding: an identity this service
+    /// does not serve enrols while the operator's bound has room, as the vector-pinned [`Enrolment`] decides (M§4.1,
+    /// spec-gaps 115, 130), and its device is registered. Returns the refusal to send instead of handling the operation
+    /// (`mailbox.not-served`), or `None`. A service identity (bound as itself) is not an owner and never enrols; its
+    /// operations go to the drop box as before.
+    fn owner_op(&mut self, identity: &str, device: &str, id: &str, now: i64) -> Option<Vec<Out>> {
+        if identity == device || self.serves(identity) {
+            return None;
         }
-        if identity == device || !self.serve_any.is_some_and(|cap| self.enrolled.len() < cap) {
-            return false;
+        let emissions = self.enrolment.owner_op(identity, device, id);
+        if emissions.iter().any(|e| e.get("enrolled").is_some()) {
+            let o = self.ensure_owner(identity);
+            let mut devices: Vec<String> = o.mailbox.devices().to_vec();
+            devices.push(device.to_string());
+            o.mailbox.register_devices(&devices);
+            tracing::info!("enrolled {identity} (serve-any {}/{})", self.enrolment.entries().len(), self.serve_any.unwrap_or(0));
+            return None;
         }
-        self.enrolled.push(identity.to_string());
-        let o = self.ensure_owner(identity);
-        let mut devices: Vec<String> = o.mailbox.devices().to_vec();
-        devices.push(device.to_string());
-        o.mailbox.register_devices(&devices);
-        tracing::info!("enrolled {identity} (serve-any {}/{})", self.enrolled.len(), self.serve_any.unwrap_or(0));
-        true
+        tracing::info!("not serving {identity}: serve-any {}/{} (M§4.1)", self.enrolment.entries().len(), self.serve_any.unwrap_or(0));
+        Some(self.mailbox_out(identity, emissions, now))
+    }
+
+    /// End an identity's enrolment (M§4.1, spec-gap 130): delete everything held for it — its mailbox machine and
+    /// store, the blobs only it had, its pending replications — and close its devices' bindings. Its place in the
+    /// bound is already free in [`Enrolment`].
+    fn end_enrolment(&mut self, identity: &str, cause: &str) {
+        let devices = self.owned.remove(identity).map(|o| o.mailbox.devices().to_vec()).unwrap_or_default();
+        for d in &devices {
+            if let Some(tx) = self.bound.remove(d) {
+                let _ = tx.send(CLOSE_SENTINEL.to_string());
+            }
+            if let Some(tx) = self.standby.remove(d) {
+                let _ = tx.send(CLOSE_SENTINEL.to_string());
+            }
+        }
+        let mut deleted = 0;
+        self.blob_owners.retain(|sha, owners| {
+            owners.remove(identity);
+            if owners.is_empty() {
+                let _ = std::fs::remove_file(self.blob_dir.join(sha));
+                deleted += 1;
+            }
+            !owners.is_empty()
+        });
+        self.replicate_later.retain(|(owner, ..)| owner != identity);
+        tracing::info!("released {identity} ({cause}): deleted its mailbox, {deleted} blob(s), closed {} binding(s)", devices.len());
+        self.persist();
     }
 
     /// The mailbox machine that answers for `recipient`: its own if served, else the drop box (§19.4 anti-enumeration:
@@ -830,7 +885,9 @@ async fn main() -> Result<()> {
         key,
         configured: args.owners.clone(),
         serve_any: args.serve_any,
-        enrolled: vec![],
+        enrolment: Enrolment::new(&json!({"now": now_s(), "configured": args.owners, "serve_any": args.serve_any.unwrap_or(0),
+            "expire_idle": args.release_idle, "mls_retention_s": args.mls_retention})),
+        blob_owners: BTreeMap::new(),
         owned: BTreeMap::new(),
         drop_box: Mailbox::new(&mailbox_ctx),
         mailbox_ctx,
@@ -1007,9 +1064,16 @@ async fn blob_request(mut req: http::Request<Tls>, service: Arc<Mutex<Service>>)
                 }
                 v
             };
-            let st = service.lock().await;
+            let mut st = service.lock().await;
             let to = authorization["payload"]["from"].as_str().unwrap_or("").to_string();
             let status = verdict["status"].as_u64().unwrap_or(500) as u16;
+            if verdict.get("accepted").is_some() {
+                // spec-gap 130: whose blob it is, so a release deletes it
+                if let Some(owner) = authorization["identity"].as_str() {
+                    st.blob_owners.entry(sha.clone()).or_default().insert(owner.to_string());
+                    st.persist();
+                }
+            }
             let env = match verdict.get("accepted") {
                 Some(a) => {
                     let mut extra = json!({});
@@ -1091,6 +1155,10 @@ async fn replicate_blob(service: Arc<Mutex<Service>>, owner: String, entry: Valu
             let tmp = path.with_extension("part");
             if std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
                 tracing::info!("replicated blob {} ({} bytes) from {uri}", entry["sha256"].as_str().unwrap_or(""), body.len());
+                // spec-gap 130: replicated for this owner, deleted with it
+                let mut st = service.lock().await;
+                st.blob_owners.entry(entry["sha256"].as_str().unwrap_or("").to_string()).or_default().insert(owner.clone());
+                st.persist();
             }
         }
         _ if d["retry"] == json!(true) => {
@@ -1164,6 +1232,8 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
             // identity's device is registered (M§4.4).
             st.bound.insert(device.clone(), tx.clone());
             if st.serves(&identity) {
+                // M§4.4: a verified hello keeps the identity's device registered, and its enrolment alive (M§4.1)
+                st.enrolment.hello(&identity);
                 // M§5.4: live push belongs to a connection. A new binding starts not live, whatever an earlier
                 // connection of this device asked for, until it syncs live; otherwise a push could jump its cursor past
                 // items stored while it was away, which it would then never sync.
@@ -1445,7 +1515,9 @@ fn dispatch(
             hub_deposit(st, &p, &device, &identity, item, resolver, now)
         }
         "sync" => {
-            st.enrol_if_room(&identity, &device);
+            if let Some(refused) = st.owner_op(&identity, &device, &id, now) {
+                return refused;
+            }
             let mut e = json!({"id": id, "device": device, "since": p["since"], "live": p["live"] == json!(true)});
             if let Some(a) = p.get("ack_through") {
                 e["ack_through"] = a.clone();
@@ -1459,7 +1531,9 @@ fn dispatch(
             st.mailbox_out(&identity, emissions, now)
         }
         "key-packages" => {
-            st.enrol_if_room(&identity, &device);
+            if let Some(refused) = st.owner_op(&identity, &device, &id, now) {
+                return refused;
+            }
             let packages: Vec<String> = p["key_packages"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
             let count = packages.len() as i64;
             let last = p["last_resort"].as_str().map(String::from);
@@ -1485,7 +1559,19 @@ fn dispatch(
             st.mailbox_out(&target, emissions, now)
         }
         "mailbox-config" => {
-            st.enrol_if_room(&identity, &device);
+            if p["release"] == json!(true) && identity != device {
+                // M§4.1, M§5.7 (spec-gap 130): accepted, then everything held for the identity is deleted; the other
+                // fields are not applied
+                let emissions = st.enrolment.release(&identity, &device, &id);
+                let out = st.mailbox_out(&identity, emissions.clone(), now);
+                if emissions.iter().any(|e| e.get("released").is_some()) {
+                    st.end_enrolment(&identity, "owner");
+                }
+                return out;
+            }
+            if let Some(refused) = st.owner_op(&identity, &device, &id, now) {
+                return refused;
+            }
             let mut e = json!({"id": id, "device": device});
             for k in ["mode", "admit", "groups", "revoked_grants", "introductions_sent"] {
                 if let Some(v) = p.get(k) {
