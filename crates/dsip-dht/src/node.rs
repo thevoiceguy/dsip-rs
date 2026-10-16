@@ -9,6 +9,10 @@
 //! Impl: records are re-announced every [`NodeConfig::republish_interval`]
 //! while unexpired so replication survives churn; re-*signing* before
 //! `expires_at` is the publisher's job (it holds the key), see the agent.
+//! Housekeeping — redialing known peers when the routing table is empty,
+//! ending bans, dropping expired records, saving peers and records — runs on
+//! its own, shorter [`NodeConfig::maintain_interval`], so a long republish
+//! interval neither delays rejoining nor risks state on a crash.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -55,6 +59,8 @@ pub struct NodeConfig {
     pub resolver: StaticResolver,
     /// How often held records are re-announced.
     pub republish_interval: Duration,
+    /// How often the node does its housekeeping and saves its peers and records.
+    pub maintain_interval: Duration,
     /// Kademlia query timeout.
     pub query_timeout: Duration,
     /// Serve the overlay (Kademlia server mode). `false` for short-lived clients (`dsip resolve`,
@@ -67,14 +73,14 @@ pub struct NodeConfig {
     /// Where learned peers are kept across restarts (one `/…/p2p/<PeerId>` multiaddr per line).
     ///
     /// Spec: DHT profile §3 — implementations SHOULD persist learned peers across restarts.
-    /// Impl: read at start and dialed alongside `bootstrap`; rewritten every republish tick.
+    /// Impl: read at start and dialed alongside `bootstrap`; rewritten every maintenance tick.
     /// On the WAN testbed a restarted bootstrap node with nothing to dial sat with an empty
     /// routing table for minutes, until another node happened to dial it.
     pub peers_file: Option<std::path::PathBuf>,
     /// Where held records are kept across restarts: one JSON line `{"frame", "republish"}` per record.
     ///
     /// Spec: DHT profile §4 — a record is verified at every hop, a node's own disk included.
-    /// Impl: rewritten every republish tick; at start every line is evaluated again (signature, expiry, §8.3
+    /// Impl: rewritten every maintenance tick; at start every line is evaluated again (signature, expiry, §8.3
     /// against what is already restored) and only what verifies is stored. `republish` marks the records this
     /// node publishes itself, which it keeps re-announcing; the others it only serves.
     pub records_file: Option<std::path::PathBuf>,
@@ -100,6 +106,7 @@ impl Default for NodeConfig {
             bootstrap: vec![],
             resolver: StaticResolver::default(),
             republish_interval: Duration::from_secs(60),
+            maintain_interval: Duration::from_secs(60),
             query_timeout: Duration::from_secs(10),
             server: true,
             peers_file: None,
@@ -311,6 +318,7 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
 
     let (tx, mut rx) = mpsc::channel::<Command>(64);
     let republish_interval = cfg.republish_interval;
+    let maintain_interval = cfg.maintain_interval;
     let (ban_secs, ban_ip) = (cfg.ban_secs, cfg.ban_ip);
     tokio::spawn(async move {
         let mut listen_addrs: Vec<Multiaddr> = vec![];
@@ -325,6 +333,8 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
         let mut peer_ips: HashMap<PeerId, std::net::IpAddr> = HashMap::new();
         let mut republish = tokio::time::interval(republish_interval);
         republish.tick().await;
+        let mut maintain = tokio::time::interval(maintain_interval);
+        maintain.tick().await;
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => match event {
@@ -496,6 +506,15 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                     Some(Command::Shutdown) | None => break,
                 },
                 _ = republish.tick() => {
+                    let now = now_s();
+                    for (key, (frame, exp)) in &held {
+                        if *exp > now {
+                            let record = Record { key: RecordKey::new(key), value: frame.clone().into_bytes(), publisher: None, expires: None };
+                            let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::All);
+                        }
+                    }
+                }
+                _ = maintain.tick() => {
                     let in_table: usize = swarm.behaviour_mut().kad.kbuckets().map(|b| b.num_entries()).sum();
                     if in_table == 0 {
                         // nobody in the routing table: dial everything this node has ever known (DHT profile §3)
@@ -513,10 +532,6 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         tracing::info!("ban on {p} ended");
                     }
                     swarm.behaviour_mut().gate.expire(t);
-                    for (key, (frame, _)) in &held {
-                        let record = Record { key: RecordKey::new(key), value: frame.clone().into_bytes(), publisher: None, expires: None };
-                        let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::All);
-                    }
                     if let Some(f) = &records_file {
                         save_records(f, &mut swarm, &held);
                     }

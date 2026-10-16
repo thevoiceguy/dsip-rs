@@ -40,8 +40,9 @@ Edit `/etc/dsip-node/config.toml`; every key is explained in `config.example.tom
 a key (`dsip-node --help`), and a misspelt key is an error.
 - **Join an overlay:** add its bootstrap nodes to `[overlay] bootstrap`, as `/dns4/<name>/tcp/4610/p2p/<PeerId>`.
 - **Find your node's PeerId:** `curl localhost:8080/dsip/v1/node`, or look in the log at start.
-- **Behind a reverse proxy:** set `[limits] trust_x_forwarded_for = true`, so rate limits apply per client, not per
-  proxy.
+- **Behind a reverse proxy on the same host** (dsip-relay's `--node-proxy`, or a TLS proxy): set `[limits]
+  trust_x_forwarded_for = true`, so rate limits apply per client, not per proxy. The header is honoured only on
+  loopback connections; anything else is limited by its own address.
 
 ## Security posture
 

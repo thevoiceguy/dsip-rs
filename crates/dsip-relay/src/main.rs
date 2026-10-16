@@ -628,7 +628,7 @@ async fn main() -> Result<()> {
         let routes = routes.clone();
         tokio::spawn(async move {
             match acceptor.accept(tcp).await {
-                Ok(tls_stream) => match www::dispatch(tls_stream, &routes).await {
+                Ok(tls_stream) => match www::dispatch(tls_stream, &routes, peer.ip()).await {
                     Ok(www::First::WebSocket(stream)) => {
                         if let Err(e) = serve(stream, peer, state).await {
                             tracing::info!("{peer}: {e}");

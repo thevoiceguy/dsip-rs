@@ -11,6 +11,9 @@ state_dir = "/var/lib/dsip-node"
 listen = ["/ip4/0.0.0.0/tcp/4610"]
 # Multiaddrs with /p2p/<PeerId>; /dns4/ names let an operator rotate nodes behind a name.
 bootstrap = []
+# Seconds between re-announcing held records to the peers now closest to them. A third of a hint's 3600 s life: a
+# peer that joined near a key gets the record about twice before its publisher re-signs it (at 2/3).
+republish_secs = 1200
 
 [mainline]
 # The BitTorrent Mainline DHT, for Pkarr packets (DHT Hints Profile §9).
@@ -35,7 +38,8 @@ ban_secs = 600
 ban_ip = false
 # HTTP requests per client IP per minute, answered 429 beyond (0: no limit).
 http_requests_per_ip_per_min = 120
-# Behind a reverse proxy that sets X-Forwarded-For, rate-limit by the client's address instead of the proxy's.
+# Behind a proxy on this host that sets X-Forwarded-For (dsip-relay's --node-proxy does), rate-limit by the client's
+# address instead of the proxy's. Honoured only on loopback connections: anyone else is limited by its own address.
 trust_x_forwarded_for = false
 
 [numbers]

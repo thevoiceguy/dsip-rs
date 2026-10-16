@@ -51,7 +51,8 @@ pub struct LimitsSection {
     pub ban_ip: Option<bool>,
     /// HTTP requests per client IP per minute (default 120; 0: no limit).
     pub http_requests_per_ip_per_min: Option<u32>,
-    /// Take the client IP from `X-Forwarded-For` (default false; only behind a proxy that sets it).
+    /// Take the client IP from `X-Forwarded-For` on loopback connections (default false; for a node behind its
+    /// co-located relay, which sets the header). Other connections are limited by their own address.
     pub trust_x_forwarded_for: Option<bool>,
 }
 
@@ -71,6 +72,9 @@ pub struct OverlaySection {
     pub listen: Option<Vec<String>>,
     /// Bootstrap multiaddrs with `/p2p/<PeerId>` (`/dns4/…` names let an operator rotate nodes).
     pub bootstrap: Option<Vec<String>>,
+    /// Seconds between re-announcing held records to the closest peers (default 1200: a third of a hint's 3600 s life,
+    /// so a record reaches peers that joined near its key about twice before its publisher re-signs it at ⅔).
+    pub republish_secs: Option<u64>,
 }
 
 /// `[mainline]`: the BitTorrent Mainline DHT.

@@ -55,6 +55,12 @@ struct Args {
     /// HTTP requests per client IP per minute [default: 120; 0: no limit].
     #[arg(long)]
     http_requests_per_ip_per_min: Option<u32>,
+    /// Limit loopback connections by their `X-Forwarded-For` client (the co-located relay's proxy sets it).
+    #[arg(long)]
+    trust_x_forwarded_for: bool,
+    /// Seconds between re-announcing held records [default: 1200].
+    #[arg(long)]
+    republish_secs: Option<u64>,
 }
 
 fn parse_addrs(v: &[String], what: &str) -> Result<Vec<Multiaddr>> {
@@ -107,7 +113,7 @@ async fn main() -> Result<()> {
             records_file: state.as_ref().map(StateDir::overlay_records),
             ban_secs: a.ban_secs.or(cfg.limits.ban_secs).unwrap_or(600),
             ban_ip: a.ban_ip || cfg.limits.ban_ip.unwrap_or(false),
-            republish_interval: Duration::from_secs(60),
+            republish_interval: Duration::from_secs(a.republish_secs.or(cfg.overlay.republish_secs).unwrap_or(1200).max(1)),
             ..Default::default()
         };
         let (h, id) = dsip_dht::node::start(ncfg).await.context("starting the overlay")?;
@@ -176,7 +182,7 @@ async fn main() -> Result<()> {
     let mut node = dsip_node::Node::new(overlay, mainline, peer_id, state);
     node.limits = dsip_node::Limits {
         http_per_ip_per_min: a.http_requests_per_ip_per_min.or(cfg.limits.http_requests_per_ip_per_min).unwrap_or(120),
-        trust_forwarded_for: cfg.limits.trust_x_forwarded_for.unwrap_or(false),
+        trust_forwarded_for: a.trust_x_forwarded_for || cfg.limits.trust_x_forwarded_for.unwrap_or(false),
     };
     if let Some(p) = a.tn_policy.clone().or(cfg.numbers.policy.clone()) {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?)?;
