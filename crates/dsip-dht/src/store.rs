@@ -11,7 +11,7 @@
 //! republishing restores. Measured on a disk: about 580 stores a second with a sync per store, far below what a node
 //! holding a million records re-announces (about 830 a second over 20 minutes).
 //!
-//! Values are the hint's frame and nothing else, stored deflated behind a one-byte format tag ([`encode`]): a
+//! Values are the hint's frame and nothing else, stored deflated behind a one-byte format tag: a
 //! browser's device-signed hint is about 2.2 KB, which redb's 4 KB pages hold one to a page; deflated (about 1.4 KB)
 //! two fit, and the store takes half the disk (measured: `examples/store_stress.rs`). libp2p's `publisher` and `expires` are not kept: a hint carries
 //! its own `expires_at`, which is what decides. Provider records are not used by DSIP and stay in memory. A store opened without a path lives
@@ -313,7 +313,7 @@ impl RecordStore for DiskStore {
     }
 }
 
-/// Every record held, read [`BATCH`] at a time, unverified.
+/// Every record held, read a batch (512) at a time, unverified.
 pub struct Records<'a> {
     store: &'a DiskStore,
     buf: VecDeque<(Vec<u8>, Vec<u8>)>, // one batch of `Pairs`
