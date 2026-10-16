@@ -332,6 +332,13 @@ impl State {
         }
     }
 
+    /// Advance the clock and act on what that emits: queue expiry, legs expiring with their invite and the attempt
+    /// outcome that follows (§12.7 rule 6, spec-gap 132), what the relay forgets (spec-gap 131).
+    fn advance(&mut self) {
+        let em = self.tick();
+        self.apply(em, None, None, "");
+    }
+
     /// This binary's own tables follow what the tracker and the authority still hold, at most once a second (spec-gap
     /// 131: the relay's memory follows live traffic). Nothing here is observable: a reject frame is kept only while its
     /// attempt is (the outcome is chosen from it), an introduction rate-limit key only while it has a time inside the
@@ -368,7 +375,9 @@ impl State {
                         self.deliver(&leg, &inb.frame);
                     }
                 }
-                Emission::Forward { msg_type, from, .. } => {
+                Emission::Forward { msg_type, from, session, .. } => {
+                    // the emission names its attempt: an outcome reached on a clock advance has no frame in hand
+                    let sid = session.as_str();
                     let Some(initiator) = self.tracker.attempt_initiator(sid).map(String::from) else { continue };
                     if msg_type == "reject" {
                         // §12.7 rule 6: forward the most informative leg's reject as the attempt outcome
@@ -392,6 +401,7 @@ impl State {
                         let reason = m.reason.as_deref().unwrap_or("transport.routing-refused");
                         let f = self.error_frame(&to, reason, m.in_reply_to.as_deref(), m.session.as_deref(), None);
                         if reason == "transport.no-response" {
+                            let sid = m.session.as_deref().unwrap_or(sid);
                             tracing::info!("attempt {sid} outcome: no leg responded");
                             self.stats.attempt_failed(sid, "no-response");
                         }
@@ -412,7 +422,7 @@ impl State {
         let to = p["to"].as_str().unwrap_or("").to_string();
         let Some(msg) = Message::from_payload(p) else { return };
         let sid = msg.session_id().to_string();
-        let _ = self.tick();
+        self.advance();
         self.stats.frame_in(&t);
 
         if t == "introduction" {
@@ -568,6 +578,18 @@ async fn main() -> Result<()> {
         revocations: vec![],
         stats: status::Stats::new(now_s()),
     }));
+    // The clock runs without traffic too: a leg that never answered expires with its invite and the initiator is told
+    // transport.no-response within a second of it (§12.7 rule 6, spec-gap 132).
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                every.tick().await;
+                state.lock().await.advance();
+            }
+        });
+    }
     if let Some(addr) = args.status_listen {
         let state = state.clone();
         tokio::spawn(async move {
@@ -696,7 +718,7 @@ async fn serve(
         tracing::info!("{peer}: bound device {device} for identity {identity}");
         st.stats.bound();
         // §13.3: binding flushes the store-and-forward queues and adds this device as a leg to live attempts (§12.7 rule 3)
-        let _ = st.tick();
+        st.advance();
         let em = st.tracker.step(&RelayEvent::Relay(RelayAction::Bind { device: device.clone(), identity: identity.clone() }));
         st.apply(em, None, None, "");
         let _ = st.authority.advance_to(now_s());

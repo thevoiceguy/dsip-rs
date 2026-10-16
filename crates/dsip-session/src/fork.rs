@@ -59,6 +59,8 @@ pub struct Attempt {
     /// When the relay last forked, flushed or added a leg for it, or received one of its messages from a leg or the
     /// initiator (spec-gap 131: [`Relay::forget`]).
     pub last: i64,
+    /// Legs that have sent `progress`, `answer` or `reject` (spec-gap 132: only a silent leg expires with the invite).
+    pub heard: std::collections::BTreeSet<String>,
 }
 
 impl Attempt {
@@ -186,6 +188,38 @@ impl Relay {
         self.bindings.contains_key(to) || self.devices.contains_key(to)
     }
 
+    /// Expire the legs that have sent nothing — no `progress`, `answer` or `reject` — once the invite has expired
+    /// (`expires_at < now`), and complete the attempt when that leaves no leg outstanding.
+    ///
+    /// Spec: §12.7 rules 3 and 6 (a leg terminates by answering, rejecting or expiring; the relay signals the
+    /// outcome, `transport.no-response` when every leg expired), §12.9 (expired is `expires_at < now`; T-Ring-Local).
+    /// Impl (spec-gap 132): a responder acts only on an unexpired invite and acts at once, so a leg still silent past
+    /// the invite's expiry never processed it; a leg that rang ends itself with `reject user.no-answer` at
+    /// T-Ring-Local. Attempts in id order, legs in device order (spec-gap 89). An attempt with no invite on record
+    /// (forked by a `RelayAction::Invite` alone) is expired only by `RelayAction::LegExpired`.
+    pub fn expire_silent_legs(&mut self) {
+        let now = self.now;
+        let sids: Vec<String> = self.attempts.keys().cloned().collect();
+        for sid in sids {
+            if !self.invites.get(&sid).and_then(|inv| inv.expires_at).is_some_and(|e| e < now) {
+                continue;
+            }
+            let att = self.attempts.get_mut(&sid).expect("listed");
+            let silent: Vec<String> = att
+                .legs
+                .iter()
+                .filter(|(l, st)| **st == LegState::Delivered && !att.heard.contains(*l))
+                .map(|(l, _)| l.clone())
+                .collect();
+            for leg in &silent {
+                att.legs.insert(leg.clone(), LegState::Expired);
+            }
+            if !silent.is_empty() {
+                self.check_complete(&sid);
+            }
+        }
+    }
+
     /// What the relay stops holding, on every clock advance. Nothing is emitted.
     ///
     /// Spec: §13.3 (known = bound "within the relay's retention window"; a relay holding no attempt for a session
@@ -240,6 +274,7 @@ impl Relay {
                 reasons: vec![],
                 outcome: None,
                 last: self.now,
+                heard: Default::default(),
             });
             att.legs.insert(device.to_string(), LegState::Delivered);
             att.last = self.now;
@@ -319,6 +354,7 @@ impl Relay {
             RelayEvent::Advance { advance } => {
                 self.now += advance;
                 self.expire_queues();
+                self.expire_silent_legs();
                 self.forget();
             }
             RelayEvent::Relay(a) => self.action(a),
@@ -338,6 +374,7 @@ impl Relay {
                     reasons: vec![],
                     outcome: None,
                 last: self.now,
+                heard: Default::default(),
                 };
                 for leg in legs {
                     att.legs.insert(leg.clone(), LegState::Delivered);
@@ -487,6 +524,7 @@ impl Relay {
             return self.route_plain(m);
         };
         att.last = now;
+        att.heard.insert(leg.clone());
         if m.msg_type == "answer" {
             // Never withheld, whatever the leg's state (spec-gap 86): only the initiator ends a leg that has
             // answered — bye already-answered / cancelled / failed (§12.7 rule 4, §12.5 rule 3, §12.4). The
@@ -498,7 +536,7 @@ impl Relay {
                     att.outcome = Some("answered");
                 }
             }
-            self.out.push(Emission::Forward { msg_type: "answer".into(), status: None, reason: None, from: leg });
+            self.out.push(Emission::Forward { msg_type: "answer".into(), status: None, reason: None, from: leg, session: sid });
             return;
         }
         if state.terminated() {
@@ -513,6 +551,7 @@ impl Relay {
                 status: m.status.clone(),
                 reason: None,
                 from: leg,
+                session: sid.clone(),
             }),
             "reject" => {
                 att.legs.insert(leg.clone(), LegState::Rejected);
@@ -575,6 +614,6 @@ impl Relay {
             .map(|r| r.to_string())
             .unwrap_or_else(|| att.reasons[0].1.clone());
         let from = att.reasons.iter().find(|(_, r)| *r == best).map(|(l, _)| l.clone()).unwrap_or_default();
-        self.out.push(Emission::Forward { msg_type: "reject".into(), status: None, reason: Some(best), from });
+        self.out.push(Emission::Forward { msg_type: "reject".into(), status: None, reason: Some(best), from, session: sid.to_string() });
     }
 }

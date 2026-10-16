@@ -243,7 +243,7 @@ pub fn metrics(st: &State, now: i64) -> String {
 pub async fn render(state: std::sync::Arc<tokio::sync::Mutex<State>>, page: Page) -> (&'static str, String) {
     let mut st = state.lock().await;
     let now = dsip_transport::now_s();
-    let _ = st.tick();
+    st.advance();
     match page {
         Page::Status { detail } => (JSON_TYPE, format!("{:#}\n", status(&st, now, detail))),
         Page::Metrics => (METRICS_TYPE, metrics(&st, now)),
