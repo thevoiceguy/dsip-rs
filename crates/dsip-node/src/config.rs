@@ -72,6 +72,11 @@ pub struct OverlaySection {
     pub listen: Option<Vec<String>>,
     /// Bootstrap multiaddrs with `/p2p/<PeerId>` (`/dns4/…` names let an operator rotate nodes).
     pub bootstrap: Option<Vec<String>>,
+    /// The most records the store holds (default 1,000,000): past it the node refuses new keys, and the operator sees
+    /// it in `stored` against `max_records` at `/dsip/v1/node`. Each hint takes about 2.3 KB on disk.
+    pub max_records: Option<usize>,
+    /// Memory for the record store's page cache, MB (default 256): what bounds the node's memory for records.
+    pub store_cache_mb: Option<usize>,
     /// Seconds between re-announcing held records to the closest peers (default 1200: a third of a hint's 3600 s life,
     /// so a record reaches peers that joined near its key about twice before its publisher re-signs it at ⅔).
     pub republish_secs: Option<u64>,
@@ -145,9 +150,14 @@ impl StateDir {
         self.0.join("overlay-peers")
     }
 
-    /// Held overlay records.
+    /// Held overlay records as the node kept them before its record store: imported once, then renamed.
     pub fn overlay_records(&self) -> PathBuf {
         self.0.join("overlay-records.jsonl")
+    }
+
+    /// The overlay's record store (redb).
+    pub fn overlay_db(&self) -> PathBuf {
+        self.0.join("overlay-records.redb")
     }
 
     /// Mainline routing nodes, the next start's extra bootstrap.

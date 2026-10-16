@@ -14,6 +14,11 @@ bootstrap = []
 # Seconds between re-announcing held records to the peers now closest to them. A third of a hint's 3600 s life: a
 # peer that joined near a key gets the record about twice before its publisher re-signs it (at 2/3).
 republish_secs = 1200
+# The most records held (about 2.3 KB each on disk, in overlay-records.redb in state_dir); past it new keys are
+# refused. /dsip/v1/node shows stored against it.
+max_records = 1000000
+# Memory for the record store's page cache, MB: what bounds the node's memory for records, however many it holds.
+store_cache_mb = 256
 
 [mainline]
 # The BitTorrent Mainline DHT, for Pkarr packets (DHT Hints Profile §9).
