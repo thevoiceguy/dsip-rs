@@ -39,6 +39,9 @@ operator would, run `packaging/test.sh`.
 Edit `/etc/dsip-node/config.toml`; every key is explained in `config.example.toml`. A flag of the same name overrides
 a key (`dsip-node --help`), and a misspelt key is an error.
 - **Join an overlay:** add its bootstrap nodes to `[overlay] bootstrap`, as `/dns4/<name>/tcp/4610/p2p/<PeerId>`.
+- **Mainline bootstrap:** list your other nodes in `[mainline] bootstrap` (`host:6881`) with a public node that
+  answers (`dht.libtorrent.org:25401`). The list replaces the library's defaults, some of which may not answer, and a
+  node relies on it whenever its saved routing nodes (`mainline-nodes` in the state directory) have dwindled.
 - **Find your node's PeerId:** `curl localhost:8080/dsip/v1/node`, or look in the log at start.
 - **Size the record store:** overlay records live in `overlay-records.redb` in the state directory. A browser's
   device-signed hint takes about 2.9 KB on disk, so the default `[overlay] max_records = 1000000` needs about 3 GB.
