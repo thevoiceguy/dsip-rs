@@ -4,7 +4,7 @@
 // it to the personal group and the conversation and re-sends the archive keys (M§12.3, M§6.7); the second device
 // reads the archive records the first one wrote as history (M§12.2), with both sides and the right seqs, then takes
 // part live both ways, and a reload keeps it all (spec-gap 44).
-import { launch, person, enrolled, ready, until, addContact, rowButton, checker, dump, logOf, sleep } from './lib.mjs';
+import { launch, person, enrolled, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const check = checker();
@@ -30,7 +30,7 @@ try {
   await addContact(alice, bob); await addContact(bob, alice);
   await rowButton(alice, bob, 'Introduce');
   await alice.page.fill('#introduce-purpose', 'history test');
-  await alice.page.click('#introduce-form button[type=submit]');
+  await submit(alice.page, 'introduce-form');
   await until(bob.page, () => window.dsip.requests().length === 1);
   await bob.page.click('#request-list button:text-is("Grant")');
   await until(alice.page, (did) => window.dsip.contactStatus(did) === 'they granted you', bob.did);

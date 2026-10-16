@@ -4,7 +4,7 @@
 // spec-gap 126): Bob sees "Alice removed Carol", and what he writes next does not reach Carol. Alice adds Carol back, and her device joins from the new welcome (spec-gap 127);
 // Bob leaves, and a remaining member's device commits his removal (M§7.3 "Leaving"). Every member renders every roster
 // change attributed to the committing identity, and a reload keeps them.
-import { launch, person, ready, until, addContact, rowButton, checker, dump, sleep } from './lib.mjs';
+import { launch, person, ready, until, addContact, rowButton, checker, dump, sleep, submit } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const check = checker();
@@ -27,7 +27,7 @@ const sees = (p, text) => until(p.page, (t) => { const g = window.dsip.conversat
 const granted = async (from, to) => {
   await rowButton(from, to, 'Introduce');
   await from.page.fill('#introduce-purpose', 'a group');
-  await from.page.click('#introduce-form button[type=submit]');
+  await submit(from.page, 'introduce-form');
   await until(to.page, () => window.dsip.requests().length >= 1);
   await to.page.click('#request-list button:text-is("Grant")');
   await until(from.page, (did) => window.dsip.contactStatus(did) === 'they granted you', to.did);

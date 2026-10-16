@@ -6,7 +6,7 @@
 // Bob through hub fan-out to a mailbox found through the hint; text both ways, delivered receipts (M§10.2); Bob reloads
 // and the conversation, its history and the MLS state survive (spec-gap 44), with nothing shown twice (M§8.5).
 import { readFileSync } from 'node:fs';
-import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep } from './lib.mjs';
+import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit } from './lib.mjs';
 
 const RELAY_B = process.env.RELAY_B || 'wss://127.0.0.1:8444/dsip';
 const MAILBOX_A = process.env.MAILBOX_A, MAILBOX_A_DID = process.env.MAILBOX_A_DID;
@@ -49,7 +49,7 @@ try {
   await addContact(bob, alice);
   await rowButton(alice, bob, 'Introduce');
   await alice.page.fill('#introduce-purpose', 'Can we message?');
-  await alice.page.click('#introduce-form button[type=submit]');
+  await submit(alice.page, 'introduce-form');
   await until(alice.page, () => /introduction to .* goes through their relay/.test(document.getElementById('log').textContent));
   check('Alice: the introduction went through relay B, named by Bob\'s hint', (await alice.page.evaluate(() => window.dsip.callRelays())).includes(RELAY_B));
   await until(bob.page, () => window.dsip.requests().length === 1);

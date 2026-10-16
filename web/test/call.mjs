@@ -1,7 +1,7 @@
 // Headless call test: two browsers (two storage contexts, so two identities) call each other through a relay that
 // serves the client. Drives the screens through the DOM, like a person would; reads state through `window.dsip`.
 // Run by test/run.sh (which starts the relay); helpers and env in lib.mjs.
-import { launch, openPage, person, until, state, checker, dump, which, URL } from './lib.mjs';
+import { launch, openPage, person, until, state, checker, dump, which, URL, submit } from './lib.mjs';
 
 const check = checker();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -29,7 +29,7 @@ try {
   // Alice adds Bob and calls him
   await alice.page.fill('#contact-name', 'Bob');
   await alice.page.fill('#contact-did', bob.did);
-  await alice.page.click('#contact-add button[type=submit]');
+  await submit(alice.page, 'contact-add');
   await alice.page.waitForSelector('#contact-list li .name:text("Bob")');
   await alice.page.click('#contact-list li button:text("Call")');
   await alice.page.waitForSelector('#view-call:not(.hidden)');
@@ -71,7 +71,7 @@ try {
   // second call the other way (Bob adds Alice): the client is reusable after a call
   await bob.page.fill('#contact-name', 'Alice');
   await bob.page.fill('#contact-did', alice.did);
-  await bob.page.click('#contact-add button[type=submit]');
+  await submit(bob.page, 'contact-add');
   await bob.page.click('#contact-list li button:text("Call")');
   await alice.page.waitForSelector('#view-incoming:not(.hidden)');
   check('Alice: a known contact is not flagged unknown', !(await alice.page.textContent('#in-contact')).includes('unknown'));

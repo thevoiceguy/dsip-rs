@@ -3,7 +3,7 @@
 // operator. Bob binds to relay B and publishes his reachability hint on the node; Alice, on relay A, looks him up
 // and calls through relay B; then Bob calls her back through relay A. Env: RELAY_B, TURN_SECRET (from run.sh).
 import { createHmac } from 'node:crypto';
-import { launch, person, until, state, checker, dump, addContact, rowButton, sleep, URL } from './lib.mjs';
+import { launch, person, until, state, checker, dump, addContact, rowButton, sleep, URL, submit } from './lib.mjs';
 
 const check = checker();
 const RELAY_A = URL.replace(/^https:/, 'wss:').replace(/\/$/, '') + '/dsip';
@@ -82,7 +82,7 @@ try {
   // 6. a DID nobody published: no hint, the call goes through our own relay and ends as unknown there
   await alice.page.fill('#contact-name', 'Nobody');
   await alice.page.fill('#contact-did', 'did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK');
-  await alice.page.click('#contact-add button[type=submit]');
+  await submit(alice.page, 'contact-add');
   await alice.page.waitForSelector('#contact-list li .name:text("Nobody")');
   await alice.page.click('#contact-list li:has(.name:text("Nobody")) button:text("Call")');
   await until(alice.page, () => /hints for .*: 0 record/.test(document.getElementById('log').textContent));

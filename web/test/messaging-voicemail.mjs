@@ -3,7 +3,7 @@
 // device records a missed call in his personal group (M§13.3). Alice calls again and Bob declines: Alice is offered a
 // voicemail, records it, and it reaches Bob as audio with purpose voicemail and the invite's session, end to end through
 // the direct conversation. Bob's timeline interleaves both call events and the voicemail; a reload keeps them.
-import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep } from './lib.mjs';
+import { launch, person, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const check = checker();
@@ -33,7 +33,7 @@ try {
   await addContact(alice, bob); await addContact(bob, alice);
   await rowButton(alice, bob, 'Introduce');
   await alice.page.fill('#introduce-purpose', 'voicemail test');
-  await alice.page.click('#introduce-form button[type=submit]');
+  await submit(alice.page, 'introduce-form');
   await until(bob.page, () => window.dsip.requests().length === 1);
   await bob.page.click('#request-list button:text-is("Grant")');
   await until(alice.page, (did) => window.dsip.contactStatus(did) === 'they granted you', bob.did);
