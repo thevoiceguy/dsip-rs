@@ -42,6 +42,7 @@ use dsip_transport::conn::ws_config;
 use dsip_transport::verify::{verify_frame_with, Inbound, SeenIds};
 use dsip_transport::{now_s, tls, HELLO_TIMEOUT_S};
 
+mod status;
 mod www;
 
 #[derive(Parser)]
@@ -117,6 +118,10 @@ struct Args {
     /// reaches the node through the origin that served it.
     #[arg(long)]
     node_proxy: Option<String>,
+    /// Serve `GET /status` (JSON; `?detail=1` adds DIDs and sessions) and `GET /metrics` (Prometheus) on this
+    /// address, plain HTTP: bound devices, sessions, queues, refusals. Keep it on loopback (`dsipctl relay-status`).
+    #[arg(long)]
+    status_listen: Option<SocketAddr>,
 }
 
 type Tx = mpsc::UnboundedSender<String>;
@@ -153,6 +158,8 @@ struct State {
     /// `delegation-revocation` records handed to this relay (§7.4, v0.8; spec-gap 57): applied to every later
     /// `hello` and frame. A `did:key` identity has no document, so this is where its revocations reach the relay.
     revocations: Vec<Envelope>,
+    /// Counters and the sessions followed for the status page (`--status-listen`).
+    stats: status::Stats,
 }
 
 impl State {
@@ -198,7 +205,8 @@ impl State {
         }
     }
 
-    fn error_frame(&self, to: &str, reason: &str, in_reply_to: Option<&str>, session: Option<&str>, detail: Option<&str>) -> String {
+    fn error_frame(&mut self, to: &str, reason: &str, in_reply_to: Option<&str>, session: Option<&str>, detail: Option<&str>) -> String {
+        self.stats.refused(reason, detail);
         let now = now_s();
         let mut p = json!({
             "dsip": version_block(&self.supported, &[]), "type": "error", "id": Ulid::generate().as_str(),
@@ -314,6 +322,7 @@ impl State {
     /// Advance the tracker's clock to now (expires queues) and forget frames past retention.
     fn tick(&mut self) -> Vec<Emission> {
         let now = now_s();
+        self.stats.prune(now);
         self.frames.retain(|_, (_, deadline)| *deadline > now);
         let delta = now - self.tracker.now;
         if delta > 0 {
@@ -346,6 +355,7 @@ impl State {
                         // §12.7 rule 6: forward the most informative leg's reject as the attempt outcome
                         if let Some(f) = self.reject_frames.get(&(sid.to_string(), from.clone())).cloned() {
                             tracing::info!("attempt {sid} outcome: reject from {from}");
+                            self.stats.attempt_failed(sid, "reject");
                             self.deliver(&initiator, &f);
                         }
                     } else if let Some(inb) = inbound {
@@ -364,6 +374,7 @@ impl State {
                         let f = self.error_frame(&to, reason, m.in_reply_to.as_deref(), m.session.as_deref(), None);
                         if reason == "transport.no-response" {
                             tracing::info!("attempt {sid} outcome: no leg responded");
+                            self.stats.attempt_failed(sid, "no-response");
                         }
                         self.deliver(&to, &f);
                     }
@@ -383,6 +394,7 @@ impl State {
         let Some(msg) = Message::from_payload(p) else { return };
         let sid = msg.session_id().to_string();
         let _ = self.tick();
+        self.stats.frame_in(&t);
 
         if t == "introduction" {
             // §19.4: relays MUST rate-limit introductions per sender identity and per recipient inbox.
@@ -462,6 +474,8 @@ impl State {
             self.apply_authority(em);
             return;
         }
+        let to_identity = self.identity_of(&to);
+        self.stats.observe(&t, &sid, sender_identity, &to_identity, now_s());
         let em = self.tracker.step(&RelayEvent::Recv { recv: msg });
         self.apply(em, Some(sender), Some(inbound), &sid);
     }
@@ -537,7 +551,16 @@ async fn main() -> Result<()> {
         records: HashMap::new(),
         statements: HashMap::new(),
         revocations: vec![],
+        stats: status::Stats::new(now_s()),
     }));
+    if let Some(addr) = args.status_listen {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dsip_transport::status::serve(addr, move |p| status::render(state.clone(), p)).await {
+                tracing::warn!("status port {addr}: {e}");
+            }
+        });
+    }
 
     if let Some(w) = &args.www {
         tracing::info!("serving {} at https://{}/", w.display(), args.listen);
@@ -577,7 +600,10 @@ async fn main() -> Result<()> {
                     Ok(www::First::Served) => {}
                     Err(e) => tracing::info!("{peer}: {e}"),
                 },
-                Err(e) => tracing::info!("{peer}: TLS handshake failed: {e}"),
+                Err(e) => {
+                    state.lock().await.stats.tls_failed();
+                    tracing::info!("{peer}: TLS handshake failed: {e}");
+                }
             }
         });
     }
@@ -620,6 +646,7 @@ async fn serve(
                 // We cannot address the sender before verification; close with the reason in the close frame: the
                 // reason token and the verdict's code token as the vectors spell it (`delegation-revoked`, …).
                 let code = v.to_expect()["code"].as_str().unwrap_or("rejected").to_string();
+                st.stats.refused("transport.hello-rejected", Some(&code));
                 let _ = ws
                     .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
                         code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
@@ -652,6 +679,7 @@ async fn serve(
         let env: Envelope = sign(&hello, &st.key, &st.key.kid());
         ws.send(WsMessage::Text(env.frame().into())).await?;
         tracing::info!("{peer}: bound device {device} for identity {identity}");
+        st.stats.bound();
         // §13.3: binding flushes the store-and-forward queues and adds this device as a leg to live attempts (§12.7 rule 3)
         let _ = st.tick();
         let em = st.tracker.step(&RelayEvent::Relay(RelayAction::Bind { device: device.clone(), identity: identity.clone() }));
@@ -733,6 +761,7 @@ async fn serve(
     .await;
 
     let mut st = state.lock().await;
+    st.stats.unbound();
     st.devices.remove(&device);
     if let Some(set) = st.identities.get_mut(&identity) {
         set.remove(&device);

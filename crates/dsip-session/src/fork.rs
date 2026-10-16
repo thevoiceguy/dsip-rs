@@ -231,6 +231,13 @@ impl Relay {
         self.attempts.get(session).map(|a| a.initiator.as_str())
     }
 
+    /// Attempts held and invites on record, for an operator's status page (`attempts`, `invites`).
+    ///
+    /// Spec: none (infrastructure).
+    pub fn held(&self) -> (usize, usize) {
+        (self.attempts.len(), self.invites.len())
+    }
+
     /// Invite on record for a session (for delivering to legs added mid-attempt).
     pub fn invite(&self, session: &str) -> Option<&Message> {
         self.invites.get(session)
