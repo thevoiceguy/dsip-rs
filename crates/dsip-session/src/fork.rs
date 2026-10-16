@@ -9,7 +9,7 @@
 //! This is the data model `dsip-relay` uses; it has no I/O so the vector
 //! suite can drive it directly.
 //!
-//! Impl (spec-gap 131): what the relay stops holding, so its memory follows live traffic rather than every call
+//! §13.3 (v0.16, spec-gap 131): what the relay stops holding, so its memory follows live traffic rather than every call
 //! and device it has ever seen — see [`Relay::forget`].
 
 use std::collections::BTreeMap;
@@ -180,8 +180,8 @@ impl Relay {
         }
     }
 
-    /// Spec: §13.3 — a recipient is known if a device has bound for it here within the retention window. Impl
-    /// (spec-gap 131): while bound, and until [`Relay::forget`] drops it.
+    /// Spec: §13.3 — a recipient is known while a device is bound for it here, and until [`Relay::forget`] drops it
+    /// (v0.16, spec-gap 131: the window runs from the end of its last binding).
     pub fn known(&self, to: &str) -> bool {
         self.bindings.contains_key(to) || self.devices.contains_key(to)
     }
@@ -189,7 +189,7 @@ impl Relay {
     /// What the relay stops holding, on every clock advance. Nothing is emitted.
     ///
     /// Spec: §13.3 (known = bound "within the relay's retention window"; a relay holding no attempt for a session
-    /// routes its traffic by `to`, spec-gap 82), §12.9/§12.10 (the T-Queue hard cap). Impl (spec-gap 131): an attempt
+    /// routes its traffic by `to`, spec-gap 82), §12.9/§12.10 (the T-Queue hard cap). §13.3 (v0.16, spec-gap 131): an attempt
     /// and its invite once more than [`crate::endpoint::T_QUEUE_CAP`] has passed since [`Attempt::last`] — every pre-answer wait in
     /// the core ends within that of the last `progress`, so nothing still expected needs the record; an identity or
     /// device with nothing bound and nothing held, once its last binding ended more than `retention`
