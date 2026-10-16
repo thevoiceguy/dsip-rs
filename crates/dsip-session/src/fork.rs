@@ -193,7 +193,7 @@ impl Relay {
     ///
     /// Spec: §12.7 rules 3 and 6 (a leg terminates by answering, rejecting or expiring; the relay signals the
     /// outcome, `transport.no-response` when every leg expired), §12.9 (expired is `expires_at < now`; T-Ring-Local).
-    /// Impl (spec-gap 132): a responder acts only on an unexpired invite and acts at once, so a leg still silent past
+    /// §12.7 rule 3 (v0.16, spec-gap 132): a responder acts only on an unexpired invite and acts at once, so a leg still silent past
     /// the invite's expiry never processed it; a leg that rang ends itself with `reject user.no-answer` at
     /// T-Ring-Local. Attempts in id order, legs in device order (spec-gap 89). An attempt with no invite on record
     /// (forked by a `RelayAction::Invite` alone) is expired only by `RelayAction::LegExpired`.
