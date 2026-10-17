@@ -1326,11 +1326,17 @@ impl Client {
     /// End this identity's enrolment at its mailbox (M§4.1, M§5.7; spec-gap 130): the mailbox answers `accepted` and
     /// deletes everything it holds for the identity. A device SHOULD send it only once its identity no longer advertises
     /// the mailbox; this console leaves that to its operator.
+    ///
+    /// Impl: the mailbox closes the binding once it has released the identity; the device then stays offline
+    /// instead of redialling, since the sync after a redial is an owner operation and would enrol it again
+    /// (M§4.1). Only an explicit command connects it again.
     async fn release(&mut self) -> Result<()> {
         let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now_s(), wire::TTL_S,
             json!({"subject": self.identity, "release": true}));
         println!("RELEASE sent to {}", self.mailbox.0);
-        self.send(&env).await
+        self.send(&env).await?;
+        self.held_offline = true;
+        Ok(())
     }
 
     /// Sync and process everything stored, until the mailbox has no more (M§5.4).

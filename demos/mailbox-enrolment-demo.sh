@@ -29,12 +29,12 @@ trap cleanup EXIT
 wait_for() { # file pattern seconds
   local f=$1 pat=$2 n=${3:-20}
   for _ in $(seq $((n * 5))); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
-  echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -30 "$f"; return 1
+  echo "--- $f"; tail -12 "$f"; echo "TIMEOUT waiting for /$pat/ in $f"; return 1
 }
 count() { grep -cE "$2" "$1" 2>/dev/null || true; }
 wait_more() { # file pattern count-before seconds: wait until the pattern appears more often than before
   for _ in $(seq $(($4 * 5))); do [ "$(count "$1" "$2")" -gt "$3" ] && return 0; sleep 0.2; done
-  echo "TIMEOUT waiting for another /$2/ in $1"; tail -20 "$1"; return 1
+  tail -12 "$1"; echo "TIMEOUT waiting for another /$2/ in $1"; return 1
 }
 
 mailbox() {
