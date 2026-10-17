@@ -182,7 +182,8 @@ enum Cmd {
     Answer {
         #[command(flatten)]
         opts: ConnOpts,
-        /// Automatic policy: accept | screen | decline | none.
+        /// Automatic policy: accept | screen | decline | silent | none. `silent` never responds to an invite (no
+        /// progress, answer or reject): a test callee for the relay's transport.no-response (§12.7 rule 6).
         #[arg(long, default_value = "none")]
         auto: String,
         /// §19.4: reject invites from identities holding no grant (policy.first-contact-required).

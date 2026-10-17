@@ -271,7 +271,7 @@ pub enum Mode {
         /// Callee identity or device DID.
         to: String,
     },
-    /// Wait for calls; `auto` = accept | screen | decline | none.
+    /// Wait for calls; `auto` = accept | screen | decline | silent | none.
     Answer {
         /// Automatic policy.
         auto: String,
@@ -648,7 +648,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             }
                             if message.msg_type == "invite" && offered {
                                 current = Some(sid.clone());
-                                if media_enabled(&opts) {
+                                if media_enabled(&opts) && auto != "silent" {
                                     if remote_sdp.is_none() {
                                         println!("  media   caller offered no SDP; answering without media");
                                     }
@@ -684,6 +684,9 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
                                         agent.local(LocalEvent::Decline { session: sid.clone(), reason: None }).await?;
                                     }
+                                    // a device that is bound but never responds: no progress, answer or reject. The relay
+                                    // expires the leg with the invite and tells the caller (§12.7 rule 6, spec-gap 132)
+                                    "silent" => println!("  ☎  invite received — staying silent (--auto silent)"),
                                     _ => {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(120) }).await?;
                                         println!("  ☎  RINGING — type accept / screen / decline");
