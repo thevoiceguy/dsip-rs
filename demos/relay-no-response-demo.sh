@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # A forking relay tells the caller when nobody answers (§12.7 rule 6; spec-gaps 76, 132), over the wire.
 #
-# Self-verifying. Bob's device binds and then freezes (SIGSTOP): its connection stays open, but it never processes the
-# invite. Once the invite has expired (the reference endpoint signs it for 30 s) the relay expires the silent leg and,
+# Self-verifying. Bob's device binds and then stays silent (`dsip answer --auto silent`): its connection stays open, but
+# it never responds to the invite. Once the invite has expired (the reference endpoint signs it for 30 s) the relay expires the silent leg and,
 # with no leg left, tells Alice transport.no-response in its own voice; her call ends with that reason, before her own
 # T-Establish (set to 60 s here) would have fired. Then the other half: a device that rings is not cut off when the
 # invite expires; its call is still alive well past 30 s.
@@ -15,7 +15,7 @@ cargo build -q -p dsip-cli -p dsip-relay
 B=target/debug
 S=127.0.0.1:9473
 
-cleanup() { kill -CONT $(jobs -p) 2>/dev/null || true; kill $(jobs -p) 2>/dev/null || true; }
+cleanup() { kill $(jobs -p) 2>/dev/null || true; }
 trap cleanup EXIT
 fail() { echo "FAIL: $*"; exit 1; }
 wait_for() { # file pattern seconds
@@ -30,11 +30,10 @@ $B/dsip-relay --listen 127.0.0.1:8483 --state "$DIR/relay" --status-listen $S >"
 wait_for "$DIR/relay.log" "status on http://$S" 20
 U=wss://127.0.0.1:8483/dsip; CA="$DIR/relay/cert.pem"
 
-echo "=== Bob's device binds, then freezes; Alice calls"
-$B/dsip answer --identity "$DIR/bob" --relay $U --ca "$CA" --auto accept --script "sleep 90; quit" >"$DIR/bob1.log" 2>&1 &
+echo "=== Bob's device binds and stays silent; Alice calls"
+$B/dsip answer --identity "$DIR/bob" --relay $U --ca "$CA" --auto silent --script "sleep 90; quit" >"$DIR/bob1.log" 2>&1 &
 BOB_PID=$!
 wait_for "$DIR/relay.log" "bound device" 20
-kill -STOP $BOB_PID
 T0=$(date +%s)
 $B/dsip call --identity "$DIR/alice" --relay $U --ca "$CA" --to "$BOB" --t-establish 60 --script "sleep 50; quit" >"$DIR/alice1.log" 2>&1 &
 A1=$!
@@ -42,9 +41,10 @@ wait_for "$DIR/alice1.log" "ended reason=transport.no-response" 45
 took=$(( $(date +%s) - T0 ))
 [ $took -ge 30 ] && [ $took -le 40 ] || fail "no-response after ${took} s, expected just past the invite's 30 s"
 grep -q "outcome: no leg responded" "$DIR/relay.log" || fail "the relay did not log the outcome"
+grep -q "staying silent" "$DIR/bob1.log" || fail "Bob never saw the invite: the leg was not delivered"
 echo "    ok: after ${took} s the relay said transport.no-response; Alice's call ended with it"
 # one device key binds once: both of these go before the next call binds the same devices (§13.2 rebinding)
-kill -CONT $BOB_PID; kill $BOB_PID $A1 2>/dev/null || true; wait $BOB_PID $A1 2>/dev/null || true
+kill $BOB_PID $A1 2>/dev/null || true; wait $BOB_PID $A1 2>/dev/null || true
 
 echo "=== a device that rings is not cut off when the invite expires"
 $B/dsip answer --identity "$DIR/bob" --relay $U --ca "$CA" --auto none --script "sleep 50; quit" >"$DIR/bob2.log" 2>&1 &
