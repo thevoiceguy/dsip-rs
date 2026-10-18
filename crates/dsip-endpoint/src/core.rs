@@ -137,6 +137,100 @@ pub enum CoreEvent {
     },
 }
 
+/// What a host adds to an invite it places.
+#[derive(Debug, Clone, Default)]
+pub struct Invite {
+    /// The SDP offer, carried as the transport binding object (§16.3).
+    pub sdp: Option<String>,
+    /// `identity.claims` (§18.1: claims, never badges; e.g. a gateway's PSTN caller claim, a `tel` binding N§4).
+    pub claims: Vec<Value>,
+    /// Changes to this invite's offer.
+    pub patch: InvitePatch,
+}
+
+/// Changes to one invite's offer.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct InvitePatch {
+    /// Every media descriptor's `direction` (Recording Profile C§6: a recording session offers `sendonly`).
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// `recording_session` metadata (Recording Profile C§6).
+    #[serde(default)]
+    pub recording_session: Option<Value>,
+    /// The PSTN number asked of the gateway named by `to` (N§4.1).
+    #[serde(default)]
+    pub destination: Option<Value>,
+}
+
+impl InvitePatch {
+    fn is_empty(&self) -> bool {
+        *self == InvitePatch::default()
+    }
+}
+
+/// A host request: an engine event, with the data the host supplies for the message it sends.
+///
+/// Spec: none (infrastructure) — the engine events are [`LocalEvent`]; this adds what a host supplies beside them.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Command {
+    /// Place a call (`invite`).
+    PlaceCall {
+        /// Session (= invite) id.
+        session: String,
+        /// Addressed identity or device DID.
+        to: String,
+        /// What the host adds to the invite.
+        invite: Invite,
+    },
+    /// Answer an offered session.
+    Accept {
+        /// Session id.
+        session: String,
+        /// `answered_by` (default `user`, §14.3).
+        answered_by: Option<String>,
+        /// The SDP answer (§16.3).
+        sdp: Option<String>,
+    },
+    /// Send an `update`.
+    Update {
+        /// Session id.
+        session: String,
+        /// Update id.
+        id: String,
+        /// Optional role-transition signal (§14.4).
+        answered_by: Option<String>,
+        /// The SDP re-offer (§16.3).
+        sdp: Option<String>,
+    },
+    /// Answer the peer's outstanding update.
+    AnswerUpdate {
+        /// Session id.
+        session: String,
+        /// The update id.
+        in_reply_to: String,
+        /// `answered_by` (default `user`).
+        answered_by: Option<String>,
+        /// The SDP answer (§16.3).
+        sdp: Option<String>,
+    },
+    /// Send an `info` to the WebRTC binding (§12.12).
+    Info {
+        /// Session id.
+        session: String,
+        /// Its `data`, e.g. `{candidates, end_of_candidates}` (B§4).
+        data: Value,
+    },
+    /// Any other engine event; it carries nothing from the host.
+    Engine(LocalEvent),
+}
+
+impl From<LocalEvent> for Command {
+    fn from(ev: LocalEvent) -> Command {
+        Command::Engine(ev)
+    }
+}
+
 /// The core.
 pub struct Core {
     keys: IdentityKeys,
@@ -157,9 +251,8 @@ pub struct Core {
     video_codecs: Vec<String>,
     /// This side's recording declaration (Recording Profile C§3), carried on every invite, answer and update.
     recording: Option<serde_json::Value>,
-    /// A patch for the next invite only: `{direction?, recording_session?, destination?}` (C§6: a recording session's
-    /// offer; N§4.1: the PSTN number asked of a gateway).
-    invite_patch: Option<serde_json::Value>,
+    /// Changes to the invite being placed (C§6, N§4.1).
+    invite_patch: Option<InvitePatch>,
     /// `identity.claims` to put on the next invite (a gateway's PSTN caller claim, §18.1).
     pending_claims: Vec<Value>,
     pending_info_data: Option<Value>,
@@ -284,11 +377,6 @@ impl Core {
         self.recording = declaration;
     }
 
-    /// For the next invite only: every media descriptor's `direction`, and `recording_session` metadata
-    /// (Recording Profile C§6: a recording session offers its streams `sendonly`).
-    pub fn set_invite_patch(&mut self, patch: Option<serde_json::Value>) {
-        self.invite_patch = patch;
-    }
 
     /// Hold a DID document for resolution from now on (§8.1: a document is the authority for its DID; the host
     /// obtained it, as the CLI does with `--did-document`). `did:web` signers verify against it.
@@ -315,10 +403,6 @@ impl Core {
         })
     }
 
-    /// SDP to embed in the next `invite`/`update`/`answer` transport descriptor (consumed on use).
-    pub fn set_sdp(&mut self, sdp: Option<String>) {
-        self.pending_sdp = sdp;
-    }
 
     /// Whether the next `invite`/`update` offers video (B§2.1: the descriptors must match the SDP the host
     /// supplies, and a host decides that per call).
@@ -334,16 +418,7 @@ impl Core {
         }
     }
 
-    /// Claims for the next invite's `identity.claims` (§18.1: claims, never badges — e.g. a
-    /// gateway's `tel` claim about a PSTN caller).
-    pub fn set_claims(&mut self, claims: Vec<Value>) {
-        self.pending_claims = claims;
-    }
 
-    /// `data` object for the next `info` (consumed on use).
-    pub fn set_info_data(&mut self, data: Value) {
-        self.pending_info_data = Some(data);
-    }
 
     /// Pending introductions (id → identity).
     pub fn requests(&self) -> Vec<(String, String)> {
@@ -394,11 +469,47 @@ impl Core {
         self.handle(em, now)
     }
 
-    /// A local request.
+    /// A local request that carries nothing from the host (see [`Core::command`] for those that do).
     pub fn local(&mut self, ev: LocalEvent, now: i64) -> Result<Vec<CoreEvent>> {
+        self.command(Command::Engine(ev), now)
+    }
+
+    /// A host request. What it carries goes into the message the engine sends for it, and only that message: a
+    /// refused request leaves nothing behind for a later one.
+    pub fn command(&mut self, cmd: Command, now: i64) -> Result<Vec<CoreEvent>> {
         let mut out = self.tick(now)?;
+        let ev = match cmd {
+            Command::PlaceCall { session, to, invite } => {
+                self.pending_sdp = invite.sdp;
+                self.pending_claims = invite.claims;
+                self.invite_patch = (!invite.patch.is_empty()).then_some(invite.patch);
+                LocalEvent::PlaceCall { session, to }
+            }
+            Command::Accept { session, answered_by, sdp } => {
+                self.pending_sdp = sdp;
+                LocalEvent::Accept { session, answered_by }
+            }
+            Command::Update { session, id, answered_by, sdp } => {
+                self.pending_sdp = sdp;
+                LocalEvent::Update { session, id, answered_by }
+            }
+            Command::AnswerUpdate { session, in_reply_to, answered_by, sdp } => {
+                self.pending_sdp = sdp;
+                LocalEvent::AnswerUpdate { session, in_reply_to, answered_by }
+            }
+            Command::Info { session, data } => {
+                self.pending_info_data = Some(data);
+                LocalEvent::Info { session }
+            }
+            Command::Engine(ev) => ev,
+        };
         let em = self.ep.step(&Event::Local(ev));
-        out.extend(self.handle(em, now)?);
+        let handled = self.handle(em, now);
+        self.pending_sdp = None;
+        self.pending_claims.clear();
+        self.invite_patch = None;
+        self.pending_info_data = None;
+        out.extend(handled?);
         Ok(out)
     }
 
@@ -622,16 +733,16 @@ impl Core {
                 p["transports"] = offer["transports"].clone();
                 p["policy"] = json!({"recording": "consent-required", "ai_processing": "denied"});
                 if let Some(patch) = self.invite_patch.take() {
-                    if let Some(d) = patch["direction"].as_str() {
+                    if let Some(d) = &patch.direction {
                         for m in p["media"].as_array_mut().into_iter().flatten() {
-                            m["direction"] = d.into();
+                            m["direction"] = d.as_str().into();
                         }
                     }
-                    if let Some(rs) = patch.get("recording_session") {
-                        p["recording_session"] = rs.clone(); // C§6
+                    if let Some(rs) = patch.recording_session {
+                        p["recording_session"] = rs; // C§6
                     }
-                    if let Some(d) = patch.get("destination") {
-                        p["destination"] = d.clone(); // N§4.1: a tel URI for the gateway named by `to`
+                    if let Some(d) = patch.destination {
+                        p["destination"] = d; // N§4.1: a tel URI for the gateway named by `to`
                     }
                     self.offers.insert(session.clone(), json!({"media": p["media"], "transports": p["transports"]}));
                 }

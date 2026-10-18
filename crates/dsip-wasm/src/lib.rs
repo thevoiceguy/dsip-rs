@@ -22,7 +22,7 @@ use dsip_core::envelope::{sign, Context, Envelope};
 use dsip_core::keys::KeyPair;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
-use dsip_endpoint::{ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys};
+use dsip_endpoint::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite, InvitePatch};
 use dsip_session::LocalEvent;
 
 fn hex(b: &[u8]) -> String {
@@ -44,6 +44,31 @@ pub(crate) fn unhex(s: &str) -> Result<[u8; 32], JsValue> {
 pub(crate) fn js<E: std::fmt::Display>(e: E) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
+
+/// A `local` call's JSON as a [`Command`]: the engine event plus the host fields beside it.
+fn command_from_json(v: &Value) -> Result<Command, serde_json::Error> {
+    let ev: LocalEvent = serde_json::from_value(v.clone())?;
+    let sdp = v.get("sdp").and_then(Value::as_str).map(String::from);
+    Ok(match ev {
+        LocalEvent::PlaceCall { session, to } => {
+            let claims = v.get("claims").and_then(Value::as_array).cloned().unwrap_or_default();
+            let patch = match v.get("patch") {
+                Some(p) if p.is_object() => serde_json::from_value(p.clone())?,
+                _ => InvitePatch::default(),
+            };
+            Command::PlaceCall { session, to, invite: Invite { sdp, claims, patch } }
+        }
+        LocalEvent::Accept { session, answered_by } => Command::Accept { session, answered_by, sdp },
+        LocalEvent::Update { session, id, answered_by } => Command::Update { session, id, answered_by, sdp },
+        LocalEvent::AnswerUpdate { session, in_reply_to, answered_by } => Command::AnswerUpdate { session, in_reply_to, answered_by, sdp },
+        LocalEvent::Info { session } => match v.get("data") {
+            Some(data) => Command::Info { session, data: data.clone() },
+            None => Command::Engine(LocalEvent::Info { session }),
+        },
+        other => Command::Engine(other),
+    })
+}
+
 
 fn core_event_json(e: &CoreEvent) -> Value {
     match e {
@@ -378,12 +403,7 @@ impl Endpoint {
         self.core.new_id(now as i64)
     }
 
-    /// SDP for the next invite/answer/update transport descriptor.
-    pub fn set_sdp(&mut self, sdp: Option<String>) {
-        self.core.set_sdp(sdp);
-    }
-
-    /// Whether the next `invite`/`update` offers video (its descriptors must match the SDP set with `set_sdp`, B§2.1).
+    /// Whether the next `invite`/`update` offers video (its descriptors must match the SDP that rides with it, B§2.1).
     pub fn set_video(&mut self, video: bool) {
         self.core.set_video(video);
     }
@@ -395,17 +415,13 @@ impl Endpoint {
         }
     }
 
-    /// `data` for the next `info` (ICE candidates).
-    pub fn set_info_data(&mut self, data_json: &str) {
-        if let Ok(v) = serde_json::from_str(data_json) {
-            self.core.set_info_data(v);
-        }
-    }
-
-    /// A local event (README vocabulary JSON). Returns a JSON array of events.
+    /// A local event (README vocabulary JSON), with what the host supplies for its message beside it: `sdp` on
+    /// `place_call`, `accept`, `update` and `answer_update`; `claims` (§18.1) and `patch` (`{direction?,
+    /// recording_session?, destination?}`, C§6, N§4.1) on `place_call`; `data` on `info` (B§4). Returns a JSON
+    /// array of events.
     pub fn local(&mut self, event_json: &str, now: f64) -> Result<String, JsValue> {
-        let ev: LocalEvent = serde_json::from_str(event_json).map_err(js)?;
-        let out = self.core.local(ev, now as i64).map_err(js)?;
+        let v: Value = serde_json::from_str(event_json).map_err(js)?;
+        let out = self.core.command(command_from_json(&v).map_err(js)?, now as i64).map_err(js)?;
         Ok(Value::Array(out.iter().map(core_event_json).collect()).to_string())
     }
 
@@ -465,17 +481,6 @@ impl Endpoint {
             }
             Err(_) => false,
         }
-    }
-
-    /// `identity.claims` for the next invite (a JSON array): a `tel` claim with the caller's own `binding` (N§4).
-    pub fn set_claims(&mut self, claims_json: &str) {
-        self.core.set_claims(serde_json::from_str(claims_json).unwrap_or_default());
-    }
-
-    /// A patch for the next invite only (JSON object): `{"destination": "tel:+…"}` names the PSTN number a gateway
-    /// should reach (N§4.1); `null` clears it.
-    pub fn set_invite_patch(&mut self, patch_json: &str) {
-        self.core.set_invite_patch(serde_json::from_str::<Value>(patch_json).ok().filter(Value::is_object));
     }
 
     /// Hold a `delegation-revocation` frame (one we signed, or one handed to us): every later verification applies

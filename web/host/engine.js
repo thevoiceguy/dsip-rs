@@ -21,12 +21,13 @@ export class Engine {
   loadContactsFile(text) { if (text) this.ep.load_contacts(text); }
   newId() { return this.ep.new_id(this.now()); }
 
-  /** A local event by name (`place_call`, `alert`, `accept`, `decline`, `cancel`, `hangup`, `update`, …). */
+  /** A local event by name (`place_call`, `alert`, `accept`, `decline`, `cancel`, `hangup`, `update`, …), with what
+   *  its message carries beside it: `sdp` (place_call, accept, update, answer_update), `claims` and `patch` (place_call),
+   *  `data` (info). */
   async local(ev) { return this.drive(this.ep.local(JSON.stringify(ev), this.now())); }
   async inbound(frame) { return this.drive(this.ep.inbound(frame, this.now()), frame); }
   async tick() { return this.drive(this.ep.tick(this.now())); }
 
-  setSdp(sdp) { this.ep.set_sdp(sdp ?? undefined); }
   setVideo(v) { this.ep.set_video(!!v); }      // the next offer's descriptors match the SDP (B§2.1)
   /** The video codecs the next offer lists, taken from the SDP's video section so the descriptors match it (B§3.4). */
   setVideoCodecsFromSdp(sdp) {
@@ -36,7 +37,6 @@ export class Engine {
     for (const m of (section || '').matchAll(/a=rtpmap:\d+ ([A-Za-z0-9]+)\//g)) { const id = names[m[1].toUpperCase()]; if (id && !ids.includes(id)) ids.push(id); }
     this.ep.set_video_codecs(JSON.stringify(ids));
   }
-  setInfoData(data) { this.ep.set_info_data(JSON.stringify(data)); }
 
   startTimers() { this.timer ??= setInterval(() => this.tick(), 1000); }   // §12.9
 

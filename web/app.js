@@ -519,8 +519,7 @@ async function flushLocalCandidates() {
   // §12.12: candidates ride in signed info, ACTIVE-only; everything gathered earlier waits here
   if (!call || engine.state(call.sid) !== 'ACTIVE' || !call.pendingLocal.length) return;
   const batch = call.pendingLocal; call.pendingLocal = [];
-  engine.setInfoData({ candidates: batch.filter(Boolean), end_of_candidates: batch.some((c) => c === null) });
-  await engine.local({ local: 'info', session: call.sid });
+  await engine.local({ local: 'info', session: call.sid, data: { candidates: batch.filter(Boolean), end_of_candidates: batch.some((c) => c === null) } });
 }
 
 /** Place a call to a DID; with `destination` (`tel:+…`), `to` is a gateway and the number rides as the invite's
@@ -563,10 +562,10 @@ async function placeCall(to, video, destination) {
     const sdp = await call.media.offer();
     engine.setVideo(video);
     if (video) engine.setVideoCodecsFromSdp(sdp);
-    engine.setSdp(sdp);                                     // B§: SDP as the transport binding object
-    engine.ep.set_claims(JSON.stringify(settings.binding ? [{ type: 'tel', number: bindingNumber(), binding: settings.binding }] : []));
-    engine.ep.set_invite_patch(destination ? JSON.stringify({ destination }) : 'null');
-    await engine.local({ local: 'place_call', session: call.sid, to });
+    await engine.local({ local: 'place_call', session: call.sid, to,
+      sdp,                                                  // B§: SDP as the transport binding object
+      claims: settings.binding ? [{ type: 'tel', number: bindingNumber(), binding: settings.binding }] : [],   // N§4
+      patch: destination ? { destination } : null });       // N§4.1
   } catch (err) { notify(`cannot call: ${err.message || err}`); endCall(); }
   renderCall();
 }
@@ -699,8 +698,8 @@ async function accept(screening) {
     call.media = await newMedia();
     const offerSdp = call.offer.transports?.[0]?.sdp;
     if (!screening) { await call.media.capture(!!call.offer.media?.some((m) => m.type === 'video')); $('local').srcObject = call.media.localStream; }
-    engine.setSdp(await call.media.answer(offerSdp, screening));
-    await engine.local({ local: 'accept', session: call.sid, answered_by: screening ? 'screening' : 'user' });
+    const sdp = await call.media.answer(offerSdp, screening);
+    await engine.local({ local: 'accept', session: call.sid, answered_by: screening ? 'screening' : 'user', sdp });
   } catch (err) { notify(`cannot answer: ${err.message || err}`); await engine.local({ local: 'decline', session: call.sid }); endCall(); }
   renderCall();
 }
@@ -737,8 +736,7 @@ async function sendUpdate(escalate) {
   const sdp = await call.media.offer();
   engine.setVideo(escalate ? offeredVideo : true);
   engine.setVideoCodecsFromSdp(sdp);
-  engine.setSdp(sdp);
-  const ev = { local: 'update', session: call.sid, id: engine.newId() };
+  const ev = { local: 'update', session: call.sid, id: engine.newId(), sdp };
   if (escalate) { ev.answered_by = 'user'; call.screening = false; $('call-mode').textContent = ''; }   // §14.4 step 3
   await engine.local(ev);
   renderCall();
@@ -749,8 +747,8 @@ async function answerUpdate() {
   const id = call.pendingUpdate; call.pendingUpdate = null;
   const wantVideo = !!call.offer.media?.some((m) => m.type === 'video');
   if (wantVideo && !call.screening) { await call.media.addVideo(); $('local').srcObject = call.media.localStream; }
-  engine.setSdp(await call.media.answer(call.offer.transports?.[0]?.sdp, call.screening));
-  await engine.local({ local: 'answer_update', session: call.sid, in_reply_to: id, answered_by: 'user' });
+  const sdp = await call.media.answer(call.offer.transports?.[0]?.sdp, call.screening);
+  await engine.local({ local: 'answer_update', session: call.sid, in_reply_to: id, answered_by: 'user', sdp });
   renderCall();
 }
 

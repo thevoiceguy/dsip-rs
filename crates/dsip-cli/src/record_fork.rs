@@ -17,6 +17,7 @@ use dsip_media::{Candidate, Feed, MediaConfig, MediaEvent, MediaLeg, Source};
 use dsip_session::LocalEvent;
 use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
 use dsip_transport::identity::Identity;
+use dsip_transport::{Command, Invite, InvitePatch};
 use futures_util::FutureExt as _;
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
@@ -71,10 +72,13 @@ pub async fn run(f: Fork, mut stop: oneshot::Receiver<()>, mut paused: watch::Re
     for (participant, feed) in f.feeds {
         let leg = MediaLeg::new(MediaConfig { source: Source::Feed(feed), record: None, stun: vec![], turn: vec![], backend,
                                               send_only: true, tap_in: None, tap_out: None }).await?;
-        agent.set_sdp(Some(leg.create_offer().await?));
         let rs = json!({"of": f.of, "participants": participants, "streams": [{"media": 0, "participant": participant}]});
-        agent.set_invite_patch(Some(json!({"direction": "sendonly", "recording_session": rs})));
-        let sid = agent.place_call(&f.recorder).await?;
+        let invite = Invite {
+            sdp: Some(leg.create_offer().await?),
+            patch: InvitePatch { direction: Some("sendonly".into()), recording_session: Some(rs), ..Default::default() },
+            ..Default::default()
+        };
+        let sid = agent.place_call_with(&f.recorder, invite).await?;
         println!("  ⏺  recorder leg …{} → {} (stream of {})   C§6", &sid[sid.len() - 8..], f.recorder, participant);
         legs.insert(sid, Leg { leg, participant, pending: vec![], active: false });
     }
@@ -99,8 +103,7 @@ pub async fn run(f: Fork, mut stop: oneshot::Receiver<()>, mut paused: watch::Re
                         let batch = std::mem::take(&mut l.pending);
                         let end = batch.iter().any(Option::is_none);
                         let cands: Vec<Candidate> = batch.into_iter().flatten().collect();
-                        agent.set_info_data(json!({"candidates": cands, "end_of_candidates": end}));
-                        agent.local(LocalEvent::Info { session: sid.clone() }).await?;
+                        agent.command(Command::Info { session: sid.clone(), data: json!({"candidates": cands, "end_of_candidates": end}) }).await?;
                     }
                 }
             }

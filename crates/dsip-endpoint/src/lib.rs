@@ -18,4 +18,4 @@ pub mod core;
 pub mod hello;
 pub mod verify;
 
-pub use core::{ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys};
+pub use core::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite, InvitePatch};
