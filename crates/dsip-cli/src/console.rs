@@ -451,6 +451,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         t_ring_local: opts.t_ring_local,
         first_contact_required: matches!(&mode, Mode::Answer { first_contact: true, .. }),
         seal: opts.seal,
+        did_resolver: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     if let Mode::Answer { first_contact, tokens, .. } = &mode {

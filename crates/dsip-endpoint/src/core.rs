@@ -63,7 +63,21 @@ pub struct CoreConfig {
     /// §10.4: X25519 secrets this endpoint opens sealed bodies with, by the DID they belong to (its identity and
     /// its device); the one matching an inbound payload's `to` is used.
     pub unseal_keys: Vec<(String, [u8; 32])>,
+    /// §8.1: when a frame is signed, or carries a delegation issued, under a `did:web` whose document the core does
+    /// not hold, hold the frame and ask the host for the document ([`CoreEvent::Resolve`]) instead of verifying
+    /// without it. The host answers with [`Core::resolved`]. A host that cannot fetch leaves this off.
+    pub resolve_on_demand: bool,
 }
+
+/// Seconds a frame waits for the documents it needs before it is verified without them (and rejected).
+pub const RESOLVE_WAIT_S: i64 = 10;
+/// Seconds after a failed fetch before the core asks for the same DID again.
+pub const RESOLVE_RETRY_S: i64 = 60;
+/// Frames held at once, and DIDs asked for at once. A frame is held before its signature can be checked, so any
+/// sender can cause a fetch (§8.4); past these bounds a frame is verified at once, as without on-demand resolution.
+pub const RESOLVE_MAX_HELD: usize = 64;
+/// See [`RESOLVE_MAX_HELD`].
+pub const RESOLVE_MAX_PENDING: usize = 16;
 
 /// Persisted first-contact state.
 ///
@@ -135,6 +149,19 @@ pub enum CoreEvent {
         /// Human detail.
         detail: String,
     },
+    /// Fetch the DID document of `did` (a `did:web`) and pass the outcome to [`Core::resolved`]. Emitted only with
+    /// [`CoreConfig::resolve_on_demand`]; the frame that needs it is held meanwhile.
+    Resolve {
+        /// The DID.
+        did: String,
+    },
+}
+
+/// A frame held until the documents it needs arrive.
+struct Held {
+    frame: String,
+    since: i64,
+    dids: Vec<String>,
 }
 
 /// What a host adds to an invite it places.
@@ -257,6 +284,12 @@ pub struct Core {
     pending_claims: Vec<Value>,
     pending_info_data: Option<Value>,
     counter: u64,
+    /// Frames waiting for documents ([`CoreConfig::resolve_on_demand`]).
+    held: Vec<Held>,
+    /// DIDs asked of the host and not yet answered.
+    resolving: std::collections::HashSet<String>,
+    /// DIDs whose fetch failed, until when the core does not ask again.
+    failed: HashMap<String, i64>,
 }
 
 impl Core {
@@ -294,6 +327,9 @@ impl Core {
             pending_claims: vec![],
             pending_info_data: None,
             counter: 0,
+            held: vec![],
+            resolving: Default::default(),
+            failed: HashMap::new(),
         }
     }
 
@@ -466,7 +502,51 @@ impl Core {
             return Ok(vec![]);
         }
         let em = self.ep.step(&Event::Advance { advance: delta });
-        self.handle(em, now)
+        let mut out = self.handle(em, now)?;
+        // Frames that waited too long are verified with what the core holds.
+        let (late, waiting): (Vec<Held>, Vec<Held>) = std::mem::take(&mut self.held).into_iter().partition(|h| now - h.since >= RESOLVE_WAIT_S);
+        self.held = waiting;
+        for h in late {
+            for did in &h.dids {
+                if self.resolving.remove(did) {
+                    self.failed.insert(did.clone(), now + RESOLVE_RETRY_S);
+                }
+            }
+            out.extend(self.verify_inbound(&h.frame, now, false)?);
+        }
+        Ok(out)
+    }
+
+    /// When [`Core::tick`] next has work: the engine's next timer, or the time a held frame stops waiting.
+    pub fn next_deadline(&self) -> Option<i64> {
+        let held = self.held.iter().map(|h| h.since + RESOLVE_WAIT_S).min();
+        match (self.ep.next_deadline(), held) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The outcome of a [`CoreEvent::Resolve`]: the document is held from now on (§8.1), and every frame that was
+    /// waiting only for documents now held or failed is verified again.
+    pub fn resolved(&mut self, did: &str, result: std::result::Result<dsip_core::did::DidDocument, dsip_core::did::ResolveError>, now: i64) -> Result<Vec<CoreEvent>> {
+        self.resolving.remove(did);
+        match result {
+            Ok(doc) if doc.id == did => {
+                self.failed.remove(did);
+                self.resolver.insert(doc);
+            }
+            _ => {
+                self.failed.insert(did.to_string(), now + RESOLVE_RETRY_S);
+            }
+        }
+        let mut out = self.tick(now)?;
+        let (ready, waiting): (Vec<Held>, Vec<Held>) =
+            std::mem::take(&mut self.held).into_iter().partition(|h| h.dids.iter().all(|d| !self.resolving.contains(d)));
+        self.held = waiting;
+        for h in ready {
+            out.extend(self.verify_inbound(&h.frame, now, true)?);
+        }
+        Ok(out)
     }
 
     /// A local request that carries nothing from the host (see [`Core::command`] for those that do).
@@ -516,6 +596,41 @@ impl Core {
     /// A frame arrived.
     pub fn inbound(&mut self, frame: &str, now: i64) -> Result<Vec<CoreEvent>> {
         let mut out = self.tick(now)?;
+        out.extend(self.verify_inbound(frame, now, true)?);
+        Ok(out)
+    }
+
+    fn rejected(&self, v: dsip_core::Verdict, mut out: Vec<CoreEvent>) -> Vec<CoreEvent> {
+        out.push(CoreEvent::Rejected {
+            code: v.code.and_then(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).unwrap_or_default(),
+            detail: v.detail.unwrap_or_default(),
+        });
+        out
+    }
+
+    /// Verify `frame` and act on it. With `may_hold`, a frame naming a `did:web` document the core does not hold, and
+    /// may still fetch, is held instead ([`CoreConfig::resolve_on_demand`]).
+    fn verify_inbound(&mut self, frame: &str, now: i64, may_hold: bool) -> Result<Vec<CoreEvent>> {
+        let mut out = vec![];
+        // Held before verification, so nothing about the frame (its id as seen, a learned identity) is recorded until
+        // it is verified with the documents it names. Without them a did:web signer fails `kid-unresolvable`, and a
+        // did:web delegation is not learned (the frame then counts as from the bare device).
+        if may_hold && self.cfg.resolve_on_demand {
+            let dids: Vec<String> = dsip_core::did::missing_web_dids(frame, &self.resolver)
+                .into_iter()
+                .filter(|d| self.failed.get(d).is_none_or(|until| now >= *until))
+                .collect();
+            let new = dids.iter().filter(|d| !self.resolving.contains(*d)).count();
+            if !dids.is_empty() && self.held.len() < RESOLVE_MAX_HELD && self.resolving.len() + new <= RESOLVE_MAX_PENDING {
+                for did in &dids {
+                    if self.resolving.insert(did.clone()) {
+                        out.push(CoreEvent::Resolve { did: did.clone() });
+                    }
+                }
+                self.held.push(Held { frame: frame.to_string(), since: now, dids });
+                return Ok(out);
+            }
+        }
         let sem = dsip_schema::SemanticContext {
             supported: self.supported.clone(),
             unseal_key: self.unseal_key_for(frame),
@@ -528,11 +643,7 @@ impl Core {
                 // Impl: drop, for every frame that fails verification (decided 2026-10-02): a reply would tell
                 // a prober the identity exists and is reachable. Relays, which MUST reply (§13.3), still
                 // give a sealed-body sender its `session.unsupported-critical-extension` (§10.4 fallback).
-                out.push(CoreEvent::Rejected {
-                    code: v.code.and_then(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).unwrap_or_default(),
-                    detail: v.detail.unwrap_or_default(),
-                });
-                return Ok(out);
+                return Ok(self.rejected(v, out));
             }
         };
         let p = inbound.verified.payload.clone();

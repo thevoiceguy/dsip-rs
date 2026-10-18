@@ -64,6 +64,7 @@ pub async fn run(f: Fork, mut stop: oneshot::Receiver<()>, mut paused: watch::Re
         t_ring_local: None,
         first_contact_required: false,
         seal: false,
+        did_resolver: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     let backend = dsip_media::Backend::parse(&f.backend)?;

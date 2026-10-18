@@ -78,6 +78,7 @@ fn core_event_json(e: &CoreEvent) -> Value {
             json!({"received": {"message": message, "identity": identity, "display_name": display_name, "payload": payload}})
         }
         CoreEvent::Rejected { code, detail } => json!({"rejected": {"code": code, "detail": detail}}),
+        CoreEvent::Resolve { did } => json!({"resolve": {"did": did}}),
     }
 }
 

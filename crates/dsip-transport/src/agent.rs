@@ -12,7 +12,12 @@ use dsip_core::version::Supported;
 use dsip_endpoint::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite};
 use dsip_session::{Emission, Endpoint, LocalEvent, Message};
 
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+
 use crate::conn::{ConnectParams, Connection};
+use crate::resolver::{DidResolver, DidWebResolver};
 use crate::identity::Identity;
 use crate::verify::SeenIds;
 use crate::error::Result;
@@ -74,7 +79,12 @@ pub struct AgentConfig {
     pub first_contact_required: bool,
     /// §10.4: seal outbound session bodies (`sealed-body/1.0`). Inbound sealed bodies are opened either way.
     pub seal: bool,
+    /// §8.1: how to fetch a `did:web` document an inbound frame needs and the agent does not hold. `None` fetches
+    /// over HTTPS ([`DidWebResolver`]).
+    pub did_resolver: Option<Arc<dyn DidResolver>>,
 }
+
+type Resolution = (String, std::result::Result<dsip_core::did::DidDocument, dsip_core::did::ResolveError>);
 
 /// The agent.
 pub struct Agent {
@@ -85,6 +95,9 @@ pub struct Agent {
     conn: Connection,
     core: Core,
     events: Vec<AgentEvent>,
+    did_resolver: Arc<dyn DidResolver>,
+    resolved_tx: mpsc::UnboundedSender<Resolution>,
+    resolved_rx: mpsc::UnboundedReceiver<Resolution>,
 }
 
 impl Agent {
@@ -106,6 +119,7 @@ impl Agent {
             t_ring_local: cfg.t_ring_local,
             first_contact_required: cfg.first_contact_required,
             seal: cfg.seal,
+            resolve_on_demand: true,
             unseal_keys: vec![
                 (id.meta.identity.clone(), dsip_core::hpke::x25519_from_ed25519_seed(&id.controller.seed())),
                 (id.device.did(), dsip_core::hpke::x25519_from_ed25519_seed(&id.device.seed())),
@@ -116,7 +130,9 @@ impl Agent {
         let file: ContactFile =
             std::fs::read(id.dir.join("contacts.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         core.load_contacts(&file);
-        Ok(Agent { id, cfg, supported, resolver, conn, core, events: vec![] })
+        let did_resolver = cfg.did_resolver.clone().unwrap_or_else(|| Arc::new(DidWebResolver::new()));
+        let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
+        Ok(Agent { id, cfg, supported, resolver, conn, core, events: vec![], did_resolver, resolved_tx, resolved_rx })
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -238,6 +254,17 @@ impl Agent {
                     self.events.push(AgentEvent::Received { message, identity, display_name, payload })
                 }
                 CoreEvent::Rejected { code, detail } => self.events.push(AgentEvent::Rejected(code, detail)),
+                CoreEvent::Resolve { did } => {
+                    // Fetched off the loop; the outcome comes back through `next`.
+                    let (r, tx) = (Arc::clone(&self.did_resolver), self.resolved_tx.clone());
+                    tokio::spawn(async move {
+                        let result = r.resolve(&did).await;
+                        if let Err(e) = &result {
+                            tracing::warn!("resolving {did}: {e}");
+                        }
+                        let _ = tx.send((did, result));
+                    });
+                }
             }
         }
         Ok(())
@@ -250,7 +277,7 @@ impl Agent {
             if !self.events.is_empty() {
                 return Ok(std::mem::take(&mut self.events));
             }
-            let wait = self.core.endpoint().next_deadline().map(|d| (d - now_s()).max(0) as u64).unwrap_or(3600);
+            let wait = self.core.next_deadline().map(|d| (d - now_s()).max(0) as u64).unwrap_or(3600);
             tokio::select! {
                 frame = self.conn.recv() => match frame {
                     Ok(Some(text)) => {
@@ -263,6 +290,13 @@ impl Agent {
                         self.reconnect().await?;
                     }
                 },
+                Some((did, result)) = self.resolved_rx.recv() => {
+                    if let Ok(doc) = &result {
+                        self.resolver.insert(doc.clone()); // held for reconnects too (relay hello)
+                    }
+                    let out = self.core.resolved(&did, result, now_s())?;
+                    self.dispatch(out).await?;
+                }
                 _ = tokio::time::sleep(Duration::from_secs(wait.max(1))) => {}
             }
             self.tick_and_handle().await?;

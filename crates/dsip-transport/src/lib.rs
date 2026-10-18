@@ -24,6 +24,7 @@ pub mod tls;
 pub use dsip_endpoint::verify;
 pub use dsip_endpoint::{Command, Invite, InvitePatch};
 pub use error::{Error, HelloFailure, Result};
+pub use resolver::{Chain, DidResolver, DidWebResolver};
 
 /// Seconds of inactivity before the client sends a WebSocket Ping. Spec: §13.2 (RECOMMENDED 30 s).
 pub const PING_IDLE_S: u64 = 30;

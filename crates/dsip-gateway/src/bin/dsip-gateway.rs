@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
         t_ring_local: None,
         first_contact_required: false,
         seal: false,
+        did_resolver: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     let my_did = agent.identity_did().to_string();

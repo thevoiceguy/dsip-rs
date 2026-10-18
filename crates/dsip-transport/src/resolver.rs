@@ -6,8 +6,15 @@
 //! Impl: native implementation of the did:web URL mapping; the `ssi` crate
 //! named in the plan is not used — the mapping is ten lines and avoids API churn.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use dsip_core::did::{DidDocument, ResolveError, StaticResolver};
+
 use crate::error::{file, Error, Result};
-use dsip_core::did::{DidDocument, StaticResolver};
 
 /// Map a `did:web` to its document URL.
 ///
@@ -28,12 +35,14 @@ pub fn did_web_url(did: &str) -> Result<String> {
 
 /// Fetch and parse a `did:web` document. Verifies that the document `id` matches the DID.
 pub async fn fetch_did_web(did: &str) -> Result<DidDocument> {
+    let client = reqwest::Client::builder().https_only(true).build().map_err(|source| Error::Fetch { url: String::new(), source })?;
+    fetch_with(&client, did).await
+}
+
+async fn fetch_with(client: &reqwest::Client, did: &str) -> Result<DidDocument> {
     let url = did_web_url(did)?;
     let fetch = |source| Error::Fetch { url: url.clone(), source };
-    let doc: DidDocument = reqwest::Client::builder()
-        .https_only(true)
-        .build()
-        .map_err(fetch)?
+    let doc: DidDocument = client
         .get(&url)
         .send()
         .await
@@ -67,9 +76,124 @@ pub async fn build_resolver(files: &[std::path::PathBuf], fetch: &[String]) -> R
     Ok(r)
 }
 
+/// What [`DidResolver::resolve`] returns.
+pub type ResolveFuture<'a> = Pin<Box<dyn Future<Output = std::result::Result<DidDocument, ResolveError>> + Send + 'a>>;
+
+/// A resolver that may fetch, and so may fail: what a host runs when [`dsip_endpoint::CoreEvent::Resolve`] asks for
+/// a document.
+///
+/// Spec: §8.1 — the DID document is authoritative and is obtained by the DID method; nothing may answer from a
+/// cache, a DHT or a relay as if it were authoritative (a cache here only saves refetching what the method returned).
+pub trait DidResolver: Send + Sync {
+    /// Resolve `did` to its document.
+    fn resolve<'a>(&'a self, did: &'a str) -> ResolveFuture<'a>;
+}
+
+impl DidResolver for StaticResolver {
+    fn resolve<'a>(&'a self, did: &'a str) -> ResolveFuture<'a> {
+        let doc = dsip_core::did::Resolver::resolve(self, did);
+        Box::pin(async move { doc.ok_or_else(|| ResolveError::NotFound(did.to_string())) })
+    }
+}
+
+/// Fetches `did:web` documents over HTTPS and reuses each for [`DidWebResolver::ttl`].
+///
+/// Spec: §7.2 (`did:web`), §8.4 (it depends on DNS and Web PKI).
+pub struct DidWebResolver {
+    client: reqwest::Client,
+    ttl: Duration,
+    cache: Mutex<HashMap<String, (DidDocument, Instant)>>,
+}
+
+impl DidWebResolver {
+    /// Seconds a fetched document is reused before it is fetched again.
+    pub const TTL_S: u64 = 300;
+    /// Seconds a fetch may take.
+    pub const TIMEOUT_S: u64 = 5;
+
+    /// A resolver with the default lifetime and timeout.
+    pub fn new() -> DidWebResolver {
+        DidWebResolver::with(Duration::from_secs(Self::TTL_S), Duration::from_secs(Self::TIMEOUT_S))
+    }
+
+    /// A resolver reusing documents for `ttl` and giving each fetch `timeout`.
+    pub fn with(ttl: Duration, timeout: Duration) -> DidWebResolver {
+        // A client that cannot be built falls back to reqwest's default; https_only is then checked by did_web_url,
+        // which only ever builds https URLs.
+        let client = reqwest::Client::builder().https_only(true).timeout(timeout).build().unwrap_or_default();
+        DidWebResolver { client, ttl, cache: Mutex::new(HashMap::new()) }
+    }
+
+    /// How long a fetched document is reused.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+}
+
+impl Default for DidWebResolver {
+    fn default() -> DidWebResolver {
+        DidWebResolver::new()
+    }
+}
+
+impl DidResolver for DidWebResolver {
+    fn resolve<'a>(&'a self, did: &'a str) -> ResolveFuture<'a> {
+        Box::pin(async move {
+            if !did.starts_with("did:web:") {
+                return Err(ResolveError::Unsupported(did.to_string()));
+            }
+            let cached = self.cache.lock().ok().and_then(|c| c.get(did).filter(|(_, at)| at.elapsed() < self.ttl).map(|(d, _)| d.clone()));
+            if let Some(doc) = cached {
+                return Ok(doc);
+            }
+            let doc = fetch_with(&self.client, did).await.map_err(|e| match e {
+                Error::DocumentMismatch { did, got } => ResolveError::Mismatch { did, got },
+                Error::Fetch { source, .. } if source.is_decode() => ResolveError::Invalid { did: did.to_string(), detail: source.to_string() },
+                other => ResolveError::Fetch { did: did.to_string(), detail: other.to_string() },
+            })?;
+            if let Ok(mut c) = self.cache.lock() {
+                c.insert(did.to_string(), (doc.clone(), Instant::now()));
+            }
+            Ok(doc)
+        })
+    }
+}
+
+/// Ask the first resolver, then the second when the first has no document (or does not handle the method).
+pub struct Chain(pub Arc<dyn DidResolver>, pub Arc<dyn DidResolver>);
+
+impl DidResolver for Chain {
+    fn resolve<'a>(&'a self, did: &'a str) -> ResolveFuture<'a> {
+        Box::pin(async move {
+            match self.0.resolve(did).await {
+                Err(ResolveError::NotFound(_) | ResolveError::Unsupported(_)) => self.1.resolve(did).await,
+                r => r,
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_resolvers_chain_held_documents_before_fetching() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let key = dsip_core::keys::KeyPair::from_seed([7; 32]);
+        let mut held = StaticResolver::default();
+        held.insert(DidDocument::minimal_web("did:web:held.example", &key.public(), None));
+        let web = DidWebResolver::new();
+        rt.block_on(async {
+            assert_eq!(DidResolver::resolve(&held, "did:web:held.example").await.unwrap().id, "did:web:held.example");
+            assert!(matches!(DidResolver::resolve(&held, "did:web:other.example").await, Err(ResolveError::NotFound(_))));
+            assert!(matches!(web.resolve(&key.did()).await, Err(ResolveError::Unsupported(_))));
+            let chain = Chain(Arc::new(held), Arc::new(web));
+            assert_eq!(chain.resolve("did:web:held.example").await.unwrap().id, "did:web:held.example");
+            // Falls through to the fetcher, which refuses a did:key without touching the network.
+            assert!(matches!(chain.resolve(&key.did()).await, Err(ResolveError::Unsupported(_))));
+        });
+    }
 
     #[test]
     fn url_mapping() {

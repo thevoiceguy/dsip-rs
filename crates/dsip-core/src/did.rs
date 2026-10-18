@@ -254,6 +254,68 @@ impl Resolver for StaticResolver {
     }
 }
 
+/// Why a DID could not be resolved by a resolver that fetches (an async resolver in a host).
+///
+/// Spec: §8.1 — the DID document is authoritative, fetched by the DID method; §8.4 — `did:web` depends on DNS and
+/// Web PKI, so a fetch can fail for reasons that say nothing about the identity.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ResolveError {
+    /// The resolver holds no document for the DID, and has no way to fetch one.
+    #[error("no document for {0}")]
+    NotFound(String),
+    /// The DID's method is not one this resolver fetches.
+    #[error("{0}: method not supported by this resolver")]
+    Unsupported(String),
+    /// The fetch failed: DNS, TLS, HTTP status or timeout.
+    #[error("{did}: {detail}")]
+    Fetch {
+        /// The DID.
+        did: String,
+        /// What failed.
+        detail: String,
+    },
+    /// The fetched document is not a DID document.
+    #[error("{did}: not a DID document: {detail}")]
+    Invalid {
+        /// The DID.
+        did: String,
+        /// The parse failure.
+        detail: String,
+    },
+    /// The fetched document's `id` names another DID.
+    #[error("document id {got} does not match {did}")]
+    Mismatch {
+        /// The DID asked for.
+        did: String,
+        /// The document's `id`.
+        got: String,
+    },
+}
+
+/// The DIDs a frame needs documents for and `resolver` does not hold: the signer of the envelope and the signer of
+/// each delegation in its header, `did:web` only (`did:key` needs no document). Empty when the frame does not parse.
+///
+/// Spec: §10.2 (the verifier resolves `kid`), §7.4 (a delegation is verified against its issuer's key).
+pub fn missing_web_dids(frame: &str, resolver: &dyn Resolver) -> Vec<String> {
+    let Ok(env) = crate::envelope::Envelope::from_frame(frame) else { return vec![] };
+    let header = |e: &crate::envelope::Envelope| -> Option<crate::envelope::ProtectedHeader> {
+        serde_json::from_slice(&crate::b64::decode(&e.protected)?).ok()
+    };
+    let Some(h) = header(&env) else { return vec![] };
+    let mut kids = vec![h.kid.clone()];
+    kids.extend(h.delegations.iter().filter_map(|d| header(d).map(|h| h.kid)));
+    let mut out: Vec<String> = vec![];
+    for kid in kids {
+        if let Some((did, _)) = split_did_url(&kid) {
+            if did.starts_with("did:web:") && resolver.resolve(did).is_none() && !out.iter().any(|d| d == did) {
+                out.push(did.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Resolve a `kid` DID URL to an Ed25519 public key.
 ///
 /// Spec: §10.2 — verifiers resolve `kid` through the DID document. For
