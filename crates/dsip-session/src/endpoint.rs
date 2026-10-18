@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use dsip_core::registry::{effective_answered_by, effective_progress_status, resolve_reason, INFO_ABOUT};
 
-use crate::event::{Emission, Event, LocalEvent, SendMsg};
+use crate::event::{DropReason, Emission, Event, LocalEvent, MediaCommand, Refusal, SendMsg, TimerAction, TimerName, UiEvent};
 use crate::message::Message;
 
 /// T-Establish default and bounds (seconds). Spec: §12.9.
@@ -139,7 +139,7 @@ impl Session {
 
 #[derive(Debug, Clone)]
 struct Timer {
-    name: &'static str,
+    name: TimerName,
     session: String,
     deadline: i64,
     seq: u64,
@@ -357,34 +357,30 @@ impl Endpoint {
         });
     }
 
-    fn ui(&mut self, kind: &'static str) {
-        self.emit(Emission::Ui { kind, fields: vec![] });
+    fn ui(&mut self, ui: UiEvent) {
+        self.emit(Emission::Ui(ui));
     }
 
-    fn ui_with(&mut self, kind: &'static str, key: &'static str, v: &str) {
-        self.emit(Emission::Ui { kind, fields: vec![(key, v.into())] });
-    }
-
-    fn running(&self, sid: &str, name: &str) -> bool {
+    fn running(&self, sid: &str, name: TimerName) -> bool {
         self.timers.iter().any(|t| t.session == sid && t.name == name)
     }
 
-    fn start_timer(&mut self, sid: &str, name: &'static str, seconds: i64) {
+    fn start_timer(&mut self, sid: &str, name: TimerName, seconds: i64) {
         self.timers.retain(|t| !(t.session == sid && t.name == name));
         self.seq += 1;
         self.timers.push(Timer { name, session: sid.into(), deadline: self.now + seconds, seq: self.seq });
-        self.emit(Emission::Timer { action: "start", name, seconds: Some(seconds) });
+        self.emit(Emission::Timer { action: TimerAction::Start { seconds }, name });
     }
 
-    fn stop_timer(&mut self, sid: &str, name: &'static str) {
+    fn stop_timer(&mut self, sid: &str, name: TimerName) {
         if self.running(sid, name) {
             self.timers.retain(|t| !(t.session == sid && t.name == name));
-            self.emit(Emission::Timer { action: "stop", name, seconds: None });
+            self.emit(Emission::Timer { action: TimerAction::Stop, name });
         }
     }
 
     fn stop_all(&mut self, sid: &str) {
-        for name in ["T-Establish", "T-Ring", "T-Queue", "T-Ring-Local"] {
+        for name in [TimerName::Establish, TimerName::Ring, TimerName::Queue, TimerName::RingLocal] {
             self.stop_timer(sid, name);
         }
     }
@@ -397,10 +393,10 @@ impl Endpoint {
             s.state = SessionState::Ended;
         }
         if media_stop {
-            self.emit(Emission::Media("stop"));
+            self.emit(Emission::Media(MediaCommand::Stop));
         }
         if let Some(r) = ui_reason {
-            self.ui_with("ended", "reason", r);
+            self.ui(UiEvent::Ended { reason: r.into() });
         }
     }
 
@@ -418,17 +414,17 @@ impl Endpoint {
     }
 
     fn fire(&mut self, t: &Timer) {
-        self.emit(Emission::Timer { action: "fire", name: t.name, seconds: None });
+        self.emit(Emission::Timer { action: TimerAction::Fire, name: t.name });
         let Some(s) = self.sessions.get(&t.session).cloned() else { return };
         match (t.name, s.state) {
-            ("T-Establish" | "T-Ring" | "T-Queue", SessionState::Inviting | SessionState::Proceeding) => {
+            (TimerName::Establish | TimerName::Ring | TimerName::Queue, SessionState::Inviting | SessionState::Proceeding) => {
                 // §12.9: on expiry, cancel with reason session.timeout
                 self.stop_all(&s.id);
                 self.send_simple("cancel", s.invite_to.as_deref().unwrap_or(""), &s.id, Some("session.timeout"));
                 self.sessions.get_mut(&s.id).expect("exists").cancelled = true;
                 self.end(&s.id, Some("session.timeout"), false);
             }
-            ("T-Ring-Local", SessionState::Alerting) => {
+            (TimerName::RingLocal, SessionState::Alerting) => {
                 // §12.9: on expiry, reject with reason user.no-answer
                 self.send_simple("reject", &s.peer, &s.id, Some("user.no-answer"));
                 self.end(&s.id, Some("user.no-answer"), false);
@@ -457,7 +453,7 @@ impl Endpoint {
             LocalEvent::PlaceCall { session, to } => {
                 if self.sessions.contains_key(session) {
                     // spec-gap 90: a session id is used once (§12.9); a held session, live or ended, is never overwritten
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                     return;
                 }
                 let mut s = Session::new(session, Role::Initiator, SessionState::Inviting, to);
@@ -473,7 +469,7 @@ impl Endpoint {
                     ..Default::default()
                 });
                 let t = self.cfg.t_establish;
-                self.start_timer(session, "T-Establish", t); // §12.9: started on sending invite
+                self.start_timer(session, TimerName::Establish, t); // §12.9: started on sending invite
                 return;
             }
             LocalEvent::Introduce { id, to, purpose, contact_token } => {
@@ -491,7 +487,7 @@ impl Endpoint {
             }
             LocalEvent::Grant { introduction, id, scope, valid_until } => {
                 let Some((identity, _)) = self.contacts.requests.remove(introduction) else {
-                    self.emit(Emission::Refused("unknown-introduction"));
+                    self.emit(Emission::Refused(Refusal::UnknownIntroduction));
                     return;
                 };
                 let scope = if scope.is_empty() { vec!["dsip.invite".to_string()] } else { scope.clone() };
@@ -500,7 +496,7 @@ impl Endpoint {
             }
             LocalEvent::RejectIntroduction { introduction, reason } => {
                 let Some((identity, _)) = self.contacts.requests.remove(introduction) else {
-                    self.emit(Emission::Refused("unknown-introduction"));
+                    self.emit(Emission::Refused(Refusal::UnknownIntroduction));
                     return;
                 };
                 // §19.4 outcome 2: reject naming the introduction id; a policy choice, not an obligation.
@@ -510,7 +506,7 @@ impl Endpoint {
             }
             LocalEvent::Revoke { grant } => {
                 if self.contacts.grants_issued.remove(grant).is_none() {
-                    self.emit(Emission::Refused("unknown-grant"));
+                    self.emit(Emission::Refused(Refusal::UnknownGrant));
                 }
                 return;
             }
@@ -521,7 +517,7 @@ impl Endpoint {
             _ => {}
         }
         let Some(s) = self.sessions.get(ev.session()).cloned() else {
-            self.emit(Emission::Refused("unknown-session"));
+            self.emit(Emission::Refused(Refusal::UnknownSession));
             return;
         };
         let sid = s.id.clone();
@@ -540,7 +536,7 @@ impl Endpoint {
                     m.cancelled = true;
                     m.state = SessionState::Ended;
                 } else {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 }
             }
             LocalEvent::Hangup { reason, .. } => {
@@ -550,10 +546,10 @@ impl Endpoint {
                     self.sessions.get_mut(&sid).expect("exists").outstanding = None;
                     let reason = reason.as_deref().unwrap_or("user.hangup");
                     self.send_simple("bye", &s.peer, &sid, Some(reason));
-                    self.emit(Emission::Media("stop"));
+                    self.emit(Emission::Media(MediaCommand::Stop));
                     self.sessions.get_mut(&sid).expect("exists").state = SessionState::Ended;
                 } else {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 }
             }
             LocalEvent::Alert { ring_timeout, .. } => {
@@ -575,9 +571,9 @@ impl Endpoint {
                     self.sessions.get_mut(&sid).expect("exists").state = SessionState::Alerting;
                     // §12.9: T-Ring-Local SHOULD be ≤ the advertised ring_timeout
                     let secs = ring_timeout.map(|r| clamp(r, T_RING_LOCAL)).unwrap_or(self.cfg.t_ring_local);
-                    self.start_timer(&sid, "T-Ring-Local", secs);
+                    self.start_timer(&sid, TimerName::RingLocal, secs);
                 } else {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 }
             }
             LocalEvent::AutoReject { reason, .. } => {
@@ -585,7 +581,7 @@ impl Endpoint {
                     self.send_simple("reject", &s.peer, &sid, Some(reason));
                     self.end(&sid, None, false);
                 } else {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 }
             }
             LocalEvent::Accept { answered_by, .. } => {
@@ -601,9 +597,9 @@ impl Endpoint {
                     let m = self.sessions.get_mut(&sid).expect("exists");
                     m.state = SessionState::Active;
                     m.was_active = true;
-                    self.emit(Emission::Media("start"));
+                    self.emit(Emission::Media(MediaCommand::Start));
                 } else {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 }
             }
             LocalEvent::Decline { reason, .. } => {
@@ -612,14 +608,14 @@ impl Endpoint {
                     self.send_simple("reject", &s.peer, &sid, Some(reason.as_deref().unwrap_or("user.declined")));
                     self.end(&sid, None, false);
                 } else {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 }
             }
             LocalEvent::Update { id, answered_by, .. } => {
                 if s.state != SessionState::Active {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 } else if s.outstanding.is_some() {
-                    self.emit(Emission::Refused("update-pending")); // §12.8 rule 2: one outstanding, both directions
+                    self.emit(Emission::Refused(Refusal::UpdatePending)); // §12.8 rule 2: one outstanding, both directions
                 } else {
                     self.send(SendMsg {
                         msg_type: "update".into(),
@@ -637,7 +633,7 @@ impl Endpoint {
                 let pending_inbound = s.state == SessionState::Active
                     && matches!(&s.outstanding, Some(o) if o.direction == Direction::Inbound && &o.id == in_reply_to);
                 if !pending_inbound {
-                    self.emit(Emission::Refused("no-pending-update"));
+                    self.emit(Emission::Refused(Refusal::NoPendingUpdate));
                     return;
                 }
                 match ev {
@@ -650,7 +646,7 @@ impl Endpoint {
                             in_reply_to: Some(in_reply_to.clone()),
                             ..Default::default()
                         });
-                        self.emit(Emission::Media("apply_update"));
+                        self.emit(Emission::Media(MediaCommand::ApplyUpdate));
                     }
                     LocalEvent::RejectUpdate { reason, .. } => {
                         self.send(SendMsg {
@@ -670,7 +666,7 @@ impl Endpoint {
                 if s.state == SessionState::Active {
                     self.send_simple("info", &s.peer, &sid, None);
                 } else {
-                    self.emit(Emission::Refused("invalid-state"));
+                    self.emit(Emission::Refused(Refusal::InvalidState));
                 }
             }
         }
@@ -697,7 +693,7 @@ impl Endpoint {
                 self.end(&sid, Some("transport.no-response"), false);
                 return;
             }
-            self.ui_with("error", "reason", &r);
+            self.ui(UiEvent::Error { reason: r.clone() });
             return;
         }
         if t == "introduction" {
@@ -710,7 +706,7 @@ impl Endpoint {
             // §19.4 outcome 2: rejection addressed to the introduction id
             self.contacts.pending_sent.remove(m.session.as_deref().unwrap_or(""));
             let reason = resolve_reason(m.reason.as_deref().unwrap_or(""), "reject").effective;
-            self.ui_with("introduction_rejected", "reason", &reason);
+            self.ui(UiEvent::IntroductionRejected { reason: reason.clone() });
             return;
         }
         let Some(s) = m.session.as_ref().and_then(|sid| self.sessions.get(sid)).cloned() else {
@@ -729,7 +725,7 @@ impl Endpoint {
                 };
                 self.send_simple("bye", &m.from, &s.id, Some(reason));
             } else {
-                self.emit(Emission::Drop("ended-session"));
+                self.emit(Emission::Drop(DropReason::EndedSession));
             }
             return;
         }
@@ -750,25 +746,25 @@ impl Endpoint {
 
     fn recv_introduction(&mut self, m: &Message) {
         if !self.contacts.seen_introductions.insert(m.id.clone()) {
-            self.emit(Emission::Drop("duplicate-introduction"));
+            self.emit(Emission::Drop(DropReason::DuplicateIntroduction));
             return;
         }
         let identity = self.identity_of(&m.from).to_string();
         if let Some(gid) = m.contact_token.as_ref().and_then(|t| self.contacts.tokens.remove(t)) {
             // §19.4: a valid out-of-band contact token MAY be auto-granted per recipient policy (single use)
-            self.emit(Emission::Ui { kind: "introduction_received", fields: vec![("from", json!(identity)), ("token", json!(true))] });
+            self.ui(UiEvent::IntroductionReceived { from: identity.clone(), token: true });
             let until = self.now + 31_536_000;
             self.issue_grant(&gid, &identity, vec!["dsip.invite".into()], until, &m.id);
             return;
         }
         // §19.4 UX requirement: a distinct requests surface — never a ring, never call history
         self.contacts.requests.insert(m.id.clone(), (identity.clone(), m.from.clone()));
-        self.emit(Emission::Ui { kind: "introduction_received", fields: vec![("from", json!(identity))] });
+        self.ui(UiEvent::IntroductionReceived { from: identity.clone(), token: false });
     }
 
     fn recv_grant(&mut self, m: &Message) {
         let Some(intro) = m.session.clone().filter(|i| self.contacts.pending_sent.contains_key(i)) else {
-            self.emit(Emission::Drop("unknown-introduction"));
+            self.emit(Emission::Drop(DropReason::UnknownIntroduction));
             return;
         };
         self.contacts.pending_sent.remove(&intro);
@@ -777,7 +773,7 @@ impl Endpoint {
             m.id.clone(),
             Grant { identity: by.clone(), scope: m.scope.clone().unwrap_or_default(), valid_until: m.valid_until.unwrap_or(0) },
         );
-        self.emit(Emission::Ui { kind: "granted", fields: vec![("by", json!(by))] });
+        self.ui(UiEvent::Granted { by: by.clone() });
     }
 
     fn recv_invite(&mut self, m: &Message) {
@@ -809,7 +805,7 @@ impl Endpoint {
         if rivals.is_empty() {
             if let Some(existing) = self.sessions.get(&sid) {
                 if existing.state == SessionState::Ended {
-                    self.emit(Emission::Drop("ended-session"));
+                    self.emit(Emission::Drop(DropReason::EndedSession));
                 } else {
                     let probe = Message { session: Some(sid.clone()), ..m.clone() };
                     self.error(&probe, "session.invalid-state");
@@ -832,12 +828,12 @@ impl Endpoint {
                 let gm = self.sessions.get_mut(&g.id).expect("exists");
                 gm.cancelled = true;
                 gm.state = SessionState::Ended;
-                self.ui_with("ended", "reason", "session.glare");
+                self.ui(UiEvent::Ended { reason: "session.glare".into() });
             }
             if first == sid {
                 // §12.6: equal ids — both invites rejected; MAY retry after 1–4 s
                 self.send_simple("reject", &m.from, &sid, Some("session.glare"));
-                self.ui("glare_retry");
+                self.ui(UiEvent::GlareRetry);
                 return;
             }
         }
@@ -845,7 +841,7 @@ impl Endpoint {
         s.invite_to = m.to.clone();
         s.invite_expires_at = m.expires_at;
         self.sessions.insert(sid, s);
-        self.ui("offered");
+        self.ui(UiEvent::Offered);
     }
 
     fn recv_progress(&mut self, s: &Session, m: &Message) {
@@ -854,20 +850,20 @@ impl Endpoint {
         }
         let sid = s.id.clone();
         let status = effective_progress_status(m.status.as_deref().unwrap_or("")).to_string();
-        self.stop_timer(&sid, "T-Establish"); // §12.9: stopped by first progress
+        self.stop_timer(&sid, TimerName::Establish); // §12.9: stopped by first progress
         self.sessions.get_mut(&sid).expect("exists").state = SessionState::Proceeding;
-        self.ui_with("progress", "status", &status);
+        self.ui(UiEvent::Progress { status: status.clone() });
         match status.as_str() {
             "ringing" => {
                 self.sessions.get_mut(&sid).expect("exists").queue_count = 0;
-                self.stop_timer(&sid, "T-Queue"); // §12.10: subsequent ringing cancels T-Queue
+                self.stop_timer(&sid, TimerName::Queue); // §12.10: subsequent ringing cancels T-Queue
                 if let Some(rt) = m.ring_timeout {
                     // §12.9: responder MAY extend via ring_timeout; honored up to the upper bound.
                     // Impl (spec-gap 4): a ringing progress carrying ring_timeout (re)starts T-Ring.
-                    self.start_timer(&sid, "T-Ring", clamp(rt, T_RING));
-                } else if !self.running(&sid, "T-Ring") {
+                    self.start_timer(&sid, TimerName::Ring, clamp(rt, T_RING));
+                } else if !self.running(&sid, TimerName::Ring) {
                     let t = self.cfg.t_ring;
-                    self.start_timer(&sid, "T-Ring", t);
+                    self.start_timer(&sid, TimerName::Ring, t);
                 }
             }
             "queued" => {
@@ -881,14 +877,14 @@ impl Endpoint {
                     self.end(&sid, Some("session.timeout"), false);
                     return;
                 }
-                self.stop_timer(&sid, "T-Ring"); // §12.10: queued suspends T-Ring
-                self.start_timer(&sid, "T-Queue", m.queue_timeout.unwrap_or(T_QUEUE_CAP).min(T_QUEUE_CAP));
+                self.stop_timer(&sid, TimerName::Ring); // §12.10: queued suspends T-Ring
+                self.start_timer(&sid, TimerName::Queue, m.queue_timeout.unwrap_or(T_QUEUE_CAP).min(T_QUEUE_CAP));
             }
             _ => {
                 // Impl (spec-gap 4): trying/forwarded start T-Ring as the backstop.
-                if !self.running(&sid, "T-Ring") && !self.running(&sid, "T-Queue") {
+                if !self.running(&sid, TimerName::Ring) && !self.running(&sid, TimerName::Queue) {
                     let t = self.cfg.t_ring;
-                    self.start_timer(&sid, "T-Ring", t);
+                    self.start_timer(&sid, TimerName::Ring, t);
                 }
             }
         }
@@ -914,9 +910,9 @@ impl Endpoint {
                     sm.answered_device = Some(m.from.clone());
                     sm.peer = m.from.clone();
                 }
-                self.emit(Emission::Media("start"));
+                self.emit(Emission::Media(MediaCommand::Start));
                 let ab = effective_answered_by(m.answered_by.as_deref().unwrap_or("")).to_string();
-                self.ui_with("answered", "answered_by", &ab);
+                self.ui(UiEvent::Answered { answered_by: ab.clone() });
                 if s.invite_to.as_deref() != Some(m.from.as_str()) {
                     // §12.4/§12.7 rule 3; Impl (spec-gap 5): forked inferred from answer.from ≠ invite.to
                     self.send_simple("cancel", s.invite_to.as_deref().unwrap_or(""), &sid, Some("session.answered-elsewhere"));
@@ -926,9 +922,9 @@ impl Endpoint {
                 if let Some(irt) = &m.in_reply_to {
                     if matches!(&s.outstanding, Some(o) if o.direction == Direction::Outbound && &o.id == irt) {
                         self.sessions.get_mut(&sid).expect("exists").outstanding = None;
-                        self.emit(Emission::Media("apply_update"));
+                        self.emit(Emission::Media(MediaCommand::ApplyUpdate));
                     } else {
-                        self.emit(Emission::Drop("stale-update-reply"));
+                        self.emit(Emission::Drop(DropReason::StaleUpdateReply));
                     }
                 } else if s.answered_device.as_deref() != Some(m.from.as_str()) {
                     // §12.7 rule 4: later answer from another leg
@@ -956,9 +952,9 @@ impl Endpoint {
                 if matches!(&s.outstanding, Some(o) if o.direction == Direction::Outbound && &o.id == irt) {
                     // §12.8 rule 5: rejected update leaves the session in its prior state
                     self.sessions.get_mut(&sid).expect("exists").outstanding = None;
-                    self.ui_with("update_rejected", "reason", &reason);
+                    self.ui(UiEvent::UpdateRejected { reason: reason.clone() });
                 } else {
-                    self.emit(Emission::Drop("stale-update-reply"));
+                    self.emit(Emission::Drop(DropReason::StaleUpdateReply));
                 }
                 return;
             }
@@ -978,7 +974,7 @@ impl Endpoint {
                 self.stop_all(&sid);
                 if reason != "session.answered-elsewhere" {
                     // §12.4/§12.11: answered-elsewhere MUST NOT surface as a missed call
-                    self.ui("missed_call");
+                    self.ui(UiEvent::MissedCall);
                 }
                 self.end(&sid, Some(&reason), false);
             }
@@ -1016,7 +1012,7 @@ impl Endpoint {
                         });
                         return;
                     }
-                    self.ui_with("update_rejected", "reason", "session.glare");
+                    self.ui(UiEvent::UpdateRejected { reason: "session.glare".into() });
                     self.sessions.get_mut(&sid).expect("exists").outstanding = None;
                 }
                 Direction::Inbound => {
@@ -1029,11 +1025,11 @@ impl Endpoint {
         }
         self.sessions.get_mut(&sid).expect("exists").outstanding =
             Some(Outstanding { id: m.id.clone(), direction: Direction::Inbound });
-        self.ui("update_offered");
+        self.ui(UiEvent::UpdateOffered);
         if let Some(ab) = &m.answered_by {
             // §14.4 step 3: escalation signal
             let ab = effective_answered_by(ab).to_string();
-            self.ui_with("answered", "answered_by", &ab);
+            self.ui(UiEvent::Answered { answered_by: ab.clone() });
         }
     }
 
@@ -1043,7 +1039,7 @@ impl Endpoint {
         }
         match m.about.as_deref() {
             Some(a) if INFO_ABOUT.contains(&a) => self.emit(Emission::Info { about: a.to_string() }),
-            _ => self.emit(Emission::Drop("unknown-about")), // §12.12: never critical
+            _ => self.emit(Emission::Drop(DropReason::UnknownAbout)), // §12.12: never critical
         }
     }
 

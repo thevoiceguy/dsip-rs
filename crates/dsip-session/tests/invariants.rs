@@ -66,7 +66,7 @@ proptest! {
                     }
                 }
                 if cancelled {
-                    prop_assert!(!matches!(e, Emission::Media("start")), "media started after cancel: {:?}", events);
+                    prop_assert!(!matches!(e, Emission::Media(dsip_session::MediaCommand::Start)), "media started after cancel: {:?}", events);
                 }
             }
             if let Some(s) = ep.session(SID) {
