@@ -50,9 +50,11 @@ try {
   await until(alice.page, () => window.dsip.state() === 'ACTIVE');
   await until(bob.page, () => window.dsip.state() === 'ACTIVE');
   await until(bob2.page, () => window.dsip.state() === null);
-  // the state clears first; the incoming screen and the note follow (each waited for, so a slow render is not a failure)
+  // the state clears first; the incoming screen and the note follow (each waited for, so a slow render is not a failure).
+  // The note is read from the log: the note line shows only the latest notice, and an unrelated one (a messaging
+  // refusal) can replace it within the wait.
   const gone = await bob2.page.waitForSelector('#view-incoming', { state: 'hidden', timeout: 5000 }).then(() => true, () => false);
-  const noted = await until(bob2.page, () => /another of your devices/.test(window.dsip.note()), null, 5000).then(() => true, () => false);
+  const noted = await until(bob2.page, () => /another of your devices/.test(document.querySelector('#log').textContent), null, 5000).then(() => true, () => false);
   check('device 2 stops when device 1 answers: the incoming screen is gone', gone);
   check('device 2: ended as answered elsewhere (§12.7)', noted, await bob2.page.evaluate(() => window.dsip.note()));
   check('device 2: no missed call', !/missed_call/.test(await logOf(bob2)));
