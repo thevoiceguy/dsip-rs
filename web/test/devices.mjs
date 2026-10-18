@@ -43,6 +43,7 @@ try {
   await until(bob2.page, () => window.dsip.state() === null);
 
   // the other way round: device 1 answers, device 2 stops
+  const elsewhereBefore = ((await logOf(bob2)).match(/answered-elsewhere/g) || []).length;
   await rowButton(alice, bob, 'Call');
   await bob.page.waitForSelector('#view-incoming:not(.hidden)', { timeout: 20000 });
   await bob2.page.waitForSelector('#view-incoming:not(.hidden)', { timeout: 20000 });
@@ -50,9 +51,12 @@ try {
   await until(alice.page, () => window.dsip.state() === 'ACTIVE');
   await until(bob.page, () => window.dsip.state() === 'ACTIVE');
   await until(bob2.page, () => window.dsip.state() === null);
-  // the state clears first; the incoming screen and the note follow (each waited for, so a slow render is not a failure)
+  // the state clears first; the incoming screen and the note follow (each waited for, so a slow render is not a failure).
+  // The reason is read from the log, as device 1's is: the note line shows only the latest notice, and an unrelated one
+  // (a messaging refusal) can replace the call's note within the wait. Only a new answered-elsewhere line counts.
   const gone = await bob2.page.waitForSelector('#view-incoming', { state: 'hidden', timeout: 5000 }).then(() => true, () => false);
-  const noted = await until(bob2.page, () => /another of your devices/.test(window.dsip.note()), null, 5000).then(() => true, () => false);
+  const noted = await until(bob2.page, (n) => (document.querySelector('#log').textContent.match(/answered-elsewhere/g) || []).length > n,
+    elsewhereBefore, 5000).then(() => true, () => false);
   check('device 2 stops when device 1 answers: the incoming screen is gone', gone);
   check('device 2: ended as answered elsewhere (§12.7)', noted, await bob2.page.evaluate(() => window.dsip.note()));
   check('device 2: no missed call', !/missed_call/.test(await logOf(bob2)));
