@@ -1,8 +1,8 @@
 # A DSIP stack for developers — design note
 
-**Status:** a design note, written 2026-10-17 at poc-v0.16, for when the specs settle. It does not start work. It
+**Status:** a design note, written 2026-10-17 at poc-v0.16 and decided 2026-10-18, for when the specs settle. It does not start work. It
 records what a developer-facing DSIP stack would contain, how it relates to siphon-rs, what in today's PoC is and is
-not library-shaped, and the order to build it in. The decisions it needs are in [§9](#9-decisions-for-the-owner).
+not library-shaped, and the order to build it in. The decisions are in [§9](#9-decisions-the-owner-2026-10-18).
 
 ## 1. The goal
 
@@ -195,10 +195,14 @@ match call.outcome().await? {
 
 Today the equivalent is the select loop in `console.rs`, around 500 lines.
 
-## 9. Decisions for the owner
+## 9. Decisions (the owner, 2026-10-18)
 
-1. **Relationship to siphon-rs:** A (separate, same conventions; recommended), B or C ([§3](#3-relationship-to-siphon-rs)).
-2. **Where it grows:** in this workspace until core 1.0 (recommended, so parity applies), or a new repository now.
-3. **The first consumer**, which shapes the facades: the browser client, the gateway, siphon-ai, or a third party.
-4. **The browser API:** generated TypeScript types over wasm (recommended), or keep the JSON-string boundary.
-5. **Name.** The licence needs no decision: the workspace is already `MIT OR Apache-2.0`, as siphon-rs is.
+1. **Relationship to siphon-rs: A.** A separate stack with siphon-rs's conventions ([§3](#3-relationship-to-siphon-rs)).
+2. **Where it grows: this workspace until core 1.0**, so the vectors, three-way parity and fuzzing check every stage;
+   it moves out at stage 5.
+3. **The first consumer: the browser client.** The facades are shaped around it, and stage 2 moves it onto
+   `dsip-endpoint` right after the CLI.
+4. **The browser API: TypeScript types generated from the Rust types** over wasm, in place of the JSON-string
+   boundary.
+5. **Name: `dsip-rs`**, the repository and umbrella name; the crates keep their `dsip-*` names. The licence stays
+   `MIT OR Apache-2.0`, as the workspace and siphon-rs already are.
