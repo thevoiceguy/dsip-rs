@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::event::Emission;
+use crate::event::{DequeueReason, DropReason, Emission};
 use crate::message::Message;
 
 /// §12.7 rule 6 preference order. Other tokens rank after these, first-seen first.
@@ -295,7 +295,7 @@ impl Relay {
             let (expired, keep): (Vec<Queued>, Vec<Queued>) = q.drain(..).partition(|e| e.deadline <= now);
             *q = keep;
             for e in expired {
-                self.out.push(Emission::Dequeue { to: to.clone(), msg_type: e.message.msg_type.clone(), why: "expired" });
+                self.out.push(Emission::Dequeue { to: to.clone(), msg_type: e.message.msg_type.clone(), why: DequeueReason::Expired });
             }
             if q.is_empty() {
                 empties.push(to);
@@ -485,7 +485,7 @@ impl Relay {
                         if q.is_empty() {
                             self.inbox.remove(&to);
                         }
-                        self.out.push(Emission::Dequeue { to, msg_type: "invite".into(), why: "cancelled" });
+                        self.out.push(Emission::Dequeue { to, msg_type: "invite".into(), why: DequeueReason::Cancelled });
                         return;
                     }
                 }
@@ -542,7 +542,7 @@ impl Relay {
         if state.terminated() {
             // A stale progress or a second reject from a leg that is done would read, at an initiator that
             // cannot see legs, as the attempt's own; nobody needs it, so the relay screens it (spec-gap 86).
-            self.out.push(Emission::Drop("leg-terminated"));
+            self.out.push(Emission::Drop(DropReason::LegTerminated));
             return;
         }
         match m.msg_type.as_str() {
@@ -558,7 +558,7 @@ impl Relay {
                 att.reasons.push((leg, m.reason.clone().unwrap_or_default()));
                 self.check_complete(&sid);
             }
-            _ => self.out.push(Emission::Drop("not-attempt-scoped")),
+            _ => self.out.push(Emission::Drop(DropReason::NotAttemptScoped)),
         }
     }
 

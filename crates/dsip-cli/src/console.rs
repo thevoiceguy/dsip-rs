@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use dsip_core::ulid::Ulid;
 use dsip_media::{Candidate, MediaConfig, MediaEvent, MediaLeg, Source};
-use dsip_session::{Emission, LocalEvent};
+use dsip_session::{Emission, LocalEvent, MediaCommand, TimerAction, UiEvent};
 use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
 use dsip_transport::identity::Identity;
 use dsip_transport::resolver::build_resolver;
@@ -321,27 +321,26 @@ fn sid8(s: &str) -> &str {
 
 fn print_emission(e: &Emission) {
     match e {
-        Emission::Timer { action, name, seconds } => match seconds {
-            Some(s) => println!("  ⏱  {name} {action} ({s} s)                      §12.9"),
-            None => println!("  ⏱  {name} {action}                             §12.9"),
+        Emission::Timer { action, name } => match action {
+            TimerAction::Start { seconds } => println!("  ⏱  {name} start ({seconds} s)                      §12.9"),
+            _ => println!("  ⏱  {name} {}                             §12.9", action.as_str()),
         },
         Emission::Media(m) => println!("  ♫  media {m}                                   §14.1"),
-        Emission::Ui { kind, fields } => {
-            let f = fields.iter().map(|(k, v)| format!("{k}={}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect::<Vec<_>>().join(" ");
-            let sec = match *kind {
-                "progress" => "§12.10",
-                "answered" => "§14.3",
-                "offered" => "§12.4",
-                "update_offered" | "update_rejected" => "§12.8",
-                "missed_call" => "§12.11",
-                "ended" => "§12.4",
-                "glare_retry" => "§12.6",
-                "introduction_received" | "granted" | "introduction_rejected" => "§19.4",
-                "error" => "§15",
+        Emission::Ui(ui) => {
+            let f = ui.fields().iter().map(|(k, v)| format!("{k}={}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect::<Vec<_>>().join(" ");
+            let sec = match ui {
+                UiEvent::Progress { .. } => "§12.10",
+                UiEvent::Answered { .. } => "§14.3",
+                UiEvent::Offered | UiEvent::Ended { .. } => "§12.4",
+                UiEvent::UpdateOffered | UiEvent::UpdateRejected { .. } => "§12.8",
+                UiEvent::MissedCall => "§12.11",
+                UiEvent::GlareRetry => "§12.6",
+                UiEvent::IntroductionReceived { .. } | UiEvent::Granted { .. } | UiEvent::IntroductionRejected { .. } => "§19.4",
+                UiEvent::Error { .. } => "§15",
                 _ => "§12",
             };
-            let extra = if *kind == "answered" && f == "answered_by=screening" { "  ← SCREENING MODE (§14.4)" } else { "" };
-            println!("  ◆  {kind} {f}{extra}                         {sec}");
+            let extra = if matches!(ui, UiEvent::Answered { answered_by } if answered_by == "screening") { "  ← SCREENING MODE (§14.4)" } else { "" };
+            println!("  ◆  {} {f}{extra}                         {sec}", ui.kind());
         }
         Emission::Info { about } => println!("  ℹ  info for {about}                          §12.12"),
         Emission::Refused(r) => println!("  ✗  refused: {r}"),
@@ -723,7 +722,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                             print_emission(&e);
                             if let Emission::Media(what) = &e {
                                 match (*what, media.as_mut()) {
-                                    ("start", Some(m)) => {
+                                    (MediaCommand::Start, Some(m)) => {
                                         if !consent.hold_media() {
                                             m.leg.start_sending();   // §14.1: only now, after the signed answer (C§4: and accepted)
                                         }
@@ -740,8 +739,8 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                         }
                                         flush_candidates(&mut agent, &mut media, &current).await?;
                                     }
-                                    ("apply_update", Some(m)) if !consent.hold_media() => m.leg.start_sending(),
-                                    ("stop", Some(m)) => {
+                                    (MediaCommand::ApplyUpdate, Some(m)) if !consent.hold_media() => m.leg.start_sending(),
+                                    (MediaCommand::Stop, Some(m)) => {
                                         let st = m.leg.stats();
                                         println!("  media   closed — received {} RTP packets / {} bytes, sent {} Opus frames", st.packets_in, st.bytes_in, st.frames_out);
                                         m.leg.close().await;
@@ -750,8 +749,8 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                     _ => {}
                                 }
                             }
-                            if let Emission::Ui { kind, .. } = &e {
-                                if matches!(*kind, "granted" | "introduction_rejected") && intro_deadline.is_some() {
+                            if let Emission::Ui(ui) = &e {
+                                if matches!(ui, UiEvent::Granted { .. } | UiEvent::IntroductionRejected { .. }) && intro_deadline.is_some() {
                                     agent.save_contacts()?;
                                     agent.close().await;
                                     println!("bye.");

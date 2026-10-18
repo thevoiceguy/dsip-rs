@@ -214,30 +214,309 @@ pub struct SendMsg {
     pub extra: Vec<(&'static str, Value)>,
 }
 
+/// The engine's timers (§12.9).
+///
+/// Spec: §12.9 — the names are the engine's own vocabulary, fixed by `impl/vectors/README.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TimerName {
+    /// `T-Establish`: the initiator's bound on reaching an answer.
+    Establish,
+    /// `T-Ring`: the initiator's bound once the callee rings.
+    Ring,
+    /// `T-Queue`: the initiator's bound while queued.
+    Queue,
+    /// `T-Ring-Local`: the responder's own ring bound.
+    RingLocal,
+}
+
+impl TimerName {
+    /// The name as the vectors write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimerName::Establish => "T-Establish",
+            TimerName::Ring => "T-Ring",
+            TimerName::Queue => "T-Queue",
+            TimerName::RingLocal => "T-Ring-Local",
+        }
+    }
+}
+
+impl std::fmt::Display for TimerName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What happened to a timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerAction {
+    /// Started (or restarted) for this many seconds.
+    Start {
+        /// Seconds until it fires.
+        seconds: i64,
+    },
+    /// Stopped before firing.
+    Stop,
+    /// Fired.
+    Fire,
+}
+
+impl TimerAction {
+    /// `start` | `stop` | `fire`, as the vectors write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimerAction::Start { .. } => "start",
+            TimerAction::Stop => "stop",
+            TimerAction::Fire => "fire",
+        }
+    }
+}
+
+/// A media-layer instruction (§14.1).
+///
+/// Spec: §14.1 — media starts only after the signed answer; §12.8 — an accepted update is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MediaCommand {
+    /// Start sending media.
+    Start,
+    /// Stop media.
+    Stop,
+    /// Apply the media of an accepted update.
+    ApplyUpdate,
+}
+
+impl MediaCommand {
+    /// `start` | `stop` | `apply_update`, as the vectors write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaCommand::Start => "start",
+            MediaCommand::Stop => "stop",
+            MediaCommand::ApplyUpdate => "apply_update",
+        }
+    }
+}
+
+impl std::fmt::Display for MediaCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the application should show. Registry-governed values (`status`, `answered_by`, reason tokens) stay
+/// strings: registries grow, so unknown values pass through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UiEvent {
+    /// A `progress` arrived (§12.10).
+    Progress {
+        /// The `progress.status` token.
+        status: String,
+    },
+    /// The session was answered (§14.3).
+    Answered {
+        /// The `answered_by` token.
+        answered_by: String,
+    },
+    /// An invite is offered to the user (§12.4).
+    Offered,
+    /// The peer offered an update (§12.8).
+    UpdateOffered,
+    /// An update was rejected (§12.8).
+    UpdateRejected {
+        /// The reason token.
+        reason: String,
+    },
+    /// The caller gave up before the user answered (§12.11).
+    MissedCall,
+    /// The session ended (§12.4).
+    Ended {
+        /// The reason token.
+        reason: String,
+    },
+    /// Glare: this side withdraws and may retry (§12.6).
+    GlareRetry,
+    /// A signed `error` arrived (§15).
+    Error {
+        /// The reason token.
+        reason: String,
+    },
+    /// An introduction arrived (§19.4).
+    IntroductionReceived {
+        /// The introducing identity.
+        from: String,
+        /// It carried a contact token this endpoint issued.
+        token: bool,
+    },
+    /// A grant arrived (§19.4).
+    Granted {
+        /// The granting identity.
+        by: String,
+    },
+    /// An introduction was rejected (§19.4).
+    IntroductionRejected {
+        /// The reason token.
+        reason: String,
+    },
+}
+
+impl UiEvent {
+    /// The kind, as the vectors write it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            UiEvent::Progress { .. } => "progress",
+            UiEvent::Answered { .. } => "answered",
+            UiEvent::Offered => "offered",
+            UiEvent::UpdateOffered => "update_offered",
+            UiEvent::UpdateRejected { .. } => "update_rejected",
+            UiEvent::MissedCall => "missed_call",
+            UiEvent::Ended { .. } => "ended",
+            UiEvent::GlareRetry => "glare_retry",
+            UiEvent::Error { .. } => "error",
+            UiEvent::IntroductionReceived { .. } => "introduction_received",
+            UiEvent::Granted { .. } => "granted",
+            UiEvent::IntroductionRejected { .. } => "introduction_rejected",
+        }
+    }
+
+    /// The named fields, in emission order.
+    pub fn fields(&self) -> Vec<(&'static str, Value)> {
+        match self {
+            UiEvent::Progress { status } => vec![("status", status.as_str().into())],
+            UiEvent::Answered { answered_by } => vec![("answered_by", answered_by.as_str().into())],
+            UiEvent::UpdateRejected { reason }
+            | UiEvent::Ended { reason }
+            | UiEvent::Error { reason }
+            | UiEvent::IntroductionRejected { reason } => vec![("reason", reason.as_str().into())],
+            UiEvent::IntroductionReceived { from, token: true } => vec![("from", from.as_str().into()), ("token", true.into())],
+            UiEvent::IntroductionReceived { from, token: false } => vec![("from", from.as_str().into())],
+            UiEvent::Granted { by } => vec![("by", by.as_str().into())],
+            UiEvent::Offered | UiEvent::UpdateOffered | UiEvent::MissedCall | UiEvent::GlareRetry => vec![],
+        }
+    }
+}
+
+/// Why the engine refused a local request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// Not allowed in the session's current state.
+    InvalidState,
+    /// No such session.
+    UnknownSession,
+    /// No such introduction.
+    UnknownIntroduction,
+    /// No such grant.
+    UnknownGrant,
+    /// §12.8 rule 2: an update is already outstanding, in either direction.
+    UpdatePending,
+    /// No update to answer.
+    NoPendingUpdate,
+}
+
+impl Refusal {
+    /// The refusal, as the vectors write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Refusal::InvalidState => "invalid-state",
+            Refusal::UnknownSession => "unknown-session",
+            Refusal::UnknownIntroduction => "unknown-introduction",
+            Refusal::UnknownGrant => "unknown-grant",
+            Refusal::UpdatePending => "update-pending",
+            Refusal::NoPendingUpdate => "no-pending-update",
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why the engine silently ignored a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DropReason {
+    /// The session has ended.
+    EndedSession,
+    /// The introduction was already received.
+    DuplicateIntroduction,
+    /// No such introduction.
+    UnknownIntroduction,
+    /// A reply to an update that is no longer outstanding.
+    StaleUpdateReply,
+    /// §12.12: an `info` for a binding this endpoint does not know; never critical.
+    UnknownAbout,
+    /// Relay: the leg has already terminated.
+    LegTerminated,
+    /// Relay: the message is not scoped to an attempt.
+    NotAttemptScoped,
+}
+
+impl DropReason {
+    /// The reason, as the vectors write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DropReason::EndedSession => "ended-session",
+            DropReason::DuplicateIntroduction => "duplicate-introduction",
+            DropReason::UnknownIntroduction => "unknown-introduction",
+            DropReason::StaleUpdateReply => "stale-update-reply",
+            DropReason::UnknownAbout => "unknown-about",
+            DropReason::LegTerminated => "leg-terminated",
+            DropReason::NotAttemptScoped => "not-attempt-scoped",
+        }
+    }
+}
+
+impl std::fmt::Display for DropReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a relay dropped a queued envelope (§13.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequeueReason {
+    /// Its `expires_at` passed.
+    Expired,
+    /// The attempt it belonged to was cancelled.
+    Cancelled,
+}
+
+impl DequeueReason {
+    /// `expired` | `cancelled`, as the vectors write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DequeueReason::Expired => "expired",
+            DequeueReason::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for DequeueReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Everything the engine can emit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Emission {
     /// Send a message.
     Send(SendMsg),
-    /// Timer lifecycle: `start` (with seconds), `stop`, `fire`.
+    /// Timer lifecycle.
     Timer {
-        /// `start` | `stop` | `fire`.
-        action: &'static str,
-        /// Timer name.
-        name: &'static str,
-        /// Seconds, on start.
-        seconds: Option<i64>,
+        /// Started, stopped or fired.
+        action: TimerAction,
+        /// Which timer.
+        name: TimerName,
     },
-    /// Media-layer instruction: `start` | `stop` | `apply_update`.
-    Media(&'static str),
-    /// UI surface: kind plus fields.
-    Ui {
-        /// `progress`, `answered`, `offered`, `update_offered`, `update_rejected`, `missed_call`, `ended`, `glare_retry`, `error`,
-        /// `introduction_received`, `granted`, `introduction_rejected`.
-        kind: &'static str,
-        /// Named fields, in emission order.
-        fields: Vec<(&'static str, Value)>,
-    },
+    /// Media-layer instruction.
+    Media(MediaCommand),
+    /// What the application should show.
+    Ui(UiEvent),
     /// Relay queued a message for an identity with no bound device (§19.4 anti-enumeration).
     Queue {
         /// Identity.
@@ -251,9 +530,9 @@ pub enum Emission {
         about: String,
     },
     /// A local request was refused.
-    Refused(&'static str),
+    Refused(Refusal),
     /// A message was silently ignored.
-    Drop(&'static str),
+    Drop(DropReason),
     /// Relay: deliver to a specific leg.
     Deliver {
         /// Leg device DID.
@@ -272,7 +551,7 @@ pub enum Emission {
         /// Message type.
         msg_type: String,
         /// Why.
-        why: &'static str,
+        why: DequeueReason,
     },
     /// Relay: forward a leg's message to the initiator.
     Forward {
@@ -317,23 +596,23 @@ impl Emission {
                 }
                 json!({ "send": o })
             }
-            Emission::Timer { action, name, seconds } => match seconds {
-                Some(s) => json!({"timer": action, "name": name, "seconds": s}),
-                None => json!({"timer": action, "name": name}),
+            Emission::Timer { action, name } => match action {
+                TimerAction::Start { seconds } => json!({"timer": action.as_str(), "name": name.as_str(), "seconds": seconds}),
+                _ => json!({"timer": action.as_str(), "name": name.as_str()}),
             },
-            Emission::Media(m) => json!({ "media": m }),
-            Emission::Ui { kind, fields } => {
+            Emission::Media(m) => json!({ "media": m.as_str() }),
+            Emission::Ui(ui) => {
                 let mut o = Map::new();
-                o.insert("ui".into(), (*kind).into());
-                for (k, v) in fields {
-                    o.insert((*k).into(), v.clone());
+                o.insert("ui".into(), ui.kind().into());
+                for (k, v) in ui.fields() {
+                    o.insert(k.into(), v);
                 }
                 Value::Object(o)
             }
             Emission::Queue { to, msg_type } => json!({"queue": {"to": to, "type": msg_type}}),
             Emission::Info { about } => json!({"info": {"about": about}}),
-            Emission::Refused(r) => json!({ "refused": r }),
-            Emission::Drop(r) => json!({ "drop": r }),
+            Emission::Refused(r) => json!({ "refused": r.as_str() }),
+            Emission::Drop(r) => json!({ "drop": r.as_str() }),
             Emission::Deliver { leg, msg_type, reason, id } => {
                 let mut o = Map::new();
                 o.insert("leg".into(), leg.clone().into());
@@ -346,7 +625,7 @@ impl Emission {
                 }
                 json!({ "deliver": o })
             }
-            Emission::Dequeue { to, msg_type, why } => json!({"dequeue": {"to": to, "type": msg_type, "why": why}}),
+            Emission::Dequeue { to, msg_type, why } => json!({"dequeue": {"to": to, "type": msg_type, "why": why.as_str()}}),
             Emission::Forward { msg_type, status, reason, from, .. } => {
                 let mut o = Map::new();
                 o.insert("type".into(), msg_type.clone().into());
