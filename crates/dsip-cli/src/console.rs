@@ -260,7 +260,7 @@ async fn flush_candidates(agent: &mut Agent, media: &mut Option<Media>, current:
     let batch = std::mem::take(&mut m.pending);
     let end = batch.iter().any(Option::is_none);
     let cands: Vec<Candidate> = batch.into_iter().flatten().collect();
-    agent.command(Command::Info { session: sid.clone(), data: serde_json::json!({"candidates": cands, "end_of_candidates": end}) }).await
+    Ok(agent.command(Command::Info { session: sid.clone(), data: serde_json::json!({"candidates": cands, "end_of_candidates": end}) }).await?)
 }
 
 const DEFAULT_RELAY: &str = "wss://127.0.0.1:8443/dsip";

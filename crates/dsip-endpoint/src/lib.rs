@@ -15,7 +15,9 @@
 #![forbid(unsafe_code)]
 
 pub mod core;
+pub mod error;
 pub mod hello;
 pub mod verify;
 
+pub use error::{Error, Result};
 pub use core::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite, InvitePatch};

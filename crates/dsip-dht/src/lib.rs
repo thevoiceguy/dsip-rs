@@ -23,6 +23,8 @@
 #[cfg(feature = "node")]
 pub mod control;
 #[cfg(feature = "node")]
+pub mod error;
+#[cfg(feature = "node")]
 pub mod node;
 #[cfg(feature = "node")]
 pub mod store;

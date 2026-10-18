@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use super::error::Result;
 use dsip_session::LocalEvent;
 use dsip_transport::agent::Agent;
 use dsip_transport::{Command, Invite};
@@ -119,7 +119,7 @@ async fn apply_dsip(call: &mut Call, d: &Value, agent: &mut Agent) -> Result<()>
             return Ok(());
         }
     };
-    agent.command(ev).await
+    Ok(agent.command(ev).await?)
 }
 
 async fn apply_sip(call: &mut Call, s: &Value, legs: &mut Legs<'_>) -> Result<()> {

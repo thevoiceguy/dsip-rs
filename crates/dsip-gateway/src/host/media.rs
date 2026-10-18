@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use super::error::{Error, Result};
 use bytes::Bytes;
 use forge_codecs::g711;
 use forge_rtp::rtp::RtpPacket;
@@ -78,7 +78,8 @@ pub struct RtpLeg {
 impl RtpLeg {
     /// Bind an RTP socket on `bind_ip:0`.
     pub async fn bind(bind_ip: &str, payload_type: u8, ssrc: u32) -> Result<Arc<RtpLeg>> {
-        let socket = Arc::new(UdpSocket::bind(format!("{bind_ip}:0")).await.context("bind rtp")?);
+        let addr = format!("{bind_ip}:0");
+        let socket = Arc::new(UdpSocket::bind(&addr).await.map_err(|source| Error::Bind { what: "RTP", addr, source })?);
         Ok(Arc::new(RtpLeg {
             socket,
             remote: Arc::new(Mutex::new(None)),

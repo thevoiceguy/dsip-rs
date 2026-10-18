@@ -18,11 +18,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use forge_webrtc::{AudioCodec, Direction, PeerConfig, PeerConnection, PeerEvent, TransportConfig, TurnServer};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::error::{At as _, Result};
 use crate::leg::{Candidate, MediaConfig, MediaEvent, Stats};
 use crate::ogg::{rtp_packet, Recorder};
 use crate::source::{self, Source, FRAME_SAMPLES};
@@ -68,7 +68,7 @@ impl ForgeLeg {
             },
         })
         .await
-        .context("forge peer connection")?;
+        .at("peer connection")?;
         let (events_tx, events) = mpsc::unbounded_channel();
         Ok(ForgeLeg {
             pc: Arc::new(Mutex::new(pc)),
@@ -169,7 +169,7 @@ impl ForgeLeg {
 
     /// Create an SDP offer (also used for re-offers, §12.8).
     pub async fn create_offer(&self) -> Result<String> {
-        let sdp = self.pc.lock().await.create_offer().await.context("forge create_offer")?;
+        let sdp = self.pc.lock().await.create_offer().await.at("create_offer")?;
         self.ensure_pump().await;
         Ok(sdp)
     }
@@ -178,8 +178,8 @@ impl ForgeLeg {
     pub async fn accept_offer(&self, sdp: &str) -> Result<String> {
         let answer = {
             let mut pc = self.pc.lock().await;
-            pc.set_remote_offer(sdp).await.context("forge set_remote_offer")?;
-            pc.create_answer().await.context("forge create_answer")?
+            pc.set_remote_offer(sdp).await.at("set_remote_offer")?;
+            pc.create_answer().await.at("create_answer")?
         };
         self.ensure_pump().await;
         Ok(answer)
@@ -187,12 +187,12 @@ impl ForgeLeg {
 
     /// Apply the remote answer.
     pub async fn set_answer(&self, sdp: &str) -> Result<()> {
-        self.pc.lock().await.set_remote_answer(sdp).await.context("forge set_remote_answer")
+        self.pc.lock().await.set_remote_answer(sdp).await.at("set_remote_answer")
     }
 
     /// Add a remote candidate (from a verified `info`).
     pub async fn add_remote_candidate(&self, c: &Candidate) -> Result<()> {
-        self.pc.lock().await.add_ice_candidate_str(&c.candidate).await.context("forge add candidate")
+        self.pc.lock().await.add_ice_candidate_str(&c.candidate).await.at("add candidate")
     }
 
     /// Next leg event.

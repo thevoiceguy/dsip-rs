@@ -10,6 +10,7 @@ dsip-core.workspace = true
 dsip-number.workspace = true
 dsip-dht = { workspace = true, features = ["node"] }
 anyhow.workspace = true
+thiserror.workspace = true
 axum.workspace = true
 clap.workspace = true
 libp2p.workspace = true

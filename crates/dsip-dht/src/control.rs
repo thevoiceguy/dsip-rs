@@ -4,7 +4,7 @@
 //! `{"op":"publish","frame":…}`, `{"op":"get","did":…}`, `{"op":"addrs"}`,
 //! `{"op":"stats"}`, `{"op":"shutdown"}`, and the test-only `{"op":"put_raw","did":…,"frame":…}`.
 
-use anyhow::Result;
+use crate::error::{Error, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -63,7 +63,7 @@ pub async fn dispatch(req: &Value, handle: &Handle) -> Value {
             handle.shutdown().await;
             Ok(json!({"ok": true}))
         }
-        other => Err(anyhow::anyhow!("unknown op {other}")),
+        other => Err(Error::UnknownOp(other.to_string())),
     };
     r.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}))
 }

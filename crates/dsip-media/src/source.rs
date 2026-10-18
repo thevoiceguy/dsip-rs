@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
 use bytes::Bytes;
+use crate::error::{At as _, Error, Result};
 
 /// 20 ms Opus frames at 48 kHz mono.
 pub const FRAME_SAMPLES: usize = 960;
@@ -66,9 +66,9 @@ impl Source {
         Ok(match s {
             "none" => Source::None,
             "tone" => Source::Tone { hz: 440.0 },
-            t if t.starts_with("tone:") => Source::Tone { hz: t[5..].parse().context("tone frequency")? },
+            t if t.starts_with("tone:") => Source::Tone { hz: t[5..].parse().map_err(|_| Error::UnknownSource(t.to_string()))? },
             f if f.starts_with("file:") => Source::File(PathBuf::from(&f[5..])),
-            other => anyhow::bail!("unknown media source {other} (none | tone[:hz] | file:<path.ogg>)"),
+            other => return Err(Error::UnknownSource(other.to_string())),
         })
     }
 }
@@ -86,7 +86,7 @@ impl ToneEncoder {
     /// A tone at `hz`, about −12 dBFS.
     pub fn new(hz: f32) -> Result<ToneEncoder> {
         let mut enc = audiopus::coder::Encoder::new(audiopus::SampleRate::Hz48000, audiopus::Channels::Mono, audiopus::Application::Voip)
-            .context("opus encoder")?;
+            .at("opus encoder")?;
         enc.set_bitrate(audiopus::Bitrate::BitsPerSecond(32_000)).ok();
         Ok(ToneEncoder { enc, phase: 0.0, step: hz * 2.0 * std::f32::consts::PI / 48_000.0, pcm: vec![0; FRAME_SAMPLES], out: vec![0; 4000] })
     }
@@ -100,7 +100,7 @@ impl ToneEncoder {
                 self.phase -= 2.0 * std::f32::consts::PI;
             }
         }
-        let n = self.enc.encode(&self.pcm, &mut self.out).context("opus encode")?;
+        let n = self.enc.encode(&self.pcm, &mut self.out).at("opus encode")?;
         Ok(Bytes::copy_from_slice(&self.out[..n]))
     }
 }

@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -27,6 +26,7 @@ use dsip_session::endpoint::Grant;
 use dsip_session::event::SendMsg;
 use dsip_session::{Emission, Endpoint, EndpointConfig, Event, LocalEvent, Message};
 
+use crate::error::{Error, Result};
 use crate::verify::{verify_frame_with, SeenIds};
 
 /// Interactive Media Profile identifier. Spec: §17.
@@ -570,7 +570,7 @@ impl Core {
         if p["type"] == "invite" || p["type"] == "update" {
             self.offers.insert(p["id"].as_str().unwrap_or("").to_string(), json!({"media": p["media"], "transports": p["transports"]}));
         }
-        let msg = Message::from_payload(&p).context("payload shape")?;
+        let msg = Message::from_payload(&p).ok_or(Error::PayloadShape("not a session message"))?;
         let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
         let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation");
         out.push(CoreEvent::Received { message: msg.clone(), identity, display_name, payload: p });
@@ -787,7 +787,7 @@ impl Core {
                 p["about"] = "transport:webrtc".into();
                 p["data"] = self.pending_info_data.take().unwrap_or_else(|| json!({"candidates": [], "end_of_candidates": true}));
             }
-            other => anyhow::bail!("engine asked to send unsupported type {other}"),
+            other => return Err(Error::UnsupportedType(other.to_string())),
         }
         if matches!(m.msg_type.as_str(), "invite" | "answer" | "update") {
             if let Some(r) = &self.recording {

@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
                                 media.sip_remote(&calls, call_id, r.clone()).await;
                             }
                         }
-                        on_sip_event(&calls, &sip, ev, Some(&mut agent)).await
+                        on_sip_event(&calls, &sip, ev, Some(&mut agent)).await.map_err(anyhow::Error::from)
                     }
                 };
                 if let Err(e) = r {
@@ -336,7 +336,7 @@ async fn inbound_invite(
         }
         Route::None => {
             println!("route     {to_tn} → nothing configured, no binding: identity.unknown (404)   N§6.1, G§4.2");
-            return sip.reject(&call_id, 404, Some(1), "identity.unknown").await;
+            return Ok(sip.reject(&call_id, 404, Some(1), "identity.unknown").await?);
         }
     };
     let rtp = RtpLeg::bind(local_ip, 0, rand_ssrc(&call_id)).await?;
@@ -428,7 +428,7 @@ async fn dsip_event(
         _ => return Ok(()),
     };
     println!("← {:<8} from {}  session …{}", message.msg_type, identity, &sid[sid.len().saturating_sub(8)..]);
-    on_dsip_event(calls, sip, &sid, event, agent).await
+    Ok(on_dsip_event(calls, sip, &sid, event, agent).await?)
 }
 
 /// DSIP → PSTN: the destination, the caller's attested number, the PASSporT when entitled (N§4.1), then the dial.
@@ -451,7 +451,7 @@ async fn outbound_invite(
     // country code, it is declined
     let (Some(to_tn), Some(trunk)) = (destination.strip_prefix("tel:").filter(|d| d.starts_with('+')).and_then(e164), trunk) else {
         println!("reject    no PSTN destination (or no --sip-peer trunk): identity.unknown   N§4.1, spec-gap 111");
-        return agent.local(dsip_session::LocalEvent::Decline { session: sid.to_string(), reason: Some("identity.unknown".into()) }).await;
+        return Ok(agent.local(dsip_session::LocalEvent::Decline { session: sid.to_string(), reason: Some("identity.unknown".into()) }).await?);
     };
     let claims = payload.pointer("/identity/claims").and_then(Value::as_array).cloned().unwrap_or_default();
     let a = numbers.assert(&claims, caller, &to_tn, dsip_transport::now_s(), &origid_for(sid));

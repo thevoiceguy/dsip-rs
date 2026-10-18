@@ -9,6 +9,9 @@
 
 pub mod call;
 pub mod dsip_leg;
+pub mod error;
 pub mod media;
 pub mod numbers;
 pub mod sip_leg;
+
+pub use error::{Error, Result};

@@ -9,7 +9,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -26,6 +25,7 @@ use dsip_core::version::Supported;
 use dsip_core::WS_MAX_ENVELOPE_BYTES;
 use dsip_schema::SemanticContext;
 
+use crate::error::{Error, HelloFailure, Result};
 use crate::verify::{verify_frame, SeenIds};
 use crate::{now_s, BINDING, PING_IDLE_S};
 
@@ -73,13 +73,13 @@ impl Connection {
     /// Dial, send `hello`, verify the relay's `hello`. Fails closed on any binding error.
     pub async fn connect(p: &ConnectParams<'_>, resolver: &dyn Resolver, seen: &mut SeenIds) -> Result<Connection> {
         if !p.url.starts_with("wss://") {
-            bail!("ws/1.0 requires a wss:// URL (spec §13.2); refusing {}", p.url);
+            return Err(Error::NotWss(p.url.clone()));
         }
         let connector = p.tls.clone().map(Connector::Rustls);
         let (mut ws, _) =
             tokio_tungstenite::connect_async_tls_with_config(p.url.as_str(), Some(ws_config()), false, connector)
                 .await
-                .with_context(|| format!("connecting to {}", p.url))?;
+                .map_err(|e| Error::Connect { url: p.url.clone(), source: Box::new(e) })?;
 
         // Client hello (§13.2)
         let now = now_s();
@@ -100,24 +100,27 @@ impl Connection {
             match tokio::time::timeout(Duration::from_secs(crate::HELLO_TIMEOUT_S), ws.next()).await {
                 Ok(Some(Ok(WsMessage::Text(t)))) => break t.to_string(),
                 Ok(Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_)))) => continue,
-                Ok(Some(Ok(WsMessage::Close(c)))) => bail!("relay closed during hello: {c:?}"),
-                Ok(Some(Ok(_))) => bail!("relay sent a non-text frame during hello"),
+                Ok(Some(Ok(WsMessage::Close(c)))) => return Err(Error::Hello(HelloFailure::Closed(format!("{c:?}")))),
+                Ok(Some(Ok(_))) => return Err(Error::Hello(HelloFailure::NonText)),
                 Ok(Some(Err(e))) => return Err(e.into()),
-                Ok(None) => bail!("connection ended during hello"),
-                Err(_) => bail!("no relay hello within {} s", crate::HELLO_TIMEOUT_S),
+                Ok(None) => return Err(Error::Hello(HelloFailure::Ended)),
+                Err(_) => return Err(Error::Hello(HelloFailure::Timeout)),
             }
         };
         let sem = SemanticContext { supported: p.supported.clone(), sent_hello_id: Some(id.to_string()), ..Default::default() };
         let inbound = verify_frame(&frame, now_s(), resolver, &[], seen, &sem).map_err(|v| {
-            anyhow!("relay hello rejected: {:?} ({})", v.code, v.detail.unwrap_or_default())
+            Error::Hello(HelloFailure::Rejected { code: v.code, detail: v.detail.unwrap_or_default() })
         })?;
         if inbound.verified.msg_type() != "hello" {
             let _ = ws.close(None).await;
             let p = &inbound.verified.payload;
             if inbound.verified.msg_type() == "error" {
-                bail!("hello refused: {} {}", p["reason"].as_str().unwrap_or(""), p["detail"].as_str().unwrap_or(""));
+                return Err(Error::Hello(HelloFailure::Refused {
+                    reason: p["reason"].as_str().unwrap_or("").to_string(),
+                    detail: p["detail"].as_str().unwrap_or("").to_string(),
+                }));
             }
-            bail!("first frame from relay was {}, not hello", inbound.verified.msg_type());
+            return Err(Error::Hello(HelloFailure::NotHello(inbound.verified.msg_type().to_string())));
         }
         // The schema enforces relay form (in_reply_to ⇔ capabilities, max_envelope_bytes const).
         let caps = inbound.verified.payload["capabilities"].clone();
@@ -132,7 +135,7 @@ impl Connection {
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
         let frame = env.frame();
         if frame.len() > WS_MAX_ENVELOPE_BYTES {
-            bail!("envelope is {} bytes; ws/1.0 cap is {}", frame.len(), WS_MAX_ENVELOPE_BYTES);
+            return Err(Error::Oversize { len: frame.len(), cap: WS_MAX_ENVELOPE_BYTES });
         }
         self.ws.send(WsMessage::Text(frame.into())).await?;
         self.last_activity = std::time::Instant::now();
@@ -149,14 +152,14 @@ impl Connection {
                         self.last_activity = std::time::Instant::now();
                         if t.len() > WS_MAX_ENVELOPE_BYTES {
                             self.close(CloseCode::Size, "envelope too large").await;
-                            bail!("peer sent an oversize frame");
+                            return Err(Error::PeerViolation("an oversize frame"));
                         }
                         return Ok(Some(t.to_string()));
                     }
                     Some(Ok(WsMessage::Binary(_))) => {
                         // §13.2: text frames only
                         self.close(CloseCode::Unsupported, "text frames only").await;
-                        bail!("peer sent a binary frame");
+                        return Err(Error::PeerViolation("a binary frame"));
                     }
                     Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {
                         self.last_activity = std::time::Instant::now();
@@ -164,7 +167,7 @@ impl Connection {
                     Some(Ok(WsMessage::Close(_))) | None => return Ok(None),
                     Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(_))) => {
                         self.close(CloseCode::Size, "envelope too large").await;
-                        bail!("peer sent an oversize frame");
+                        return Err(Error::PeerViolation("an oversize frame"));
                     }
                     Some(Err(e)) => return Err(e.into()),
                 },

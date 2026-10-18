@@ -99,28 +99,35 @@ pub struct DiskStore {
     providers: MemoryStore,
 }
 
-fn db_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
-    anyhow::anyhow!("record store: {e}")
+fn db_err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
 }
 
 impl DiskStore {
     /// Open (or create) the store at `path`, or in memory without one. `max_records` bounds what it holds: a store
     /// at the bound refuses new keys (libp2p's `MaxRecords`), and replacing a held key is always allowed.
     /// `cache_bytes` is the page cache's size: the store's memory, however much it holds.
-    pub fn open(path: Option<&Path>, local: PeerId, resolver: StaticResolver, max_records: usize, cache_bytes: usize) -> anyhow::Result<DiskStore> {
-        let mut b = Database::builder();
-        b.set_cache_size(cache_bytes);
-        let db = match path {
-            Some(p) => b.create(p).map_err(db_err)?,
-            None => b.create_with_backend(redb::backends::InMemoryBackend::new()).map_err(db_err)?,
+    pub fn open(path: Option<&Path>, local: PeerId, resolver: StaticResolver, max_records: usize, cache_bytes: usize) -> crate::error::Result<DiskStore> {
+        let open = || -> std::result::Result<(Database, usize), String> {
+            let mut b = Database::builder();
+            b.set_cache_size(cache_bytes);
+            let db = match path {
+                Some(p) => b.create(p).map_err(db_err)?,
+                None => b.create_with_backend(redb::backends::InMemoryBackend::new()).map_err(db_err)?,
+            };
+            let w = db.begin_write().map_err(db_err)?;
+            let count = {
+                let t = w.open_table(RECORDS).map_err(db_err)?;
+                w.open_table(HELD).map_err(db_err)?;
+                t.len().map_err(db_err)? as usize
+            };
+            w.commit().map_err(db_err)?;
+            Ok((db, count))
         };
-        let w = db.begin_write().map_err(db_err)?;
-        let count = {
-            let t = w.open_table(RECORDS).map_err(db_err)?;
-            w.open_table(HELD).map_err(db_err)?;
-            t.len().map_err(db_err)? as usize
-        };
-        w.commit().map_err(db_err)?;
+        let (db, count) = open().map_err(|detail| crate::error::Error::Store {
+            at: path.map(|p| p.display().to_string()).unwrap_or_else(|| "(memory)".into()),
+            detail,
+        })?;
         Ok(DiskStore { db, resolver, max_records, count, providers: MemoryStore::new(local) })
     }
 

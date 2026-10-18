@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context as _, Result};
+use super::error::{Error, Result, Sip as _};
 use bytes::Bytes;
 use sip_core::{Method, Request, Response, SipUri};
 use sip_dialog::Dialog;
@@ -161,9 +161,9 @@ pub struct SipLeg {
 impl SipLeg {
     /// Bind `listen` and start the receive loop.
     pub async fn new(listen: SocketAddr, local_ip: &str, user: &str) -> Result<(Arc<SipLeg>, mpsc::Receiver<SipEvent>)> {
-        let socket = Arc::new(UdpSocket::bind(listen).await.with_context(|| format!("bind SIP {listen}"))?);
+        let socket = Arc::new(UdpSocket::bind(listen).await.map_err(|source| Error::Bind { what: "SIP", addr: listen.to_string(), source })?);
         let port = socket.local_addr()?.port();
-        let local_uri = SipUri::parse(&format!("sip:{user}@{local_ip}:{port}")).map_err(|e| anyhow!("local uri: {e}"))?;
+        let local_uri = SipUri::parse(&format!("sip:{user}@{local_ip}:{port}")).sip("local uri")?;
         let (events, rx) = mpsc::channel(64);
         let leg = Arc::new(SipLeg {
             socket,
@@ -215,14 +215,14 @@ impl SipLeg {
     ///
     /// Spec: N§4.1, G§11 (path b presents the number only; path c adds the PASSporT).
     pub async fn invite_from(&self, target: &str, sdp: &str, from_user: Option<&str>, identity: Option<&str>) -> Result<String> {
-        let uri = SipUri::parse(target).map_err(|e| anyhow!("target uri: {e}"))?;
+        let uri = SipUri::parse(target).sip("target uri")?;
         let port = self.socket.local_addr().map(|a| a.port()).unwrap_or(5060);
         let from = from_user
-            .map(|u| SipUri::parse(&format!("sip:{u}@{}:{port}", self.local_ip)).map_err(|e| anyhow!("from uri: {e}")))
+            .map(|u| SipUri::parse(&format!("sip:{u}@{}:{port}", self.local_ip)).sip("from uri"))
             .transpose()?;
         let mut req = self.uac.create_invite_with_from(&uri, Some(sdp), from.as_ref());
         if let Some(v) = identity {
-            req.headers_mut().push("Identity", v).map_err(|e| anyhow!("Identity header: {e}"))?;
+            req.headers_mut().push("Identity", v).sip("Identity header")?;
         }
         let call_id = header(&req, "Call-ID").unwrap_or_default();
         let addr = resolve_uri_addr(&uri)?;
@@ -234,7 +234,7 @@ impl SipLeg {
     /// CANCEL an outbound INVITE.
     pub async fn cancel(&self, call_id: &str) -> Result<()> {
         let calls = self.calls.lock().await;
-        let c = calls.get(call_id).ok_or_else(|| anyhow!("unknown call"))?;
+        let c = calls.get(call_id).ok_or_else(|| Error::UnknownCall(call_id.to_string()))?;
         let req = cancel_for(&c.invite)?;
         self.send_req(&req, c.remote_addr).await
     }
@@ -242,7 +242,7 @@ impl SipLeg {
     /// ACK a 2xx.
     pub async fn ack(&self, call_id: &str, response_status: u16) -> Result<()> {
         let calls = self.calls.lock().await;
-        let c = calls.get(call_id).ok_or_else(|| anyhow!("unknown call"))?;
+        let c = calls.get(call_id).ok_or_else(|| Error::UnknownCall(call_id.to_string()))?;
         let _ = response_status;
         // The last 2xx we saw is kept in the dialog; build the ACK from the INVITE + a synthetic OK.
         let Some(dialog) = &c.dialog else { return Ok(()) };
@@ -275,10 +275,10 @@ impl SipLeg {
         for d in digits.chars() {
             let (req, addr) = {
                 let mut calls = self.calls.lock().await;
-                let c = calls.get_mut(call_id).ok_or_else(|| anyhow!("unknown call"))?;
-                let dialog = c.dialog.as_mut().ok_or_else(|| anyhow!("no dialog yet for INFO"))?;
+                let c = calls.get_mut(call_id).ok_or_else(|| Error::UnknownCall(call_id.to_string()))?;
+                let dialog = c.dialog.as_mut().ok_or(Error::NoDialog("INFO"))?;
                 let body = format!("Signal={d}\r\nDuration={ms}\r\n");
-                let req = self.uac.create_info(dialog, "application/dtmf-relay", &body).map_err(|e| anyhow!("info: {e}"))?;
+                let req = self.uac.create_info(dialog, "application/dtmf-relay", &body).sip("info")?;
                 dialog.next_local_cseq();
                 (req, c.remote_addr)
             };
@@ -290,7 +290,7 @@ impl SipLeg {
     /// Provisional response to an inbound INVITE.
     pub async fn ringing(&self, call_id: &str) -> Result<()> {
         let calls = self.calls.lock().await;
-        let c = calls.get(call_id).ok_or_else(|| anyhow!("unknown call"))?;
+        let c = calls.get(call_id).ok_or_else(|| Error::UnknownCall(call_id.to_string()))?;
         let resp = self.uas.create_ringing(&c.invite);
         self.send_resp(&resp, c.remote_addr).await
     }
@@ -298,8 +298,8 @@ impl SipLeg {
     /// 200 OK with our SDP to an inbound INVITE.
     pub async fn accept(&self, call_id: &str, sdp: &str) -> Result<()> {
         let mut calls = self.calls.lock().await;
-        let c = calls.get_mut(call_id).ok_or_else(|| anyhow!("unknown call"))?;
-        let (resp, dialog) = self.uas.accept_invite(&c.invite, Some(sdp)).map_err(|e| anyhow!("accept: {e}"))?;
+        let c = calls.get_mut(call_id).ok_or_else(|| Error::UnknownCall(call_id.to_string()))?;
+        let (resp, dialog) = self.uas.accept_invite(&c.invite, Some(sdp)).sip("accept")?;
         c.dialog = Some(dialog);
         self.send_resp(&resp, c.remote_addr).await
     }
@@ -350,13 +350,13 @@ impl SipLeg {
                     let _ = self.events.send(SipEvent::Ack { call_id }).await;
                 }
                 m if *m == Method::Bye => {
-                    let ok = self.uas.create_ok(&req, None).map_err(|e| anyhow!("ok: {e}"))?;
+                    let ok = self.uas.create_ok(&req, None).sip("ok")?;
                     self.send_resp(&ok, from).await?;
                     self.calls.lock().await.remove(&call_id);
                     let _ = self.events.send(SipEvent::Bye { call_id, q850: q850_of(header(&req, "Reason").as_deref()) }).await;
                 }
                 m if *m == Method::Cancel => {
-                    let ok = self.uas.create_ok(&req, None).map_err(|e| anyhow!("ok: {e}"))?;
+                    let ok = self.uas.create_ok(&req, None).sip("ok")?;
                     self.send_resp(&ok, from).await?;
                     if let Some(c) = self.calls.lock().await.remove(&call_id) {
                         let terminated = UserAgentServer::create_request_terminated_from_cancel(&c.invite);
@@ -379,7 +379,7 @@ impl SipLeg {
                         let body = String::from_utf8_lossy(req.body()).to_string();
                         match dtmf_relay_of(&body) {
                             Some((digits, duration_ms)) => {
-                                let ok = self.uas.create_ok(&req, None).map_err(|e| anyhow!("ok: {e}"))?;
+                                let ok = self.uas.create_ok(&req, None).sip("ok")?;
                                 self.send_resp(&ok, from).await?;
                                 let _ = self.events.send(SipEvent::Info { call_id, digits, duration_ms }).await;
                             }
@@ -464,7 +464,7 @@ fn q850_of(reason: Option<&str>) -> Option<u32> {
 fn resolve_uri_addr(uri: &SipUri) -> Result<SocketAddr> {
     let host = uri.host().to_string();
     let port = uri.port().unwrap_or(5060);
-    format!("{host}:{port}").parse().with_context(|| format!("sip target {host}:{port} must be ip:port in round one"))
+    format!("{host}:{port}").parse().map_err(|_| Error::SipTarget(format!("{host}:{port}")))
 }
 
 fn cancel_for(invite: &Request) -> Result<Request> {
@@ -473,13 +473,13 @@ fn cancel_for(invite: &Request) -> Result<Request> {
     let mut h = sip_core::Headers::new();
     for name in ["Via", "From", "To", "Call-ID", "Max-Forwards"] {
         if let Some(v) = headers.get(name) {
-            h.push(name, v).map_err(|e| anyhow!("{e}"))?;
+            h.push(name, v).sip("CANCEL header")?;
         }
     }
     let cseq = headers.get("CSeq").unwrap_or("1 INVITE").split_whitespace().next().unwrap_or("1").to_string();
-    h.push("CSeq", format!("{cseq} CANCEL")).map_err(|e| anyhow!("{e}"))?;
-    h.push("Content-Length", "0").map_err(|e| anyhow!("{e}"))?;
-    Request::new(sip_core::RequestLine::new(Method::Cancel, uri), h, Bytes::new()).map_err(|e| anyhow!("{e}"))
+    h.push("CSeq", format!("{cseq} CANCEL")).sip("CANCEL header")?;
+    h.push("Content-Length", "0").sip("CANCEL header")?;
+    Request::new(sip_core::RequestLine::new(Method::Cancel, uri), h, Bytes::new()).sip("CANCEL")
 }
 
 fn ok_for(invite: &Request, dialog: &Dialog) -> Result<Response> {

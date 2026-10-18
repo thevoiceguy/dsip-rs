@@ -559,7 +559,7 @@ impl Client {
 
     async fn send(&mut self, env: &Envelope) -> Result<()> {
         self.connect().await?;
-        self.conn.as_mut().context("offline")?.send(env).await
+        Ok(self.conn.as_mut().context("offline")?.send(env).await?)
     }
 
     /// A short-lived connection to another identity's mailbox (M§5.5 fetch).

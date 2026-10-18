@@ -15,9 +15,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, Result};
 use crate::source::Source;
 
 /// Which media stack a leg runs on.
@@ -36,7 +36,7 @@ impl Backend {
         match s {
             "webrtc-rs" | "webrtc" => Ok(Backend::WebRtcRs),
             "forge" | "forge-media" => Ok(Backend::Forge),
-            other => anyhow::bail!("unknown media backend {other} (webrtc-rs | forge)"),
+            other => Err(Error::UnknownBackend(other.to_string())),
         }
     }
 
@@ -174,8 +174,7 @@ impl MediaLeg {
             #[cfg(feature = "forge")]
             Backend::Forge => Ok(MediaLeg::Forge(crate::backend::forge::ForgeLeg::new(cfg).await?)),
             #[allow(unreachable_patterns)]
-            other => anyhow::bail!("media backend {} is not compiled into this build (features: {:?})", other.name(),
-                                   Backend::available().iter().map(Backend::name).collect::<Vec<_>>()),
+            other => Err(Error::NotCompiled { backend: other.name(), available: Backend::available().iter().map(Backend::name).collect() }),
         }
     }
 

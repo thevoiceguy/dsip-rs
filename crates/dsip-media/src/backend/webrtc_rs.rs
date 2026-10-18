@@ -8,7 +8,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
 use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
@@ -27,6 +26,7 @@ use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
+use crate::error::{At as _, Result};
 use crate::leg::{Candidate, MediaConfig, MediaEvent, Stats};
 use crate::ogg::Recorder;
 use crate::source::{self, Source, FRAME_DURATION};
@@ -48,9 +48,9 @@ impl WebRtcRsLeg {
     /// Build the peer connection and local track; nothing is sent until [`WebRtcRsLeg::start_sending`].
     pub async fn new(cfg: MediaConfig) -> Result<WebRtcRsLeg> {
         let mut me = MediaEngine::default();
-        me.register_default_codecs().context("codecs")?;
+        me.register_default_codecs().at("codecs")?;
         let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut me).context("interceptors")?;
+        registry = register_default_interceptors(registry, &mut me).at("interceptors")?;
         let api = APIBuilder::new().with_media_engine(me).with_interceptor_registry(registry).build();
         let mut ice_servers = Vec::new();
         if !cfg.stun.is_empty() {
@@ -64,7 +64,7 @@ impl WebRtcRsLeg {
             });
         }
         let config = RTCConfiguration { ice_servers, ..Default::default() };
-        let pc = Arc::new(api.new_peer_connection(config).await.context("peer connection")?);
+        let pc = Arc::new(api.new_peer_connection(config).await.at("peer connection")?);
         let (tx, events) = mpsc::unbounded_channel();
 
         // Local track (or a recvonly transceiver for screening / receive-only legs)
@@ -74,7 +74,7 @@ impl WebRtcRsLeg {
                 Some(RTCRtpTransceiverInit { direction: RTCRtpTransceiverDirection::Recvonly, send_encodings: vec![] }),
             )
             .await
-            .context("recvonly transceiver")?;
+            .at("recvonly transceiver")?;
             None
         } else {
             let t = Arc::new(TrackLocalStaticSample::new(
@@ -90,10 +90,10 @@ impl WebRtcRsLeg {
                         Some(RTCRtpTransceiverInit { direction: RTCRtpTransceiverDirection::Sendonly, send_encodings: vec![] }),
                     )
                     .await
-                    .context("sendonly transceiver")?;
+                    .at("sendonly transceiver")?;
                 tr.sender().await
             } else {
-                pc.add_track(Arc::clone(&t) as Arc<dyn TrackLocal + Send + Sync>).await.context("add track")?
+                pc.add_track(Arc::clone(&t) as Arc<dyn TrackLocal + Send + Sync>).await.at("add track")?
             };
             // Drain RTCP for the sender so the interceptors keep working.
             tokio::spawn(async move {
@@ -182,7 +182,7 @@ impl WebRtcRsLeg {
             "audio".to_owned(),
             "dsip".to_owned(),
         ));
-        let sender = self.pc.add_track(Arc::clone(&t) as Arc<dyn TrackLocal + Send + Sync>).await.context("add track")?;
+        let sender = self.pc.add_track(Arc::clone(&t) as Arc<dyn TrackLocal + Send + Sync>).await.at("add track")?;
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1500];
             while sender.read(&mut buf).await.is_ok() {}
@@ -195,24 +195,24 @@ impl WebRtcRsLeg {
 
     /// Create an SDP offer (also used for re-offers, §12.8).
     pub async fn create_offer(&self) -> Result<String> {
-        let offer = self.pc.create_offer(None).await.context("create offer")?;
+        let offer = self.pc.create_offer(None).await.at("create offer")?;
         let sdp = offer.sdp.clone();
-        self.pc.set_local_description(offer).await.context("set local")?;
+        self.pc.set_local_description(offer).await.at("set local")?;
         Ok(sdp)
     }
 
     /// Apply a remote offer and produce the SDP answer.
     pub async fn accept_offer(&self, sdp: &str) -> Result<String> {
-        self.pc.set_remote_description(RTCSessionDescription::offer(sdp.to_string())?).await.context("set remote offer")?;
-        let answer = self.pc.create_answer(None).await.context("create answer")?;
+        self.pc.set_remote_description(RTCSessionDescription::offer(sdp.to_string()).at("parse offer")?).await.at("set remote offer")?;
+        let answer = self.pc.create_answer(None).await.at("create answer")?;
         let out = answer.sdp.clone();
-        self.pc.set_local_description(answer).await.context("set local answer")?;
+        self.pc.set_local_description(answer).await.at("set local answer")?;
         Ok(out)
     }
 
     /// Apply the remote answer.
     pub async fn set_answer(&self, sdp: &str) -> Result<()> {
-        self.pc.set_remote_description(RTCSessionDescription::answer(sdp.to_string())?).await.context("set remote answer")
+        self.pc.set_remote_description(RTCSessionDescription::answer(sdp.to_string()).at("parse answer")?).await.at("set remote answer")
     }
 
     /// Add a remote candidate (from a verified `info`).
@@ -225,7 +225,7 @@ impl WebRtcRsLeg {
                 username_fragment: None,
             })
             .await
-            .context("add candidate")
+            .at("add candidate")
     }
 
     /// Next leg event.

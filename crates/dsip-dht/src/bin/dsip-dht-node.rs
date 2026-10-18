@@ -78,5 +78,5 @@ async fn main() -> Result<()> {
     for a in handle.addrs().await? {
         println!("listening: {a}");
     }
-    dsip_dht::control::serve(control, handle).await
+    Ok(dsip_dht::control::serve(control, handle).await?)
 }

@@ -104,11 +104,47 @@ pub struct HttpSection {
     pub listen: Option<String>,
 }
 
+/// Why loading the configuration or the state directory failed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// Reading or writing a file failed.
+    #[error("{}: {source}", path.display())]
+    File {
+        /// The file.
+        path: PathBuf,
+        /// The I/O failure.
+        source: std::io::Error,
+    },
+    /// The config file is not valid TOML for [`Config`].
+    #[error("{}: {source}", path.display())]
+    Toml {
+        /// The file.
+        path: PathBuf,
+        /// The parser's error.
+        source: Box<toml::de::Error>,
+    },
+    /// `overlay.key` is not 32 bytes of hex.
+    #[error("{}: not 32 bytes of hex", .0.display())]
+    BadKey(PathBuf),
+    /// Generating the overlay key failed.
+    #[error("generating the overlay key: {0}")]
+    KeyGen(String),
+}
+
+/// `Result` with [`ConfigError`].
+pub type Result<T> = std::result::Result<T, ConfigError>;
+
+fn file(path: &Path) -> impl FnOnce(std::io::Error) -> ConfigError {
+    let path = path.to_path_buf();
+    move |source| ConfigError::File { path, source }
+}
+
 impl Config {
     /// Read and parse a config file.
-    pub fn load(path: &Path) -> anyhow::Result<Config> {
-        let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    pub fn load(path: &Path) -> Result<Config> {
+        let text = std::fs::read_to_string(path).map_err(file(path))?;
+        toml::from_str(&text).map_err(|source| ConfigError::Toml { path: path.to_path_buf(), source: Box::new(source) })
     }
 }
 
@@ -118,30 +154,30 @@ pub struct StateDir(pub PathBuf);
 
 impl StateDir {
     /// Create the directory (and `pkarr/`) if needed.
-    pub fn open(path: &Path) -> anyhow::Result<StateDir> {
-        std::fs::create_dir_all(path.join("pkarr"))?;
+    pub fn open(path: &Path) -> Result<StateDir> {
+        std::fs::create_dir_all(path.join("pkarr")).map_err(file(path))?;
         Ok(StateDir(path.to_path_buf()))
     }
 
     /// The overlay identity: a 32-byte seed, generated once, so the PeerId survives restarts.
-    pub fn overlay_seed(&self) -> anyhow::Result<[u8; 32]> {
+    pub fn overlay_seed(&self) -> Result<[u8; 32]> {
         let p = self.0.join("overlay.key");
         if let Ok(hex) = std::fs::read_to_string(&p) {
             let b: Vec<u8> = (0..32).filter_map(|i| u8::from_str_radix(hex.trim().get(2 * i..2 * i + 2)?, 16).ok()).collect();
-            return b.try_into().map_err(|_| anyhow::anyhow!("{}: not 32 bytes of hex", p.display()));
+            return b.try_into().map_err(|_| ConfigError::BadKey(p.clone()));
         }
         // a fresh Ed25519 key from libp2p (the OS's CSPRNG); its secret is the seed kept from now on
-        let kp = libp2p::identity::Keypair::generate_ed25519().try_into_ed25519().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let seed: [u8; 32] = kp.secret().as_ref().try_into().map_err(|_| anyhow::anyhow!("ed25519 secret"))?;
+        let kp = libp2p::identity::Keypair::generate_ed25519().try_into_ed25519().map_err(|e| ConfigError::KeyGen(e.to_string()))?;
+        let seed: [u8; 32] = kp.secret().as_ref().try_into().map_err(|_| ConfigError::KeyGen("ed25519 secret is not 32 bytes".into()))?;
         let tmp = p.with_extension("tmp");
         {
             use std::io::Write as _;
             use std::os::unix::fs::OpenOptionsExt as _;
             // the node's signing identity: readable by its owner only, from the first byte written
-            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-            f.write_all(seed.iter().map(|b| format!("{b:02x}")).collect::<String>().as_bytes())?;
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(file(&tmp))?;
+            f.write_all(seed.iter().map(|b| format!("{b:02x}")).collect::<String>().as_bytes()).map_err(file(&tmp))?;
         }
-        std::fs::rename(&tmp, &p)?;
+        std::fs::rename(&tmp, &p).map_err(file(&p))?;
         Ok(seed)
     }
 

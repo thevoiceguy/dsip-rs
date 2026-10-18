@@ -1341,7 +1341,6 @@ dependencies = [
 name = "dsip-endpoint"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "dsip-core",
  "dsip-schema",
  "dsip-session",
@@ -1350,6 +1349,7 @@ dependencies = [
  "rand 0.8.7",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1394,6 +1394,7 @@ dependencies = [
  "sip-parse",
  "sip-uac",
  "sip-uas",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1449,7 +1450,6 @@ dependencies = [
 name = "dsip-media"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "audiopus",
  "bytes",
  "forge-webrtc 0.7.0",
@@ -1457,6 +1457,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1516,6 +1517,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tokio",
  "toml",
  "tracing",
@@ -1587,7 +1589,6 @@ dependencies = [
 name = "dsip-transport"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "dsip-core",
  "dsip-endpoint",

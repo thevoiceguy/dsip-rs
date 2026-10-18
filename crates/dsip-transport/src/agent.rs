@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
 
 use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
@@ -16,6 +15,7 @@ use dsip_session::{Emission, Endpoint, LocalEvent, Message};
 use crate::conn::{ConnectParams, Connection};
 use crate::identity::Identity;
 use crate::verify::SeenIds;
+use crate::error::Result;
 use crate::{now_s, BACKOFF};
 
 /// Interactive Media Profile identifier. Spec: §17.
@@ -132,8 +132,8 @@ impl Agent {
 
     /// Persist first-contact state to the identity directory.
     pub fn save_contacts(&self) -> Result<()> {
-        std::fs::write(self.id.dir.join("contacts.json"), serde_json::to_string_pretty(&self.core.contacts())?)?;
-        Ok(())
+        let path = self.id.dir.join("contacts.json");
+        crate::error::file(&path, std::fs::write(&path, serde_json::to_string_pretty(&self.core.contacts())?))
     }
 
     /// Pending introductions (id → identity).
@@ -188,7 +188,7 @@ impl Agent {
     /// Sign and send an application-built payload (publish / subscribe / provenance, …).
     pub async fn send_payload(&mut self, payload: serde_json::Value, ttl: i64) -> Result<String> {
         let frame = self.core.sign_payload(payload, now_s(), ttl)?;
-        let env = dsip_core::envelope::Envelope::from_frame(&frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
+        let env = dsip_core::envelope::Envelope::from_frame(&frame)?;
         self.conn.send(&env).await?;
         Ok(frame)
     }
@@ -229,7 +229,7 @@ impl Agent {
         for e in out {
             match e {
                 CoreEvent::Send { frame, msg_type, session, to } => {
-                    let env = dsip_core::envelope::Envelope::from_frame(&frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
+                    let env = dsip_core::envelope::Envelope::from_frame(&frame)?;
                     self.conn.send(&env).await?;
                     self.events.push(AgentEvent::Sent { msg_type, session, to });
                 }

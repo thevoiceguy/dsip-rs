@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context as _, Result};
+use crate::error::{Error, Result};
 use futures_util::StreamExt;
 use libp2p::kad::{self, store::RecordStore, QueryId, Quorum, Record, RecordKey};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -205,37 +205,37 @@ impl Handle {
     /// Publish a signed hint frame.
     pub async fn publish(&self, frame: String) -> Result<PublishOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Command::Publish(frame, tx)).await.map_err(|_| anyhow!("node stopped"))?;
-        rx.await.map_err(|_| anyhow!("node stopped"))?
+        self.tx.send(Command::Publish(frame, tx)).await.map_err(|_| Error::Stopped)?;
+        rx.await.map_err(|_| Error::Stopped)?
     }
 
     /// Resolve hints for a DID.
     pub async fn get(&self, did: String) -> Result<GetOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Command::Get(did, tx)).await.map_err(|_| anyhow!("node stopped"))?;
-        rx.await.map_err(|_| anyhow!("node stopped"))?
+        self.tx.send(Command::Get(did, tx)).await.map_err(|_| Error::Stopped)?;
+        rx.await.map_err(|_| Error::Stopped)?
     }
 
     /// Test-only: put `frame` under `did`'s key with no verification. This is the attacker's
     /// tool for plan §10.3 poisoning runs; honest nodes never call it.
     pub async fn put_raw(&self, did: String, frame: String) -> Result<PublishOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Command::PutRaw(did, frame, tx)).await.map_err(|_| anyhow!("node stopped"))?;
-        rx.await.map_err(|_| anyhow!("node stopped"))?
+        self.tx.send(Command::PutRaw(did, frame, tx)).await.map_err(|_| Error::Stopped)?;
+        rx.await.map_err(|_| Error::Stopped)?
     }
 
     /// Listen addresses (with `/p2p/<PeerId>`).
     pub async fn addrs(&self) -> Result<Vec<Multiaddr>> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Command::Addrs(tx)).await.map_err(|_| anyhow!("node stopped"))?;
-        rx.await.map_err(|_| anyhow!("node stopped"))
+        self.tx.send(Command::Addrs(tx)).await.map_err(|_| Error::Stopped)?;
+        rx.await.map_err(|_| Error::Stopped)
     }
 
     /// Counters.
     pub async fn stats(&self) -> Result<Stats> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Command::Stats(tx)).await.map_err(|_| anyhow!("node stopped"))?;
-        rx.await.map_err(|_| anyhow!("node stopped"))
+        self.tx.send(Command::Stats(tx)).await.map_err(|_| Error::Stopped)?;
+        rx.await.map_err(|_| Error::Stopped)
     }
 
     /// Stop the node.
@@ -277,11 +277,12 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
     let resolver = cfg.resolver.clone();
     let mut store = Some(
         DiskStore::open(cfg.records_db.as_deref(), peer_id, cfg.resolver.clone(), cfg.max_records, cfg.store_cache_bytes)
-            .with_context(|| format!("record store {}", cfg.records_db.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "(memory)".into())))?,
+            ?,
     );
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(cfg.keypair.clone())
         .with_tokio()
-        .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)?
+        .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)
+        .map_err(|e| Error::Swarm(e.to_string()))?
         .with_behaviour(|key| {
             let mut kcfg = kad::Config::new(StreamProtocol::new(PROTOCOL));
             // Every inbound record is evaluated before it is stored (§8.3 at the storage boundary).
@@ -297,12 +298,13 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
             kad.set_mode(Some(if cfg.server { kad::Mode::Server } else { kad::Mode::Client }));
             let identify = identify::Behaviour::new(identify::Config::new(PROTOCOL.into(), key.public()));
             Behaviour { kad, identify, gate: IpGate::default() }
-        })?
+        })
+        .map_err(|e| Error::Swarm(e.to_string()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
     for addr in &cfg.listen {
-        swarm.listen_on(addr.clone()).with_context(|| format!("listen on {addr}"))?;
+        swarm.listen_on(addr.clone()).map_err(|source| Error::Listen { addr: addr.to_string(), source })?;
     }
     // Configured bootstrap peers first, then the peers this node learned before its last restart.
     let mut known: Vec<Multiaddr> = cfg.bootstrap.clone();
@@ -513,11 +515,11 @@ pub async fn start(cfg: NodeConfig) -> Result<(Handle, PeerId)> {
                         let ctx = Context::new(now_s(), &resolver);
                         let ev = evaluate(&frame, &ctx, existing.as_ref());
                         let Some(h) = ev.hint.as_ref() else {
-                            let _ = reply.send(Err(anyhow!("refusing to publish an unverifiable hint: {}", ev.to_expect())));
+                            let _ = reply.send(Err(Error::Unverifiable(ev.to_expect().to_string())));
                             continue;
                         };
                         if ev.winner != "input" {
-                            let _ = reply.send(Err(anyhow!("refusing to publish: superseded by a record already held ({:?})", ev.conflict)));
+                            let _ = reply.send(Err(Error::Superseded(format!("{:?}", ev.conflict))));
                             continue;
                         }
                         let key = key_for(&h.subject);
@@ -659,7 +661,7 @@ impl libp2p::swarm::NetworkBehaviour for IpGate {
         _: libp2p::swarm::ConnectionId,
         _: &Multiaddr,
         remote: &Multiaddr,
-    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+    ) -> std::result::Result<(), libp2p::swarm::ConnectionDenied> {
         let ip = remote.iter().find_map(|p| match p {
             libp2p::multiaddr::Protocol::Ip4(a) => Some(std::net::IpAddr::V4(a)),
             libp2p::multiaddr::Protocol::Ip6(a) => Some(std::net::IpAddr::V6(a)),
@@ -680,7 +682,7 @@ impl libp2p::swarm::NetworkBehaviour for IpGate {
         _: PeerId,
         _: &Multiaddr,
         _: &Multiaddr,
-    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+    ) -> std::result::Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
         Ok(libp2p::swarm::dummy::ConnectionHandler)
     }
 
@@ -691,7 +693,7 @@ impl libp2p::swarm::NetworkBehaviour for IpGate {
         _: &Multiaddr,
         _: libp2p::core::Endpoint,
         _: libp2p::core::transport::PortUse,
-    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+    ) -> std::result::Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
         Ok(libp2p::swarm::dummy::ConnectionHandler)
     }
 

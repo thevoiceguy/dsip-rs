@@ -6,8 +6,7 @@
 //! Impl: native implementation of the did:web URL mapping; the `ssi` crate
 //! named in the plan is not used — the mapping is ten lines and avoids API churn.
 
-use anyhow::{bail, Context as _, Result};
-
+use crate::error::{file, Error, Result};
 use dsip_core::did::{DidDocument, StaticResolver};
 
 /// Map a `did:web` to its document URL.
@@ -16,9 +15,9 @@ use dsip_core::did::{DidDocument, StaticResolver};
 /// `did:web:example.com:users:bob` → `https://example.com/users/bob/did.json`;
 /// `%3A` in the host decodes to a port.
 pub fn did_web_url(did: &str) -> Result<String> {
-    let Some(rest) = did.strip_prefix("did:web:") else { bail!("{did} is not a did:web") };
+    let Some(rest) = did.strip_prefix("did:web:") else { return Err(Error::NotDidWeb(did.to_string())) };
     let mut parts = rest.split(':');
-    let host = parts.next().context("empty did:web")?.replace("%3A", ":");
+    let host = parts.next().filter(|h| !h.is_empty()).ok_or_else(|| Error::NotDidWeb(did.to_string()))?.replace("%3A", ":");
     let path: Vec<&str> = parts.collect();
     Ok(if path.is_empty() {
         format!("https://{host}/.well-known/did.json")
@@ -30,19 +29,21 @@ pub fn did_web_url(did: &str) -> Result<String> {
 /// Fetch and parse a `did:web` document. Verifies that the document `id` matches the DID.
 pub async fn fetch_did_web(did: &str) -> Result<DidDocument> {
     let url = did_web_url(did)?;
+    let fetch = |source| Error::Fetch { url: url.clone(), source };
     let doc: DidDocument = reqwest::Client::builder()
         .https_only(true)
-        .build()?
+        .build()
+        .map_err(fetch)?
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()?
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(fetch)?
         .json()
         .await
-        .context("parsing DID document")?;
+        .map_err(fetch)?;
     if doc.id != did {
-        bail!("document id {} does not match {did}", doc.id);
+        return Err(Error::DocumentMismatch { did: did.to_string(), got: doc.id });
     }
     Ok(doc)
 }
@@ -51,7 +52,7 @@ pub async fn fetch_did_web(did: &str) -> Result<DidDocument> {
 pub async fn build_resolver(files: &[std::path::PathBuf], fetch: &[String]) -> Result<StaticResolver> {
     let mut r = StaticResolver::default();
     for f in files {
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(f)?)?;
+        let v: serde_json::Value = serde_json::from_slice(&file(f, std::fs::read(f))?)?;
         if v.get("id").is_some() {
             r.insert(serde_json::from_value(v)?);
         } else {

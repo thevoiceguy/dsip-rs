@@ -5,10 +5,10 @@
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use webrtc_media::io::ogg_writer::OggWriter;
 use webrtc_media::io::Writer;
+use crate::error::{Error, Result};
 
 /// Records inbound Opus RTP payloads to an Ogg file.
 pub struct Recorder {
@@ -84,9 +84,11 @@ pub struct FileSource {
 impl FileSource {
     /// Open an Ogg/Opus file and index its audio frames.
     pub fn open(path: &Path) -> Result<FileSource> {
-        let data = std::fs::read(path).with_context(|| format!("open {}", path.display()))?;
+        let data = std::fs::read(path).map_err(|source| Error::File { path: path.to_path_buf(), source })?;
         let frames = parse_opus_frames(&data);
-        anyhow::ensure!(!frames.is_empty(), "{} has no Opus audio frames (not an Ogg/Opus file?)", path.display());
+        if frames.is_empty() {
+            return Err(Error::NotOggOpus(path.to_path_buf()));
+        }
         Ok(FileSource { frames, pos: 0 })
     }
 

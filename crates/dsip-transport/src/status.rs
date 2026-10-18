@@ -37,7 +37,7 @@ pub fn page_of(method: &str, target: &str) -> Option<Page> {
 
 /// Serve status requests on `listen` until the process ends. `render` answers each [`Page`] with a content type and
 /// a body; one request per connection.
-pub async fn serve<F, Fut>(listen: SocketAddr, render: F) -> anyhow::Result<()>
+pub async fn serve<F, Fut>(listen: SocketAddr, render: F) -> crate::Result<()>
 where
     F: Fn(Page) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = (&'static str, String)> + Send,

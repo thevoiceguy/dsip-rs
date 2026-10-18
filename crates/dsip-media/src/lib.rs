@@ -29,9 +29,12 @@
 compile_error!("dsip-media needs at least one backend feature: `webrtc-rs` or `forge`");
 
 pub mod backend;
+pub mod error;
 pub mod leg;
 pub mod ogg;
 pub mod source;
+
+pub use error::{Error, Result};
 
 pub use leg::{Backend, Candidate, MediaConfig, MediaEvent, MediaLeg, Stats, TurnConfig};
 pub use source::{Feed, Source};

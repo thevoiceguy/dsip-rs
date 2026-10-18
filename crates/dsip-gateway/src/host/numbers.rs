@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use super::error::{Error, Result};
 use dsip_number::{Assertion, GatewayCert, PassportOutcome, Policy, Route};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -36,19 +36,20 @@ impl Numbers {
     ///
     /// Spec: none (infrastructure).
     pub fn load(policy: Option<&Path>, x5u: Option<String>, key: Option<&Path>, routes: &[String], nodes: Vec<String>, documents: &[PathBuf]) -> Result<Numbers> {
-        let read = |p: &Path| -> Result<Value> { Ok(serde_json::from_slice(&std::fs::read(p).with_context(|| p.display().to_string())?)?) };
+        let file = |p: &Path| { let path = p.to_path_buf(); move |source| Error::File { path, source } };
+        let read = |p: &Path| -> Result<Value> { Ok(serde_json::from_slice(&std::fs::read(p).map_err(file(p))?)?) };
         let policy = match policy {
             Some(p) => Policy::from_json(&read(p)?),
             None => Policy::default(),
         };
         let gateway = match (x5u, key) {
-            (Some(x5u), Some(k)) => Some(GatewayCert { x5u, key_pem: std::fs::read_to_string(k).with_context(|| k.display().to_string())? }),
+            (Some(x5u), Some(k)) => Some(GatewayCert { x5u, key_pem: std::fs::read_to_string(k).map_err(file(k))? }),
             (None, None) => None,
-            _ => anyhow::bail!("--sti-x5u and --sti-key go together"),
+            _ => return Err(Error::Config("--sti-x5u and --sti-key go together".into())),
         };
         let mut configured = Map::new();
         for r in routes {
-            let (tn, did) = r.split_once('=').with_context(|| format!("--route {r}: number=did"))?;
+            let (tn, did) = r.split_once('=').ok_or_else(|| Error::Config(format!("--route {r}: number=did")))?;
             configured.insert(tn.to_string(), Value::String(did.to_string()));
         }
         let mut docs = Map::new();

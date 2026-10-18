@@ -6,12 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use dsip_core::delegation::delegation_payload;
 use dsip_core::envelope::{sign, Envelope};
 use dsip_core::keys::KeyPair;
+
+use crate::error::{file, Error, Result};
 
 /// Metadata written next to the keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,14 +43,20 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Result<[u8; 32]> {
+fn unhex(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
-    anyhow::ensure!(s.len() == 64, "expected 64 hex chars");
+    if s.len() != 64 {
+        return None;
+    }
     let mut out = [0u8; 32];
     for (i, c) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(c)?, 16)?;
+        out[i] = u8::from_str_radix(std::str::from_utf8(c).ok()?, 16).ok()?;
     }
-    Ok(out)
+    Some(out)
+}
+
+fn write(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    file(path, std::fs::write(path, contents))
 }
 
 impl Identity {
@@ -60,7 +67,7 @@ impl Identity {
 
     /// As [`Identity::init`], delegating `extra` capabilities as well (e.g. `dsip.record`, Recording Profile C§1).
     pub fn init_with(dir: &Path, display_name: &str, fixture: Option<&str>, controller_from: Option<&Path>, extra: &[String]) -> Result<Identity> {
-        std::fs::create_dir_all(dir)?;
+        file(dir, std::fs::create_dir_all(dir))?;
         let (controller, device) = match (fixture, controller_from) {
             // A second device of an existing identity: reuse its controller, mint a new device key.
             (_, Some(src)) => (Identity::load(src)?.controller, KeyPair::generate()),
@@ -81,10 +88,10 @@ impl Identity {
         );
         let delegation = sign(&payload, &controller, &controller.kid());
         let meta = IdentityMeta { identity: controller.did(), device: device.did(), display_name: display_name.into() };
-        std::fs::write(dir.join("controller.key"), hex(&controller.seed()))?;
-        std::fs::write(dir.join("device.key"), hex(&device.seed()))?;
-        std::fs::write(dir.join("delegation.json"), delegation.frame())?;
-        std::fs::write(dir.join("identity.json"), serde_json::to_string_pretty(&meta)?)?;
+        write(&dir.join("controller.key"), hex(&controller.seed()))?;
+        write(&dir.join("device.key"), hex(&device.seed()))?;
+        write(&dir.join("delegation.json"), delegation.frame())?;
+        write(&dir.join("identity.json"), serde_json::to_string_pretty(&meta)?)?;
         Ok(Identity { dir: dir.to_path_buf(), controller, device, delegation, meta })
     }
 
@@ -94,7 +101,9 @@ impl Identity {
     ///
     /// Spec: §7.2 (did:web), §7.4 (the delegation names the identity), §8.1 (the document is authoritative).
     pub fn rehome_did_web(&mut self, did: &str, also_known_as: &[String]) -> Result<()> {
-        anyhow::ensure!(did.starts_with("did:web:"), "not a did:web DID: {did}");
+        if !did.starts_with("did:web:") {
+            return Err(Error::NotDidWeb(did.to_string()));
+        }
         let kid = format!("{did}#key-1");
         // Keep the capabilities the current delegation grants (its payload is our own, already trusted).
         use base64::Engine as _;
@@ -120,18 +129,19 @@ impl Identity {
         if !also_known_as.is_empty() {
             doc["alsoKnownAs"] = serde_json::json!(also_known_as);
         }
-        std::fs::write(self.dir.join("delegation.json"), self.delegation.frame())?;
-        std::fs::write(self.dir.join("identity.json"), serde_json::to_string_pretty(&self.meta)?)?;
-        std::fs::write(self.dir.join("did.json"), serde_json::to_string_pretty(&doc)?)?;
+        write(&self.dir.join("delegation.json"), self.delegation.frame())?;
+        write(&self.dir.join("identity.json"), serde_json::to_string_pretty(&self.meta)?)?;
+        write(&self.dir.join("did.json"), serde_json::to_string_pretty(&doc)?)?;
         Ok(())
     }
 
     /// Load an identity directory.
     pub fn load(dir: &Path) -> Result<Identity> {
-        let read = |n: &str| std::fs::read_to_string(dir.join(n)).with_context(|| format!("reading {}/{n}", dir.display()));
-        let controller = KeyPair::from_seed(unhex(&read("controller.key")?)?);
-        let device = KeyPair::from_seed(unhex(&read("device.key")?)?);
-        let delegation = Envelope::from_frame(&read("delegation.json")?).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
+        let read = |n: &str| file(dir.join(n), std::fs::read_to_string(dir.join(n)));
+        let key = |n: &str| unhex(&read(n)?).ok_or_else(|| Error::BadKey(dir.join(n)));
+        let controller = KeyPair::from_seed(key("controller.key")?);
+        let device = KeyPair::from_seed(key("device.key")?);
+        let delegation = Envelope::from_frame(&read("delegation.json")?)?;
         let meta: IdentityMeta = serde_json::from_str(&read("identity.json")?)?;
         Ok(Identity { dir: dir.to_path_buf(), controller, device, delegation, meta })
     }
