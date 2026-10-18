@@ -1342,6 +1342,7 @@ name = "dsip-endpoint"
 version = "0.1.0"
 dependencies = [
  "dsip-core",
+ "dsip-recording",
  "dsip-schema",
  "dsip-session",
  "dsip-webrtc-binding",

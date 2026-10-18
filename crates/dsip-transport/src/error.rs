@@ -87,6 +87,9 @@ pub enum Error {
     /// Generating a certificate failed.
     #[error("certificate: {0}")]
     Certificate(#[from] rcgen::Error),
+    /// A call operation on an agent that does not run the call glue (`AgentConfig::calls` is `None`).
+    #[error("the agent runs no call glue (AgentConfig::calls)")]
+    NoCalls,
     /// A PEM file holds no private key.
     #[error("{0}: no private key")]
     NoPrivateKey(PathBuf),
