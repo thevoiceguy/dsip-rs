@@ -38,11 +38,11 @@ fn compiled() -> &'static HashMap<&'static str, Validator> {
             if *name == "message" {
                 continue; // relative $refs; dispatched natively instead
             }
-            let schema: Value = serde_json::from_str(text).expect("embedded schema is JSON");
-            let v = jsonschema::options()
-                .should_validate_formats(false)
-                .build(&schema)
-                .unwrap_or_else(|e| panic!("schema {name} does not compile: {e}"));
+            // An embedded schema that does not parse or compile is left out, so its messages are refused
+            // ("no schema") rather than the process panicking on the first message; `all_schemas_compile_and_dispatch`
+            // fails the build on such a schema.
+            let Ok(schema) = serde_json::from_str::<Value>(text) else { continue };
+            let Ok(v) = jsonschema::options().should_validate_formats(false).build(&schema) else { continue };
             m.insert(*name, v);
         }
         m

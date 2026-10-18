@@ -215,7 +215,9 @@ pub fn verify(env: &Envelope, ctx: &Context, frame: Option<&str>) -> Result<Veri
     let mut ver = verify_raw(env, ctx, true)?;
     let p = &ver.payload;
     let msg_type = ver.msg_type().to_string();
-    let from = p["from"].as_str().expect("core shape").to_string();
+    // Stage 4 (core shape, `verify_raw` above) guarantees these fields; a payload without them is refused, never a panic.
+    let shape = |what: &str| Verdict::reject(RejectCode::PayloadShape).detail(what.to_string());
+    let from = p["from"].as_str().ok_or_else(|| shape("from"))?.to_string();
     let hello = msg_type == "hello";
     let with_hello_reason = |v: Verdict| if hello { Verdict { reason: Some("transport.hello-rejected"), ..v } } else { v };
 
@@ -238,7 +240,10 @@ pub fn verify(env: &Envelope, ctx: &Context, frame: Option<&str>) -> Result<Veri
     }
 
     // Stages 8–9: expiry ordering, replay window, expiry
-    let (ia, ea) = (p["issued_at"].as_i64().expect("shape"), p["expires_at"].as_i64().expect("shape"));
+    let (ia, ea) = match (p["issued_at"].as_i64(), p["expires_at"].as_i64()) {
+        (Some(ia), Some(ea)) => (ia, ea),
+        _ => return Err(shape("timestamps")),
+    };
     if ea <= ia {
         return Err(Verdict::reject(RejectCode::ExpiryOrder));
     }
@@ -274,12 +279,12 @@ pub fn verify(env: &Envelope, ctx: &Context, frame: Option<&str>) -> Result<Veri
         });
     }
     // Stage 10: dedup
-    let id = p["id"].as_str().expect("shape");
+    let id = p["id"].as_str().ok_or_else(|| shape("id"))?;
     if ctx.seen_ids.contains(id) {
         return Err(Verdict::reject(RejectCode::DuplicateId));
     }
     // Stage 11: ULID timestamp vs issued_at (§20.6)
-    let ulid = Ulid::parse(id).expect("shape");
+    let ulid = Ulid::parse(id).ok_or_else(|| shape("id"))?;
     if (ulid.timestamp_s() - ia).abs() > ULID_TOLERANCE_S {
         return Err(Verdict::reject(RejectCode::UlidIssuedAtMismatch));
     }
