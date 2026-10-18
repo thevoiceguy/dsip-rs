@@ -15,7 +15,7 @@ DIR=${DEMO_DIR:-/tmp/dsip-enrolment-demo}
 BOB=did:web:bob.example
 CAROL=did:web:carol.example
 RETENTION=4
-rm -rf "$DIR"; mkdir -p "$DIR"/{mbx,dev-b,dev-c,docs}
+rm -rf "$DIR"; mkdir -p "$DIR"/{mbx,dev-b,dev-bl,dev-c,docs}
 
 cargo build -q -p dsip-mailbox
 MBX=target/debug/dsip-mailbox
@@ -60,12 +60,28 @@ device() { # who fifo log
 }
 
 echo "=== Bob enrols with his first owner operation"
-mkfifo "$DIR/b.in" "$DIR/c.in"
+mkfifo "$DIR/b.in" "$DIR/c.in" "$DIR/bl.in"
 device bob "$DIR/b.in" "$DIR/b.log"; BOB_PID=$LAST_PID; exec 3>"$DIR/b.in"
 wait_for "$DIR/b.log" "OK connected" 20
+# Bob's laptop (the same identity, its own device key) binds before the phone enrols him: not yet served, so not
+# registered at its hello
+$MSG --state "$DIR/dev-bl" --identity "$BOB" --controller "$DIR/dev-b/controller.key" "${RESOLVER[@]}" --ca "$DIR/ca.pem" \
+  <"$DIR/bl.in" >>"$DIR/bl.log" 2>&1 &
+LAPTOP_PID=$!; exec 5>"$DIR/bl.in"
+wait_for "$DIR/bl.log" "OK connected" 20
 echo "kp 2" >&3; wait_for "$DIR/b.log" "OK uploaded" 10
 wait_for "$DIR/mbx.log" "enrolled $BOB \(serve-any 1/1\)" 10
 echo "    ok: $BOB enrolled, the bound is full"
+
+echo "=== the laptop, bound before the enrolment, is registered by its own owner operation (M§4.4)"
+LAPTOP=$(grep -m1 "^DEVICE " "$DIR/bl.log" | cut -d' ' -f2)
+# the answers come in order on the binding: once the mailbox has handled the sync after it, the upload's is out
+echo "kp 2" >&5; echo "sync" >&5
+wait_for "$DIR/mbx.log" "sync from $LAPTOP " 10; sleep 1
+if grep -q "^ERR" "$DIR/bl.log"; then tail -3 "$DIR/bl.log"; echo "FAIL: the laptop was refused"; exit 1; fi
+grep -q "enrolled $BOB " "$DIR/mbx.log" && [ "$(count "$DIR/mbx.log" "enrolled $BOB ")" = 1 ]
+echo "    ok: the laptop's key packages accepted, one enrolment"
+echo "quit" >&5; exec 5>&-; wait $LAPTOP_PID 2>/dev/null || true
 
 echo "=== Carol, arriving while the place is taken, is refused mailbox.not-served (not dropped)"
 device carol "$DIR/c.in" "$DIR/c.log"; CAROL_PID=$LAST_PID; exec 4>"$DIR/c.in"

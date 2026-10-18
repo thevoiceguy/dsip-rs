@@ -59,6 +59,8 @@ try {
   alice = watch(await person(browser, 'Alice'));
   bob = watch(await person(browser, 'Bob'));
   await mailboxBound(alice); await mailboxBound(bob);
+  // Kim fetches their KeyPackages as soon as they grant (M§5.5): their own upload must have landed first
+  for (const p of [alice, bob]) await until(p.page, () => /◇ key_packages_uploaded/.test(document.getElementById('log').textContent), null, 20000);
   for (const p of [alice, bob]) await p.page.evaluate((d) => window.dsip.setRecordKeeper(d), kim.did);
   step = '2 contacts';
   await addContact(alice, bob); await addContact(bob, alice);

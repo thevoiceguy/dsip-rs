@@ -515,20 +515,34 @@ impl Service {
     /// (`mailbox.not-served`), or `None`. A service identity (bound as itself) is not an owner and never enrols; its
     /// operations go to the drop box as before.
     fn owner_op(&mut self, identity: &str, device: &str, id: &str, now: i64) -> Option<Vec<Out>> {
-        if identity == device || self.serves(identity) {
+        if identity == device {
+            return None;
+        }
+        if self.serves(identity) {
+            // M§4.4: the device is on a verified binding of a served identity. One that bound before another device of
+            // the identity enrolled it was not registered at its hello, so it is registered here.
+            self.register(identity, device);
             return None;
         }
         let emissions = self.enrolment.owner_op(identity, device, id);
         if emissions.iter().any(|e| e.get("enrolled").is_some()) {
-            let o = self.ensure_owner(identity);
-            let mut devices: Vec<String> = o.mailbox.devices().to_vec();
-            devices.push(device.to_string());
-            o.mailbox.register_devices(&devices);
+            self.ensure_owner(identity);
+            self.register(identity, device);
             tracing::info!("enrolled {identity} (serve-any {}/{})", self.enrolment.entries().len(), self.serve_any.unwrap_or(0));
             return None;
         }
         tracing::info!("not serving {identity}: serve-any {}/{} (M§4.1)", self.enrolment.entries().len(), self.serve_any.unwrap_or(0));
         Some(self.mailbox_out(identity, emissions, now))
+    }
+
+    /// Register `device` as one of the served `identity`'s devices (M§4.4), if it is not already.
+    fn register(&mut self, identity: &str, device: &str) {
+        let Some(o) = self.owned.get_mut(identity) else { return };
+        if !o.mailbox.devices().iter().any(|d| d == device) {
+            let mut devices: Vec<String> = o.mailbox.devices().to_vec();
+            devices.push(device.to_string());
+            o.mailbox.register_devices(&devices);
+        }
     }
 
     /// End an identity's enrolment (M§4.1, spec-gap 130): delete everything held for it — its mailbox machine and
@@ -1266,12 +1280,9 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
                 // M§5.4: live push belongs to a connection. A new binding starts not live, whatever an earlier
                 // connection of this device asked for, until it syncs live; otherwise a push could jump its cursor past
                 // items stored while it was away, which it would then never sync.
-                let o = st.ensure_owner(&identity);
-                o.mailbox.step(&json!({"unbind": {"device": device}}));
+                st.ensure_owner(&identity).mailbox.step(&json!({"unbind": {"device": device}}));
                 // The owner's registered devices are the ones that have bound (M§4.4), including before a restart.
-                let mut devices: Vec<String> = o.mailbox.devices().to_vec();
-                devices.push(device.clone());
-                o.mailbox.register_devices(&devices);
+                st.register(&identity, &device);
             }
         }
         st.persist();
