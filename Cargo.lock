@@ -1346,6 +1346,7 @@ dependencies = [
  "dsip-schema",
  "dsip-session",
  "dsip-webrtc-binding",
+ "proptest",
  "rand 0.8.7",
  "serde",
  "serde_json",

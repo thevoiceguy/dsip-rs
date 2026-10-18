@@ -527,7 +527,8 @@ impl Endpoint {
             | LocalEvent::Grant { .. }
             | LocalEvent::RejectIntroduction { .. }
             | LocalEvent::Revoke { .. }
-            | LocalEvent::IssueToken { .. } => unreachable!("handled above"),
+            // handled before the session lookup, which returned for each of them
+            | LocalEvent::IssueToken { .. } => self.emit(Emission::Refused(Refusal::InvalidState)),
             LocalEvent::Cancel { .. } => {
                 if s.role == Role::Initiator && matches!(s.state, SessionState::Inviting | SessionState::Proceeding) {
                     self.stop_all(&sid);
@@ -658,7 +659,11 @@ impl Endpoint {
                             ..Default::default()
                         });
                     }
-                    _ => unreachable!(),
+                    // the outer arm admits only these two
+                    _ => {
+                        self.emit(Emission::Refused(Refusal::InvalidState));
+                        return;
+                    }
                 }
                 self.sessions.get_mut(&sid).expect("exists").outstanding = None;
             }

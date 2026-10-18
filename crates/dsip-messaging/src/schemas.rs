@@ -42,15 +42,14 @@ pub const SCHEMAS: &[(&str, &str)] = &[
 fn compiled() -> &'static HashMap<&'static str, Validator> {
     static CELL: OnceLock<HashMap<&'static str, Validator>> = OnceLock::new();
     CELL.get_or_init(|| {
+        // A schema that does not parse or compile is left out, so `schema_ok` refuses its instances rather than
+        // the process panicking; `every_schema_compiles` fails the build on such a schema.
         SCHEMAS
             .iter()
-            .map(|(name, text)| {
-                let schema: Value = serde_json::from_str(text).expect("embedded schema is JSON");
-                let v = jsonschema::options()
-                    .should_validate_formats(false)
-                    .build(&schema)
-                    .unwrap_or_else(|e| panic!("messaging schema {name} does not compile: {e}"));
-                (*name, v)
+            .filter_map(|(name, text)| {
+                let schema: Value = serde_json::from_str(text).ok()?;
+                let v = jsonschema::options().should_validate_formats(false).build(&schema).ok()?;
+                Some((*name, v))
             })
             .collect()
     })
@@ -59,4 +58,16 @@ fn compiled() -> &'static HashMap<&'static str, Validator> {
 /// Whether `instance` is valid against the named profile schema. An unknown name is invalid.
 pub fn schema_ok(name: &str, instance: &Value) -> bool {
     compiled().get(name).is_some_and(|v| v.is_valid(instance))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_schema_compiles() {
+        for (name, _) in SCHEMAS.iter() {
+            assert!(compiled().contains_key(name), "messaging schema {name} does not compile");
+        }
+    }
 }
