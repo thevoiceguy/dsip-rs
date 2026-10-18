@@ -43,14 +43,12 @@ const sdp = (n, setup, direction = 'sendrecv') => ['v=0', `o=- ${n} 1 IN IP4 127
   'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'c=IN IP4 0.0.0.0', 'a=ice-ufrag:0123456789abcdef0123456789abcdef',
   'a=ice-pwd:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', `a=fingerprint:sha-256 ${FP}`,
   `a=setup:${setup}`, 'a=mid:0', `a=${direction}`, 'a=rtcp-mux', 'a=rtpmap:111 opus/48000/2'].join('\r\n') + '\r\n';
-A.set_sdp(sdp(1, 'actpass'));
 const sid = A.new_id(now());
-drive('A', A.local(JSON.stringify({ local: 'place_call', session: sid, to: bob.identity }), now()));
+drive('A', A.local(JSON.stringify({ local: 'place_call', session: sid, to: bob.identity, sdp: sdp(1, 'actpass') }), now()));
 let r = pump();
 check('bob received verified invite', kinds(r.B).includes('recv:invite') && kinds(r.B).includes('ui:offered'), JSON.stringify(kinds(r.B)));
 drive('B', B.local(JSON.stringify({ local: 'alert', session: sid, ring_timeout: 60 }), now()));
-B.set_sdp(sdp(2, 'active'));
-drive('B', B.local(JSON.stringify({ local: 'accept', session: sid, answered_by: 'user' }), now()));
+drive('B', B.local(JSON.stringify({ local: 'accept', session: sid, answered_by: 'user', sdp: sdp(2, 'active') }), now()));
 r = pump();
 const ka = kinds(r.A);
 check('alice: progress then answer → ACTIVE with media start', ka.includes('recv:progress') && ka.includes('recv:answer') && ka.includes('media:start'), JSON.stringify(ka));
@@ -60,19 +58,17 @@ const answerEv = r.A.find((e) => e.received?.message.type === 'answer');
 check('answer carried SDP in transports[0].sdp (§16.3 binding object)', answerEv?.received.payload.transports?.[0]?.sdp?.startsWith('v=0'));
 
 // 2. ICE candidates ride in signed info (ACTIVE-only)
-A.set_info_data(JSON.stringify({ candidates: [{ candidate: 'candidate:1 1 udp 1 127.0.0.1 5000 typ host', sdp_mid: '0', sdp_m_line_index: 0 }], end_of_candidates: false }));
-drive('A', A.local(JSON.stringify({ local: 'info', session: sid }), now()));
+drive('A', A.local(JSON.stringify({ local: 'info', session: sid,
+  data: { candidates: [{ candidate: 'candidate:1 1 udp 1 127.0.0.1 5000 typ host', sdp_mid: '0', sdp_m_line_index: 0 }], end_of_candidates: false } }), now()));
 r = pump();
 check('bob received info with candidates', r.B.some((e) => e.received?.message.type === 'info' && e.received.payload.data.candidates.length === 1));
 
 // 3. renegotiation: bob adds video via update; alice answers it
-B.set_sdp(sdp(3, 'actpass'));
 const uid = B.new_id(now());
-drive('B', B.local(JSON.stringify({ local: 'update', session: sid, id: uid }), now()));
+drive('B', B.local(JSON.stringify({ local: 'update', session: sid, id: uid, sdp: sdp(3, 'actpass') }), now()));
 r = pump();
 check('alice: update offered', kinds(r.A).includes('ui:update_offered'));
-A.set_sdp(sdp(4, 'active'));
-drive('A', A.local(JSON.stringify({ local: 'answer_update', session: sid, in_reply_to: uid }), now()));
+drive('A', A.local(JSON.stringify({ local: 'answer_update', session: sid, in_reply_to: uid, sdp: sdp(4, 'active') }), now()));
 r = pump();
 check('bob: update answered → media apply_update', kinds(r.B).includes('media:apply_update'));
 

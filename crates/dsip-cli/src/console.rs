@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use dsip_core::ulid::Ulid;
 use dsip_media::{Candidate, MediaConfig, MediaEvent, MediaLeg, Source};
+use dsip_transport::{Command, Invite};
 use dsip_session::{Emission, LocalEvent, MediaCommand, TimerAction, UiEvent};
 use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
 use dsip_transport::identity::Identity;
@@ -215,6 +216,7 @@ fn media_enabled(opts: &ConsoleOpts) -> bool {
 ///
 /// Spec: §12.4 (invite), §19.4 (held grant), §16.3 (SDP in the transport descriptor).
 async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(String, Option<Media>)> {
+    let mut invite = Invite::default();
     if let Some(g) = agent.endpoint().contacts.held_from(to, dsip_transport::now_s()) {
         println!("contacts  holding grant …{} from {} — attached to the invite   §19.4", sid8(&g), short(to));
     }
@@ -224,20 +226,20 @@ async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(
         let b = dsip_number::parse_binding(&binding).map_err(|r| anyhow::anyhow!("--tn-binding: {}", r.0))?;
         let number = b.payload["tn"].as_str().unwrap_or_default().to_string();
         println!("claims    tel {number} with a binding (x5u {}) → invite identity.claims   N§4", b.header["x5u"].as_str().unwrap_or_default());
-        agent.set_claims(vec![serde_json::json!({"type": "tel", "number": number, "binding": binding})]);
+        invite.claims = vec![serde_json::json!({"type": "tel", "number": number, "binding": binding})];
     }
     if let Some(d) = &opts.destination {
-        agent.set_invite_patch(Some(serde_json::json!({"destination": d}))); // N§4.1
+        invite.patch.destination = Some(d.as_str().into()); // N§4.1
     }
     let mut media = None;
     if media_enabled(opts) {
         let m = new_leg(opts, false).await?;
         let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
         println!("media     WebRTC offer created ({} bytes SDP, backend {}) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len(), m.leg.backend().name());
-        agent.set_sdp(Some(sdp));
+        invite.sdp = Some(sdp);
         media = Some(m);
     }
-    Ok((agent.place_call(to).await?, media))
+    Ok((agent.place_call_with(to, invite).await?, media))
 }
 
 async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
@@ -258,8 +260,7 @@ async fn flush_candidates(agent: &mut Agent, media: &mut Option<Media>, current:
     let batch = std::mem::take(&mut m.pending);
     let end = batch.iter().any(Option::is_none);
     let cands: Vec<Candidate> = batch.into_iter().flatten().collect();
-    agent.set_info_data(serde_json::json!({"candidates": cands, "end_of_candidates": end}));
-    agent.local(LocalEvent::Info { session: sid.clone() }).await
+    agent.command(Command::Info { session: sid.clone(), data: serde_json::json!({"candidates": cands, "end_of_candidates": end}) }).await
 }
 
 const DEFAULT_RELAY: &str = "wss://127.0.0.1:8443/dsip";
@@ -669,15 +670,16 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                     "done" => {}
                                     "accept" | "screen" => {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
+                                        let mut sdp = None;
                                         if let Some(m) = media.as_mut() {
                                             if let Some(offer) = m.remote_offer.take() {
                                                 let ans = relay_only_sdp(m.leg.accept_offer(&offer).await?, opts.relay_only);
                                                 println!("  media   WebRTC answer created ({} bytes SDP, backend {}) → answer.transports[0].sdp", ans.len(), m.leg.backend().name());
-                                                agent.set_sdp(Some(ans));
+                                                sdp = Some(ans);
                                             }
                                         }
                                         let ab = if auto == "screen" { "screening" } else { "user" };
-                                        agent.local(LocalEvent::Accept { session: sid.clone(), answered_by: Some(ab.into()) }).await?;
+                                        agent.command(Command::Accept { session: sid.clone(), answered_by: Some(ab.into()), sdp }).await?;
                                     }
                                     "decline" => {
                                         agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
@@ -900,6 +902,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     continue;
                 };
                 // Media preparation for commands that carry SDP (§16.3)
+                let mut sdp = None;
                 match cmd.as_str() {
                     "accept" | "screen" => {
                         if let Some(m) = media.as_mut() {
@@ -911,7 +914,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                     m.leg = fresh.leg;
                                 }
                                 let ans = m.leg.accept_offer(&offer).await?;
-                                agent.set_sdp(Some(ans));
+                                sdp = Some(ans);
                             }
                         }
                     }
@@ -921,36 +924,35 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                 // §14.4 step 3: the screening leg was recvonly; add our source and re-offer sendrecv
                                 m.leg.add_source(Source::parse(&opts.media)?).await?;
                             }
-                            let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
-                            agent.set_sdp(Some(sdp));
+                            sdp = Some(relay_only_sdp(m.leg.create_offer().await?, opts.relay_only));
                         }
                     }
                     "answer-update" => {
                         if let Some(m) = media.as_mut() {
                             if let Some(offer) = m.remote_offer.take() {
                                 let ans = m.leg.accept_offer(&offer).await?;
-                                agent.set_sdp(Some(ans));
+                                sdp = Some(ans);
                             }
                         }
                     }
                     _ => {}
                 }
                 let ev = match cmd.as_str() {
-                    "cancel" => Some(LocalEvent::Cancel { session: sid }),
-                    "hangup" => Some(LocalEvent::Hangup { session: sid, reason: None }),
-                    "accept" => Some(LocalEvent::Accept { session: sid, answered_by: Some("user".into()) }),
-                    "screen" => Some(LocalEvent::Accept { session: sid, answered_by: Some("screening".into()) }),
-                    "decline" => Some(LocalEvent::Decline { session: sid, reason: None }),
-                    "update" => Some(LocalEvent::Update { session: sid, id: Ulid::generate().to_string(), answered_by: None }),
-                    "escalate" => Some(LocalEvent::Update { session: sid, id: Ulid::generate().to_string(), answered_by: Some("user".into()) }),
-                    "answer-update" => pending_update.take().map(|u| LocalEvent::AnswerUpdate { session: sid, in_reply_to: u, answered_by: Some("user".into()) }),
-                    "reject-update" => pending_update.take().map(|u| LocalEvent::RejectUpdate { session: sid, in_reply_to: u, reason: "media.unsupported".into() }),
-                    "info" => Some(LocalEvent::Info { session: sid }),
+                    "cancel" => Some(LocalEvent::Cancel { session: sid }.into()),
+                    "hangup" => Some(LocalEvent::Hangup { session: sid, reason: None }.into()),
+                    "accept" => Some(Command::Accept { session: sid, answered_by: Some("user".into()), sdp }),
+                    "screen" => Some(Command::Accept { session: sid, answered_by: Some("screening".into()), sdp }),
+                    "decline" => Some(LocalEvent::Decline { session: sid, reason: None }.into()),
+                    "update" => Some(Command::Update { session: sid, id: Ulid::generate().to_string(), answered_by: None, sdp }),
+                    "escalate" => Some(Command::Update { session: sid, id: Ulid::generate().to_string(), answered_by: Some("user".into()), sdp }),
+                    "answer-update" => pending_update.take().map(|u| Command::AnswerUpdate { session: sid, in_reply_to: u, answered_by: Some("user".into()), sdp }),
+                    "reject-update" => pending_update.take().map(|u| LocalEvent::RejectUpdate { session: sid, in_reply_to: u, reason: "media.unsupported".into() }.into()),
+                    "info" => Some(LocalEvent::Info { session: sid }.into()),
                     "quit" => break,
                     other => { println!("unknown command {other}"); None }
                 };
                 if let Some(ev) = ev {
-                    agent.local(ev).await?;
+                    agent.command(ev).await?;
                 }
             }
         }

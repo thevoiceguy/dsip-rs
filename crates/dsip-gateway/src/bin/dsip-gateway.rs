@@ -30,7 +30,6 @@ use tokio::sync::Mutex;
 use dsip_gateway::host::call::{apply, on_dsip_event, on_rtp_dtmf, on_sip_event, Call, Calls, Legs};
 use dsip_gateway::host::dsip_leg::DsipMedia;
 use dsip_gateway::host::media::{bridge, RtpLeg};
-use dsip_session::LocalEvent;
 use dsip_gateway::host::numbers::{e164, origid_for, Numbers};
 use dsip_gateway::host::sip_leg::{SipEvent, SipLeg};
 
@@ -245,8 +244,7 @@ impl MediaTable {
             }
             let batch = std::mem::take(&mut m.pending);
             let n = batch.len();
-            agent.set_info_data(json!({"candidates": batch, "end_of_candidates": false}));
-            if agent.local(LocalEvent::Info { session: sid.clone() }).await.is_ok() {
+            if agent.command(dsip_transport::Command::Info { session: sid.clone(), data: json!({"candidates": batch, "end_of_candidates": false}) }).await.is_ok() {
                 println!("media     {n} ICE candidate(s) sent in a signed info   §12.12");
             }
         }

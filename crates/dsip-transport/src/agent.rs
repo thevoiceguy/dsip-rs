@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
-use dsip_endpoint::{ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys};
+use dsip_endpoint::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite};
 use dsip_session::{Emission, Endpoint, LocalEvent, Message};
 
 use crate::conn::{ConnectParams, Connection};
@@ -170,8 +170,13 @@ impl Agent {
 
     /// Place a call; returns the new session id.
     pub async fn place_call(&mut self, to: &str) -> Result<String> {
+        self.place_call_with(to, Invite::default()).await
+    }
+
+    /// Place a call with what the host adds to the invite (SDP, claims, patch); returns the new session id.
+    pub async fn place_call_with(&mut self, to: &str, invite: Invite) -> Result<String> {
         let sid = self.core.new_id(now_s());
-        self.local(LocalEvent::PlaceCall { session: sid.clone(), to: to.to_string() }).await?;
+        self.command(Command::PlaceCall { session: sid.clone(), to: to.to_string(), invite }).await?;
         Ok(sid)
     }
 
@@ -186,16 +191,6 @@ impl Agent {
         let env = dsip_core::envelope::Envelope::from_frame(&frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
         self.conn.send(&env).await?;
         Ok(frame)
-    }
-
-    /// SDP for the next invite/answer/update (§16.3 transport binding object).
-    pub fn set_sdp(&mut self, sdp: Option<String>) {
-        self.core.set_sdp(sdp);
-    }
-
-    /// A patch for the next invite only (Recording Profile C§6).
-    pub fn set_invite_patch(&mut self, patch: Option<serde_json::Value>) {
-        self.core.set_invite_patch(patch);
     }
 
     /// Whether `device` presented a delegation granting `capability` (Recording Profile C§6).
@@ -213,19 +208,14 @@ impl Agent {
         self.core.set_seal(on);
     }
 
-    /// Claims for the next invite's `identity.claims` (§18.1).
-    pub fn set_claims(&mut self, claims: Vec<serde_json::Value>) {
-        self.core.set_claims(claims);
-    }
-
-    /// `data` for the next `info` (ICE candidates, §12.12).
-    pub fn set_info_data(&mut self, data: serde_json::Value) {
-        self.core.set_info_data(data);
-    }
-
     /// Drive a local event through the core and act on its output.
     pub async fn local(&mut self, ev: LocalEvent) -> Result<()> {
-        let out = self.core.local(ev, now_s())?;
+        self.command(Command::Engine(ev)).await
+    }
+
+    /// Drive a host request through the core and act on its output.
+    pub async fn command(&mut self, cmd: Command) -> Result<()> {
+        let out = self.core.command(cmd, now_s())?;
         self.dispatch(out).await
     }
 

@@ -14,6 +14,7 @@ use dsip_media::{Candidate, MediaConfig, MediaEvent, MediaLeg, Source};
 use dsip_session::LocalEvent;
 use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
 use dsip_transport::identity::Identity;
+use dsip_transport::Command;
 use futures_util::FutureExt as _;
 use serde_json::{json, Value};
 
@@ -66,8 +67,7 @@ pub async fn run(identity: PathBuf, relay: String, ca: Option<PathBuf>, dir: Pat
                         let batch = std::mem::take(&mut s.pending);
                         let end = batch.iter().any(Option::is_none);
                         let cands: Vec<Candidate> = batch.into_iter().flatten().collect();
-                        agent.set_info_data(json!({"candidates": cands, "end_of_candidates": end}));
-                        agent.local(LocalEvent::Info { session: sid.clone() }).await?;
+                        agent.command(Command::Info { session: sid.clone(), data: json!({"candidates": cands, "end_of_candidates": end}) }).await?;
                     }
                 }
             }
@@ -91,9 +91,8 @@ pub async fn run(identity: PathBuf, relay: String, ca: Option<PathBuf>, dir: Pat
                                                                   send_only: false, tap_in: None, tap_out: None }).await?;
                             let offer = payload.pointer("/transports/0/sdp").and_then(Value::as_str).context("recording session without SDP")?;
                             let ans = leg.accept_offer(offer).await?;
-                            agent.set_sdp(Some(ans));
                             agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(30) }).await?;
-                            agent.local(LocalEvent::Accept { session: sid.clone(), answered_by: Some("service".into()) }).await?;
+                            agent.command(Command::Accept { session: sid.clone(), answered_by: Some("service".into()), sdp: Some(ans) }).await?;
                             // the metadata, kept beside the media (RFC 7865 shape)
                             let meta_path = dir.join(format!("{of}.json"));
                             let mut meta: Value = std::fs::read_to_string(&meta_path).ok().and_then(|s| serde_json::from_str(&s).ok())
