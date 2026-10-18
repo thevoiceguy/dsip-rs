@@ -45,6 +45,7 @@ pub async fn run(identity: PathBuf, relay: String, ca: Option<PathBuf>, dir: Pat
         first_contact_required: false,
         seal: false,
         did_resolver: None,
+        calls: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     println!("recorder  bound; answering recording sessions only   C§6");

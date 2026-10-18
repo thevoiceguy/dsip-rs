@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use dsip_core::ulid::Ulid;
 use dsip_media::{Candidate, MediaConfig, MediaEvent, MediaLeg, Source};
-use dsip_transport::{Command, Invite};
+use dsip_transport::{AnswerPolicy, CallCommand, CallEvent, CallsConfig, Invite, MediaRequest, MediaResult};
 use dsip_session::{Emission, LocalEvent, MediaCommand, TimerAction, UiEvent};
 use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
 use dsip_transport::identity::Identity;
@@ -192,13 +192,11 @@ impl TnContext {
     }
 }
 
-/// Media state for the current session.
+/// The media leg of the current session. The call glue (`dsip_endpoint::calls`) says what to do with it.
 struct Media {
     leg: MediaLeg,
-    /// Candidates gathered before ACTIVE (§12.12: info is ACTIVE-only).
-    pending: Vec<Option<Candidate>>,
-    /// Remote offer SDP awaiting our answer (invite or update).
-    remote_offer: Option<String>,
+    /// Made for screening: recvonly, no local source (§14.4).
+    screening: bool,
 }
 
 async fn next_media(m: &mut Option<Media>) -> MediaEvent {
@@ -212,10 +210,10 @@ fn media_enabled(opts: &ConsoleOpts) -> bool {
     opts.media != "none" || opts.record.is_some()
 }
 
-/// Place a call to `to`: attach a held grant, create the media offer, send the invite.
+/// Place a call to `to`: attach a held grant and our number claim; the call glue asks for the media offer.
 ///
 /// Spec: §12.4 (invite), §19.4 (held grant), §16.3 (SDP in the transport descriptor).
-async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(String, Option<Media>)> {
+async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<String> {
     let mut invite = Invite::default();
     if let Some(g) = agent.endpoint().contacts.held_from(to, dsip_transport::now_s()) {
         println!("contacts  holding grant …{} from {} — attached to the invite   §19.4", sid8(&g), short(to));
@@ -231,15 +229,7 @@ async fn start_call(agent: &mut Agent, opts: &ConsoleOpts, to: &str) -> Result<(
     if let Some(d) = &opts.destination {
         invite.patch.destination = Some(d.as_str().into()); // N§4.1
     }
-    let mut media = None;
-    if media_enabled(opts) {
-        let m = new_leg(opts, false).await?;
-        let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
-        println!("media     WebRTC offer created ({} bytes SDP, backend {}) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len(), m.leg.backend().name());
-        invite.sdp = Some(sdp);
-        media = Some(m);
-    }
-    Ok((agent.place_call_with(to, invite).await?, media))
+    Ok(agent.place(to, invite).await?)
 }
 
 async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
@@ -248,19 +238,79 @@ async fn new_leg(opts: &ConsoleOpts, screening: bool) -> Result<Media> {
     let leg = MediaLeg::new(MediaConfig { source, record: opts.record.clone(), stun: opts.stun.clone(), turn: opts.turn.clone(), backend,
                                          send_only: false, tap_in: opts.fork_taps.as_ref().map(|t| t.0.clone()),
                                          tap_out: opts.fork_taps.as_ref().map(|t| t.1.clone()) }).await?;
-    Ok(Media { leg, pending: vec![], remote_offer: None })
+    Ok(Media { leg, screening })
 }
 
-/// Send buffered candidates in a signed `info` once the session is ACTIVE (§12.12).
-async fn flush_candidates(agent: &mut Agent, media: &mut Option<Media>, current: &Option<String>) -> Result<()> {
-    let (Some(m), Some(sid)) = (media.as_mut(), current) else { return Ok(()) };
-    if m.pending.is_empty() || agent.endpoint().session(sid).map(|s| s.state) != Some(dsip_session::SessionState::Active) {
-        return Ok(());
+/// Do the media work the call glue asks for, and hand back the SDP it waits on.
+///
+/// Spec: §16.3 (SDP in `transports[0].sdp`), §14.4 (a screening leg sends nothing; escalation adds the source),
+/// §12.12 (remote candidates from signed `info`), §14.1 (send only once told).
+async fn handle_media(agent: &mut Agent, media: &mut Option<Media>, opts: &ConsoleOpts, req: MediaRequest) -> Result<()> {
+    match req {
+        MediaRequest::Offer { session, add_source } => {
+            let fresh = media.is_none();
+            if fresh {
+                *media = Some(new_leg(opts, false).await?);
+            }
+            let Some(m) = media.as_mut() else { return Ok(()) };
+            if add_source {
+                // §14.4 step 3: the screening leg was recvonly; add our source and re-offer sendrecv
+                m.leg.add_source(Source::parse(&opts.media)?).await?;
+            }
+            let sdp = relay_only_sdp(m.leg.create_offer().await?, opts.relay_only);
+            if fresh {
+                println!("media     WebRTC offer created ({} bytes SDP, backend {}) → rides in invite.transports[0].sdp   §16.3 (spec-gap 16)", sdp.len(), m.leg.backend().name());
+            }
+            agent.media(MediaResult::Offer { session, sdp }).await?;
+        }
+        MediaRequest::Answer { session, offer, screening } => {
+            if media.as_ref().is_none_or(|m| screening && !m.screening) {
+                if let Some(old) = media.take() {
+                    old.leg.close().await;
+                }
+                *media = Some(new_leg(opts, screening).await?);
+            }
+            let Some(m) = media.as_mut() else { return Ok(()) };
+            let sdp = relay_only_sdp(m.leg.accept_offer(&offer).await?, opts.relay_only);
+            println!("  media   WebRTC answer created ({} bytes SDP, backend {}) → answer.transports[0].sdp", sdp.len(), m.leg.backend().name());
+            agent.media(MediaResult::Answer { session, sdp }).await?;
+        }
+        MediaRequest::ApplyAnswer { sdp, .. } => {
+            if let Some(m) = media.as_ref() {
+                m.leg.set_answer(&sdp).await?;
+                println!("  media   remote WebRTC answer applied");
+            }
+        }
+        MediaRequest::RemoteCandidates { candidates, .. } => {
+            if let Some(m) = media.as_ref() {
+                let cands: Vec<Candidate> = candidates.into_iter().filter_map(|c| serde_json::from_value(c).ok()).collect();
+                for c in &cands {
+                    if opts.relay_only && !c.candidate.contains("typ relay") { continue; }
+                    m.leg.add_remote_candidate(c).await.ok();
+                }
+                println!("  media   {} remote ICE candidate(s) applied from signed info   §12.12", cands.len());
+            }
+        }
+        MediaRequest::StartSending { .. } => {
+            if let Some(m) = media.as_ref() {
+                m.leg.start_sending(); // §14.1: only now, after the signed answer (C§4: and accepted)
+            }
+        }
+        MediaRequest::HoldSending { .. } => {
+            if let Some(m) = media.as_ref() {
+                m.leg.hold_sending();
+            }
+        }
+        MediaRequest::Close { .. } => {
+            if let Some(m) = media.take() {
+                let st = m.leg.stats();
+                println!("  media   closed — received {} RTP packets / {} bytes, sent {} Opus frames", st.packets_in, st.bytes_in, st.frames_out);
+                m.leg.close().await;
+            }
+        }
+        other => println!("  media   unhandled request {other:?}"),
     }
-    let batch = std::mem::take(&mut m.pending);
-    let end = batch.iter().any(Option::is_none);
-    let cands: Vec<Candidate> = batch.into_iter().flatten().collect();
-    Ok(agent.command(Command::Info { session: sid.clone(), data: serde_json::json!({"candidates": cands, "end_of_candidates": end}) }).await?)
+    Ok(())
 }
 
 const DEFAULT_RELAY: &str = "wss://127.0.0.1:8443/dsip";
@@ -442,6 +492,23 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         }
     }
     let relay_url = relay_url.unwrap_or_else(|| DEFAULT_RELAY.to_string());
+    // Recording Profile C§4: our consent to the other side's declaration; the answer policy for incoming calls
+    let accept_policy = match opts.recording_accept.as_str() {
+        "always" => dsip_recording::AcceptPolicy::Always,
+        "never" => dsip_recording::AcceptPolicy::Never,
+        _ => dsip_recording::AcceptPolicy::Ask,
+    };
+    let auto = match &mode {
+        Mode::Answer { auto, .. } => auto.clone(),
+        _ => String::new(),
+    };
+    let answer = match auto.as_str() {
+        "accept" => AnswerPolicy::Accept,
+        "screen" => AnswerPolicy::Screen,
+        "decline" => AnswerPolicy::Decline,
+        "silent" => AnswerPolicy::Silent,
+        _ => AnswerPolicy::Ring,
+    };
     let cfg = AgentConfig {
         relay_url: relay_url.clone(),
         tls: tls::client_config(opts.ca.as_deref())?,
@@ -452,6 +519,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         first_contact_required: matches!(&mode, Mode::Answer { first_contact: true, .. }),
         seal: opts.seal,
         did_resolver: None,
+        calls: Some(CallsConfig { media: media_enabled(&opts), answer, recording: accept_policy }),
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     if let Mode::Answer { first_contact, tokens, .. } = &mode {
@@ -510,33 +578,17 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
     }
 
     let mut current: Option<String> = None;
-    let mut pending_update: Option<String> = None;
-    // Recording Profile C§3–C§4: our declaration, and our consent to the other side's
-    let accept_policy = match opts.recording_accept.as_str() {
-        "always" => dsip_recording::AcceptPolicy::Always,
-        "never" => dsip_recording::AcceptPolicy::Never,
-        _ => dsip_recording::AcceptPolicy::Ask,
-    };
+    // Recording Profile C§3: our declaration
     if let (Some(r), false) = (&opts.recorded_by, opts.record_later) {
         agent.set_recording(Some(serde_json::json!({"state": "on", "recorder": r, "purpose": opts.record_purpose})));
         println!("recording this side is recorded by {}  (purpose {}) — declared on every invite/answer/update   C§3", short(r), opts.record_purpose);
     }
-    let mut consent = dsip_recording::Consent::new(matches!(mode, Mode::Answer { .. }), accept_policy);
-    let mut deferred_answer: Option<&'static str> = None;
-    let auto = match &mode {
-        Mode::Answer { auto, .. } => auto.clone(),
-        _ => String::new(),
-    };
     let mut intro_deadline: Option<tokio::time::Instant> = None;
     let mut cmds_closed = false;
     let mut media: Option<Media> = None;
-    // §10.4: a sealed call refused as an unknown critical extension is placed once more in clear
-    let mut resent_in_clear = false;
     match &mode {
         Mode::Call { to } => {
-            let (sid, m) = start_call(&mut agent, &opts, to).await?;
-            current = Some(sid);
-            media = m;
+            current = Some(start_call(&mut agent, &opts, to).await?);
             println!("(commands: cancel | update | answer-update | reject-update | info | hangup | quit)");
         }
         Mode::Introduce { to, purpose, token, wait } => {
@@ -597,23 +649,6 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                 }
                                 println!("  🔎 trust: {}   §18.1", dsip_core::trust::verification_basis(&identity, &claims));
                             }
-                            // §10.4, §11.3: a relay or callee without sealed-body/1.0 refuses the sealed invite as an
-                            // unknown critical extension; the sender MAY send a new message in clear — once.
-                            if matches!(message.msg_type.as_str(), "error" | "reject")
-                                && message.reason.as_deref() == Some("session.unsupported-critical-extension")
-                                && opts.seal && !resent_in_clear {
-                                if let Mode::Call { to } = &mode {
-                                    resent_in_clear = true;
-                                    println!("seal      sealed body refused by {} — placing the call again in clear   §10.4, §11.3", short(&identity));
-                                    if let Some(m) = media.take() {
-                                        m.leg.close().await;
-                                    }
-                                    agent.set_seal(false);
-                                    let (sid, m) = start_call(&mut agent, &opts, to).await?;
-                                    current = Some(sid);
-                                    media = m;
-                                }
-                            }
                             // §6.3 / G§7: a gateway.downgraded error names what crossing the PSTN lost.
                             if message.msg_type == "error" && message.reason.as_deref() == Some("gateway.downgraded") {
                                 let losses: Vec<&str> = payload.pointer("/detail/losses").and_then(|l| l.as_array())
@@ -625,96 +660,9 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                 peer_identity = Some(identity.clone());
                             }
                             print_state(&agent, &sid);
-                            let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
-                            let remote_sdp = payload.pointer("/transports/0/sdp").and_then(|v| v.as_str()).map(String::from);
-                            // C§4: the other side's recording declaration — render it, hold, or decline
-                            let mut recording_decline: Option<String> = None;
-                            if matches!(message.msg_type.as_str(), "invite" | "answer" | "update") {
-                                if message.msg_type == "invite" && offered {
-                                    consent = dsip_recording::Consent::new(true, accept_policy);
-                                }
-                                for e in consent.received(&message.msg_type, payload.get("recording")) {
-                                    if let Some(send) = e.get("send") {
-                                        recording_decline = send["type"].as_str().map(String::from);
-                                    }
-                                    print_recording(&e);
-                                }
-                                if consent.hold_media() {
-                                    if let Some(m) = media.as_ref() { m.leg.hold_sending(); }
-                                    println!("  ⏺  holding our media until you accept — type accept-recording / decline-recording   C§4");
-                                }
-                                if recording_decline.as_deref() == Some("bye") {
-                                    agent.local(LocalEvent::Hangup { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }).await?;
-                                }
-                            }
-                            if message.msg_type == "invite" && offered {
+                            // the call glue has already rung, answered or declined it by policy
+                            if message.msg_type == "invite" && agent.endpoint().session(&sid).is_some_and(|s| s.role == dsip_session::Role::Responder) {
                                 current = Some(sid.clone());
-                                if media_enabled(&opts) && auto != "silent" {
-                                    if remote_sdp.is_none() {
-                                        println!("  media   caller offered no SDP; answering without media");
-                                    }
-                                    media = Some(Media { leg: new_leg(&opts, auto == "screen").await?.leg, pending: vec![], remote_offer: remote_sdp.clone() });
-                                }
-                                let auto_now = if recording_decline.is_some() {
-                                    // C§4: declined by standing policy — ring, then reject policy.recording-declined
-                                    agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
-                                    agent.local(LocalEvent::Decline { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }).await?;
-                                    "done"
-                                } else if consent.pending() && matches!(auto.as_str(), "accept" | "screen") {
-                                    // C§4: never answer before acceptance
-                                    deferred_answer = Some(if auto == "screen" { "screen" } else { "accept" });
-                                    "none"
-                                } else {
-                                    auto.as_str()
-                                };
-                                match auto_now {
-                                    "done" => {}
-                                    "accept" | "screen" => {
-                                        agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
-                                        let mut sdp = None;
-                                        if let Some(m) = media.as_mut() {
-                                            if let Some(offer) = m.remote_offer.take() {
-                                                let ans = relay_only_sdp(m.leg.accept_offer(&offer).await?, opts.relay_only);
-                                                println!("  media   WebRTC answer created ({} bytes SDP, backend {}) → answer.transports[0].sdp", ans.len(), m.leg.backend().name());
-                                                sdp = Some(ans);
-                                            }
-                                        }
-                                        let ab = if auto == "screen" { "screening" } else { "user" };
-                                        agent.command(Command::Accept { session: sid.clone(), answered_by: Some(ab.into()), sdp }).await?;
-                                    }
-                                    "decline" => {
-                                        agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(60) }).await?;
-                                        agent.local(LocalEvent::Decline { session: sid.clone(), reason: None }).await?;
-                                    }
-                                    // a device that is bound but never responds: no progress, answer or reject. The relay
-                                    // expires the leg with the invite and tells the caller (§12.7 rule 6, spec-gap 132)
-                                    "silent" => println!("  ☎  invite received — staying silent (--auto silent)"),
-                                    _ => {
-                                        agent.local(LocalEvent::Alert { session: sid.clone(), ring_timeout: Some(120) }).await?;
-                                        println!("  ☎  RINGING — type accept / screen / decline");
-                                    }
-                                }
-                            }
-                            if message.msg_type == "update" {
-                                pending_update = Some(message.id.clone());
-                                if let Some(m) = media.as_mut() { m.remote_offer = remote_sdp.clone(); }
-                                println!("  ☎  update offered — type answer-update / reject-update");
-                            }
-                            if message.msg_type == "answer" {
-                                if let (Some(m), Some(sdp)) = (media.as_ref(), remote_sdp.as_ref()) {
-                                    m.leg.set_answer(sdp).await?;
-                                    println!("  media   remote WebRTC answer applied");
-                                }
-                            }
-                            if message.msg_type == "info" && payload["about"] == "transport:webrtc" {
-                                if let Some(m) = media.as_ref() {
-                                    let cands: Vec<Candidate> = serde_json::from_value(payload["data"]["candidates"].clone()).unwrap_or_default();
-                                    for c in &cands {
-                                        if opts.relay_only && !c.candidate.contains("typ relay") { continue; }
-                                        m.leg.add_remote_candidate(c).await.ok();
-                                    }
-                                    println!("  media   {} remote ICE candidate(s) applied from signed info   §12.12", cands.len());
-                                }
                             }
                             if message.msg_type == "introduction" {
                                 println!("  ✉  REQUEST (not a call): \"{}\" — type grant / reject-intro, or ignore (silence is a valid outcome)",
@@ -723,33 +671,17 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         }
                         AgentEvent::Emission(e) => {
                             print_emission(&e);
-                            if let Emission::Media(what) = &e {
-                                match (*what, media.as_mut()) {
-                                    (MediaCommand::Start, Some(m)) => {
-                                        if !consent.hold_media() {
-                                            m.leg.start_sending();   // §14.1: only now, after the signed answer (C§4: and accepted)
-                                        }
-                                        // C§6: the recorder leg, from our second device, once media flows
-                                        if let (Some((self_feed, peer_feed)), Some(dev), Some(rec), Some(of), Some(peer)) =
-                                            (fork_feeds.take(), opts.record_device.clone(), opts.recorded_by.clone(), current.clone(), peer_identity.clone()) {
-                                            let me = my_identity.clone();
-                                            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-                                            let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
-                                            let f = crate::record_fork::Fork { device: dev, relay: relay_url.clone(), ca: opts.ca.clone(), recorder: rec,
-                                                of, me: me.clone(), peer: peer.clone(), backend: opts.media_backend.clone(),
-                                                feeds: vec![(me, self_feed), (peer, peer_feed)] };
-                                            fork = Some((stop_tx, pause_tx, tokio::spawn(crate::record_fork::run(f, stop_rx, pause_rx))));
-                                        }
-                                        flush_candidates(&mut agent, &mut media, &current).await?;
-                                    }
-                                    (MediaCommand::ApplyUpdate, Some(m)) if !consent.hold_media() => m.leg.start_sending(),
-                                    (MediaCommand::Stop, Some(m)) => {
-                                        let st = m.leg.stats();
-                                        println!("  media   closed — received {} RTP packets / {} bytes, sent {} Opus frames", st.packets_in, st.bytes_in, st.frames_out);
-                                        m.leg.close().await;
-                                        media = None;
-                                    }
-                                    _ => {}
+                            // C§6: the recorder leg, from our second device, once media flows
+                            if let (Emission::Media(MediaCommand::Start), Some(_)) = (&e, media.as_ref()) {
+                                if let (Some((self_feed, peer_feed)), Some(dev), Some(rec), Some(of), Some(peer)) =
+                                    (fork_feeds.take(), opts.record_device.clone(), opts.recorded_by.clone(), current.clone(), peer_identity.clone()) {
+                                    let me = my_identity.clone();
+                                    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+                                    let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+                                    let f = crate::record_fork::Fork { device: dev, relay: relay_url.clone(), ca: opts.ca.clone(), recorder: rec,
+                                        of, me: me.clone(), peer: peer.clone(), backend: opts.media_backend.clone(),
+                                        feeds: vec![(me, self_feed), (peer, peer_feed)] };
+                                    fork = Some((stop_tx, pause_tx, tokio::spawn(crate::record_fork::run(f, stop_rx, pause_rx))));
                                 }
                             }
                             if let Emission::Ui(ui) = &e {
@@ -761,6 +693,26 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                                 }
                             }
                         }
+                        AgentEvent::Media(req) => handle_media(&mut agent, &mut media, &opts, req).await?,
+                        AgentEvent::Call(ev) => match ev {
+                            CallEvent::Ringing { .. } => println!("  ☎  RINGING — type accept / screen / decline"),
+                            // a device that is bound but never responds: no progress, answer or reject. The relay
+                            // expires the leg with the invite and tells the caller (§12.7 rule 6, spec-gap 132)
+                            CallEvent::Silent { .. } => println!("  ☎  invite received — staying silent (--auto silent)"),
+                            CallEvent::NoOffer { .. } => println!("  media   caller offered no SDP; answering without media"),
+                            CallEvent::UpdateOffered { .. } => println!("  ☎  update offered — type answer-update / reject-update"),
+                            CallEvent::Recording { emission, .. } => print_recording(&emission),
+                            CallEvent::RecordingHeld { .. } => {
+                                println!("  ⏺  holding our media until you accept — type accept-recording / decline-recording   C§4")
+                            }
+                            CallEvent::SendingResumed { .. } => println!("  media   sending resumed"),
+                            CallEvent::NothingToAccept { .. } => println!("nothing to accept"),
+                            CallEvent::ResentInClear { new, by, .. } => {
+                                println!("seal      sealed body refused by {} — placing the call again in clear   §10.4, §11.3", short(&by));
+                                current = Some(new);
+                            }
+                            other => println!("  ☎  {other:?}"),
+                        },
                         AgentEvent::Rejected(code, detail) => println!("✗ inbound rejected: {code} {detail}"),
                         AgentEvent::Reconnected { attempts } => println!("↻ reconnected after {attempts} attempt(s)           §13.2"),
                     }
@@ -774,10 +726,10 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         // end-of-candidates `None` marker).
                         let keep = !opts.relay_only
                             || c.as_ref().map(|cd| cd.candidate.contains("typ relay")).unwrap_or(true);
-                        if keep {
-                            if let Some(m) = media.as_mut() { m.pending.push(c); }
+                        if let (true, Some(session)) = (keep, current.clone()) {
+                            let candidate = c.map(serde_json::to_value).transpose()?;
+                            agent.media(MediaResult::Candidate { session, candidate }).await?;
                         }
-                        flush_candidates(&mut agent, &mut media, &current).await?;
                     }
                     MediaEvent::State(st) => {
                         println!("  media   webrtc {st}   (DTLS-SRTP)");
@@ -820,36 +772,10 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                 let verb = verb.as_str();
                 // Recording Profile C§3–C§4 commands
                 let cmd = match verb {
-                    "accept-recording" => {
-                        let emitted = consent.accept();
-                        emitted.iter().for_each(print_recording);
-                        if emitted.is_empty() {
-                            println!("nothing to accept");
-                            continue;
-                        }
-                        if let Some(c) = deferred_answer.take() {
-                            c.to_string()
-                        } else {
-                            let active = current.as_ref().and_then(|s| agent.endpoint().session(s)).map(|s| s.state) == Some(dsip_session::SessionState::Active);
-                            if let (Some(m), true) = (media.as_ref(), active) {
-                                m.leg.start_sending();
-                                println!("  media   sending resumed");
-                            }
-                            continue;
-                        }
-                    }
-                    "decline-recording" => {
-                        let Some(sid) = current.clone() else { continue };
-                        for e in consent.decline_now() {
-                            print_recording(&e);
-                            let ev = if e["send"]["type"] == "reject" {
-                                LocalEvent::Decline { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }
-                            } else {
-                                LocalEvent::Hangup { session: sid.clone(), reason: Some(dsip_recording::DECLINED.into()) }
-                            };
-                            agent.local(ev).await?;
-                        }
-                        deferred_answer = None;
+                    "accept-recording" | "decline-recording" => {
+                        let Some(session) = current.clone() else { println!("nothing to accept"); continue };
+                        agent.call(if verb == "accept-recording" { CallCommand::AcceptRecording { session } }
+                                   else { CallCommand::DeclineRecording { session } }).await?;
                         continue;
                     }
                     "record" => {
@@ -902,59 +828,22 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     println!("no session yet");
                     continue;
                 };
-                // Media preparation for commands that carry SDP (§16.3)
-                let mut sdp = None;
-                match cmd.as_str() {
-                    "accept" | "screen" => {
-                        if let Some(m) = media.as_mut() {
-                            if let Some(offer) = m.remote_offer.take() {
-                                if cmd == "screen" {
-                                    // §14.4: a recvonly leg exposes no local media while screening
-                                    let fresh = new_leg(&opts, true).await?;
-                                    m.leg.close().await;
-                                    m.leg = fresh.leg;
-                                }
-                                let ans = m.leg.accept_offer(&offer).await?;
-                                sdp = Some(ans);
-                            }
-                        }
-                    }
-                    "update" | "escalate" => {
-                        if let Some(m) = media.as_mut() {
-                            if verb == "escalate" {
-                                // §14.4 step 3: the screening leg was recvonly; add our source and re-offer sendrecv
-                                m.leg.add_source(Source::parse(&opts.media)?).await?;
-                            }
-                            sdp = Some(relay_only_sdp(m.leg.create_offer().await?, opts.relay_only));
-                        }
-                    }
-                    "answer-update" => {
-                        if let Some(m) = media.as_mut() {
-                            if let Some(offer) = m.remote_offer.take() {
-                                let ans = m.leg.accept_offer(&offer).await?;
-                                sdp = Some(ans);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                let ev = match cmd.as_str() {
-                    "cancel" => Some(LocalEvent::Cancel { session: sid }.into()),
-                    "hangup" => Some(LocalEvent::Hangup { session: sid, reason: None }.into()),
-                    "accept" => Some(Command::Accept { session: sid, answered_by: Some("user".into()), sdp }),
-                    "screen" => Some(Command::Accept { session: sid, answered_by: Some("screening".into()), sdp }),
-                    "decline" => Some(LocalEvent::Decline { session: sid, reason: None }.into()),
-                    "update" => Some(Command::Update { session: sid, id: Ulid::generate().to_string(), answered_by: None, sdp }),
-                    "escalate" => Some(Command::Update { session: sid, id: Ulid::generate().to_string(), answered_by: Some("user".into()), sdp }),
-                    "answer-update" => pending_update.take().map(|u| Command::AnswerUpdate { session: sid, in_reply_to: u, answered_by: Some("user".into()), sdp }),
-                    "reject-update" => pending_update.take().map(|u| LocalEvent::RejectUpdate { session: sid, in_reply_to: u, reason: "media.unsupported".into() }.into()),
-                    "info" => Some(LocalEvent::Info { session: sid }.into()),
+                let session = sid;
+                let call = match cmd.as_str() {
+                    "cancel" => CallCommand::Cancel { session },
+                    "hangup" => CallCommand::Hangup { session },
+                    "accept" => CallCommand::Accept { session },
+                    "screen" => CallCommand::Screen { session },
+                    "decline" => CallCommand::Decline { session },
+                    "update" => CallCommand::Update { session },
+                    "escalate" => CallCommand::Escalate { session },
+                    "answer-update" => CallCommand::AnswerUpdate { session },
+                    "reject-update" => CallCommand::RejectUpdate { session },
+                    "info" => CallCommand::Info { session },
                     "quit" => break,
-                    other => { println!("unknown command {other}"); None }
+                    other => { println!("unknown command {other}"); continue }
                 };
-                if let Some(ev) = ev {
-                    agent.command(ev).await?;
-                }
+                agent.call(call).await?;
             }
         }
     }

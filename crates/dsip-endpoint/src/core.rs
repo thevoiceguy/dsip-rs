@@ -407,6 +407,11 @@ impl Core {
         self.cfg.seal = on;
     }
 
+    /// Whether outbound session bodies are sealed (§10.4).
+    pub fn seal(&self) -> bool {
+        self.cfg.seal
+    }
+
     /// This side's recording declaration, `{state, recorder, purpose?}`, from now on (Recording Profile C§3): it
     /// rides on every `invite`, `answer` and `update` this endpoint sends; `None` sends none (meaning `off`).
     pub fn set_recording(&mut self, declaration: Option<serde_json::Value>) {

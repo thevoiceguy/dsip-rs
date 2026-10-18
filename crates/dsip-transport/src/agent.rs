@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
-use dsip_endpoint::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite};
+use dsip_endpoint::{CallCommand, CallEvent, CallOut, Calls, CallsConfig, Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys,
+                    Invite, MediaRequest, MediaResult};
 use dsip_session::{Emission, Endpoint, LocalEvent, Message};
 
 use std::sync::Arc;
@@ -59,6 +60,11 @@ pub enum AgentEvent {
         /// Attempts.
         attempts: u32,
     },
+    /// Media work for the host, from the call glue ([`AgentConfig::calls`]); SDP results go back through
+    /// [`Agent::media`].
+    Media(MediaRequest),
+    /// Something about a call, from the call glue.
+    Call(CallEvent),
 }
 
 /// Agent configuration.
@@ -82,6 +88,10 @@ pub struct AgentConfig {
     /// §8.1: how to fetch a `did:web` document an inbound frame needs and the agent does not hold. `None` fetches
     /// over HTTPS ([`DidWebResolver`]).
     pub did_resolver: Option<Arc<dyn DidResolver>>,
+    /// Run the call glue ([`dsip_endpoint::calls`]): the agent then answers by policy and asks for media work with
+    /// [`AgentEvent::Media`]; calls are placed with [`Agent::place`] and driven with [`Agent::call`]. `None` leaves
+    /// all of that to the host.
+    pub calls: Option<CallsConfig>,
 }
 
 type Resolution = (String, std::result::Result<dsip_core::did::DidDocument, dsip_core::did::ResolveError>);
@@ -94,6 +104,7 @@ pub struct Agent {
     resolver: StaticResolver,
     conn: Connection,
     core: Core,
+    calls: Option<Calls>,
     events: Vec<AgentEvent>,
     did_resolver: Arc<dyn DidResolver>,
     resolved_tx: mpsc::UnboundedSender<Resolution>,
@@ -132,7 +143,8 @@ impl Agent {
         core.load_contacts(&file);
         let did_resolver = cfg.did_resolver.clone().unwrap_or_else(|| Arc::new(DidWebResolver::new()));
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
-        Ok(Agent { id, cfg, supported, resolver, conn, core, events: vec![], did_resolver, resolved_tx, resolved_rx })
+        let calls = cfg.calls.map(Calls::new);
+        Ok(Agent { id, cfg, supported, resolver, conn, core, calls, events: vec![], did_resolver, resolved_tx, resolved_rx })
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -224,6 +236,29 @@ impl Agent {
         self.core.set_seal(on);
     }
 
+    /// Place a call through the call glue; returns the new session id. With media, the invite goes once the host
+    /// answers the [`MediaRequest::Offer`].
+    pub async fn place(&mut self, to: &str, invite: Invite) -> Result<String> {
+        let Some(calls) = self.calls.as_mut() else { return Err(crate::Error::NoCalls) };
+        let (sid, out) = calls.place(&mut self.core, to, invite, now_s())?;
+        self.act(out).await?;
+        Ok(sid)
+    }
+
+    /// Do what the application asks of a call, through the call glue.
+    pub async fn call(&mut self, cmd: CallCommand) -> Result<()> {
+        let Some(calls) = self.calls.as_mut() else { return Err(crate::Error::NoCalls) };
+        let out = calls.command(&mut self.core, cmd, now_s())?;
+        self.act(out).await
+    }
+
+    /// Hand the call glue the result of a [`MediaRequest`], or a local ICE candidate.
+    pub async fn media(&mut self, result: MediaResult) -> Result<()> {
+        let Some(calls) = self.calls.as_mut() else { return Err(crate::Error::NoCalls) };
+        let out = calls.media(&mut self.core, result, now_s())?;
+        self.act(out).await
+    }
+
     /// Drive a local event through the core and act on its output.
     pub async fn local(&mut self, ev: LocalEvent) -> Result<()> {
         self.command(Command::Engine(ev)).await
@@ -241,8 +276,28 @@ impl Agent {
         self.dispatch(out).await
     }
 
+    /// Act on the core's output, through the call glue when it runs.
     async fn dispatch(&mut self, out: Vec<CoreEvent>) -> Result<()> {
-        for e in out {
+        let out = match self.calls.as_mut() {
+            Some(calls) => calls.observe(&mut self.core, out, now_s())?,
+            None => out.into_iter().map(CallOut::Core).collect(),
+        };
+        self.act(out).await
+    }
+
+    async fn act(&mut self, out: Vec<CallOut>) -> Result<()> {
+        for o in out {
+            let e = match o {
+                CallOut::Core(e) => e,
+                CallOut::Media(m) => {
+                    self.events.push(AgentEvent::Media(m));
+                    continue;
+                }
+                CallOut::Call(c) => {
+                    self.events.push(AgentEvent::Call(c));
+                    continue;
+                }
+            };
             match e {
                 CoreEvent::Send { frame, msg_type, session, to } => {
                     let env = dsip_core::envelope::Envelope::from_frame(&frame)?;
