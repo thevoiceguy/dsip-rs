@@ -53,7 +53,7 @@ use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Inbound, Outcome, ProcessOptions, Route};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Inbound, Outbox, Outcome, ProcessOptions, Route};
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
@@ -394,13 +394,11 @@ struct Client {
     /// Blob fetches to try again (M§8.4 "Fetching", spec-gap 106): `{object, blobs, sender, attempt, next_at}`, persisted.
     pending_blobs: Vec<Value>,
     gap_timeout: i64,
-    /// The outbox per group while its hub cannot be reached (M§9.4; spec-gap 72).
-    outages: BTreeMap<String, HubOutage>,
     /// M§7.4 (spec-gap 129): per group that moved, the vector-pinned wait for the new hub to host it.
     arrivals: BTreeMap<String, MoveArrival>,
-    /// Pending items per group, oldest first: `{id, mls, obj, extra}`, kept durably until accepted (M§9.2).
-    pending: BTreeMap<String, Vec<Value>>,
-    hub_timeout: i64,
+    /// Pending items per group, oldest first: `{id, mls, obj, extra}`, kept durably until accepted (M§9.2), and the
+    /// outage machine of each group, advanced every tick (M§9.4; spec-gap 72).
+    pending: Outbox,
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
     own: HashSet<String>,
     resume: Resume,
@@ -928,24 +926,22 @@ impl Client {
                 .tls_serialize_detached()?;
             // M§9.2: the item is pending until the hub's accepted; its bytes are what every retry re-deposits (M§9.3)
             let item = json!({"id": item_id, "mls": b64(&msg), "obj": obj, "extra": extra});
-            self.pending.entry(group.to_string()).or_default().push(item.clone());
-            let decision = self.outage_mut(group).deposit(&item_id);
-            if decision.iter().any(|e| e.get("queued").is_some()) {
-                // M§9.4: the hub is down; the item waits behind the pending ones and goes out with them
-                println!("PENDING {item_id} queued");
-                self.save_pending()?;
-                return Ok(json!({"type": "pending", "id": item_id}));
-            }
-            if decision.iter().any(|e| e.get("refuse").is_some()) {
-                self.pending.entry(group.to_string()).or_default().retain(|i| i["id"] != item_id);
-                bail!("group abandoned after its hub outage; the conversation continues in its successor");
+            match self.pending.deposit(group, item.clone(), now_s(), true) {
+                Deposit::Queued => {
+                    // M§9.4: the hub is down; the item waits behind the pending ones and goes out with them
+                    println!("PENDING {item_id} queued");
+                    self.save_pending()?;
+                    return Ok(json!({"type": "pending", "id": item_id}));
+                }
+                Deposit::Abandoned => bail!("group abandoned after its hub outage; the conversation continues in its successor"),
+                Deposit::Send => {}
             }
             let (more, reply) = self.deposit_item(group, &item).await?;
             let Some(reply) = reply else {
                 self.run_outage(group, more).await?; // kept pending; the ticker retries with the §13.2 backoff
                 return Ok(json!({"type": "pending", "id": item_id}));
             };
-            self.pending.entry(group.to_string()).or_default().retain(|i| i["id"] != item_id);
+            self.pending.remove(group, &item_id);
             self.run_outage(group, more).await?; // an accepted answer may end an outage and flush the queue
             let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
             let actions = retry.answer(reason.as_deref());
@@ -962,17 +958,16 @@ impl Client {
     }
 
     fn outage_mut(&mut self, group: &str) -> &mut HubOutage {
-        let timeout = self.hub_timeout;
-        self.outages.entry(group.to_string()).or_insert_with(|| HubOutage::new(&json!({"now": now_s(), "hub_timeout": timeout})))
+        self.pending.outage_mut(group, now_s())
     }
 
     /// Persist the outbox (M§9.2 pending items) with each outage's start, so a restart resumes the retries and the
     /// threshold (spec-gap 72).
     fn save_pending(&mut self) -> Result<()> {
         let mut v = serde_json::Map::new();
-        for (g, items) in &self.pending {
+        for (g, items) in &self.pending.items {
             if !items.is_empty() {
-                v.insert(g.clone(), json!({"items": items, "down_since": self.outages.get(g).and_then(|o| o.down_since())}));
+                v.insert(g.clone(), json!({"items": items, "down_since": self.pending.outages.get(g).and_then(|o| o.down_since())}));
             }
         }
         self.mls.provider().put_state("pending", &Value::Object(v)).map_err(Self::state_err)
@@ -1005,10 +1000,10 @@ impl Client {
         let mut queue: std::collections::VecDeque<Value> = emissions.into();
         while let Some(e) = queue.pop_front() {
             if let Some(id) = e["forward"].as_str().map(String::from) {
-                let Some(item) = self.pending.get(group).and_then(|v| v.iter().find(|i| i["id"] == id).cloned()) else { continue };
+                let Some(item) = self.pending.item(group, &id).cloned() else { continue };
                 let (more, reply) = self.deposit_item(group, &item).await?;
                 if let Some(r) = reply {
-                    self.pending.entry(group.to_string()).or_default().retain(|i| i["id"] != id);
+                    self.pending.remove(group, &id);
                     if r["type"] == "accepted" {
                         self.sent(group, &r, &item["obj"]);
                         println!("SENT-AFTER-OUTAGE {id} seq={}", r["seq"]);
@@ -1020,7 +1015,7 @@ impl Client {
                 }
                 queue.extend(more);
             } else if let Some(d) = e["retry_in"].as_i64() {
-                let head = self.outages.get(group).and_then(|o| o.pending().first().cloned()).unwrap_or_default();
+                let head = self.pending.outages.get(group).and_then(|o| o.pending().first().cloned()).unwrap_or_default();
                 println!("PENDING {head} retry_in={d}");
             } else if e.get("handover").is_some() {
                 self.trigger_successor(group).await?; // the hand-over that failed is due again
@@ -1042,15 +1037,14 @@ impl Client {
     /// (`handover_failed`), nothing more is deposited to the dead hub meanwhile, and a restart resumes here.
     async fn trigger_successor(&mut self, dead: &str) -> Result<()> {
         let result = self.hand_over(dead).await;
-        if self.pending.get(dead).is_some_and(|items| !items.is_empty()) {
-            for em in self.outages.get_mut(dead).map(HubOutage::handover_failed).unwrap_or_default() {
+        if self.pending.pending(dead) > 0 {
+            for em in self.pending.outages.get_mut(dead).map(HubOutage::handover_failed).unwrap_or_default() {
                 if let Some(d) = em["handover_retry_in"].as_i64() {
                     println!("SUCCESSOR-RETRY of={dead} retry_in={d}");
                 }
             }
         } else {
-            self.pending.remove(dead);
-            self.outages.remove(dead);
+            self.pending.forget(dead);
             self.save_pending()?;
         }
         result
@@ -1058,7 +1052,7 @@ impl Client {
 
     /// One attempt at [`Self::trigger_successor`]: find or create the successor, then move the items across in order.
     async fn hand_over(&mut self, dead: &str) -> Result<()> {
-        let items = self.pending.get(dead).cloned().unwrap_or_default();
+        let items = self.pending.items.get(dead).cloned().unwrap_or_default();
         self.active = Some(dead.to_string());
         self.create_successor().await.map_err(|e| anyhow::anyhow!("successor of {dead} not created ({e}); {} item(s) kept pending", items.len()))?;
         let Some(winner) = self.successors.snapshot()[dead]["successor"].as_str().map(String::from) else {
@@ -1067,7 +1061,7 @@ impl Client {
         for it in items {
             // boxed: send_object → run_outage → here → send_object is the one recursion in the outbox
             let id = it["id"].as_str().unwrap_or("");
-            let outbox_ids = |c: &Self| -> Vec<Value> { c.pending.get(&winner).into_iter().flatten().map(|i| i["id"].clone()).collect() };
+            let outbox_ids = |c: &Self| -> Vec<Value> { c.pending.items.get(&winner).into_iter().flatten().map(|i| i["id"].clone()).collect() };
             let before = outbox_ids(self);
             let reply = match Box::pin(self.send_object(&winner, &it["obj"], it["extra"].clone())).await {
                 Ok(reply) => reply,
@@ -1105,9 +1099,7 @@ impl Client {
 
     /// The successor's outbox (or its hub) has the item: it leaves the dead group's.
     fn handed_over(&mut self, dead: &str, id: &str) -> Result<()> {
-        if let Some(items) = self.pending.get_mut(dead) {
-            items.retain(|i| i["id"] != id);
-        }
+        self.pending.remove(dead, id);
         self.save_pending()
     }
 
@@ -1116,17 +1108,10 @@ impl Client {
         if self.held_offline {
             return Ok(()); // a device with no network retries nothing; the backoff resumes when it is back
         }
-        let now = now_s();
-        // an abandoned outbox still has a clock: it may be retrying the hand-over to its successor
-        let down: Vec<String> = self.outages.iter().filter(|(_, o)| o.is_down() || o.is_abandoned()).map(|(g, _)| g.clone()).collect();
-        for g in down {
-            let emissions = match self.outages.get_mut(&g) {
-                Some(o) if now > o.now() => o.advance(now - o.now()),
-                _ => continue,
-            };
-            if !emissions.is_empty() {
-                self.run_outage(&g, emissions).await?;
-            }
+        // every outage machine runs on the clock, so an outage starts when the hub stopped answering; an abandoned outbox
+        // may be retrying the hand-over to its successor
+        for (g, emissions) in self.pending.due(now_s()) {
+            self.run_outage(&g, emissions).await?;
         }
         Ok(())
     }
@@ -2699,10 +2684,8 @@ async fn main() -> Result<()> {
         rec_accepted: provider_state.unwrap_or_default(),
         rec_seen: BTreeMap::new(),
         gap_timeout: args.gap_timeout,
-        outages: BTreeMap::new(),
         arrivals: BTreeMap::new(),
-        pending: BTreeMap::new(),
-        hub_timeout: args.hub_timeout,
+        pending: Outbox::new(args.hub_timeout),
         own: HashSet::new(),
         resume,
         successors: get("successors")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
@@ -2728,11 +2711,10 @@ async fn main() -> Result<()> {
             if items.is_empty() {
                 continue;
             }
-            let ids: Vec<&str> = items.iter().filter_map(|i| i["id"].as_str()).collect();
             let down_since = v["down_since"].as_i64().unwrap_or(now);
-            client.outages.insert(g.clone(), HubOutage::new(&json!({"now": now, "hub_timeout": client.hub_timeout, "pending": ids, "down_since": down_since})));
             println!("PENDING restored {} item(s) for {g}", items.len());
-            client.pending.insert(g.clone(), items);
+            client.pending.items.insert(g.clone(), items);
+            client.pending.restore_outage(g, Some(down_since), now);
         }
     }
     let mut groups: Vec<String> = get_state_list(&client, "groups")?;

@@ -41,8 +41,8 @@ use dsip_core::version::Supported;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Inbound, MemoryStore, Outcome, ProcessOptions, Route};
-use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Inbound, MemoryStore, Outbox, Outcome, ProcessOptions, Route};
+use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
@@ -228,7 +228,7 @@ pub struct Messenger {
     own: HashSet<String>,
     pending: BTreeMap<String, Pending>,
     /// Application items not yet accepted, per group, oldest first: `{id, mls, obj}` (M§9.2).
-    outbox: BTreeMap<String, Vec<Value>>,
+    outbox: Outbox,
     /// The thread, every content object shown, in arrival order: `{group, key, sender, sender_device, object, seq, mine}`.
     messages: Vec<Value>,
     /// Object keys shown (M§8.5: the archive and MLS copies are one message).
@@ -271,9 +271,6 @@ pub struct Messenger {
     restored: Vec<Value>,
     /// M§10.5: whether read watermarks are disclosed to the conversation (opt-in) or kept in the personal group.
     read_disclosed: bool,
-    /// M§9.4: per group whose hub stopped answering, the vector-pinned outbox; `hub_timeout` is this device's threshold.
-    outages: BTreeMap<String, HubOutage>,
-    hub_timeout: i64,
     /// When each application deposit went out, by deposit id: one with no answer at all counts as the hub down (M§9.4).
     sent_at: BTreeMap<String, i64>,
     /// M§7.5: the successor groups this device knows of and converged on (vector-pinned, spec-gap 61).
@@ -342,7 +339,7 @@ impl Messenger {
             own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
             // M§9.3: deposits awaiting an answer are sent again at the next binding (redeposit_pending)
             pending: st["pending"].as_object().into_iter().flatten().filter_map(|(id, p)| Some((id.clone(), Pending::from_json(p)?))).collect(),
-            outbox: serde_json::from_value(st["outbox"].clone()).unwrap_or_default(),
+            outbox: Outbox { items: serde_json::from_value(st["outbox"].clone()).unwrap_or_default(), ..Outbox::new(dsip_messaging::client::HUB_TIMEOUT_S) },
             messages: st["messages"].as_array().cloned().unwrap_or_default(),
             shown: st["messages"].as_array().into_iter().flatten().map(|m| s_of(&m["key"])).collect(),
             grants_held: serde_json::from_value(st["grants_held"].clone()).unwrap_or_default(),
@@ -365,8 +362,6 @@ impl Messenger {
             held_archive: serde_json::from_value(st["held_archive"].clone()).unwrap_or_default(),
             restored: st["restored"].as_array().cloned().unwrap_or_default(),
             read_disclosed: st["read_disclosed"].as_bool().unwrap_or(false),
-            outages: BTreeMap::new(),
-            hub_timeout: dsip_messaging::client::HUB_TIMEOUT_S,
             sent_at: BTreeMap::new(),
             successors: serde_json::from_value(st["successors"].clone()).unwrap_or_default(),
             handover: serde_json::from_value(st["handover"].clone()).unwrap_or_default(),
@@ -379,7 +374,7 @@ impl Messenger {
             roster_log: serde_json::from_value(st["roster_log"].clone()).unwrap_or_default(),
         };
         if let Some(t) = st["hub_timeout"].as_i64() {
-            m.hub_timeout = t;
+            m.outbox.hub_timeout = t;
         }
         if m.moved_from.is_some() {
             // spec-gap 122: the cursors were the old mailbox's; the new one delivers from its own beginning
@@ -387,12 +382,7 @@ impl Messenger {
         }
         // M§9.4: an outage survives a restart; its first retry is due at once
         for (gid, down_since) in st["outages"].as_object().into_iter().flatten() {
-            let pending: Vec<Value> = m.outbox.get(gid).into_iter().flatten().map(|i| i["id"].clone()).collect();
-            let mut o = HubOutage::new(&json!({"now": now_i, "hub_timeout": m.hub_timeout, "pending": pending, "down_since": down_since}));
-            if down_since.is_null() {
-                o = HubOutage::new(&json!({"now": now_i, "hub_timeout": m.hub_timeout}));
-            }
-            m.outages.insert(gid.clone(), o);
+            m.outbox.restore_outage(gid, down_since.as_i64(), now_i);
         }
         // the history machine from what this device holds: its keys and the epochs it joined at
         let keys: Vec<Value> = m.archive_keys.iter().map(|(a, (_, at))| json!({"akid": a, "created_at": at})).collect();
@@ -426,12 +416,12 @@ impl Messenger {
         }))).collect();
         let archive: serde_json::Map<String, Value> = self.archive_keys.iter().map(|(a, (k, at))| (a.clone(), json!({"key": b64(k), "created_at": at}))).collect();
         json!({"mls": mls, "state": {
-            "convs": convs, "personal": self.personal, "resume": self.resume.snapshot(), "own": self.own, "outbox": self.outbox,
+            "convs": convs, "personal": self.personal, "resume": self.resume.snapshot(), "own": self.own, "outbox": self.outbox.items,
             "messages": self.messages, "grants_held": self.grants_held, "archive_keys": archive, "group_info": self.group_info,
             "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored,
             "read_disclosed": self.read_disclosed, "calls": self.calls,
-            "outages": self.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
-            "hub_timeout": self.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
+            "outages": self.outbox.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
+            "hub_timeout": self.outbox.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
             "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
             "records_held": self.records_held, "records": self.records, "recording_accepted": self.recording_accepted, "leaving": self.leaving,
             "roster_log": self.roster_log,
@@ -516,12 +506,7 @@ impl Messenger {
         for (_, pending) in due {
             out.extend(self.redeposit(pending, now_i));
         }
-        for gid in self.outages.keys().cloned().collect::<Vec<_>>() {
-            let ems = {
-                let o = self.outages.get_mut(&gid).expect("outage");
-                let dt = (now_i - o.now()).max(0);
-                o.advance(dt)
-            };
+        for (gid, ems) in self.outbox.due(now_i) {
             out.extend(self.outage_emissions(&gid, ems, now_i));
         }
         json!(out).to_string()
@@ -529,12 +514,12 @@ impl Messenger {
 
     /// This device's hub-outage threshold, seconds (M§9.4: the client's own; 24 h RECOMMENDED).
     pub fn set_hub_timeout(&mut self, seconds: f64) {
-        self.hub_timeout = seconds as i64;
+        self.outbox.hub_timeout = seconds as i64;
     }
 
     /// Groups whose hub is unreachable: `{group: {down_since, pending, abandoned}}` (M§9.4).
     pub fn outages(&self) -> String {
-        let m: serde_json::Map<String, Value> = self.outages.iter().map(|(g, o)| (g.clone(), json!({"down_since": o.down_since(),
+        let m: serde_json::Map<String, Value> = self.outbox.outages.iter().map(|(g, o)| (g.clone(), json!({"down_since": o.down_since(),
             "pending": o.pending().len(), "abandoned": o.is_abandoned(), "successor": self.successors.successor(g)}))).collect();
         Value::Object(m).to_string()
     }
@@ -598,7 +583,7 @@ impl Messenger {
     /// The hand-over to a successor could not be done (the peers' KeyPackages could not be fetched): retried with the
     /// §13.2 backoff (M§9.4, spec-gap 72).
     pub fn successor_failed(&mut self, dead: &str) {
-        if let Some(o) = self.outages.get_mut(dead) {
+        if let Some(o) = self.outbox.outages.get_mut(dead) {
             o.handover_failed();
         }
     }
@@ -1009,8 +994,8 @@ impl Messenger {
             let _ = old;
         }
         frames.extend(self.redeposit_pending(moved, now as i64));
-        for (gid, items) in self.outbox.clone() {
-            if self.outages.get(&gid).is_some_and(|o| o.is_down() || o.is_abandoned()) {
+        for (gid, items) in self.outbox.items.clone() {
+            if self.outbox.is_down(&gid) || self.outbox.is_abandoned(&gid) {
                 continue; // M§9.4: the outage's own backoff re-deposits the head (tick)
             }
             for it in items {
@@ -1032,7 +1017,7 @@ impl Messenger {
         let mut frames = vec![];
         for (id, p) in self.pending.clone() {
             let frame = match &p {
-                Pending::GroupInfo { gid, .. } if self.convs.contains_key(gid) && !self.outages.get(gid).is_some_and(|o| o.is_down() || o.is_abandoned()) => {
+                Pending::GroupInfo { gid, .. } if self.convs.contains_key(gid) && !(self.outbox.is_down(gid) || self.outbox.is_abandoned(gid)) => {
                     self.group_info_frame(gid, now).ok()
                 }
                 Pending::Commit { gid, fields, .. } if self.convs.contains_key(gid) => Some(self.hub_deposit(gid, "handshake", fields.clone(), now)),
@@ -1218,8 +1203,8 @@ impl Messenger {
             json!({"group": g, "conversation": c.conversation, "kind": c.kind, "peer": c.peer, "members": members, "epoch": c.group.epoch().as_u64(),
                    "recorded": recording["recorded"], "recorders": recording["recorders"], "may_send": recording["may_send"],
                    "recorders_pending": recording["pending"],
-                   "hub": {"did": c.hub.0, "uri": c.hub.1}, "pending": self.outbox.get(g).map_or(0, Vec::len) + self.handover.get(g).map_or(0, Vec::len),
-                   "hub_down": self.outages.get(g).is_some_and(HubOutage::is_down),
+                   "hub": {"did": c.hub.0, "uri": c.hub.1}, "pending": self.outbox.pending(g) + self.handover.get(g).map_or(0, Vec::len),
+                   "hub_down": self.outbox.is_down(g),
                    "predecessors": self.lineage(g).into_iter().filter(|x| x != g).collect::<Vec<_>>()})
         }).collect();
         json!(list).to_string()
@@ -1534,14 +1519,15 @@ impl Messenger {
             // M§8.4 rule 4: the deposit's manifest names the blob without its key
             item["blobs"] = json!([{"uri": b["uri"], "sha256": b["sha256"], "size": b["size"]}]);
         }
-        if self.outages.get(gid).is_some_and(HubOutage::is_abandoned) {
-            // M§9.4: the dead group takes no more content; it goes to the successor once there is one
-            self.handover.entry(gid.to_string()).or_default().push(obj.clone());
-            return Ok(String::new());
-        }
-        self.outbox.entry(gid.to_string()).or_default().push(item.clone());
-        let item_id = s_of(&item["id"]);
-        let queued = self.outages.get_mut(gid).is_some_and(|o| o.deposit(&item_id).iter().any(|e| e.get("queued").is_some()));
+        let queued = match self.outbox.deposit(gid, item.clone(), now, false) {
+            Deposit::Abandoned => {
+                // M§9.4: the dead group takes no more content; it goes to the successor once there is one
+                self.handover.entry(gid.to_string()).or_default().push(obj.clone());
+                return Ok(String::new());
+            }
+            Deposit::Queued => true,
+            Deposit::Send => false,
+        };
         if obj["object"] == "content" {
             // shown at once as ours; its seq is filled in by the hub's accepted (M§8.5)
             let key = format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""));
@@ -1682,10 +1668,8 @@ impl Messenger {
                 }
             }
             Pending::Application { gid, item } => {
-                let obj = self.outbox.get(&gid).and_then(|items| items.iter().find(|i| i["id"] == item)).map(|i| i["obj"].clone());
-                if let Some(items) = self.outbox.get_mut(&gid) {
-                    items.retain(|i| i["id"] != item);
-                }
+                let obj = self.outbox.item(&gid, &item).map(|i| i["obj"].clone());
+                self.outbox.remove(&gid, &item);
                 if let (Some(obj), Some(seq)) = (obj.clone().filter(|o| o["object"] == "content"), p["seq"].as_i64()) {
                     if let Some(c) = self.convs.get_mut(&gid) {
                         // M§10.2: our own content enters the receipts machine at its hub seq, so receipts for it are booked
@@ -1719,7 +1703,7 @@ impl Messenger {
                 }
                 out.push(json!({"ui": "sent", "group": gid, "item": item, "seq": p["seq"], "duplicate": p["duplicate"]}));
                 // M§9.4: an accepted ends an outage and flushes the queue in order
-                let ems = self.outages.get_mut(&gid).map(|o| o.answer(&item, None)).unwrap_or_default();
+                let ems = self.outbox.answered(&gid, &item, None);
                 if ems.iter().any(|e| e.get("forward").is_some()) {
                     out.push(json!({"ui": "hub_back", "group": gid}));
                 }
@@ -1808,13 +1792,9 @@ impl Messenger {
                 let down = is_outage(&reason);
                 if !down {
                     // M§9.4: unreachable keeps it pending; any other refusal is final
-                    if let Some(items) = self.outbox.get_mut(&gid) {
-                        items.retain(|i| i["id"] != item);
-                    }
+                    self.outbox.remove(&gid, &item);
                     self.messages.retain(|m| m["item"] != item);
-                    if let Some(o) = self.outages.get_mut(&gid) {
-                        o.answer(&item, Some(&reason));
-                    }
+                    self.outbox.answered(&gid, &item, Some(&reason));
                 } else {
                     out.extend(self.hub_unreachable(&gid, &item, false, now));
                 }
@@ -1876,9 +1856,7 @@ impl Messenger {
                     }
                 } else {
                     // spec-gap 60: no move, so mailbox.unknown-group is final
-                    if let Some(items) = self.outbox.get_mut(&gid) {
-                        items.retain(|i| i["id"] != item);
-                    }
+                    self.outbox.remove(&gid, &item);
                     self.messages.retain(|m| m["item"] != item);
                     out.push(json!({"refused": format!("message {item}: mailbox.unknown-group"), "group": gid, "item": item, "pending": false}));
                 }
@@ -1899,11 +1877,11 @@ impl Messenger {
 
     /// An outbox item encrypted afresh at the group's current epoch and deposited to its current hub (M§7.4).
     fn reencrypt_item(&mut self, gid: &str, item_id: &str, now: i64) -> Option<String> {
-        let obj = self.outbox.get(gid)?.iter().find(|i| i["id"] == item_id)?["obj"].clone();
+        let obj = self.outbox.item(gid, item_id)?["obj"].clone();
         let (provider, signer) = (self.mls.provider(), self.mls.signer());
         let c = self.convs.get_mut(gid)?;
         let bytes = c.group.create_message(provider, &signer, &serde_json::to_vec(&obj).ok()?).ok()?.tls_serialize_detached().ok()?;
-        let item = self.outbox.get_mut(gid)?.iter_mut().find(|i| i["id"] == item_id)?;
+        let item = self.outbox.item_mut(gid, item_id)?;
         item["mls"] = json!(b64(&bytes));
         let item = item.clone();
         Some(self.deposit_item(gid, &item, now))
@@ -2210,7 +2188,7 @@ impl Messenger {
     fn redeposit(&mut self, pending: Pending, now: i64) -> Vec<Value> {
         match pending {
             Pending::Application { gid, item } => {
-                match self.outbox.get(&gid).and_then(|v| v.iter().find(|i| i["id"] == item).cloned()) {
+                match self.outbox.item(&gid, &item).cloned() {
                     Some(item) => vec![json!({"send": self.deposit_item(&gid, &item, now)})],
                     None => vec![],
                 }
@@ -2227,14 +2205,10 @@ impl Messenger {
 
     /// A deposit for `gid` met an unreachable hub (or no answer): the outage starts or continues (M§9.4).
     fn hub_unreachable(&mut self, gid: &str, item: &str, silent: bool, now: i64) -> Vec<Value> {
-        let timeout = self.hub_timeout;
-        let pending: Vec<Value> = self.outbox.get(gid).into_iter().flatten().map(|i| i["id"].clone()).collect();
-        let o = self.outages.entry(gid.to_string()).or_insert_with(|| HubOutage::new(&json!({"now": now, "hub_timeout": timeout, "pending": pending})));
-        let started = !o.is_down();
-        let ems = if silent { o.no_answer(item) } else { o.answer(item, Some("mailbox.hub-unreachable")) };
+        let (started, ems) = self.outbox.unreachable(gid, item, silent, now);
         let mut out = vec![];
-        if started && o.is_down() {
-            out.push(json!({"ui": "hub_down", "group": gid, "hub_timeout": timeout}));
+        if started {
+            out.push(json!({"ui": "hub_down", "group": gid, "hub_timeout": self.outbox.hub_timeout}));
         }
         out.extend(self.outage_emissions(gid, ems, now));
         out
@@ -2245,7 +2219,7 @@ impl Messenger {
         let mut out = vec![];
         for e in ems {
             if let Some(id) = e["forward"].as_str() {
-                if let Some(item) = self.outbox.get(gid).and_then(|v| v.iter().find(|i| i["id"] == id).cloned()) {
+                if let Some(item) = self.outbox.item(gid, id).cloned() {
                     out.push(json!({"send": self.deposit_item(gid, &item, now)}));
                 }
             } else if let Some(d) = e["retry_in"].as_i64() {
@@ -2253,7 +2227,7 @@ impl Messenger {
             } else if e.get("successor").is_some() || e.get("handover").is_some() {
                 // M§9.4: the threshold passed: the dead group takes no more content; its pending items are re-encrypted
                 // for the successor, which the host creates once it has the members' KeyPackages (M§7.5)
-                let items = self.outbox.remove(gid).unwrap_or_default();
+                let items = self.outbox.take(gid);
                 let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
                 self.messages.retain(|m| !ids.contains(&m["item"]));
                 for i in &items {
@@ -2291,7 +2265,7 @@ impl Messenger {
             if e.get("join").is_some() {
                 out.push(json!({"ui": "successor", "group": group, "of": pred, "creator": creator}));
                 // M§9.4: what this device still had pending for the dead group goes to the successor, re-encrypted
-                let items = self.outbox.remove(pred).unwrap_or_default();
+                let items = self.outbox.take(pred);
                 let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
                 self.messages.retain(|m| !ids.contains(&m["item"]));
                 for i in &items {
@@ -2300,7 +2274,7 @@ impl Messenger {
                 let mut waiting = self.handover.remove(pred).unwrap_or_default();
                 waiting.extend(items.into_iter().map(|i| i["obj"].clone()));
                 self.handover.entry(group.to_string()).or_default().extend(waiting);
-                self.outages.remove(pred);
+                self.outbox.forget(pred);
                 out.extend(self.flush_handover(group, now));
             } else if let Some(g) = e["decline"].as_str().or(e["first_contact"].as_str()) {
                 let why = if e.get("first_contact").is_some() { "not a valid successor: first contact (M§7.5)" } else { "a lower successor exists (M§7.5)" };
@@ -2358,8 +2332,7 @@ impl Messenger {
         if self.convs.remove(gid).is_none() {
             return vec![];
         }
-        self.outbox.remove(gid);
-        self.outages.remove(gid);
+        self.outbox.forget(gid);
         let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}), now);
         vec![env.frame()]
     }
