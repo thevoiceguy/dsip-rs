@@ -50,10 +50,11 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
+use dsip_messaging::client::{select_mailbox, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, Inbound, Outbox, Outcome, ProcessOptions, Route};
+use dsip_messaging_device::commits::{self, Answer, Built, Change, Synced};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, Inbound, Outbox, Outcome, ProcessOptions, Retry, Route};
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
@@ -953,7 +954,7 @@ impl Client {
 
     /// Encrypt an application object for a group and deposit it; returns the hub's answer.
     ///
-    /// A refusal is handled as the vector-pinned [`CommitRetry`] decides: in particular `mailbox.unknown-group` from a
+    /// A refusal is handled as the vector-pinned [`CommitRetry`](dsip_messaging::client::CommitRetry) decides: in particular `mailbox.unknown-group` from a
     /// hub the group has left is followed by a sync and, if it shows the move, the object is encrypted again and sent to
     /// the new hub (M§7.4, spec-gap 60).
     async fn send_object(&mut self, group: &str, obj: &Value, extra: Value) -> Result<Value> {
@@ -967,7 +968,7 @@ impl Client {
                 bail!("recorded conversation: type accept-recording first (C§5)");
             }
         }
-        let mut retry = CommitRetry::new(&json!({}));
+        let mut retry = Retry::default();
         let item_id = wire::new_id(now_s());
         loop {
             let hub_before = self.conv(group)?.hub.0.clone();
@@ -997,14 +998,13 @@ impl Client {
             self.pending.remove(group, &item_id);
             self.run_outage(group, more).await?; // an accepted answer may end an outage and flush the queue
             let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
-            let actions = retry.answer(reason.as_deref());
-            if !actions.iter().any(|a| a.get("sync").is_some()) {
+            if !matches!(retry.answer(reason.as_deref()), Answer::Discard { surface: None }) {
                 return Ok(reply); // accepted, or surfaced to the caller
             }
             println!("RETRY send: {} from {hub_before}; syncing", reason.as_deref().unwrap_or(""));
             self.sync_all().await?;
             let moved = self.conv(group)?.hub.0 != hub_before;
-            if retry.synced(true, moved).iter().any(|a| a.get("surface").is_some()) {
+            if matches!(retry.synced(true, moved), Synced::Surface(_)) {
                 return Ok(reply);
             }
         }
@@ -1219,32 +1219,21 @@ impl Client {
         Ok(())
     }
 
-    /// Build a commit for `op` against the group's current epoch: `(commit, welcome)`.
-    fn build_commit(&mut self, group: &str, op: &CommitOp) -> Result<(MlsMessageOut, Option<MlsMessageOut>)> {
+    /// Build a commit for `op` against the group's current epoch, staged in the group.
+    fn build_commit(&mut self, group: &str, op: &CommitOp) -> Result<Built> {
         let leaves = match op {
-            CommitOp::RemoveIdentity(identity) => self.leaves_where(group, |w| w.identity == *identity)?,
+            CommitOp::RemoveIdentity(identity) => self.identity_leaves(group, identity)?,
             CommitOp::RemoveDevice(device) => self.device_leaves(group, device)?,
             _ => vec![],
         };
+        let change = match op {
+            CommitOp::Add { kps, .. } => Change::Add(kps),
+            CommitOp::RemoveIdentity(_) | CommitOp::RemoveDevice(_) => Change::Remove(&leaves),
+            CommitOp::Update => Change::Update,
+            CommitOp::MoveHub(hub) => Change::MoveHub(hub),
+        };
         let c = self.convs.get_mut(group).context("group")?;
-        let (provider, signer) = (self.mls.provider(), self.mls.signer());
-        let e = |x: &dyn std::fmt::Debug| anyhow::anyhow!("{x:?}");
-        Ok(match op {
-            CommitOp::Add { kps, .. } => {
-                let (commit, welcome, _) = c.group.add_members(provider, &signer, kps).map_err(|x| e(&x))?;
-                (commit, Some(welcome))
-            }
-            CommitOp::RemoveIdentity(_) | CommitOp::RemoveDevice(_) => {
-                let (commit, welcome, _) = c.group.remove_members(provider, &signer, &leaves).map_err(|x| e(&x))?;
-                (commit, welcome)
-            }
-            CommitOp::Update => {
-                let (commit, welcome, _) =
-                    c.group.self_update(provider, &signer, LeafNodeParameters::default()).map_err(|x| e(&x))?.into_messages();
-                (commit, welcome)
-            }
-            CommitOp::MoveHub(hub) => (self.mls.move_hub_commit(&mut c.group, hub).map_err(|x| e(&x))?, None),
-        })
+        commits::build(&self.mls, &mut c.group, change).map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Whether `op` still needs doing after the device caught up with a winning commit (M§6.5 "if still needed").
@@ -1252,9 +1241,9 @@ impl Client {
         Ok(match op {
             CommitOp::Add { identity, device, .. } => match device {
                 Some(d) => self.device_leaves(group, d)?.is_empty(),
-                None => self.leaves_where(group, |w| w.identity == *identity)?.is_empty(),
+                None => self.identity_leaves(group, identity)?.is_empty(),
             },
-            CommitOp::RemoveIdentity(identity) => !self.leaves_where(group, |w| w.identity == *identity)?.is_empty(),
+            CommitOp::RemoveIdentity(identity) => !self.identity_leaves(group, identity)?.is_empty(),
             CommitOp::RemoveDevice(device) => !self.device_leaves(group, device)?.is_empty(),
             CommitOp::Update => true,
             CommitOp::MoveHub(hub) => self.conv(group)?.hub.0 != hub["did"].as_str().unwrap_or(""),
@@ -1262,29 +1251,23 @@ impl Client {
     }
 
     /// Commit `op` to a group, applying it only once the hub has accepted it, and handling refusals as the vector-pinned
-    /// [`CommitRetry`] decides (M§6.5, spec-gap 58): a conflict or stale epoch is discarded, the device syncs past the
+    /// [`CommitRetry`](dsip_messaging::client::CommitRetry) decides (M§6.5, spec-gap 58): a conflict or stale epoch is discarded, the device syncs past the
     /// winning commit and re-proposes while still needed, boundedly; any other refusal is surfaced.
     async fn commit_op(&mut self, group: &str, op: CommitOp, what: &str) -> Result<()> {
-        let mut retry = CommitRetry::new(&json!({}));
+        let mut retry = Retry::default();
         loop {
             let hub_before = self.conv(group)?.hub.0.clone();
-            let (commit, welcome) = self.build_commit(group, &op)?;
+            let built = self.build_commit(group, &op)?;
             let epoch = self.conv(group)?.group.epoch().as_u64();
-            let mut fields = json!({"mls": b64(&commit.tls_serialize_detached()?)});
-            if let Some(w) = welcome {
-                fields["welcome"] = json!(b64(&w.tls_serialize_detached()?));
-            }
-            if let CommitOp::Add { grants, .. } = &op {
-                if !grants.is_empty() {
-                    fields["grants"] = json!(grants);
-                }
-            }
-            let reply = self.hub_deposit(group, "handshake", fields).await?;
+            let grants = match &op {
+                CommitOp::Add { grants, .. } => grants.as_slice(),
+                _ => &[],
+            };
+            let reply = self.hub_deposit(group, "handshake", built.fields(grants)).await?;
             let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
-            let mut must_sync = false;
-            for action in retry.answer(reason.as_deref()) {
-                let c = self.convs.get_mut(group).context("group")?;
-                if action.get("merge").is_some() {
+            let c = self.convs.get_mut(group).context("group")?;
+            match retry.answer(reason.as_deref()) {
+                Answer::Merge => {
                     c.group.merge_pending_commit(self.mls.provider()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     println!("OK {what} epoch={} seq={}", c.group.epoch().as_u64(), reply["seq"]);
                     if let CommitOp::MoveHub(hub) = &op {
@@ -1295,36 +1278,33 @@ impl Client {
                         return self.publish_group_info_at(group, Some(seq)).await;
                     }
                     return self.publish_group_info(group).await;
-                } else if action.get("discard").is_some() {
+                }
+                Answer::Discard { surface } => {
                     c.group.clear_pending_commit(self.mls.provider().storage()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                } else if let Some(r) = action.get("surface") {
-                    bail!("{what} refused by the hub: {}", r.as_str().unwrap_or(""));
-                } else if action.get("sync").is_some() {
-                    must_sync = true;
+                    if let Some(r) = surface {
+                        bail!("{what} refused by the hub: {r}");
+                    }
                 }
             }
+            // refused and not given up: sync past the winning commit (M§6.5)
             let unknown_group = reason.as_deref() == Some("mailbox.unknown-group");
-            if must_sync && unknown_group {
+            if unknown_group {
                 // spec-gap 60: the hub may have handed the group on; everything stored shows whether it did
                 println!("MOVED? {what}: mailbox.unknown-group from {hub_before}; syncing");
                 self.sync_all().await?;
-            } else if must_sync {
+            } else {
                 println!("CONFLICT {what}: {} at epoch {epoch}; syncing past the winning commit", reason.as_deref().unwrap_or(""));
                 self.catch_up(group, epoch).await?;
             }
             let needed = self.still_needed(group, &op)?;
             let moved = self.conv(group)?.hub.0 != hub_before;
-            for action in retry.synced(needed, moved) {
-                if action.get("done").is_some() {
+            match retry.synced(needed, moved) {
+                Synced::Done => {
                     println!("OK {what} no longer needed after the winning commit");
                     return Ok(());
                 }
-                if let Some(r) = action.get("surface") {
-                    bail!("{what} refused by the hub: {}", r.as_str().unwrap_or(""));
-                }
-                if let Some(a) = action.get("repropose") {
-                    println!("REPROPOSE {what} attempt={} epoch={}", a["attempt"], self.conv(group)?.group.epoch().as_u64());
-                }
+                Synced::Surface(r) => bail!("{what} refused by the hub: {r}"),
+                Synced::Repropose(n) => println!("REPROPOSE {what} attempt={n} epoch={}", self.conv(group)?.group.epoch().as_u64()),
             }
         }
     }
@@ -1612,9 +1592,9 @@ impl Client {
 
     /// Join a group by external commit from the latest GroupInfo in this identity's mailbox: a new device with no
     /// sibling online, or a device that lost its group state (M§6.8, spec-gap 62). Refusals are handled as the pinned
-    /// [`CommitRetry`] decides; a stale GroupInfo is replaced by syncing.
+    /// [`CommitRetry`](dsip_messaging::client::CommitRetry) decides; a stale GroupInfo is replaced by syncing.
     async fn rejoin(&mut self, gid: &str) -> Result<()> {
-        let mut retry = CommitRetry::new(&json!({}));
+        let mut retry = Retry::default();
         loop {
             let gi = self.mls.provider().get_state(&format!("group_info:{gid}")).map_err(Self::state_err)?
                 .context("no GroupInfo for that group in this mailbox; sync first")?;
@@ -1626,9 +1606,8 @@ impl Client {
             self.add_conv(group, &conv);
             let reply = self.hub_deposit(gid, "handshake", json!({"mls": b64(&commit.tls_serialize_detached()?)})).await?;
             let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
-            let mut must_sync = false;
-            for action in retry.answer(reason.as_deref()) {
-                if action.get("merge").is_some() {
+            match retry.answer(reason.as_deref()) {
+                Answer::Merge => {
                     // the external commit is already applied locally (OpenMLS stores it merged)
                     self.history.step(&json!({"joined": {"group": gid, "epoch": epoch}}));
                     self.save_groups()?;
@@ -1636,27 +1615,20 @@ impl Client {
                     println!("OK rejoined {} kind={} epoch={epoch} seq={}", conv["conversation"].as_str().unwrap_or(""), conv["kind"].as_str().unwrap_or(""), reply["seq"]);
                     return self.publish_group_info(gid).await;
                 }
-                if action.get("discard").is_some() {
+                Answer::Discard { surface } => {
                     if let Some(mut c) = self.convs.remove(gid) {
                         c.group.delete(self.mls.provider().storage()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     }
                     self.save_groups()?;
-                }
-                if let Some(r) = action.get("surface") {
-                    bail!("rejoin refused by the hub: {}", r.as_str().unwrap_or(""));
-                }
-                if action.get("sync").is_some() {
-                    must_sync = true;
+                    if let Some(r) = surface {
+                        bail!("rejoin refused by the hub: {r}");
+                    }
                 }
             }
-            if must_sync {
-                println!("CONFLICT rejoin: {} at epoch {epoch}; syncing for a newer GroupInfo", reason.as_deref().unwrap_or(""));
-                self.sync_all().await?;
-            }
-            for action in retry.synced(true, false) {
-                if let Some(r) = action.get("surface") {
-                    bail!("rejoin refused by the hub: {}", r.as_str().unwrap_or(""));
-                }
+            println!("CONFLICT rejoin: {} at epoch {epoch}; syncing for a newer GroupInfo", reason.as_deref().unwrap_or(""));
+            self.sync_all().await?;
+            if let Synced::Surface(r) = retry.synced(true, false) {
+                bail!("rejoin refused by the hub: {r}");
             }
         }
     }
@@ -1671,27 +1643,22 @@ impl Client {
         self.commit_op(group, op, &format!("added {peer} ({n} device(s))")).await
     }
 
-    fn leaves_where(&self, group: &str, pred: impl Fn(&dsip_messaging::mls_wire::LeafIdentity) -> bool) -> Result<Vec<LeafNodeIndex>> {
+    /// The leaves of `identity` in a group, every device of it, authenticated (M§6.2).
+    fn identity_leaves(&self, group: &str, identity: &str) -> Result<Vec<LeafNodeIndex>> {
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
-        let c = self.conv(group)?;
-        Ok(c.group.members().filter(|m| member_identity(&c.group, m.index, &ctx).is_ok_and(|w| pred(&w))).map(|m| m.index).collect())
+        Ok(commits::identity_leaves(&self.conv(group)?.group, &ctx, identity))
     }
 
     /// The leaves whose credential names `device`, whether or not their delegation still verifies.
     fn device_leaves(&self, group: &str, device: &str) -> Result<Vec<LeafNodeIndex>> {
-        let c = self.conv(group)?;
-        Ok(c.group
-            .members()
-            .filter(|m| BasicCredential::try_from(m.credential.clone()).is_ok_and(|b| b.identity() == device.as_bytes()))
-            .map(|m| m.index)
-            .collect())
+        Ok(commits::device_leaves(&self.conv(group)?.group, device))
     }
 
     /// Remove every leaf of `identity` from the active conversation (M§7.3).
     async fn remove(&mut self, identity: &str) -> Result<()> {
         let group = self.active()?;
-        anyhow::ensure!(!self.leaves_where(&group, |w| w.identity == identity)?.is_empty(), "{identity} is not a member");
+        anyhow::ensure!(!self.identity_leaves(&group, identity)?.is_empty(), "{identity} is not a member");
         self.commit_op(&group, CommitOp::RemoveIdentity(identity.to_string()), &format!("removed {identity}")).await
     }
 
