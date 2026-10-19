@@ -182,6 +182,12 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    duplicate, first contact, archive, GroupInfo, own deposit, pre-join history, held behind a gap, or processed with
    what the gap releases) and record the decisions that need no processing. What each client does with an MLS
    outcome stays in the host until the state it writes (outbox, receipts, history, successors) is shared in 3e–3h.
+   3e is split in three, since the clients differ most here: the browser tracks every deposit by id until its
+   answer arrives, while dsip-msg awaits each answer inline. 3e-1 is the shared `Outbox`: the items pending per group
+   and their `HubOutage`, advanced on every tick. That fixes dsip-msg, whose outage clock stood still while the hub
+   was up: an outage starting after more than `hub_timeout` from the group's first deposit triggered the successor at
+   once, with no retries. 3e-2 is the deposit registry (the browser's `Pending`); 3e-3 is dsip-msg no longer waiting
+   inline.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
