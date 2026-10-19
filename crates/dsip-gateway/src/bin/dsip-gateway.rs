@@ -118,8 +118,8 @@ async fn main() -> Result<()> {
         seal: false,
         did_resolver: None,
         // The call glue answers nothing by itself: the controller decides when the DSIP leg rings and answers (G§3).
-        // Impl: a recording the DSIP side declares (C§3) is accepted by policy, as before the glue ran here: the
-        // gateway has nobody to render it to and no way to ask the PSTN party (spec-gap 133).
+        // A recording the DSIP side declares (C§3) is accepted on the PSTN party's behalf, and the crossing is
+        // downgraded `recording-not-disclosed` (spec-gap 133, decided): the gateway is not the recorded party's client.
         calls: Some(CallsConfig { media: true, answer: AnswerPolicy::Host, recording: AcceptPolicy::Always, one_call: false }),
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
@@ -415,7 +415,13 @@ async fn dsip_event(
             AgentEvent::Sent { msg_type, session, to } if msg_type == "invite" => {
                 println!("→ invite   to {to}  session …{}", &session[session.len().saturating_sub(8)..]);
             }
-            AgentEvent::Call(CallEvent::Recording { emission, .. }) => println!("record    {emission}   C§4 (accepted by policy, spec-gap 133)"),
+            AgentEvent::Call(CallEvent::Recording { session, emission }) => {
+                println!("record    {emission}   C§4 (accepted on the PSTN party's behalf, spec-gap 133)");
+                let declared = emission.pointer("/render/state").and_then(Value::as_str).is_some_and(|s| s != "off");
+                if declared {
+                    recording_not_disclosed(calls, agent, &session).await?;
+                }
+            }
             AgentEvent::Rejected(code, detail) => tracing::warn!("rejected inbound frame: {code} {detail}"),
             AgentEvent::Emission(dsip_session::Emission::Refused(reason)) => tracing::warn!("engine refused a local event: {reason}"),
             _ => {}
@@ -482,7 +488,10 @@ async fn outbound_invite(
         (None, _, r) => println!("assert    not assertable ({}) — From is the gateway's own; crossing downgraded identity-not-assertable   G§7", r.unwrap_or("")),
     }
     // G§7: name what the crossing loses, on the DSIP leg, before the call goes further (the session continues)
-    let facts = json!({"direction": "outbound", "trunk_srtp": false, "identity_assertable": a.passport.is_some(), "policy_present": false});
+    // spec-gap 133: a recording the caller declares (C§3) does not reach the PSTN party
+    let recording_declared = payload.pointer("/recording/state").and_then(Value::as_str).is_some_and(|s| s != "off");
+    let facts = json!({"direction": "outbound", "trunk_srtp": false, "identity_assertable": a.passport.is_some(), "policy_present": false,
+                       "recording_declared": recording_declared});
     if let Some(detail) = dsip_gateway::downgrade_error_detail(&facts) {
         let supported = dsip_core::version::Supported::all_known();
         let err = json!({
@@ -500,6 +509,7 @@ async fn outbound_invite(
     call.dsip_session = Some(sid.to_string());
     call.from_tn = a.from.clone();
     call.identity_header = a.passport.as_ref().map(|p| p.identity_header());
+    call.recording_downgraded = recording_declared; // the loss went in the error above
     let emits = call.step(&json!({"dsip": {"type": "invite"}}));
     apply(&mut call, emits, &mut Legs { sip, dsip: Some(agent) }).await?;
     calls.lock().await.0.insert(sid.to_string(), call);
@@ -508,4 +518,29 @@ async fn outbound_invite(
 
 fn rand_ssrc(seed: &str) -> u32 {
     seed.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193))
+}
+
+/// G§7, spec-gap 133: the DSIP side declared recording (an inbound call's answer, or an update on either), and the
+/// PSTN party is not told: a `gateway.downgraded` naming `recording-not-disclosed`, once per call (an outbound call
+/// whose invite declared it named the loss in its first downgrade error).
+async fn recording_not_disclosed(calls: &Arc<Mutex<Calls>>, agent: &mut Agent, sid: &str) -> Result<()> {
+    {
+        let mut guard = calls.lock().await;
+        let Some(key) = dsip_gateway::host::call::find_by_session(&guard, sid) else { return Ok(()) };
+        let Some(call) = guard.0.get_mut(&key) else { return Ok(()) };
+        if call.recording_downgraded {
+            return Ok(());
+        }
+        call.recording_downgraded = true;
+    }
+    let Some(peer) = agent.endpoint().session(sid).map(|s| s.peer.clone()) else { return Ok(()) };
+    let supported = dsip_core::version::Supported::all_known();
+    let err = json!({
+        "dsip": dsip_core::version::version_block(&supported, &[dsip_transport::agent::PROFILE]),
+        "type": "error", "to": peer, "session": sid,
+        "reason": "gateway.downgraded", "detail": {"losses": ["recording-not-disclosed"]},
+    });
+    agent.send_payload(err, 30).await?;
+    println!("→ error    gateway.downgraded [\"recording-not-disclosed\"]   G§7, spec-gap 133");
+    Ok(())
 }

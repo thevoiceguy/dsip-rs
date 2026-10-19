@@ -201,6 +201,9 @@ pub fn tel_claim(from_tn: &str, identity: Option<&Value>, cnam: Option<&str>, ga
 }
 
 /// §6.3: which crossings emit `gateway.downgraded`; each lost guarantee is named.
+///
+/// Spec: G§7 (the losses, in table order). Impl: `recording-not-disclosed` (spec-gap 133, decided; G§7 gains it in
+/// the next spec version): the DSIP side declared recording (C§3) and the PSTN party was not told.
 pub fn downgrade(facts: &Value) -> Value {
     let b = |k: &str| facts.get(k).and_then(Value::as_bool).unwrap_or(false);
     let direction = facts.get("direction").and_then(Value::as_str).unwrap_or("");
@@ -216,6 +219,10 @@ pub fn downgrade(facts: &Value) -> Value {
     }
     if b("policy_present") {
         lost.push("policy-unenforceable");
+    }
+    // spec-gap 133 (decided): a recording the DSIP side declared (C§3) does not reach the PSTN party
+    if b("recording_declared") {
+        lost.push("recording-not-disclosed");
     }
     json!({"downgraded": !lost.is_empty(), "lost": lost})
 }
