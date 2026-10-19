@@ -11,75 +11,105 @@ const payloadOf = (frame) => JSON.parse(Buffer.from(JSON.parse(frame).payload, '
 
 const alice = JSON.parse(create_identity(null, null, 'Alice', now()));
 const bob = JSON.parse(create_identity(null, null, 'Bob', now()));
-const A = new Endpoint(JSON.stringify(alice), JSON.stringify({ video: false }), now());
-const B = new Endpoint(JSON.stringify(bob), JSON.stringify({}), now());
+const A = new Endpoint(JSON.stringify(alice), JSON.stringify({ video: false, seal: true }), now());
+const B = new Endpoint(JSON.stringify(bob), JSON.stringify({ one_call: true }), now());
+const eps = () => ({ A, B });
 
-// in-memory "relay": frames from A go to B and vice versa
+// in-memory "relay": frames from A go to B and vice versa. The page is the media host: what the call glue asks for
+// (`media_request`) is answered at once with binding-valid SDP, as a browser's RTCPeerConnection would.
+// Binding-valid SDP (WebRTC Media Binding B§2.2): one m=audio section with ICE credentials, a
+// sha-256 fingerprint, a=setup, a=mid, direction, rtcp-mux and an opus rtpmap. The engine
+// enforces the descriptor/SDP authority rule on inbound SDP, so placeholders do not pass.
+const FP = 'AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99';
+let sdpN = 0;
+const sdp = (setup, direction = 'sendrecv') => ['v=0', `o=- ${++sdpN} 1 IN IP4 127.0.0.1`, 's=-', 't=0 0', 'a=group:BUNDLE 0',
+  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'c=IN IP4 0.0.0.0', 'a=ice-ufrag:0123456789abcdef0123456789abcdef',
+  'a=ice-pwd:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', `a=fingerprint:sha-256 ${FP}`,
+  `a=setup:${setup}`, 'a=mid:0', `a=${direction}`, 'a=rtcp-mux', 'a=rtpmap:111 opus/48000/2'].join('\r\n') + '\r\n';
 const box = { A: [], B: [] };
 function drive(who, eventsJson) {
   const ev = JSON.parse(eventsJson);
-  for (const e of ev) if (e.send) box[who === 'A' ? 'B' : 'A'].push(e.send.frame);
-  return ev;
+  const out = [];
+  for (const e of ev) {
+    out.push(e);
+    if (e.send) box[who === 'A' ? 'B' : 'A'].push(e.send.frame);
+    const m = e.media_request;
+    if (m?.kind === 'offer') out.push(...drive(who, eps()[who].media(JSON.stringify({ kind: 'offer', session: m.session, sdp: sdp('actpass') }), now())));
+    if (m?.kind === 'answer') out.push(...drive(who, eps()[who].media(JSON.stringify({ kind: 'answer', session: m.session, sdp: sdp('active', m.screening ? 'recvonly' : 'sendrecv') }), now())));
+  }
+  return out;
 }
 function pump() {
   let moved = true, all = { A: [], B: [] };
   while (moved) {
     moved = false;
     for (const who of ['A', 'B']) {
-      const ep = who === 'A' ? A : B;
-      while (box[who].length) { moved = true; all[who].push(...drive(who, ep.inbound(box[who].shift(), now()))); }
+      const ep = eps()[who];
+      while (box[who].length) {
+        const f = box[who].shift();
+        // §12.7: a relay delivers the caller's answered-elsewhere cancel to the other legs only, and there are none
+        if (payloadOf(f).type === 'cancel' && payloadOf(f).reason === 'session.answered-elsewhere') continue;
+        moved = true; all[who].push(...drive(who, ep.inbound(f, now())));
+      }
     }
   }
   return all;
 }
-const kinds = (evs) => evs.map((e) => e.send ? `send:${e.send.type}` : e.received ? `recv:${e.received.message.type}` : e.emission?.ui ? `ui:${e.emission.ui}` : e.emission?.media ? `media:${e.emission.media}` : e.rejected ? `rejected:${e.rejected.code}` : null).filter(Boolean);
+const kinds = (evs) => evs.map((e) => e.send ? `send:${e.send.type}` : e.received ? `recv:${e.received.message.type}` : e.emission?.ui ? `ui:${e.emission.ui}`
+  : e.emission?.media ? `media:${e.emission.media}` : e.rejected ? `rejected:${e.rejected.code}` : e.media_request ? `mreq:${e.media_request.kind}` : e.call ? `call:${e.call.event}` : null).filter(Boolean);
 
-// 1. call: alice → bob (identity), bob alerts and accepts
-// Binding-valid SDP (WebRTC Media Binding B§2.2): one m=audio section with ICE credentials, a
-// sha-256 fingerprint, a=setup, a=mid, direction, rtcp-mux and an opus rtpmap. The engine now
-// enforces the descriptor/SDP authority rule on inbound SDP, so placeholders no longer pass.
-const FP = 'AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99';
-const sdp = (n, setup, direction = 'sendrecv') => ['v=0', `o=- ${n} 1 IN IP4 127.0.0.1`, 's=-', 't=0 0', 'a=group:BUNDLE 0',
-  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'c=IN IP4 0.0.0.0', 'a=ice-ufrag:0123456789abcdef0123456789abcdef',
-  'a=ice-pwd:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', `a=fingerprint:sha-256 ${FP}`,
-  `a=setup:${setup}`, 'a=mid:0', `a=${direction}`, 'a=rtcp-mux', 'a=rtpmap:111 opus/48000/2'].join('\r\n') + '\r\n';
-const sid = A.new_id(now());
-drive('A', A.local(JSON.stringify({ local: 'place_call', session: sid, to: bob.identity, sdp: sdp(1, 'actpass') }), now()));
+// 1. call: alice → bob through the call glue: the invite waits for the page's SDP offer; bob's client rings; the
+// user's accept asks for the SDP answer; the answer starts media on both sides (§14.1, §16.3)
+const placed = JSON.parse(A.place(bob.identity, JSON.stringify({}), now()));
+const sid = placed.session;
+check('place asks the page for an SDP offer', placed.events.some((e) => e.media_request?.kind === 'offer' && e.media_request.session === sid), JSON.stringify(placed.events));
+const firstOut = placed.events.flatMap((e) => (e.media_request?.kind === 'offer' ? drive('A', A.media(JSON.stringify({ kind: 'offer', session: sid, sdp: sdp('actpass') }), now())) : []));
+const inviteFrame = firstOut.find((e) => e.send?.type === 'invite')?.send.frame;
+check('the invite goes out once the offer is handed back', !!inviteFrame);
+check('§10.4: the invite body is sealed to bob (no media in the clear)', inviteFrame && payloadOf(inviteFrame).media === undefined && payloadOf(inviteFrame).sealed !== undefined, inviteFrame && Object.keys(payloadOf(inviteFrame)).join(','));
 let r = pump();
-check('bob received verified invite', kinds(r.B).includes('recv:invite') && kinds(r.B).includes('ui:offered'), JSON.stringify(kinds(r.B)));
-drive('B', B.local(JSON.stringify({ local: 'alert', session: sid, ring_timeout: 60 }), now()));
-drive('B', B.local(JSON.stringify({ local: 'accept', session: sid, answered_by: 'user', sdp: sdp(2, 'active') }), now()));
+check('bob opens the sealed invite and rings', kinds(r.B).includes('recv:invite') && kinds(r.B).includes('call:ringing') && kinds(r.B).includes('send:progress'), JSON.stringify(kinds(r.B)));
+check('bob\'s invite carried the SDP after unsealing', r.B.find((e) => e.received?.message.type === 'invite')?.received.payload.transports?.[0]?.sdp?.startsWith('v=0'));
+const accepted = drive('B', B.call(JSON.stringify({ command: 'accept', session: sid }), now()));
+check('accept asks the page for an SDP answer to the offer', kinds(accepted).includes('mreq:answer') && kinds(accepted).includes('send:answer'), JSON.stringify(kinds(accepted)));
 r = pump();
 const ka = kinds(r.A);
-check('alice: progress then answer → ACTIVE with media start', ka.includes('recv:progress') && ka.includes('recv:answer') && ka.includes('media:start'), JSON.stringify(ka));
+check('alice: answer applied, media starts', ka.includes('recv:answer') && ka.includes('mreq:apply_answer') && ka.includes('mreq:start_sending'), JSON.stringify(ka));
 check('alice session ACTIVE', JSON.parse(A.session(sid))[sid].state === 'ACTIVE');
 check('bob session ACTIVE', JSON.parse(B.session(sid))[sid].state === 'ACTIVE');
-const answerEv = r.A.find((e) => e.received?.message.type === 'answer');
-check('answer carried SDP in transports[0].sdp (§16.3 binding object)', answerEv?.received.payload.transports?.[0]?.sdp?.startsWith('v=0'));
 
 // 2. ICE candidates ride in signed info (ACTIVE-only)
-drive('A', A.local(JSON.stringify({ local: 'info', session: sid,
-  data: { candidates: [{ candidate: 'candidate:1 1 udp 1 127.0.0.1 5000 typ host', sdp_mid: '0', sdp_m_line_index: 0 }], end_of_candidates: false } }), now()));
+const cand = { candidate: 'candidate:1 1 udp 1 127.0.0.1 5000 typ host', sdp_mid: '0', sdp_m_line_index: 0 };
+const sentInfo = drive('A', A.media(JSON.stringify({ kind: 'candidate', session: sid, candidate: cand }), now()));
+check('a local candidate in an ACTIVE call goes out in a signed info', kinds(sentInfo).includes('send:info'));
 r = pump();
-check('bob received info with candidates', r.B.some((e) => e.received?.message.type === 'info' && e.received.payload.data.candidates.length === 1));
+check('bob: the candidate is handed to the page', r.B.some((e) => e.media_request?.kind === 'remote_candidates' && e.media_request.candidates.length === 1));
 
-// 3. renegotiation: bob adds video via update; alice answers it
-const uid = B.new_id(now());
-drive('B', B.local(JSON.stringify({ local: 'update', session: sid, id: uid, sdp: sdp(3, 'actpass') }), now()));
+// 3. renegotiation: bob re-offers; alice answers it
+drive('B', B.call(JSON.stringify({ command: 'update', session: sid }), now()));
 r = pump();
-check('alice: update offered', kinds(r.A).includes('ui:update_offered'));
-drive('A', A.local(JSON.stringify({ local: 'answer_update', session: sid, in_reply_to: uid, sdp: sdp(4, 'active') }), now()));
+check('alice: update offered', kinds(r.A).includes('call:update_offered'));
+drive('A', A.call(JSON.stringify({ command: 'answer_update', session: sid }), now()));
 r = pump();
-check('bob: update answered → media apply_update', kinds(r.B).includes('media:apply_update'));
+check('bob: update answered → answer applied', kinds(r.B).includes('media:apply_update') && kinds(r.B).includes('mreq:apply_answer'), JSON.stringify(kinds(r.B)));
 
-// 4. hangup
-drive('A', A.local(JSON.stringify({ local: 'hangup', session: sid }), now()));
+// 4. one call at a time: a second call to bob is declined busy and never put to the user
+const D = new Endpoint(JSON.stringify(JSON.parse(create_identity(null, null, 'Dan', now()))), JSON.stringify({}), now());
+const busyPlaced = JSON.parse(D.place(bob.identity, JSON.stringify({}), now()));
+const busyInvite = JSON.parse(D.media(JSON.stringify({ kind: 'offer', session: busyPlaced.session, sdp: sdp('actpass') }), now())).find((e) => e.send?.type === 'invite').send.frame;
+const busyOut = JSON.parse(B.inbound(busyInvite, now()));
+const busyReject = busyOut.find((e) => e.send?.type === 'reject');
+check('bob declines a second call user.busy, without ringing', busyReject && payloadOf(busyReject.send.frame).reason === 'user.busy' && !kinds(busyOut).includes('call:ringing'), JSON.stringify(kinds(busyOut)));
+check('the first call is untouched', JSON.parse(B.session(sid))[sid].state === 'ACTIVE');
+
+// 5. hangup
+drive('A', A.call(JSON.stringify({ command: 'hangup', session: sid }), now()));
 r = pump();
-check('bob: bye → ended', kinds(r.B).includes('ui:ended') && JSON.parse(B.session(sid))[sid].state === 'ENDED');
+check('bob: bye → ended, media closed', kinds(r.B).includes('ui:ended') && kinds(r.B).includes('mreq:close') && JSON.parse(B.session(sid))[sid].state === 'ENDED', JSON.stringify(kinds(r.B)));
 const probe = JSON.parse(A.local(JSON.stringify({ local: 'info', session: sid }), now()));
 check('info on ended session refused', probe.some((e) => e.emission?.refused === 'invalid-state'));
 
-// 5. standalone verifier: fresh introduction accepted, tampered frame rejected
+// 6. standalone verifier: fresh introduction accepted, tampered frame rejected
 const goodFrame = JSON.parse(B.local(JSON.stringify({ local: 'introduce', id: B.new_id(now()), to: alice.identity, purpose: 'hi' }), now())).find((e) => e.send).send.frame;
 const v1 = JSON.parse(verify_frame(goodFrame, JSON.stringify({ now: Math.floor(now()) })));
 check('verify_frame accepts a fresh introduction', v1.verdict === 'accept' && v1.type === 'introduction', JSON.stringify(v1).slice(0, 100));
@@ -88,7 +118,7 @@ env.payload = env.payload.slice(0, 20) + (env.payload[20] === 'A' ? 'B' : 'A') +
 const v2 = JSON.parse(verify_frame(JSON.stringify(env), JSON.stringify({ now: Math.floor(now()) })));
 check('verify_frame rejects a tampered frame', v2.verdict === 'reject' && v2.code === 'signature-invalid', JSON.stringify(v2));
 
-// 6. first contact in wasm
+// 7. first contact in wasm (the engine's own vocabulary, beside the call glue)
 const carol = JSON.parse(create_identity(null, null, 'Carol', now()));
 const C = new Endpoint(JSON.stringify(carol), JSON.stringify({ first_contact_required: true }), now());
 const sid2 = A.new_id(now());

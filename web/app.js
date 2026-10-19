@@ -1,10 +1,13 @@
 // DSIP reference client — the screens. Everything normative (verification, the §12 engine, payload building,
-// first-contact state) runs inside dsip_wasm; this file owns the views and the one current call, and drives the
-// host layer (relay socket, WebRTC, storage). No signaling decision is made here: a screen changes only when the
-// engine emits.
+// first-contact state, and the call glue: candidates, SDP, media gating, answering, the sealed-body fallback,
+// recording consent) runs inside dsip_wasm; this file owns the views and the one current call, and is the host layer
+// (relay socket, WebRTC, storage): it does the media work the call glue asks for. No signaling decision is made here:
+// a screen changes only when the engine or the call glue emits.
 //
 // Spec: §12 (engine states shown as they are), §12.12 (ICE candidates in signed `info`, ACTIVE-only), §14.1 (no
-// media before a signed answer), §14.4 (screening), §18.1 (the verification basis, never a badge), §18.2 (display
+// media before a signed answer), §14.4 (screening), §10.4 (sealed bodies; once in clear when refused), C§3–C§4 (the
+// other side's recording declaration rendered; nothing answered or sent before acceptance), §8.4 (did:web documents
+// fetched for signers not held), §18.1 (the verification basis, never a badge), §18.2 (display
 // names are claims), §19.4 (first contact), B§ (SDP in `transports[].sdp`), G§5/G§7 (PSTN caller line, downgrade),
 // N§4 (a caller's bound number, checked by `check_claim`), N§4.1 (`tel:` through a gateway as `destination`), N§5
 // (a number that moved), N§6 (number lookup on the nodes in Settings), §8.1/§8.3 and DHT Hints Profile §10 (a
@@ -29,7 +32,10 @@ const key = (k) => (slot ? `${slot}.${k}` : k);
 const short = (d) => (d && d.length > 32 ? d.slice(0, 20) + '…' + d.slice(-8) : d || '');
 
 let identity = null, engine = null, relay = null, settings = {}, contacts = [];
-let call = null;      // {sid, role, peer, media, offer, pendingUpdate, screening}
+// {sid, role, peer, media, offer, pendingUpdate, screening, video, placing}: the call on screen. The call glue in the
+// wasm decides; this keeps what the screens show and the media leg (`placing`: our invite waits on its SDP offer)
+let call = null;
+const invites = new Map();   // session → the verified invite (`received`), until the call glue rings it
 let relayInfo = null;
 let purposes = {};    // introduction id → {purpose, basis}: what a request shows (the engine keeps only the ids)
 let links = [];       // contact links issued here: {token, url, created}
@@ -155,6 +161,24 @@ function renderCall() {
   $('btn-escalate').classList.toggle('hidden', !(st === 'ACTIVE' && call.screening));
   $('btn-answer-update').classList.toggle('hidden', !call.pendingUpdate);
   $('btn-reject-update').classList.toggle('hidden', !call.pendingUpdate);
+  renderRecording();
+}
+
+/** C§3–C§4: the other side's recording declaration, as the call glue holds it: said on both call screens; while it
+ *  waits on acceptance, accepting or declining it are the choices, and the call is not answered before it. */
+function renderRecording() {
+  const rec = call?.sid ? engine.recording(call.sid) : null;
+  const d = rec?.disclosure;
+  const on = d && d.state !== 'off';
+  const text = on ? `⏺ RECORDED: the other side declares recording ${d.state} by ${nameOf(d.recorder) || short(d.recorder)}${d.purpose ? `, purpose ${d.purpose}` : ''}`
+    + (rec.pending ? (call.role === 'responder' && !call.answered ? ': accept it to answer (C§4)' : ': nothing of yours is sent until you accept (C§4)') : ' (accepted)') : '';
+  for (const id of ['in-recording', 'call-recording']) {
+    $(id).classList.toggle('hidden', !on);
+    $(`${id}-text`).textContent = text;
+    $(`${id}-choices`).classList.toggle('hidden', !rec?.pending);
+  }
+  const blocked = !!rec?.pending;   // C§4: a callee never answers before accepting
+  $('btn-accept').disabled = blocked; $('btn-screen').disabled = blocked;
 }
 
 function renderSettings() {
@@ -162,6 +186,8 @@ function renderSettings() {
   $('set-did').textContent = identity.identity;
   $('set-device').textContent = identity.device;
   $('set-first-contact').checked = !!settings.first_contact_required;
+  $('set-seal').checked = !!settings.seal;
+  $('set-recording-accept').value = settings.recording_accept || 'ask';
   $('set-read-disclosed').checked = !!settings.read_disclosed;
   $('set-record-keeper').value = settings.record_keeper || '';
   $('record-keeper-status').textContent = settings.record_keeper ? `records go to ${nameOf(settings.record_keeper) || short(settings.record_keeper)}${messenger?.held_records() ? `; ${messenger.held_records()} held until it opens the conversation` : ''}` : 'none: no call records are sent';
@@ -371,71 +397,164 @@ async function onReceived(r) {
     return;
   }
   if (m.type === 'invite') {
-    if (engine.state(m.id) !== 'OFFERED') return;   // policy refused it (first contact): no ring, no screen
-    if (call && engine.state(call.sid) !== 'ENDED') {
-      // Impl: one call at a time in this client; a second invite is declined as busy (§15 user.busy).
-      await engine.local({ local: 'decline', session: m.id, reason: 'user.busy' });
-      log(`busy: declined a second call from ${short(r.identity)}`, '§15');
-      return;
-    }
-    call = { sid: m.id, role: 'responder', peer: r.identity, offer: p, media: null, pendingUpdate: null, screening: false };
-    const claims = (p.identity && p.identity.claims) || [];
-    const tel = claims.find((c) => c.type === 'tel');
-    $('in-name').textContent = nameOf(r.identity) || r.display_name || '(no name)';
-    $('in-did').textContent = r.identity;
-    $('in-caller').textContent = tel ? '☎ ' + tel_caller_line(JSON.stringify(tel)) + ' (via gateway)' : '';
-    $('in-caller').classList.toggle('hidden', !tel);
-    $('in-basis').textContent = verification_basis(r.identity, JSON.stringify(claims));
-    // N§4: the caller's own bound numbers, verified against the identity that signed this invite and its document;
-    // N§5: a number that a stored contact lists but that now belongs to another identity is said out loud
-    const numberLines = [], warnings = [];
-    for (const c of claims) {
-      const out = JSON.parse(check_claim(JSON.stringify(c), r.identity, JSON.stringify(documents[r.identity] ?? null), now(), JSON.stringify(setting('tn_policy') || {})));
-      if (out.outcome === 'attested') {
-        numberLines.push(`☎ ${out.line} (N§4)`);
-        const w = identity_change(JSON.stringify(contacts), c.number, r.identity, out.attested_by ?? undefined, out.issued);
-        if (w) warnings.push(`⚠ ${w} (N§5)`);
-      } else if (out.outcome === 'dropped') numberLines.push(`☎ ${out.line || 'a number'} — number binding refused: ${out.reason} (N§4, §18.2)`);
-    }
-    $('in-numbers').textContent = numberLines.join('\n');
-    $('in-tn-warning').textContent = warnings.join('\n');
-    $('in-tn-warning').classList.toggle('hidden', !warnings.length);
-    for (const l of [...numberLines, ...warnings]) log(l, 'N§4');
-    const file = JSON.parse(engine.contactsFile());
-    const granted = Object.values(file.grants_issued || {}).some((g) => g.identity === r.identity) || (file.allow || []).includes(r.identity);
-    const known = contacts.some((c) => c.did === r.identity);
-    $('in-contact').textContent = granted ? 'you granted this identity contact (§19.4)' : known ? 'in your contacts, no grant' : '⚠ unknown identity: not in your contacts, no grant';
-    $('in-contact').className = granted || known ? 'small' : 'small warn';
-    $('in-policy').textContent = p.policy ? 'their policy: ' + Object.entries(p.policy).map(([k, v]) => `${k}=${v}`).join(', ') : '';
-    $('in-downgrade').classList.add('hidden');
-    $('view-incoming').classList.remove('hidden');
-    // §12.4 OFFERED → ALERTING: policy admitted; progress ringing goes out; the person decides
-    if (call?.sid === m.id) call.alerted = true;   // M§13.3: an alerted leg that is not answered here is a call event
-    await engine.local({ local: 'alert', session: m.id, ring_timeout: 120 });
+    invites.set(m.id, r);   // the call glue rings it, declines it busy, or policy refused it
+    if (invites.size > 16) invites.delete(invites.keys().next().value);   // the ones never rung
     return;
   }
   if (!call || ![m.id, m.session, m.in_reply_to].includes(call.sid)) return;   // not this call: the engine has already acted
-  if (m.type === 'answer' && call.media) {
-    const sdp = p.transports?.[0]?.sdp;
-    if (sdp) await call.media.acceptAnswer(sdp);
-  }
   if (m.type === 'error' && m.reason === 'gateway.downgraded') {
     const text = '⚠ ' + downgrade_summary(JSON.stringify((p.detail && p.detail.losses) || []));
     for (const id of ['call-downgrade', 'in-downgrade']) { $(id).textContent = text; $(id).classList.remove('hidden'); }
     log(text, 'G§7');
   }
-  if (m.type === 'update') { call.offer = p; call.pendingUpdate = m.id; if (p.answered_by === 'user') $('call-mode').textContent = ''; }   // §14.4 step 3: the screener answered for real
-  if (m.type === 'info' && p.about === 'transport:webrtc' && p.data?.candidates && call.media) {
-    for (const c of p.data.candidates) await call.media.addRemoteCandidate(c);
+  if (m.type === 'update') { call.offer = p; if (p.answered_by === 'user') $('call-mode').textContent = ''; }   // §14.4 step 3: the screener answered for real
+}
+
+/** The incoming screen for a call the call glue rings (§12.4 OFFERED → ALERTING: policy admitted it, progress
+ *  ringing went out; the person decides). */
+function ringing(sid) {
+  const r = invites.get(sid);
+  invites.delete(sid);
+  if (!r) return;
+  const p = r.payload;
+  call = { sid, role: 'responder', peer: r.identity, offer: p, media: null, pendingUpdate: null, screening: false, alerted: true };   // M§13.3: an alerted leg not answered here is a call event
+  const claims = (p.identity && p.identity.claims) || [];
+  const tel = claims.find((c) => c.type === 'tel');
+  $('in-name').textContent = nameOf(r.identity) || r.display_name || '(no name)';
+  $('in-did').textContent = r.identity;
+  $('in-caller').textContent = tel ? '☎ ' + tel_caller_line(JSON.stringify(tel)) + ' (via gateway)' : '';
+  $('in-caller').classList.toggle('hidden', !tel);
+  $('in-basis').textContent = verification_basis(r.identity, JSON.stringify(claims));
+  // N§4: the caller's own bound numbers, verified against the identity that signed this invite and its document;
+  // N§5: a number that a stored contact lists but that now belongs to another identity is said out loud
+  const numberLines = [], warnings = [];
+  for (const c of claims) {
+    const out = JSON.parse(check_claim(JSON.stringify(c), r.identity, JSON.stringify(documents[r.identity] ?? null), now(), JSON.stringify(setting('tn_policy') || {})));
+    if (out.outcome === 'attested') {
+      numberLines.push(`☎ ${out.line} (N§4)`);
+      const w = identity_change(JSON.stringify(contacts), c.number, r.identity, out.attested_by ?? undefined, out.issued);
+      if (w) warnings.push(`⚠ ${w} (N§5)`);
+    } else if (out.outcome === 'dropped') numberLines.push(`☎ ${out.line || 'a number'} — number binding refused: ${out.reason} (N§4, §18.2)`);
   }
+  $('in-numbers').textContent = numberLines.join('\n');
+  $('in-tn-warning').textContent = warnings.join('\n');
+  $('in-tn-warning').classList.toggle('hidden', !warnings.length);
+  for (const l of [...numberLines, ...warnings]) log(l, 'N§4');
+  const file = JSON.parse(engine.contactsFile());
+  const granted = Object.values(file.grants_issued || {}).some((g) => g.identity === r.identity) || (file.allow || []).includes(r.identity);
+  const known = contacts.some((c) => c.did === r.identity);
+  $('in-contact').textContent = granted ? 'you granted this identity contact (§19.4)' : known ? 'in your contacts, no grant' : '⚠ unknown identity: not in your contacts, no grant';
+  $('in-contact').className = granted || known ? 'small' : 'small warn';
+  $('in-policy').textContent = p.policy ? 'their policy: ' + Object.entries(p.policy).map(([k, v]) => `${k}=${v}`).join(', ') : '';
+  $('in-downgrade').classList.add('hidden');
+  $('view-incoming').classList.remove('hidden');
+  renderRecording();
+}
+
+/** What the call glue says about a call (README of `dsip_endpoint::calls`: ringing, update offered, recording, the
+ *  clear resend of a refused sealed call, …). */
+async function onCall(e) {
+  if (e.event === 'ringing') {
+    if (call && call.sid !== e.session && engine.state(call.sid) !== 'ENDED') return;   // one call at a time: the glue declines the rest (user.busy)
+    ringing(e.session);
+    log(`☎ ringing: ${short(call?.peer)} is calling`, '§12.4');
+    return;
+  }
+  if (!call || ![e.session, e.old].includes(call.sid)) return;
+  if (e.event === 'update_offered') { call.pendingUpdate = e.id; renderCall(); }
+  if (e.event === 'no_offer') log('the caller offered no SDP: answered without media', '§16.3');
+  if (e.event === 'recording') {
+    const x = e.emission, r = x.render;
+    if (r) log(r.state === 'off' ? `⏺ recording ended (recorder ${short(r.recorder)})` : `⏺ RECORDED: the other side declares recording ${r.state} by ${short(r.recorder)}${r.purpose ? `  purpose ${r.purpose}` : ''}`, 'C§3');
+    else if (x.accepted) log(`⏺ recording by ${short(x.accepted.recorder)} accepted (${x.accepted.by})`, 'C§4');
+    else if (x.send) log(`⏺ declining to be recorded → ${x.send.type} policy.recording-declined`, 'C§4');
+    else if (x.blocked) log('⏺ not answering before the recording is accepted', 'C§4');
+    renderRecording();
+  }
+  if (e.event === 'recording_held') { log('⏺ holding our media until you accept the recording', 'C§4'); renderRecording(); }
+  if (e.event === 'sending_resumed') { log('media: sending resumed', 'C§4'); renderRecording(); }
+  if (e.event === 'resent_in_clear') {
+    // §10.4, §11.3: the sealed invite was refused as an unknown critical extension; the call goes again in clear, once,
+    // as a new session (its route and its record follow it)
+    log(`seal: sealed body refused by ${short(e.by)} — placing the call again in clear`, '§10.4 · §11.3');
+    const cr = callRelays.get(e.old);
+    if (cr) { callRelays.delete(e.old); callRelays.set(e.new, cr); }
+    call.sid = e.new; call.placing = true;
+    $('call-note').textContent = 'their side cannot open sealed bodies: calling again in clear (§10.4)';
+  }
+}
+
+/** Media work the call glue asks for (B§2–B§6, §12.12, §14.1, §14.4, C§4): SDP for offers and answers is handed
+ *  back to it; local candidates go to it as they are gathered, and it sends them once the call is ACTIVE. */
+async function onMediaRequest(m) {
+  if (!call || call.sid !== m.session) return;
+  try {
+    switch (m.kind) {
+      case 'offer': {
+        if (!call.media) {
+          call.media = await newMedia(m.session);
+          await call.media.capture(!!call.video);
+        } else if (m.add_source) {
+          // §14.4 step 3: the screening leg was receive-only; our source joins and the re-offer says answered_by user
+          await call.media.unscreen(!!call.offer?.media?.some((x) => x.type === 'video'));
+          call.screening = false; $('call-mode').textContent = '';
+        }
+        $('local').srcObject = call.media.localStream;
+        const sdp = await call.media.offer();
+        const video = !!call.media.localStream?.getVideoTracks().length;
+        engine.setVideo(video);                 // the offer's descriptors match the SDP that rides with it (B§2.1)
+        if (video) engine.setVideoCodecsFromSdp(sdp);
+        await engine.media({ kind: 'offer', session: m.session, sdp });
+        if (call?.sid === m.session) call.placing = false;
+        break;
+      }
+      case 'answer': {
+        const wantVideo = /(^|\n)m=video /.test(m.offer);
+        if (!call.media) {
+          call.media = await newMedia(m.session);
+          call.screening = m.screening;
+          if (!m.screening) { await call.media.capture(wantVideo); $('local').srcObject = call.media.localStream; }
+        } else if (wantVideo && !call.screening) { await call.media.addVideo(); $('local').srcObject = call.media.localStream; }
+        const sdp = await call.media.answer(m.offer, m.screening || call.screening);
+        await engine.media({ kind: 'answer', session: m.session, sdp });
+        break;
+      }
+      case 'apply_answer': await call.media?.acceptAnswer(m.sdp); break;
+      case 'remote_candidates': for (const c of m.candidates) await call.media?.addRemoteCandidate(c); break;
+      case 'start_sending': await call.media?.resume(); break;   // §14.1: once the signed answer made the call active
+      case 'hold_sending': await call.media?.hold(); break;      // C§4: a recording waits on acceptance
+      case 'close': call.media?.close(); call.media = null; break;
+      default: log(`media request ${m.kind}: not handled here`);
+    }
+  } catch (err) {
+    notify(`${call?.role === 'responder' ? 'cannot answer' : 'cannot call'}: ${err.message || err}`);
+    const sid = m.session, st = engine.state(sid);
+    if (st === 'ALERTING' || st === 'OFFERED') await engine.call('decline', sid);
+    else if (st === 'ACTIVE') await engine.call('hangup', sid);
+    else await engine.call('cancel', sid);
+    endCall();
+  }
+  renderCall();
+}
+
+/** §8.4: a did:web signer whose document is not held: fetched from where the DID says it is served, and held from
+ *  then on (§8.1: the document is the authority for its DID). The frame that needed it waits meanwhile. */
+async function resolveDid(did) {
+  let text = '', err = '';
+  const url = didWebUrl(did);
+  try {
+    const r = await fetch(url);
+    if (r.ok) text = await r.text(); else err = `HTTP ${r.status}`;
+  } catch (e) { err = e.message || String(e); }
+  log(text ? `resolved ${did} from ${url}` : `could not resolve ${did} from ${url}: ${err}`, '§8.4');
+  await engine.resolved(did, text, err);
 }
 
 async function onEmission(e) {
   if (e.timer) { log(`⏱ ${e.name} ${e.timer}${e.seconds ? ` (${e.seconds} s)` : ''}`, '§12.9'); if (e.timer === 'expired') $('call-note').textContent = `${e.name} expired`; return; }
   if (e.media) {
     log(`♫ media ${e.media}`, '§14.1');
-    if (e.media === 'start') await flushLocalCandidates();
-    if (e.media === 'stop') endCall();
+    if (e.media === 'stop' && call && !call.placing && !live(call.sid)) endCall();
     return;
   }
   if (e.ui) {
@@ -447,6 +566,9 @@ async function onEmission(e) {
     if (e.ui === 'answered') $('call-mode').textContent = e.answered_by === 'screening' ? 'answered in screening mode: they hear you, you do not hear them (§14.4)' : '';
     if (e.ui === 'missed_call') notify(`Missed call from ${nameOf(call?.peer) || short(call?.peer)}`);
     if (e.ui === 'ended') {
+      // a `ui ended` names no session: one for another session (a refused sealed invite placed again, a call declined
+      // busy) leaves the call on screen alone
+      if (call && (call.placing || live(call.sid))) return;
       const peer = call?.peer;
       if (call && legs.has(call.sid)) legs.get(call.sid).uiReason = e.reason;   // C§9: a leg that ended without a frame
       const refused = e.reason === 'policy.first-contact-required' && peer;
@@ -476,6 +598,9 @@ async function onEmission(e) {
 
 function notify(text) { $('call-note').textContent = text; log(text); }
 
+/** Whether the engine holds `sid` as a session not yet ended. */
+function live(sid) { const st = engine.state(sid); return !!st && st !== 'ENDED'; }
+
 // ---------------------------------------------------------------- calls
 
 /** The ICE servers for a call: Settings, else the operator's, else short-lived TURN credentials minted by the relay's
@@ -498,9 +623,11 @@ async function iceServers() {
 /** `https://host:port` of a `wss://host:port/dsip` relay URL. */
 function httpOrigin(wss) { return wss.replace(/^wss:/, 'https:').replace(/\/dsip\/?$/, ''); }
 
-async function newMedia() {
+/** A media leg for `sid`: its local candidates go to the call glue, which sends them in signed info once the call is
+ *  ACTIVE (§12.12). */
+async function newMedia(sid) {
   return new Media(await iceServers(), {
-    candidate: (entry) => { call.pendingLocal.push(entry); if (engine.state(call.sid) === 'ACTIVE') flushLocalCandidates(); },
+    candidate: (entry) => { engine.media({ kind: 'candidate', session: sid, candidate: entry }); },
     track: (stream) => { if ($('remote').srcObject !== stream) $('remote').srcObject = stream; },
     state: async (s) => {
       log(`webrtc: ${s}`, 'B§');
@@ -515,20 +642,14 @@ async function newMedia() {
   });
 }
 
-async function flushLocalCandidates() {
-  // §12.12: candidates ride in signed info, ACTIVE-only; everything gathered earlier waits here
-  if (!call || engine.state(call.sid) !== 'ACTIVE' || !call.pendingLocal.length) return;
-  const batch = call.pendingLocal; call.pendingLocal = [];
-  await engine.local({ local: 'info', session: call.sid, data: { candidates: batch.filter(Boolean), end_of_candidates: batch.some((c) => c === null) } });
-}
-
 /** Place a call to a DID; with `destination` (`tel:+…`), `to` is a gateway and the number rides as the invite's
  *  destination (N§4.1). A saved binding is presented on every call as a `tel` claim (N§4). */
 async function placeCall(to, video, destination) {
   if (call && engine.state(call.sid) !== 'ENDED') return notify('already in a call');
   pendingVoicemail = null; $('btn-voicemail').classList.add('hidden');
   log(`placing a ${video ? 'video ' : ''}call to ${nameOf(to) || short(to)}${destination ? ` (${destination})` : ''}`, '§12.4');
-  call = { sid: engine.newId(), role: 'initiator', peer: to, destination, media: null, pendingLocal: [], pendingUpdate: null, screening: false };
+  call = { sid: null, role: 'initiator', peer: to, destination, video, media: null, pendingUpdate: null, screening: false, placing: true };
+  const me = call;
   $('call-peer-name').textContent = nameOf(to) || '';
   $('call-peer-did').textContent = to;
   $('call-basis').textContent = verification_basis(to, '[]');
@@ -546,26 +667,25 @@ async function placeCall(to, video, destination) {
     // §8.1: discovery before the invite. A did:key has no document; the hints tier may name the peer's relay, and a
     // call to someone bound elsewhere goes through that relay on a connection of its own (the hint is not authority:
     // it only says where to try).
-    const sid = call.sid;
+    // The route is chosen before the session exists (keyed by `route` until the call glue names the session).
+    const route = `route:${engine.newId()}`;
     const hint = await discover(to);
-    if (!call || call.sid !== sid) return;
+    if (call !== me) return;
+    let r = null;
     if (hint && hint.uri && hint.uri !== relayUrl()) {
       $('call-route').textContent = `via their relay ${hint.uri} (a hint from the nodes, signed by ${short(hint.signer)}, expires in ${Math.max(0, Math.round(hint.expires_at - now()))} s; hint-sourced, not authoritative, §8.1)`;
       $('call-route').classList.remove('hidden');
-      const r = await openCallRelay(hint.uri, sid);
-      if (!call || call.sid !== sid) { r?.close(); return; }
+      r = await openCallRelay(hint.uri, route);
+      if (call !== me) { r?.close(); callRelays.delete(route); return; }
       if (!r) { log(`their relay ${hint.uri} did not bind us; trying our own relay instead`, '§8.1'); $('call-route').textContent += ' — unreachable; through our own relay'; }
     } else if (hint) { $('call-route').textContent = `their hint names our relay (${hint.uri})`; $('call-route').classList.remove('hidden'); }
-    call.media = await newMedia();
-    await call.media.capture(video);
-    $('local').srcObject = call.media.localStream;
-    const sdp = await call.media.offer();
-    engine.setVideo(video);
-    if (video) engine.setVideoCodecsFromSdp(sdp);
-    await engine.local({ local: 'place_call', session: call.sid, to,
-      sdp,                                                  // B§: SDP as the transport binding object
+    // the call glue asks for the SDP offer (onMediaRequest); the invite carries it (B§: the transport binding object)
+    const placed = engine.place(to, {
       claims: settings.binding ? [{ type: 'tel', number: bindingNumber(), binding: settings.binding }] : [],   // N§4
       patch: destination ? { destination } : null });       // N§4.1
+    call.sid = placed.session;
+    if (r) { callRelays.delete(route); callRelays.set(placed.session, r); }
+    await placed.go();
   } catch (err) { notify(`cannot call: ${err.message || err}`); endCall(); }
   renderCall();
 }
@@ -684,6 +804,7 @@ async function publishReachabilityOnce() {
 
 async function accept(screening) {
   if (!call || call.role !== 'responder') return;
+  if (engine.recording(call.sid)?.pending) return notify('accept or decline being recorded first (C§4)');
   call.answered = true;
   $('view-incoming').classList.add('hidden');
   $('call-peer-name').textContent = nameOf(call.peer) || '';
@@ -693,14 +814,8 @@ async function accept(screening) {
   $('call-mode').textContent = screening ? 'screening: nothing of yours is sent (§14.4)' : '';
   $('btn-introduce-after').classList.add('hidden');
   show('call');
-  try {
-    call.pendingLocal = []; call.screening = screening;
-    call.media = await newMedia();
-    const offerSdp = call.offer.transports?.[0]?.sdp;
-    if (!screening) { await call.media.capture(!!call.offer.media?.some((m) => m.type === 'video')); $('local').srcObject = call.media.localStream; }
-    const sdp = await call.media.answer(offerSdp, screening);
-    await engine.local({ local: 'accept', session: call.sid, answered_by: screening ? 'screening' : 'user', sdp });
-  } catch (err) { notify(`cannot answer: ${err.message || err}`); await engine.local({ local: 'decline', session: call.sid }); endCall(); }
+  // the call glue asks for the SDP answer to their offer (onMediaRequest), then answers
+  await engine.call(screening ? 'screen' : 'accept', call.sid);
   renderCall();
 }
 
@@ -708,7 +823,7 @@ async function decline() {
   if (!call) return;
   $('view-incoming').classList.add('hidden');
   const leg = call;
-  await engine.local({ local: 'decline', session: call.sid });
+  await engine.call('decline', call.sid);
   endCall();
   callEnded(leg, 'local', 'user.declined');
 }
@@ -716,46 +831,47 @@ async function decline() {
 async function hangup() {
   if (!call) return;
   const st = engine.state(call.sid);
-  if (st === 'ACTIVE') await engine.local({ local: 'hangup', session: call.sid });
+  if (st === 'ACTIVE') await engine.call('hangup', call.sid);
+  else if (call.placing) { if (call.sid) await engine.call('cancel', call.sid); endCall(); }   // no session yet: the glue drops it
   else if (st === 'ENDED' || !st) endCall();
-  else if (call.role === 'responder') await engine.local({ local: 'decline', session: call.sid });
+  else if (call.role === 'responder') await engine.call('decline', call.sid);
   else {
     // §12.5: our cancel ends the session for us at once; a late answer that crosses it is answered by the engine
     // with a bye on its own, and neither is a `ui ended` (the person ended it), so the screen is cleared here.
-    await engine.local({ local: 'cancel', session: call.sid });
+    await engine.call('cancel', call.sid);
     endCall();
   }
 }
 
+/** Add video (a re-offer with the camera, §12.8), or answer for real from screening (§14.4 step 3: the glue asks
+ *  for an offer with our source added, and the update says answered_by user). */
 async function sendUpdate(escalate) {
   if (!call?.media) return;
-  const offeredVideo = !!call.offer?.media?.some((m) => m.type === 'video');
-  if (escalate) await call.media.unscreen(offeredVideo);
-  else await call.media.addVideo();
-  $('local').srcObject = call.media.localStream;
-  const sdp = await call.media.offer();
-  engine.setVideo(escalate ? offeredVideo : true);
-  engine.setVideoCodecsFromSdp(sdp);
-  const ev = { local: 'update', session: call.sid, id: engine.newId(), sdp };
-  if (escalate) { ev.answered_by = 'user'; call.screening = false; $('call-mode').textContent = ''; }   // §14.4 step 3
-  await engine.local(ev);
+  if (!escalate) { await call.media.addVideo(); $('local').srcObject = call.media.localStream; }
+  await engine.call(escalate ? 'escalate' : 'update', call.sid);
   renderCall();
 }
 
 async function answerUpdate() {
   if (!call?.pendingUpdate || !call.media) return;
-  const id = call.pendingUpdate; call.pendingUpdate = null;
-  const wantVideo = !!call.offer.media?.some((m) => m.type === 'video');
-  if (wantVideo && !call.screening) { await call.media.addVideo(); $('local').srcObject = call.media.localStream; }
-  const sdp = await call.media.answer(call.offer.transports?.[0]?.sdp, call.screening);
-  await engine.local({ local: 'answer_update', session: call.sid, in_reply_to: id, answered_by: 'user', sdp });
+  call.pendingUpdate = null;
+  await engine.call('answer_update', call.sid);
   renderCall();
 }
 
 async function rejectUpdate() {
   if (!call?.pendingUpdate) return;
-  const id = call.pendingUpdate; call.pendingUpdate = null;
-  await engine.local({ local: 'reject_update', session: call.sid, in_reply_to: id, reason: 'media.unsupported' });
+  call.pendingUpdate = null;
+  await engine.call('reject_update', call.sid);
+  renderCall();
+}
+
+/** C§4: accept or decline the other side's recording. Accepting answers a call held for it, or sends our media
+ *  again; declining rejects a ringing call or ends an answered one (policy.recording-declined). */
+async function callRecording(accept) {
+  if (!call?.sid) return;
+  await engine.call(accept ? 'accept_recording' : 'decline_recording', call.sid);
+  if (!accept && call && !live(call.sid)) { const leg = endCall(); if (leg?.role === 'responder') callEnded(leg, 'local', 'policy.recording-declined'); }
   renderCall();
 }
 
@@ -1139,7 +1255,9 @@ function connect() {
 // ---------------------------------------------------------------- boot
 
 async function startEngine() {
-  engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required }, now);
+  // Impl: one call at a time in this client; a second invite is declined user.busy (§15) by the call glue
+  engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required, one_call: true,
+    seal: !!settings.seal, recording: settings.recording_accept || 'ask' }, now);
   engine.loadContactsFile(await store.get(key('engine.contacts')));
   for (const r of revoked) engine.ep.hold_revocation(r.frame);   // §7.4: revocations this identity issued apply here too
   for (const d of Object.values(documents)) engine.ep.add_document(JSON.stringify(d));   // §8.1: documents held
@@ -1148,12 +1266,15 @@ async function startEngine() {
       // a session placed through the peer's own relay stays there, an introduction through the relay their hint
       // named (keyed by their DID); everything else goes through ours
       const via = callRelays.get(meta.session) || callRelays.get(meta.to);
-      (via || relay).send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}${via ? ` via ${via.url}` : ''}`, '§12.4');
+      (via || relay).send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}${via ? ` via ${via.url}` : ''}${payloadOf(frame).sealed ? ' · sealed (§10.4)' : ''}`, '§12.4');
       if (meta.type === 'reject' && payloadOf(frame).reason === 'policy.first-contact-required') log(`refused a call from ${short(meta.to)} without ringing: first contact required`, '§19.4');
     },
     frame: legFrame,
     received: onReceived,
     emission: onEmission,
+    call: onCall,
+    mediaRequest: onMediaRequest,
+    resolve: (did) => { resolveDid(did); },   // not awaited: the held frame waits, nothing else does
     rejected: (code, detail) => log(`✗ inbound rejected: ${code} ${detail || ''}`, '§10.2'),
     changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); messenger?.set_grants(JSON.stringify(heldGrantFrames())); legsChanged(); },
   };
@@ -1841,6 +1962,12 @@ function renderMessages() {
   $('btn-reject-update').onclick = rejectUpdate;
   $('set-name-save').onclick = async () => { identity.display_name = $('set-name').value.trim(); await store.set(key('identity'), identity); location.reload(); };
   $('set-first-contact').onchange = async (e) => { settings.first_contact_required = e.target.checked; await saveSettings(); location.reload(); };
+  $('set-seal').onchange = async (e) => { settings.seal = e.target.checked; await saveSettings(); engine.setSeal(settings.seal); log(`call bodies ${settings.seal ? 'sealed to the callee when its key resolves' : 'sent in clear'}`, '§10.4'); };
+  $('set-recording-accept').onchange = async (e) => { settings.recording_accept = e.target.value; await saveSettings(); location.reload(); };
+  for (const id of ['in-recording', 'call-recording']) {
+    $(`${id}-accept`).onclick = () => callRecording(true);
+    $(`${id}-decline`).onclick = () => callRecording(false);
+  }
   $('set-record-keeper-save').onclick = () => setRecordKeeper($('set-record-keeper').value.trim());
   $('btn-become-keeper').onclick = becomeRecordKeeper;
   $('set-read-disclosed').onchange = async (e) => { settings.read_disclosed = e.target.checked; await saveSettings(); if (messenger) { messenger.set_read_disclosed(settings.read_disclosed, now()); await store.set(key('messenger'), JSON.parse(messenger.save())); } log(`read receipts ${settings.read_disclosed ? 'disclosed to the conversation' : 'kept to your own devices'}`, 'M§10.5'); };
@@ -1872,6 +1999,11 @@ function renderMessages() {
     identity: () => identity.identity,
     state: () => (call ? engine.state(call.sid) || 'PREPARING' : null),   // null = no call; PREPARING = media being set up, no session yet
     session: () => call?.sid || null,
+    recording: () => (call?.sid ? engine.recording(call.sid) : null),
+    recordingText: () => $('call-recording-text').textContent || $('in-recording-text').textContent,
+    holding: () => !!call?.media?.holding,
+    seal: () => engine.seal(),
+    setSeal: async (on) => { settings.seal = !!on; await saveSettings(); engine.setSeal(on); },
     relay: () => relayInfo?.did || null,
     inboundPackets: () => (call?.media ? call.media.inboundPackets() : Promise.resolve(0)),
     remoteKinds: () => ($('remote').srcObject ? $('remote').srcObject.getTracks().map((t) => t.kind).sort() : []),

@@ -50,11 +50,16 @@ pub struct CallsConfig {
     pub answer: AnswerPolicy,
     /// What to do when the other side declares recording (C§4).
     pub recording: AcceptPolicy,
+    /// One call at a time: an invite that arrives while another call is up is declined `user.busy`, and
+    /// the user is not asked.
+    ///
+    /// Impl: the host's choice, not a protocol rule; §15 lists `user.busy` for a callee that takes no more calls.
+    pub one_call: bool,
 }
 
 impl Default for CallsConfig {
     fn default() -> CallsConfig {
-        CallsConfig { media: true, answer: AnswerPolicy::Ring, recording: AcceptPolicy::Ask }
+        CallsConfig { media: true, answer: AnswerPolicy::Ring, recording: AcceptPolicy::Ask, one_call: false }
     }
 }
 
@@ -341,6 +346,12 @@ impl Calls {
         self.calls.get(session).is_some_and(|c| c.consent.hold_media())
     }
 
+    /// The other side's recording in `session` as consent sees it (C§4): `{disclosure, pending, hold_media, …}`, the
+    /// shape of `dsip_recording::Consent::snapshot`; `None` for a session that is not a call here.
+    pub fn consent(&self, session: &str) -> Option<Value> {
+        self.calls.get(session).map(|c| c.consent.snapshot())
+    }
+
     /// Place a call to `to`; returns the new session id. With media, the invite waits for the host's SDP offer.
     ///
     /// Spec: §12.4 (invite), §16.3 (SDP in the transport descriptor).
@@ -412,6 +423,12 @@ impl Calls {
         let media = self.cfg.media;
         let remote_sdp = payload.pointer("/transports/0/sdp").and_then(Value::as_str).map(String::from);
         let offered = core.endpoint().session(sid).map(|s| s.state) == Some(SessionState::Offered);
+        if msg_type == "invite" && offered && self.cfg.one_call && self.busy(core, sid) {
+            // §12.4: a callee rejects from ALERTING
+            let mut out = self.local(core, LocalEvent::Alert { session: sid.to_string(), ring_timeout: Some(AUTO_RING_TIMEOUT_S) }, now)?;
+            out.extend(self.local(core, LocalEvent::Decline { session: sid.to_string(), reason: Some("user.busy".into()) }, now)?);
+            return Ok(out);
+        }
         if msg_type == "invite" && offered {
             let mut call = Call::new(true, self.cfg.recording);
             call.remote_offer = remote_sdp.clone();
@@ -494,6 +511,11 @@ impl Calls {
             _ => {}
         }
         Ok(out)
+    }
+
+    /// Whether a call other than `sid` is up: placed and waiting on its offer, or a session not yet ended.
+    fn busy(&self, core: &Core, sid: &str) -> bool {
+        self.calls.keys().any(|s| s != sid && !matches!(core.endpoint().session(s).map(|x| x.state), Some(SessionState::Ended)))
     }
 
     /// The call a sealed-body refusal is about: the session it names, or else the one call we placed that is still
@@ -634,6 +656,12 @@ impl Calls {
     /// Do what the application asks of a call.
     pub fn command(&mut self, core: &mut Core, cmd: CallCommand, now: i64) -> Result<Vec<CallOut>> {
         let media = self.cfg.media;
+        // A call ended before the host produced its offer never reached the engine: it is dropped here.
+        if let CallCommand::Cancel { session } | CallCommand::Hangup { session } = &cmd {
+            if core.endpoint().session(session).is_none() && self.calls.remove(session).is_some() {
+                return Ok(if media { vec![CallOut::Media(MediaRequest::Close { session: session.clone() })] } else { vec![] });
+            }
+        }
         match cmd {
             CallCommand::Accept { session } => self.answer(core, &session, "user", now),
             CallCommand::Screen { session } => self.answer(core, &session, "screening", now),

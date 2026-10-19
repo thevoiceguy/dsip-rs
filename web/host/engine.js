@@ -1,6 +1,7 @@
-// The engine host: wraps the wasm `Endpoint` (verifier + §12 engine + payload builder + first-contact state) and
-// turns its JSON events into callbacks. Every normative decision is inside the wasm; this file drives it with the
-// browser's clock, delivers its frames to the relay, and persists its contact file.
+// The engine host: wraps the wasm `Endpoint` (verifier + §12 engine + payload builder + first-contact state + the
+// call glue) and turns its JSON events into callbacks. Every normative decision is inside the wasm; this file drives
+// it with the browser's clock, delivers its frames to the relay, and persists its contact file. The page is the media
+// host: it does the media work the call glue asks for (`mediaRequest`) and hands back SDP and local candidates.
 //
 // Spec: none (infrastructure). The event vocabulary is the engine's (`impl/vectors/README.md`, kind `state`).
 
@@ -9,12 +10,14 @@ export class Engine {
   constructor(Endpoint, identity, config, now) {
     this.now = now;
     this.ep = new Endpoint(JSON.stringify(identity), JSON.stringify(config), now());
-    this.on = {};                 // send(frame, meta), frame(text, dir), received(r), emission(e), rejected(code, detail), changed()
+    // send(frame, meta), frame(text, dir), received(r), emission(e), rejected(code, detail), mediaRequest(m), call(e),
+    // resolve(did), changed()
+    this.on = {};
     this.timer = null;
   }
 
   whoami() { return JSON.parse(this.ep.whoami()); }
-  state(sid) { const s = JSON.parse(this.ep.session(sid))[sid]; return s ? s.state : null; }
+  state(sid) { if (!sid) return null; const s = JSON.parse(this.ep.session(sid))[sid]; return s ? s.state : null; }
   contacts() { return JSON.parse(this.ep.contacts_snapshot()); }
   requests() { return JSON.parse(this.ep.requests()); }
   contactsFile() { return this.ep.contacts_json(); }
@@ -27,6 +30,27 @@ export class Engine {
   async local(ev) { return this.drive(this.ep.local(JSON.stringify(ev), this.now())); }
   async inbound(frame) { return this.drive(this.ep.inbound(frame, this.now()), frame); }
   async tick() { return this.drive(this.ep.tick(this.now())); }
+
+  /** The other side's recording in `sid` (C§4): `{disclosure, pending, hold_media, …}`, or null. */
+  recording(sid) { return JSON.parse(this.ep.recording(sid)); }
+
+  /** Place a call through the call glue: `invite` = {claims?, patch?}. Returns `{session, go}`: the session id at
+   *  once (so the page can route it before anything is sent), and `go()`, which drives the first events (the request
+   *  for the SDP offer; the invite goes out when the page hands it back). */
+  place(to, invite) {
+    const r = JSON.parse(this.ep.place(to, JSON.stringify(invite || {}), this.now()));
+    return { session: r.session, go: () => this.drive(JSON.stringify(r.events)) };
+  }
+  /** A call command (`accept`, `screen`, `decline`, `cancel`, `hangup`, `update`, `escalate`, `answer_update`,
+   *  `reject_update`, `accept_recording`, `decline_recording`) for `session`. */
+  async call(command, session) { return this.drive(this.ep.call(JSON.stringify({ command, session }), this.now())); }
+  /** The page's answer to a media request (`{kind: 'offer'|'answer', session, sdp}`), or a local candidate
+   *  (`{kind: 'candidate', session, candidate|null}`). */
+  async media(result) { return this.drive(this.ep.media(JSON.stringify(result), this.now())); }
+  /** The outcome of a `resolve`: the document's text, or '' and why the fetch failed (§8.4). */
+  async resolved(did, text, error) { return this.drive(this.ep.resolved(did, text || '', error || '', this.now())); }
+  setSeal(on) { this.ep.set_seal(!!on); }
+  seal() { return this.ep.seal(); }
 
   setVideo(v) { this.ep.set_video(!!v); }      // the next offer's descriptors match the SDP (B§2.1)
   /** The video codecs the next offer lists, taken from the SDP's video section so the descriptors match it (B§3.4). */
@@ -49,6 +73,9 @@ export class Engine {
       else if (e.received) { if (inFrame) this.on.frame?.(inFrame, 'in'); await this.on.received?.(e.received); }
       else if (e.emission) await this.on.emission?.(e.emission);
       else if (e.rejected) this.on.rejected?.(e.rejected.code, e.rejected.detail);
+      else if (e.media_request) await this.on.mediaRequest?.(e.media_request);
+      else if (e.call) await this.on.call?.(e.call);
+      else if (e.resolve) this.on.resolve?.(e.resolve.did);
     }
     this.on.changed?.();
     return events;

@@ -519,7 +519,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         first_contact_required: matches!(&mode, Mode::Answer { first_contact: true, .. }),
         seal: opts.seal,
         did_resolver: None,
-        calls: Some(CallsConfig { media: media_enabled(&opts), answer, recording: accept_policy }),
+        calls: Some(CallsConfig { media: media_enabled(&opts), answer, recording: accept_policy, one_call: false }),
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     if let Mode::Answer { first_contact, tokens, .. } = &mode {

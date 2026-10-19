@@ -1,10 +1,10 @@
-// WebRTC for one call: the browser's RTCPeerConnection, the local stream, and the candidate buffering the binding
-// requires. Candidates gathered before the session is ACTIVE wait; once active they ride in signed `info`
-// (the app sends them through the engine). Remote candidates that arrive before the remote description is set wait
-// too.
+// WebRTC for one call: the browser's RTCPeerConnection and the local stream. Local candidates go to the call glue,
+// which holds them until the session is ACTIVE and sends them in signed `info`. Remote candidates that arrive before
+// the remote description is set wait here.
 //
 // Spec: WebRTC Media Binding B§2–B§6 (SDP in `transports[].sdp`, one answer per offer), §12.12 (candidates in
-// `info`, ACTIVE-only), §14.1 (no media before a signed answer), §14.4 (screening: receive only).
+// `info`, ACTIVE-only), §14.1 (no media before a signed answer), §14.4 (screening: receive only), C§4 (media held
+// while a recording waits on acceptance).
 
 export class Media {
   constructor(iceServers, on) {
@@ -91,6 +91,23 @@ export class Media {
     this.localStream = s;
     return s;
   }
+
+  /** Send nothing until `resume` (C§4: the other side records, and the user has not accepted it): every sender's
+   *  track is taken off, and kept to put back. */
+  async hold() {
+    this.held ??= new Map();
+    for (const s of this.pc.getSenders()) if (s.track) { this.held.set(s, s.track); await s.replaceTrack(null); }
+  }
+
+  /** Send again what `hold` took off (§14.1: called once the signed answer made the call active). */
+  async resume() {
+    if (!this.held) return;
+    for (const [s, t] of this.held) await s.replaceTrack(t).catch(() => {});
+    this.held = null;
+  }
+
+  /** Whether `hold` keeps our media off the wire. */
+  get holding() { return !!this.held; }
 
   /** Inbound RTP packets received so far (for tests and the call screen). */
   async inboundPackets() {
