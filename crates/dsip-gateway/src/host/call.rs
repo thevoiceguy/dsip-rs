@@ -34,6 +34,8 @@ pub struct Call {
     pub from_tn: Option<String>,
     /// Outbound: the RFC 8224 `Identity` header value, when the gateway signed a PASSporT (N§4.1).
     pub identity_header: Option<String>,
+    /// The DSIP side's recording has been reported as not disclosed to the PSTN party (G§7, spec-gap 133).
+    pub recording_downgraded: bool,
     sip_call_id: Option<String>,
     media: Option<DsipMedia>,
     rtp: Option<Arc<RtpLeg>>,
@@ -219,6 +221,7 @@ impl Call {
             dsip_target: None,
             from_tn: None,
             identity_header: None,
+            recording_downgraded: false,
         }
     }
 
@@ -243,6 +246,7 @@ impl Call {
             dsip_target: None,
             from_tn: None,
             identity_header: None,
+            recording_downgraded: false,
         }
     }
 

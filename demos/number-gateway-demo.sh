@@ -13,6 +13,9 @@
 #      identity-not-assertable (G§7); Bob sees "no attestation".
 #   3. Alice dials a number nobody published: gw-b finds no route and refuses identity.unknown (404); Alice's call is
 #      rejected identity.unknown.
+#   4. Alice declares her call recorded (C§3): the PSTN party cannot be told, so gw-a accepts on its behalf and the
+#      crossing is downgraded recording-not-disclosed (G§7, spec-gap 133).
+#   5. Bob answers recorded: gw-b, the DSIP counterparty of his answer, tells him the same.
 # Media crosses both gateways: Alice's 440 Hz Opus becomes G.711 on the trunk and Opus again for Bob, and Bob's
 # 660 Hz comes back the same way; both ends count the RTP they received.
 set -euo pipefail
@@ -58,7 +61,7 @@ grep -h "^gateway\|^numbers\|^sti " "$D/gw-a.log" "$D/gw-b.log" | sed 's/^/  /' 
 
 call() { # n caller number [extra caller args]
   local n=$1 who=$2 number=$3; shift 3
-  $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --auto accept --media tone:660 "${DOCS[@]}" \
+  $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --auto accept --media tone:660 "${DOCS[@]}" ${BOB_ARGS:-} \
     --script "sleep 18; quit" >"$D/$n-bob.log" 2>&1 & BP=$!
   for _ in $(seq 50); do grep -q "capabilities" "$D/$n-bob.log" && break; sleep 0.2; done
   $B/dsip call --identity "$D/$who" --relay $R --ca "$CA" --to "tel:$number" --gateway $GWA --media tone:440 "${DOCS[@]}" \
@@ -97,8 +100,22 @@ call 3 alice $NOBODY_TN --tn-binding "$D/alice.jws"
 grep -q "route     $NOBODY_TN → nothing configured, no binding: identity.unknown (404)" "$D/gw-b.log" || fail "3: gateway B did not refuse"
 grep -q "← reject .* reason=identity.unknown" "$D/3-alice.log" || fail "3: Alice's call was not rejected identity.unknown"
 
+REC=did:web:rec.acme.example
+NOT_TOLD="the PSTN party was not told this call is recorded"
+echo "════════ 4. Alice is recorded: the PSTN party cannot be told, and the crossing says so (spec-gap 133)"
+call 4 alice $BOB_TN --tn-binding "$D/alice.jws" --recorded-by $REC
+grep -q "⚠  Trust downgraded crossing the gateway (§6.3): .*$NOT_TOLD" "$D/4-alice.log" || fail "4: Alice was not told her recording did not cross"
+grep -q "← answer" "$D/4-alice.log" || fail "4: the recorded call was not answered (the gateway accepts on the PSTN party's behalf)"
+
+echo "════════ 5. Bob answers recorded: gateway B tells him the PSTN caller was not told"
+BOB_ARGS="--recorded-by $REC" call 5 alice $BOB_TN --tn-binding "$D/alice.jws"
+grep -q "→ error    gateway.downgraded \[\"recording-not-disclosed\"\]" "$D/gw-b.log" || fail "5: gateway B sent no recording-not-disclosed"
+grep -q "⚠  Trust downgraded crossing the gateway (§6.3): $NOT_TOLD" "$D/5-bob.log" || fail "5: Bob was not told his recording did not cross"
+grep -q "media     bridged" "$D/gw-b.log" || fail "5: gateway B held the media of a recorded callee"
+
 echo
 echo "PASS: a DSIP caller's bound number crossed to the PSTN with a SHAKEN PASSporT (attestation A) signed under the"
 echo "      gateway's RFC 9060 delegate certificate; the far gateway verified it and reached the callee through the"
 echo "      binding he published, and audio crossed both gateways; a caller without a binding crossed downgraded with"
-echo "      no attestation; a number nobody published was refused identity.unknown."
+echo "      no attestation; a number nobody published was refused identity.unknown; a recording declared on either side"
+echo "      was accepted on the PSTN party's behalf, and the recording party told it was not disclosed (spec-gap 133)."
