@@ -30,7 +30,6 @@
 //! stage 3).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::RwLock;
 
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
@@ -42,43 +41,16 @@ use dsip_core::version::Supported;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Outcome, ProcessOptions};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, MemoryStore, Outcome, ProcessOptions};
 use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, message_header, Device, MlsError};
 use openmls::prelude::tls_codec::Serialize as _;
 use openmls::prelude::*;
-use openmls_rust_crypto::{MemoryStorage, RustCrypto};
 use openmls_traits::OpenMlsProvider;
 
 use crate::{js, unhex};
-
-/// The MLS provider for the browser: OpenMLS's rust-crypto, with its memory storage — exported by [`Messenger::save`]
-/// and restored by [`Messenger::new`], so a page reload keeps the groups and the KeyPackages' private halves.
-#[derive(Default)]
-pub struct BrowserProvider {
-    crypto: RustCrypto,
-    storage: MemoryStorage,
-}
-
-impl OpenMlsProvider for BrowserProvider {
-    type CryptoProvider = RustCrypto;
-    type RandProvider = RustCrypto;
-    type StorageProvider = MemoryStorage;
-
-    fn storage(&self) -> &MemoryStorage {
-        &self.storage
-    }
-
-    fn crypto(&self) -> &RustCrypto {
-        &self.crypto
-    }
-
-    fn rand(&self) -> &RustCrypto {
-        &self.crypto
-    }
-}
 
 fn b64(bytes: &[u8]) -> String {
     dsip_core::b64::encode(bytes)
@@ -241,7 +213,7 @@ const BROWSER: ProcessOptions =
 pub struct Messenger {
     keys: IdentityKeys,
     controller_seed: Option<[u8; 32]>,
-    mls: Device<BrowserProvider>,
+    mls: Device<MemoryStore>,
     mailbox: (String, String),
     resolver: StaticResolver,
     seen: SeenIds,
@@ -351,14 +323,7 @@ impl Messenger {
         let controller_seed = id["controller_seed_hex"].as_str().and_then(|h| unhex(h).ok());
         let saved: Value = saved_json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
         // the MLS storage as saved: `{b64url key: b64url value}`
-        let mut values = std::collections::HashMap::new();
-        for (k, v) in saved["mls"].as_object().into_iter().flatten() {
-            if let (Some(k), Some(v)) = (dsip_core::b64::decode(k), v.as_str().and_then(dsip_core::b64::decode)) {
-                values.insert(k, v);
-            }
-        }
-        let provider = BrowserProvider { crypto: RustCrypto::default(), storage: MemoryStorage { values: RwLock::new(values) } };
-        let mls = Device::with_provider(device, compact(&delegation), provider);
+        let mls = Device::with_provider(device, compact(&delegation), MemoryStore::from_mls_json(&saved["mls"]));
         let st = &saved["state"];
         let now_i = now as i64;
         let mut m = Messenger {
@@ -455,8 +420,7 @@ impl Messenger {
     /// Everything to keep: the MLS storage and this device's delivery state, as one JSON record. The host writes it
     /// after every step that returned something (spec-gap 44: MLS state and delivery state committed together).
     pub fn save(&self) -> String {
-        let values = self.mls.provider().storage().values.read().map(|v| v.clone()).unwrap_or_default();
-        let mls: serde_json::Map<String, Value> = values.iter().map(|(k, v)| (b64(k), json!(b64(v)))).collect();
+        let mls = self.mls.provider().mls_json();
         let convs: serde_json::Map<String, Value> = self.convs.iter().map(|(g, c)| (g.clone(), json!({
             "conversation": c.conversation, "kind": c.kind, "hub": {"did": c.hub.0, "uri": c.hub.1}, "peer": c.peer, "joined_epoch": c.joined_epoch,
         }))).collect();

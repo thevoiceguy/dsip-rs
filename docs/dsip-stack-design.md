@@ -174,6 +174,10 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    *Status (2026-10-19):* 3a the shared `process` (#204); 3a′ dsip-msg's `events` module, which holds the gateway and
    the alarm lists (E§3–E§6), so what remains in `dsip-msg.rs` is the messaging client and its host (#205); 3b the pure
    helpers both clients now call: `key_packages`, `recording`, `blob`, `archive`, `calls`.
+   3c the `Store` trait: an OpenMLS provider that also keeps the device's state values and runs a closure
+   atomically. dsip-msg's `SqliteProvider` is one (feature `sqlite`), and the browser's provider is now `MemoryStore`,
+   which keeps its save format and can roll back both maps. Neither client calls the trait yet (3d does), so the
+   browser still neither rolls back nor acknowledges an unprocessable item.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

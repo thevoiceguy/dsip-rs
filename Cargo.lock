@@ -1643,7 +1643,6 @@ dependencies = [
  "dsip-session",
  "js-sys",
  "openmls",
- "openmls_rust_crypto",
  "openmls_traits",
  "serde_json",
  "wasm-bindgen",
