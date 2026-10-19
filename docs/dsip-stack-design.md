@@ -178,6 +178,10 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    atomically. dsip-msg's `SqliteProvider` is one (feature `sqlite`), and the browser's provider is now `MemoryStore`,
    which keeps its save format and can roll back both maps. Neither client calls the trait yet (3d does), so the
    browser still neither rolls back nor acknowledges an unprocessable item.
+   3d, first part: inbound routing (`inbound::route`). Both clients decide in it where an item goes before MLS (ephemeral,
+   duplicate, first contact, archive, GroupInfo, own deposit, pre-join history, held behind a gap, or processed with
+   what the gap releases) and record the decisions that need no processing. What each client does with an MLS
+   outcome stays in the host until the state it writes (outbox, receipts, history, successors) is shared in 3e–3h.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
