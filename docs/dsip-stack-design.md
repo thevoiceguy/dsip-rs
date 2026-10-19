@@ -160,6 +160,28 @@ PoC better on their own terms: each removes duplicated glue from the reference c
 3. **One messaging client.** A library client extracted from `dsip-msg` and the wasm `Messenger`, over storage
    traits (SQLite natively, IndexedDB in the browser). `dsip-msg` keeps the device-events gateway as its own
    module.
+   *Plan (2026-10-18).* The library is a new crate, `dsip-messaging-device` (OpenMLS 0.9, so Rust 1.91 like dsip-mls;
+   a `sqlite` feature for the native store, never on wasm32). It takes the wasm `Messenger`'s shape: sans-I/O, every
+   deposit pending until its answer, the host doing the I/O. dsip-msg today waits inline for each answer, so it becomes
+   a host of that shape. Stages, each with no behaviour change and every vector, parity run, CI demo and web test
+   green: 3a the item processing (`process`, `Outcome`); 3a′ dsip-msg's device-events gateway split into its own module;
+   3b pure helpers (key-package selection, archive records, blobs, call records, recording state); 3c a `Store` trait
+   (SQLite natively, memory with rollback in the browser) with both on-disk formats unchanged; 3d the inbound pipeline;
+   3e the outbound side (deposits, outbox, outages, re-deposits; the riskiest); 3f commits and their retries; 3g
+   history and receipts; 3h successor groups; 3i what only one client has, behind `Config`; 3j thin hosts. A
+   browser↔dsip-msg demo comes before 3d: nothing tests the two clients against each other today.
+
+   Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
+   it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
+   the dedup key (with or without the sender); an unprocessable item rolled back and acknowledged (dsip-msg) or
+   neither; a seq gap that does not fill re-joined (dsip-msg) or only reported; receipts received in the personal group
+   routed to their conversation and batched (dsip-msg) or stepped at once; receipt policy and activity; waiting for the
+   epoch to move after a conflict (dsip-msg); 20 s or 60 s before a deposit with no answer is an outage; re-deposits of
+   commits, GroupInfo and config on reconnect (browser); `mailbox-config joined` after an external join (browser); a
+   successor made with one commit per peer (dsip-msg) or one for all (browser); proposals stored (browser); recorder
+   content and acceptance keys; archive keys overwritten or kept; when a call event is recorded; the blob `tried`
+   input; a sealed introduction opened without the identity key.
+
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.
 5. **Its own repository and release.** Move the stack crates (or the whole of `impl/`) out when core reaches 1.0,

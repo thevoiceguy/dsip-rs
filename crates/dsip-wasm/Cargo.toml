@@ -5,7 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
+# dsip-mls (OpenMLS 0.9) sets the floor.
+rust-version = "1.91"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -17,6 +18,7 @@ dsip-session.workspace = true
 dsip-endpoint = { workspace = true, features = ["wasm"] }
 dsip-number.workspace = true
 dsip-dht = { workspace = true, default-features = false }
+dsip-messaging-device.workspace = true
 dsip-mls.workspace = true
 dsip-messaging.workspace = true
 dsip-recording.workspace = true

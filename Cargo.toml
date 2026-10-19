@@ -16,6 +16,7 @@ members = [
     "crates/dsip-number",
     "crates/dsip-kt",
     "crates/dsip-mls",
+    "crates/dsip-messaging-device",
     "crates/dsip-mailbox",
     "crates/dsip-broadcast",
     "crates/dsip-dht",
@@ -53,6 +54,7 @@ dsip-recording = { path = "crates/dsip-recording" }
 dsip-number = { path = "crates/dsip-number" }
 dsip-kt = { path = "crates/dsip-kt" }
 dsip-mls = { path = "crates/dsip-mls" }
+dsip-messaging-device = { path = "crates/dsip-messaging-device" }
 dsip-mailbox = { path = "crates/dsip-mailbox" }
 dsip-broadcast = { path = "crates/dsip-broadcast" }
 serde = { version = "1", features = ["derive"] }
