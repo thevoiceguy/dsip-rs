@@ -188,8 +188,13 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    was up: an outage starting after more than `hub_timeout` from the group's first deposit triggered the successor at
    once, with no retries. 3e-2 is the deposit registry, `Deposits<P>`: what each deposit awaiting an answer was (`P`
    stays the host's), the hub it was addressed to, the no-answer watch, and the deposits deferred until the group's
-   new hub hosts it; the browser's four maps become one. 3e-3 is dsip-msg no longer waiting inline, on the same
-   registry.
+   new hub hosts it; the browser's four maps become one. 3e-3 puts dsip-msg on the same registry. A command still
+   waits for its own deposit's answer, since what it prints and writes follows from that answer, but the answer now
+   reaches it through `inbound` and the registry; an answer read during a nested wait is kept for the command waiting
+   for it, where it used to be dropped. The outbox's re-deposits no longer wait at all: each answer is acted on when it
+   arrives, a deposit unanswered after 20 s counts as the hub unreachable, and a moved group's new hub that does not
+   host it yet gets the same bytes again from the tick, as in the browser. `hub-return-demo.sh` covers the flush when
+   the hub comes back, which no demo did. Commits keep waiting inline until 3f.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

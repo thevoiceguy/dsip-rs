@@ -53,7 +53,7 @@ use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Inbound, Outbox, Outcome, ProcessOptions, Route};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, Inbound, Outbox, Outcome, ProcessOptions, Route};
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
@@ -342,6 +342,18 @@ struct Conv {
     last_media: Option<String>,
 }
 
+/// Seconds after which a deposit with no answer at all counts as the hub unreachable (M§9.4). Impl (spec-gap 72): the
+/// device's own answer timeout.
+const NO_ANSWER_S: i64 = 20;
+
+/// A deposit awaiting the hub's answer (M§5.3).
+enum Sent {
+    /// One a command waits for ([`Client::hub_deposit`]): its answer is kept for it.
+    Awaited,
+    /// A pending item of `group` re-deposited by the outbox (M§9.3): acted on when its answer arrives.
+    Forward { group: String, item: String },
+}
+
 struct Client {
     keys: Keys,
     identity: String,
@@ -399,6 +411,10 @@ struct Client {
     /// Pending items per group, oldest first: `{id, mls, obj, extra}`, kept durably until accepted (M§9.2), and the
     /// outage machine of each group, advanced every tick (M§9.4; spec-gap 72).
     pending: Outbox,
+    /// Deposits awaiting the hub's answer, by deposit id (M§5.3), the hub each went to and the outbox's no-answer watch.
+    deposits: Deposits<Sent>,
+    /// Answers to the deposits a command waits for, until it takes them.
+    answers: BTreeMap<String, Value>,
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
     own: HashSet<String>,
     resume: Resume,
@@ -846,40 +862,77 @@ impl Client {
     /// (M§7.4, spec-gap 129).
     async fn hub_deposit(&mut self, group: &str, class: &str, fields: Value) -> Result<Value> {
         let hub = self.conv(group)?.hub.0.clone();
-        if let Some(bytes) = fields["mls"].as_str().and_then(dsip_core::b64::decode) {
-            self.own.insert(digest(&bytes));
-        }
         let reply = loop {
-            let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], &hub, now_s(), group, class, fields.clone());
-            let id = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)).context("deposit id")?;
+            let (env, id) = self.deposit_env(group, &hub, class, fields.clone())?;
             self.send(&env).await?;
-            let reply = self.await_reply(&id).await?;
-            let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("").to_string());
-            let ems = match self.arrivals.get_mut(group) {
-                Some(a) => {
-                    a.set_now(now_s());
-                    a.answer(&hub, reason.as_deref())
-                }
-                None => vec![],
-            };
-            match ems.iter().find_map(|e| e["retry_in"].as_i64()) {
-                Some(d) => {
-                    println!("ARRIVING {group}: {hub} does not host the group yet; again in {d}s");
-                    tokio::time::sleep(std::time::Duration::from_secs(d as u64)).await;
-                }
+            self.deposits.insert(id.clone(), Sent::Awaited);
+            self.deposits.addressed(id.clone(), hub.clone());
+            let reply = self.await_answer(&id).await?;
+            match self.arrival(group, &hub, &reply) {
+                Some(d) => tokio::time::sleep(std::time::Duration::from_secs(d as u64)).await,
                 None => break reply,
             }
         };
+        self.deposit_seq(group, class, &reply)?;
+        Ok(reply)
+    }
+
+    /// A deposit to `hub` for `group`, the delegation in the header (M§5.1): the envelope and its id. Its MLS bytes are
+    /// this device's own, and their fan-out copy is known as such (spec-gap 47).
+    fn deposit_env(&mut self, group: &str, hub: &str, class: &str, fields: Value) -> Result<(Envelope, String)> {
+        if let Some(bytes) = fields["mls"].as_str().and_then(dsip_core::b64::decode) {
+            self.own.insert(digest(&bytes));
+        }
+        let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], hub, now_s(), group, class, fields);
+        let id = wire::payload_of(&env).and_then(|p| p["id"].as_str().map(String::from)).context("deposit id")?;
+        Ok((env, id))
+    }
+
+    /// M§7.4 (spec-gap 129): whether `hub`'s answer shows the hub the group moved to not hosting it yet, as the
+    /// vector-pinned [`MoveArrival`] decides; if so, the seconds before the same bytes go again.
+    fn arrival(&mut self, group: &str, hub: &str, reply: &Value) -> Option<i64> {
+        let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("").to_string());
+        let a = self.arrivals.get_mut(group)?;
+        a.set_now(now_s());
+        let d = a.answer(hub, reason.as_deref()).iter().find_map(|e| e["retry_in"].as_i64())?;
+        println!("ARRIVING {group}: {hub} does not host the group yet; again in {d}s");
+        Some(d)
+    }
+
+    /// The hub's `accepted` seq marks this device's own copy as processed (spec-gap 47), for the gap tracker as much as
+    /// for the resume state — otherwise its own items look like a gap (spec-gap 69).
+    fn deposit_seq(&mut self, group: &str, class: &str, reply: &Value) -> Result<()> {
         if let Some(seq) = reply["seq"].as_i64() {
-            // The hub's `accepted` seq marks this device's own copy as processed (spec-gap 47), for the gap
-            // tracker as much as for the resume state — otherwise its own items look like a gap (spec-gap 69).
             self.resume.sent(group, seq);
             if matches!(class, "handshake" | "application") {
                 self.gap_of_from(group, seq).step(&json!({"item": {"seq": seq, "class": class}}));
             }
             self.save_resume()?;
         }
-        Ok(reply)
+        Ok(())
+    }
+
+    /// Wait for the answer to deposit `id`, processing every other frame as it comes; none within [`NO_ANSWER_S`] is
+    /// "no answer" (M§9.4), and an answer arriving later is not ours any more.
+    async fn await_answer(&mut self, id: &str) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(NO_ANSWER_S as u64);
+        let answer = async {
+            loop {
+                if let Some(a) = self.answers.remove(id) {
+                    return Ok(a);
+                }
+                let conn = self.conn.as_mut().context("offline")?;
+                let frame = tokio::time::timeout_at(deadline, conn.recv()).await.context("no answer")??.context("mailbox closed")?;
+                if let Err(e) = Box::pin(self.inbound(&frame)).await {
+                    println!("ERR {e}");
+                }
+            }
+        }
+        .await;
+        if answer.is_err() {
+            self.deposits.remove(id);
+        }
+        answer
     }
 
     /// Read frames until the answer to `id` arrives, processing everything else as it comes.
@@ -977,21 +1030,71 @@ impl Client {
     /// emissions and, unless the item stays pending, the answer. No answer at all counts as the hub unreachable.
     async fn deposit_item(&mut self, group: &str, item: &Value) -> Result<(Vec<Value>, Option<Value>)> {
         let id = item["id"].as_str().unwrap_or("").to_string();
-        let mut fields = json!({"mls": item["mls"]});
-        for (k, v) in item["extra"].as_object().into_iter().flatten() {
-            fields[k.as_str()] = v.clone();
-        }
-        match self.hub_deposit(group, "application", fields).await {
-            Ok(reply) => {
-                let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
-                let emissions = self.outage_mut(group).answer(&id, reason.as_deref());
-                // M§9.4: the outbox keeps it for an unreachable hub, or one that could not store it (spec-gap 99)
-                let still_pending = matches!(reason.as_deref(), Some("mailbox.hub-unreachable" | "mailbox.quota-exceeded"));
-                Ok((emissions, (!still_pending).then_some(reply)))
-            }
+        match self.hub_deposit(group, "application", item_fields(item)).await {
+            Ok(reply) => Ok(self.item_answered(group, &id, reply)),
             Err(e) if e.to_string().contains("no answer") => Ok((self.outage_mut(group).no_answer(&id), None)),
             Err(e) => Err(e),
         }
+    }
+
+    /// The hub answered pending item `id` of `group`: the outbox's emissions and, unless the item stays pending, the
+    /// answer.
+    fn item_answered(&mut self, group: &str, id: &str, reply: Value) -> (Vec<Value>, Option<Value>) {
+        let reason = (reply["type"] != "accepted").then(|| reply["reason"].as_str().unwrap_or("session.failed").to_string());
+        let emissions = self.outage_mut(group).answer(id, reason.as_deref());
+        // M§9.4: the outbox keeps it for an unreachable hub, or one that could not store it (spec-gap 99)
+        let still_pending = matches!(reason.as_deref(), Some("mailbox.hub-unreachable" | "mailbox.quota-exceeded"));
+        (emissions, (!still_pending).then_some(reply))
+    }
+
+    /// The outbox re-deposits pending item `id` of `group` (M§9.3: its own MLS bytes) without waiting: its answer is
+    /// acted on when it arrives ([`Self::forward_answered`]), and none within [`NO_ANSWER_S`] counts as the hub
+    /// unreachable (M§9.4).
+    async fn forward(&mut self, group: &str, id: &str) -> Result<()> {
+        let Some(item) = self.pending.item(group, id).cloned() else { return Ok(()) };
+        let hub = self.conv(group)?.hub.0.clone();
+        let (env, did) = self.deposit_env(group, &hub, "application", item_fields(&item))?;
+        self.send(&env).await?;
+        self.deposits.insert(did.clone(), Sent::Forward { group: group.to_string(), item: id.to_string() });
+        self.deposits.addressed(did.clone(), hub);
+        self.deposits.watch(did, now_s());
+        Ok(())
+    }
+
+    /// The answer to a deposit of ours (M§5.3): kept for the command waiting for it, or acted on for the outbox.
+    async fn answered(&mut self, id: &str, sent: Sent, hub: Option<String>, reply: Value) -> Result<()> {
+        match sent {
+            Sent::Awaited => {
+                self.answers.insert(id.to_string(), reply);
+                Ok(())
+            }
+            Sent::Forward { group, item } => self.forward_answered(&group, &item, hub.as_deref().unwrap_or(""), reply).await,
+        }
+    }
+
+    /// The hub answered an outbox re-deposit of item `id` (M§9.4): the item leaves the outbox unless it stays pending,
+    /// and the outage machine's emissions are acted on.
+    async fn forward_answered(&mut self, group: &str, id: &str, hub: &str, reply: Value) -> Result<()> {
+        if let Some(d) = self.arrival(group, hub, &reply) {
+            self.deposits.defer(Sent::Forward { group: group.to_string(), item: id.to_string() }, now_s() + d);
+            return Ok(());
+        }
+        self.deposit_seq(group, "application", &reply)?;
+        let obj = self.pending.item(group, id).map(|i| i["obj"].clone());
+        let (more, reply) = self.item_answered(group, id, reply);
+        if let (Some(r), Some(obj)) = (reply, obj) {
+            self.pending.remove(group, id);
+            if r["type"] == "accepted" {
+                self.sent(group, &r, &obj);
+                println!("SENT-AFTER-OUTAGE {id} seq={}", r["seq"]);
+                self.inform_outcome(id, true).await;
+            } else {
+                println!("ERR pending {id} refused: {}", r["reason"]);
+                self.inform_outcome(id, false).await;
+            }
+        }
+        // boxed: an answer read while a command waits (await_answer → inbound → here) can start a successor that waits
+        Box::pin(self.run_outage(group, more)).await
     }
 
     /// Act on the outbox's emissions (M§9.4): re-deposit the head when due, flush the rest once the hub answers, and
@@ -999,21 +1102,8 @@ impl Client {
     async fn run_outage(&mut self, group: &str, emissions: Vec<Value>) -> Result<()> {
         let mut queue: std::collections::VecDeque<Value> = emissions.into();
         while let Some(e) = queue.pop_front() {
-            if let Some(id) = e["forward"].as_str().map(String::from) {
-                let Some(item) = self.pending.item(group, &id).cloned() else { continue };
-                let (more, reply) = self.deposit_item(group, &item).await?;
-                if let Some(r) = reply {
-                    self.pending.remove(group, &id);
-                    if r["type"] == "accepted" {
-                        self.sent(group, &r, &item["obj"]);
-                        println!("SENT-AFTER-OUTAGE {id} seq={}", r["seq"]);
-                        self.inform_outcome(&id, true).await;
-                    } else {
-                        println!("ERR pending {id} refused: {}", r["reason"]);
-                        self.inform_outcome(&id, false).await;
-                    }
-                }
-                queue.extend(more);
+            if let Some(id) = e["forward"].as_str() {
+                self.forward(group, id).await?;
             } else if let Some(d) = e["retry_in"].as_i64() {
                 let head = self.pending.outages.get(group).and_then(|o| o.pending().first().cloned()).unwrap_or_default();
                 println!("PENDING {head} retry_in={d}");
@@ -1112,6 +1202,19 @@ impl Client {
         // may be retrying the hand-over to its successor
         for (g, emissions) in self.pending.due(now_s()) {
             self.run_outage(&g, emissions).await?;
+        }
+        // re-deposits the group's new hub refused before it hosted the group, due again (M§7.4, spec-gap 129)
+        for sent in self.deposits.due(now_s()) {
+            if let Sent::Forward { group, item } = sent {
+                self.forward(&group, &item).await?;
+            }
+        }
+        // M§9.4: a re-deposit with no answer at all counts as the hub unreachable
+        for (_, sent) in self.deposits.silent(now_s()) {
+            if let Sent::Forward { group, item } = sent {
+                let emissions = self.outage_mut(&group).no_answer(&item);
+                self.run_outage(&group, emissions).await?;
+            }
         }
         Ok(())
     }
@@ -2095,6 +2198,11 @@ impl Client {
     async fn inbound(&mut self, frame: &str) -> Result<()> {
         let env = Envelope::from_frame(frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
         let p = wire::payload_of(&env).context("bad frame")?;
+        if let (Some(id), "accepted" | "error") = (p["in_reply_to"].as_str().map(String::from), p["type"].as_str().unwrap_or("")) {
+            if let Some((sent, hub)) = self.deposits.answer(&id) {
+                return self.answered(&id, sent, hub, p).await;
+            }
+        }
         match p["type"].as_str().unwrap_or("") {
             "items" => {
                 for item in p["items"].as_array().into_iter().flatten() {
@@ -2686,6 +2794,8 @@ async fn main() -> Result<()> {
         gap_timeout: args.gap_timeout,
         arrivals: BTreeMap::new(),
         pending: Outbox::new(args.hub_timeout),
+        deposits: Deposits::new(NO_ANSWER_S),
+        answers: BTreeMap::new(),
         own: HashSet::new(),
         resume,
         successors: get("successors")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
@@ -2848,6 +2958,15 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A pending item's deposit fields: its MLS bytes (M§9.3) and what the item adds (a blob manifest, M§8.4).
+fn item_fields(item: &Value) -> Value {
+    let mut fields = json!({"mls": item["mls"]});
+    for (k, v) in item["extra"].as_object().into_iter().flatten() {
+        fields[k.as_str()] = v.clone();
+    }
+    fields
 }
 
 fn get_state_list(client: &Client, key: &str) -> Result<Vec<String>> {
