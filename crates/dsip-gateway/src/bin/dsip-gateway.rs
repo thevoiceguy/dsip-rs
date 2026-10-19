@@ -23,6 +23,8 @@ use anyhow::Result;
 use clap::Parser;
 use dsip_number::Route;
 use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
+use dsip_transport::calls::AcceptPolicy;
+use dsip_transport::{AnswerPolicy, CallEvent, CallsConfig, MediaRequest, MediaResult};
 use dsip_transport::identity::Identity;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -115,7 +117,10 @@ async fn main() -> Result<()> {
         first_contact_required: false,
         seal: false,
         did_resolver: None,
-        calls: None,
+        // The call glue answers nothing by itself: the controller decides when the DSIP leg rings and answers (G§3).
+        // Impl: a recording the DSIP side declares (C§3) is accepted by policy, as before the glue ran here: the
+        // gateway has nobody to render it to and no way to ask the PSTN party (spec-gap 133).
+        calls: Some(CallsConfig { media: true, answer: AnswerPolicy::Host, recording: AcceptPolicy::Always, one_call: false }),
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     let my_did = agent.identity_did().to_string();
@@ -130,7 +135,7 @@ async fn main() -> Result<()> {
             Some(ev) = rx.recv() => {
                 let r = match ev {
                     SipEvent::Invite { call_id, from_tn, to_user, remote, identity_header } => {
-                        inbound_invite(&calls, &sip, &mut agent, &mut media, &numbers, &opts.local_ip, &my_did, call_id, from_tn, to_user, remote, identity_header).await
+                        inbound_invite(&calls, &sip, &mut agent, &numbers, &opts.local_ip, &my_did, call_id, from_tn, to_user, remote, identity_header).await
                     }
                     ev => {
                         if let SipEvent::Response { call_id, status, remote: Some(r) } = &ev {
@@ -167,17 +172,16 @@ async fn main() -> Result<()> {
     }
 }
 
-/// One call's media on the DSIP side (§12.12, §14.1): the peer connection, the candidates it gathered before the
-/// session was ACTIVE, the Opus it receives (fed to the bridge), and whether the bridge has started.
+/// One call's media on the DSIP side (§14.1): the peer connection, the candidates it has gathered and not yet handed
+/// to the call glue (which holds them until the session is ACTIVE, §12.12), the Opus it receives (fed to the bridge),
+/// and whether the bridge has started.
 struct CallMedia {
     pc: DsipMedia,
-    pending: Vec<Value>,
     gathered: std::sync::Arc<std::sync::Mutex<Vec<forge_webrtc::IceCandidate>>>,
     rtp_tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
     rtp_in: Option<tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>>,
     sip_remote: Option<dsip_gateway::host::sip_leg::RemoteRtp>,
     bridged: bool,
-    end_sent: bool,
 }
 
 impl CallMedia {
@@ -215,8 +219,8 @@ impl MediaTable {
     async fn open(&mut self, sid: &str) -> anyhow::Result<&mut CallMedia> {
         let pc = DsipMedia::new().await?;
         let (rtp_tx, rtp_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
-        self.0.insert(sid.to_string(), CallMedia { pc, pending: vec![], gathered: Default::default(), rtp_tx, rtp_in: Some(rtp_rx),
-                                                  sip_remote: None, bridged: false, end_sent: false });
+        self.0.insert(sid.to_string(), CallMedia { pc, gathered: Default::default(), rtp_tx, rtp_in: Some(rtp_rx), sip_remote: None,
+                                                  bridged: false });
         Ok(self.0.get_mut(sid).expect("inserted"))
     }
 
@@ -232,24 +236,65 @@ impl MediaTable {
         }
     }
 
-    /// §12.12: candidates gathered so far go out in a signed `info` once the session is ACTIVE.
+    /// The candidates gathered since the last tick go to the call glue, together; it sends them in one signed
+    /// `info` once the session is ACTIVE (§12.12).
     async fn flush_candidates(&mut self, agent: &mut Agent) {
         for (sid, m) in self.0.iter_mut() {
-            if m.end_sent || agent.endpoint().session(sid).map(|s| s.state) != Some(dsip_session::SessionState::Active) {
-                continue;
-            }
             let fresh: Vec<Value> = std::mem::take(&mut *m.gathered.lock().unwrap()).into_iter()
                 .map(|c| json!({"candidate": c.to_sdp_attribute(), "sdp_mid": "0", "sdp_m_line_index": 0})).collect();
-            m.pending.extend(fresh);
-            if m.pending.is_empty() {
+            if fresh.is_empty() {
                 continue;
             }
-            let batch = std::mem::take(&mut m.pending);
-            let n = batch.len();
-            if agent.command(dsip_transport::Command::Info { session: sid.clone(), data: json!({"candidates": batch, "end_of_candidates": false}) }).await.is_ok() {
-                println!("media     {n} ICE candidate(s) sent in a signed info   §12.12");
+            if let Err(e) = agent.media(MediaResult::Candidates { session: sid.clone(), candidates: fresh }).await {
+                tracing::warn!("candidates: {e}");
             }
         }
+    }
+
+    /// Media work the call glue asks for: SDP for our invite or answer (§16.3), the callee's answer and candidates
+    /// applied, the leg closed.
+    async fn request(&mut self, agent: &mut Agent, req: MediaRequest) -> anyhow::Result<()> {
+        match req {
+            MediaRequest::Offer { session, .. } => {
+                let m = self.open(&session).await?;
+                let sdp = m.pc.offer().await?;
+                m.pump();
+                println!("media     WebRTC offer created toward the DSIP callee   §16.3");
+                agent.media(MediaResult::Offer { session, sdp }).await?;
+            }
+            MediaRequest::Answer { session, offer, .. } => {
+                let m = self.open(&session).await?;
+                let sdp = m.pc.answer(&offer).await?;
+                m.pump();
+                println!("media     WebRTC answer created for the caller's offer   §16.3");
+                agent.media(MediaResult::Answer { session, sdp }).await?;
+            }
+            MediaRequest::ApplyAnswer { session, sdp } => {
+                if let Some(m) = self.0.get_mut(&session) {
+                    m.pc.set_answer(&sdp).await?;
+                    println!("media     remote WebRTC answer applied   §16.3");
+                }
+            }
+            MediaRequest::RemoteCandidates { session, candidates } => {
+                if let Some(m) = self.0.get_mut(&session) {
+                    for c in &candidates {
+                        if let Some(s) = c["candidate"].as_str() {
+                            m.pc.add_candidate(s).await.ok();
+                        }
+                    }
+                    println!("media     {} remote ICE candidate(s) applied from signed info   §12.12", candidates.len());
+                }
+            }
+            MediaRequest::Close { session } => {
+                if let Some(mut m) = self.0.remove(&session) {
+                    m.pc.close();
+                }
+            }
+            // §14.1: the bridge starts once the DSIP media is connected, which needs the signed answer; nothing is
+            // held (recordings are accepted by policy here)
+            _ => {}
+        }
+        Ok(())
     }
 
     /// §14.1: once the DSIP media is connected and the SIP side's RTP endpoint is known, bridge the two.
@@ -303,7 +348,6 @@ async fn inbound_invite(
     calls: &Arc<Mutex<Calls>>,
     sip: &Arc<SipLeg>,
     agent: &mut Agent,
-    media: &mut MediaTable,
     numbers: &Numbers,
     local_ip: &str,
     my_did: &str,
@@ -345,23 +389,10 @@ async fn inbound_invite(
     let mut call = Call::inbound_via(&json!({"direction": "inbound", "gateway": my_did}), call_id.clone(), rtp, remote);
     call.dsip_target = Some(target);
     let identity = json!({"attest": pp.attest, "verified": pp.verified});
-    // the gateway offers media toward the DSIP callee (§16.3): a peer connection per call, its SDP in the invite
-    let sid_placeholder = format!("sip:{call_id}");
-    match media.open(&sid_placeholder).await {
-        Ok(m) => match m.pc.offer().await {
-            Ok(offer) => {
-                m.pump();
-                call.offer_sdp = Some(offer); // set on the agent right before place_call (one pending slot)
-            }
-            Err(e) => tracing::warn!("media offer: {e}"),
-        },
-        Err(e) => tracing::warn!("media: {e}"),
-    }
+    // the gateway offers media toward the DSIP callee (§16.3): the call glue asks for the offer (`MediaRequest::Offer`,
+    // a peer connection per call) and the invite carries it
     let emits = call.step(&json!({"sip": {"request": "INVITE", "from_tn": from_tn, "identity": identity}}));
     apply(&mut call, emits, &mut Legs { sip, dsip: Some(agent) }).await?;
-    if let (Some(sid), Some(m)) = (call.dsip_session.clone(), media.0.remove(&sid_placeholder)) {
-        media.0.insert(sid, m); // now keyed by the session the invite got
-    }
     calls.lock().await.0.insert(call_id, call);
     Ok(())
 }
@@ -380,6 +411,11 @@ async fn dsip_event(
 ) -> Result<()> {
     let AgentEvent::Received { message, identity, payload, .. } = ev else {
         match ev {
+            AgentEvent::Media(req) => media.request(agent, req).await?,
+            AgentEvent::Sent { msg_type, session, to } if msg_type == "invite" => {
+                println!("→ invite   to {to}  session …{}", &session[session.len().saturating_sub(8)..]);
+            }
+            AgentEvent::Call(CallEvent::Recording { emission, .. }) => println!("record    {emission}   C§4 (accepted by policy, spec-gap 133)"),
             AgentEvent::Rejected(code, detail) => tracing::warn!("rejected inbound frame: {code} {detail}"),
             AgentEvent::Emission(dsip_session::Emission::Refused(reason)) => tracing::warn!("engine refused a local event: {reason}"),
             _ => {}
@@ -389,29 +425,12 @@ async fn dsip_event(
     let sid = message.session_id().to_string();
     let offered = agent.endpoint().session(&sid).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
     if message.msg_type == "invite" && offered {
-        return outbound_invite(calls, sip, agent, media, numbers, local_ip, trunk, &sid, &identity, &payload).await;
+        return outbound_invite(calls, sip, agent, numbers, local_ip, trunk, &sid, &identity, &payload).await;
     }
-    // §16.3 / §12.12: the callee's SDP answer, and candidates in signed info, reach our peer connection
-    if let Some(m) = media.0.get_mut(&sid) {
-        if message.msg_type == "answer" {
-            if let Some(sdp) = payload.pointer("/transports/0/sdp").and_then(Value::as_str) {
-                if let Err(e) = m.pc.set_answer(sdp).await {
-                    tracing::warn!("media answer: {e}");
-                } else {
-                    println!("media     remote WebRTC answer applied   §16.3");
-                }
-            }
-        }
-        if message.msg_type == "info" && payload["about"] == "transport:webrtc" {
-            let cands = payload["data"]["candidates"].as_array().cloned().unwrap_or_default();
-            for c in &cands {
-                if let Some(s) = c["candidate"].as_str() {
-                    m.pc.add_candidate(s).await.ok();
-                }
-            }
-            println!("media     {} remote ICE candidate(s) applied from signed info   §12.12", cands.len());
-            return Ok(());
-        }
+    // §16.3 / §12.12: the callee's SDP answer and the candidates in signed info reach our peer connection through
+    // the call glue (`MediaRequest::ApplyAnswer`, `RemoteCandidates`); a candidates info is nothing for the controller
+    if message.msg_type == "info" && payload["about"] == "transport:webrtc" {
+        return Ok(());
     }
     let event = match message.msg_type.as_str() {
         "progress" => json!({"dsip": {"type": "progress"}}),
@@ -439,7 +458,6 @@ async fn outbound_invite(
     calls: &Arc<Mutex<Calls>>,
     sip: &Arc<SipLeg>,
     agent: &mut Agent,
-    media: &mut MediaTable,
     numbers: &Numbers,
     local_ip: &str,
     trunk: Option<&str>,
@@ -475,25 +493,11 @@ async fn outbound_invite(
         agent.send_payload(err, 30).await?;
         println!("→ error    gateway.downgraded {}   G§7", detail["losses"]);
     }
-    // the caller's SDP offer (§16.3): answer it with a peer connection of our own, the SDP riding in our answer
-    let mut answer_sdp: Option<String> = None;
-    if let Some(offer) = payload.pointer("/transports/0/sdp").and_then(Value::as_str) {
-        match media.open(sid).await {
-            Ok(m) => match m.pc.answer(offer).await {
-                Ok(answer) => {
-                    m.pump();
-                    answer_sdp = Some(answer);
-                    println!("media     WebRTC answer prepared for the caller's offer   §16.3");
-                }
-                Err(e) => tracing::warn!("media answer: {e}"),
-            },
-            Err(e) => tracing::warn!("media: {e}"),
-        }
-    }
+    // the caller's SDP offer (§16.3) is answered when the controller accepts: the call glue asks for the answer
+    // (`MediaRequest::Answer`, a peer connection of our own) and our answer carries it
     let rtp = RtpLeg::bind(local_ip, 0, rand_ssrc(sid)).await?;
     let mut call = Call::outbound(format!("sip:{to_tn}@{trunk}"), rtp);
     call.dsip_session = Some(sid.to_string());
-    call.answer_sdp = answer_sdp; // set on the agent right before accept (one pending slot, §16.3)
     call.from_tn = a.from.clone();
     call.identity_header = a.passport.as_ref().map(|p| p.identity_header());
     let emits = call.step(&json!({"dsip": {"type": "invite"}}));

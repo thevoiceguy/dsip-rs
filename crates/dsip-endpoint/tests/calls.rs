@@ -379,3 +379,42 @@ fn consent_says_a_declared_recording_is_pending() {
     assert_eq!(b.calls.consent(&sid).map(|c| c["pending"].clone()), Some(json!(false)));
     assert_eq!(b.calls.consent("nope"), None);
 }
+
+#[test]
+fn a_host_decided_call_waits_offered_then_rings_and_answers_as_the_host_says() {
+    let (mut a, mut b) = pair(AnswerPolicy::Host);
+    let sid = place(&mut a, &b);
+    pump(&mut a, &mut b);
+    assert!(b.events.is_empty() && b.sent.is_empty() && b.media.is_empty(), "nothing until the host decides: {:?} {:?}", b.events, b.sent_types());
+    assert_eq!(b.state(&sid), Some(SessionState::Offered));
+    b.command(CallCommand::Alert { session: sid.clone(), ring_timeout: Some(60) });
+    assert_eq!(b.sent_types(), vec!["progress"]);
+    b.command(CallCommand::AcceptAs { session: sid.clone(), answered_by: "gateway".into() });
+    assert!(matches!(&b.media[0], MediaRequest::Answer { session, screening: false, .. } if *session == sid));
+    assert_eq!(b.sent_of("answer")[0]["answered_by"], "gateway");
+    pump(&mut a, &mut b);
+    assert_eq!((a.state(&sid), b.state(&sid)), (Some(SessionState::Active), Some(SessionState::Active)));
+}
+
+#[test]
+fn accepting_a_call_still_offered_alerts_it_first() {
+    let (mut a, mut b) = pair(AnswerPolicy::Host);
+    let sid = place(&mut a, &b);
+    pump(&mut a, &mut b);
+    b.command(CallCommand::AcceptAs { session: sid.clone(), answered_by: "gateway".into() });
+    assert_eq!(b.sent_types(), vec!["progress", "answer"], "§12.4: a callee answers from ALERTING");
+    pump(&mut a, &mut b);
+    assert_eq!(a.state(&sid), Some(SessionState::Active));
+}
+
+#[test]
+fn candidates_gathered_together_ride_in_one_info() {
+    let (mut a, mut b) = pair(AnswerPolicy::Accept);
+    let sid = place(&mut a, &b);
+    pump(&mut a, &mut b);
+    let c = |n: u8| json!({"candidate": format!("candidate:{n} 1 udp 1 127.0.0.1 500{n} typ host"), "sdp_mid": "0", "sdp_m_line_index": 0});
+    a.result(MediaResult::Candidates { session: sid.clone(), candidates: vec![c(1), c(2), c(3)] });
+    let infos = a.sent_of("info");
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0]["data"]["candidates"].as_array().map(Vec::len), Some(3));
+}

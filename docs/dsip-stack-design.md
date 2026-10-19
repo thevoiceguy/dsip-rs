@@ -153,6 +153,10 @@ PoC better on their own terms: each removes duplicated glue from the reference c
 2. **The host glue moves into `dsip-endpoint`.** It takes console.rs's candidate, SDP, gating, seal, consent and
    policy logic; the CLI becomes a thin host. The browser moves onto it next, which gives it the seal fallback and
    recording consent it lacks today. Then the gateway.
+
+   *Status (2026-10-18):* done. 2a `dsip_endpoint::calls` with the CLI on it (#200); 2b the browser (#201); 2c the
+   gateway, whose controller decides when the DSIP leg rings and answers (`AnswerPolicy::Host`), with a declared
+   recording accepted by policy pending spec-gap 133.
 3. **One messaging client.** A library client extracted from `dsip-msg` and the wasm `Messenger`, over storage
    traits (SQLite natively, IndexedDB in the browser). `dsip-msg` keeps the device-events gateway as its own
    module.
