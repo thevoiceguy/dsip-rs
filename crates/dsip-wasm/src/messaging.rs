@@ -25,9 +25,9 @@
 //! Impl: MLS state lives in OpenMLS's memory storage and is exported with the delivery state in one `save()`, which
 //! the host writes as one record after each step — the atomic commit of spec-gap 44 in a browser. A reload restores
 //! both. Pending deposits (not yet `accepted`) are kept with their bytes and re-deposited on the next bind (M§9.3:
-//! idempotent at the hub by digest). What this device does not do yet: archive records and history for a second
-//! device by external commit (M§6.8), voice and blobs, successor groups; and a seq gap that does not fill is
-//! reported, not re-joined (M§6.8).
+//! idempotent at the hub by digest). What this device does not do yet: a seq gap that does not fill is reported, not
+//! re-joined (M§6.8). The item processing is `dsip_messaging_device::process`, shared with `dsip-msg` (dsip-rs
+//! stage 3).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::RwLock;
@@ -43,12 +43,13 @@ use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
 use dsip_messaging::checks::check_object;
+use dsip_messaging_device::{process, Outcome, ProcessOptions};
 use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open as open_sealed, open_blob, seal, SealUse};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
-use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
-use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
+use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, message_header, Device, MlsError};
+use openmls::prelude::tls_codec::Serialize as _;
 use openmls::prelude::*;
 use openmls_rust_crypto::{MemoryStorage, RustCrypto};
 use openmls_traits::OpenMlsProvider;
@@ -229,26 +230,12 @@ impl Pending {
     }
 }
 
-/// What processing one inbound item produced.
-enum Outcome {
-    /// A welcome joined; `by` is the identity whose commit added this device (the GroupInfo's signer).
-    Joined { members: Vec<String>, group: String, conv: Value, epoch: u64, by: String },
-    NotForDevice,
-    Object { sender: String, sender_device: String, object: Value },
-    Dropped(String),
-    Unauthenticated(String),
-    /// A commit merged; `left` names the identities it removed by their own Remove proposals (M§7.3 "Leaving").
-    Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String>, left: Vec<String>, hub: Option<Value> },
-    Removed { by: String, remaining: Vec<String> },
-    /// A proposal stored for the next commit (M§7.3 "Leaving"): the proposer's identity's pending proposals in this
-    /// epoch, Remove ones as `{identity, device}` and the count of others, with the group's roster.
-    Proposal { proposer: Value, removes: Vec<Value>, others: usize, roster: Vec<Value> },
-    Nothing,
-}
 
-fn mls_err<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> MlsError {
-    move |e| MlsError(format!("{what}: {e:?}"))
-}
+/// How this device processes items (dsip-messaging-device): the object check sees the sender's device, a recorder's
+/// content is unauthenticated (C§5), call records are kept for a record-keeper (C§9), and proposals are stored for a
+/// leave (M§7.3).
+const BROWSER: ProcessOptions =
+    ProcessOptions { leaf_device_in_check: true, recorder_content_unauthenticated: true, keep_call_records: true, store_proposals: true };
 
 /// A messaging device: this identity's device key under its delegation, its MLS groups, and the state the
 /// Messaging Profile asks a device to keep (M§5.4, M§8.5). The host moves frames between it and the mailbox.
@@ -2098,7 +2085,7 @@ impl Messenger {
             let ctx = Context::new(now, &self.resolver);
             let me = self.keys.identity.clone();
             let target = self.convs.get_mut(&gid).filter(|_| class != "welcome").map(|c| (&mut c.group, c.conversation.as_str(), c.kind.as_str()));
-            process(&self.mls, target, &class, &bytes, &ctx, &me)?
+            process(&self.mls, target, &class, &bytes, &ctx, &me, BROWSER)?
         };
         // committed: the delivery state records the item with its MLS effect (the host saves both together)
         self.resume.commit(item, matches!(outcome, Outcome::NotForDevice));
@@ -2755,152 +2742,7 @@ impl Conv {
     }
 }
 
-/// Process one MLS item against a group (a welcome needs none), exactly as the console does: the welcome joined and
-/// every member authenticated (M§6.2); a commit's sender, adds, removes and conversation change checked, then merged
-/// (M§6.5, M§7.3, M§7.4, M§6.8/spec-gap 62 for an external join); an application message's object checked (M§8.1).
-fn process(mls: &Device<BrowserProvider>, group: Option<(&mut MlsGroup, &str, &str)>, class: &str, bytes: &[u8], ctx: &Context, me: &str) -> Result<Outcome, MlsError> {
-    if class == "welcome" {
-        let (joined, adder) = match mls.join_from(bytes) {
-            Ok(g) => g,
-            Err(e) if e.0.contains("NoMatchingKeyPackage") => return Ok(Outcome::NotForDevice),
-            Err(e) => return Err(e),
-        };
-        let members: Vec<String> = authenticate_members(&joined, ctx)?.into_iter().map(|m| m.identity).collect();
-        let conv: Value = serde_json::from_slice(&conversation_extension(&joined).ok_or_else(|| MlsError("no dsip_conversation".into()))?)
-            .map_err(mls_err("dsip_conversation"))?;
-        let by = member_identity(&joined, adder, ctx).map(|w| w.identity).unwrap_or_default();
-        return Ok(Outcome::Joined { members, group: b64(joined.group_id().as_slice()), conv, epoch: joined.epoch().as_u64(), by });
-    }
-    let Some((group, conversation, kind)) = group else { return Ok(Outcome::Nothing) };
-    let msg = MlsMessageIn::tls_deserialize_exact(bytes).map_err(mls_err("mls bytes"))?;
-    let pm = msg.try_into_protocol_message().map_err(mls_err("protocol message"))?;
-    let processed = group.process_message(mls.provider(), pm).map_err(mls_err("undecryptable"))?;
-    let who = match processed.sender() {
-        Sender::Member(idx) => member_identity(group, *idx, ctx).ok(),
-        _ => None,
-    };
-    let lapsed_leaf = match processed.sender() {
-        Sender::Member(idx) if who.is_none() => Some(
-            group.public_group().leaf(*idx).and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
-                .map(|b| String::from_utf8_lossy(b.identity()).into_owned()).unwrap_or_default(),
-        ),
-        _ => None,
-    };
-    let external = matches!(processed.sender(), Sender::NewMemberCommit);
-    let from_recorder = who.as_ref().is_some_and(|w| w.is_recorder());
-    let (mut sender, sender_device) = who.map(|w| (w.identity, w.device)).unwrap_or_default();
-    match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app) => {
-            let obj: Value = serde_json::from_slice(&app.into_bytes()).map_err(mls_err("content json"))?;
-            if let Some(device) = lapsed_leaf {
-                return Ok(Outcome::Unauthenticated(format!("{} from {device}: its delegation no longer verifies", obj["id"])));
-            }
-            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender, "leaf_device": sender_device});
-            let verdict = check_object(&obj, &octx);
-            if verdict["verdict"] != "accept" {
-                return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
-            }
-            if from_recorder && obj["object"] == "content" {
-                // C§5: content from a recorder leaf is treated as from an unauthenticated leaf: not rendered, not archived
-                return Ok(Outcome::Unauthenticated(format!("{} from recorder {sender_device}", obj["id"])));
-            }
-            if verdict["effective"]["store"] == "call-record" {
-                return Ok(Outcome::Object { sender, sender_device, object: obj }); // C§9: kept, never rendered
-            }
-            if verdict["effective"]["render"] == "ignore" {
-                return Ok(Outcome::Nothing);
-            }
-            Ok(Outcome::Object { sender, sender_device, object: obj })
-        }
-        ProcessedMessageContent::StagedCommitMessage(staged) => {
-            let mut joined_externally = vec![];
-            if external {
-                let described = match external_commit(group, &staged, ctx) {
-                    Ok(d) => d,
-                    Err(e) => return Ok(Outcome::Dropped(format!("external commit: {e}"))),
-                };
-                let mut roster: Vec<String> = group.members().filter_map(|m| member_identity(group, m.index, ctx).ok()).map(|w| w.identity).collect();
-                roster.sort();
-                roster.dedup();
-                let mut inp = described.clone();
-                inp["kind"] = json!(kind);
-                inp["owner"] = json!(if kind == "personal" { me } else { "" });
-                inp["roster"] = json!(roster);
-                let v = dsip_messaging::checks::check_external_join(&inp);
-                if v["verdict"] != "accept" {
-                    return Ok(Outcome::Dropped(format!("external join refused: {}", v["code"])));
-                }
-                sender = s_of(&described["joiner"]["identity"]);
-                joined_externally.push(format!("{}#{}", sender, described["joiner"]["device"].as_str().unwrap_or("")));
-            }
-            let rc = dsip_messaging::checks::check_roster_change(&dsip_mls::roster_change(group, &staged, ctx, &sender));
-            if rc["verdict"] != "accept" {
-                // M§7.3 (spec-gap 126): every member enforces the roster rules itself; a commit failing them is not merged
-                return Ok(Outcome::Dropped(format!("commit refused: {}", rc["code"])));
-            }
-            let added: Vec<String> = joined_externally.into_iter().chain(staged.add_proposals()
-                .filter_map(|a| dsip_mls::authenticate_leaf_node(a.add_proposal().key_package().leaf_node(), ctx).ok())
-                .map(|w| format!("{}#{}", w.identity, w.device))).collect();
-            let removed_leaves: Vec<LeafNodeIndex> = staged.remove_proposals().map(|r| r.remove_proposal().removed()).collect();
-            let left = left_identities(group, &staged, ctx);
-            let removed: Vec<String> = removed_leaves.iter().map(|i| match member_identity(group, *i, ctx) {
-                Ok(w) => format!("{}#{}", w.identity, w.device),
-                Err(_) => format!("unverified#{}", group.public_group().leaf(*i).and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
-                    .map(|b| String::from_utf8_lossy(b.identity()).into_owned()).unwrap_or_default()),
-            }).collect();
-            let remaining: Vec<String> = group.members().filter(|m| !removed_leaves.contains(&m.index))
-                .filter_map(|m| member_identity(group, m.index, ctx).ok()).map(|w| w.identity).collect();
-            let before = conversation_extension(group);
-            let mut hub = None;
-            if let Some(update) = conversation_update(before.as_deref(), &staged) {
-                if update["verdict"] != "accept" {
-                    return Ok(Outcome::Dropped(format!("commit {} dsip_conversation", update["code"])));
-                }
-                hub = Some(update["effective"]["hub"].clone());
-            }
-            group.merge_staged_commit(mls.provider(), *staged).map_err(mls_err("merge commit"))?;
-            if !group.is_active() {
-                return Ok(Outcome::Removed { by: sender, remaining });
-            }
-            Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed, left, hub })
-        }
-        ProcessedMessageContent::ProposalMessage(qp) => {
-            // M§7.3 "Leaving" (spec-gap 125): stored for the commit that covers it; the decision is the caller's
-            group.store_pending_proposal(mls.provider().storage(), *qp).map_err(mls_err("store proposal"))?;
-            let leaf = |idx: LeafNodeIndex| member_identity(group, idx, ctx).ok().map(|w| json!({"identity": w.identity, "device": w.device}));
-            let (mut removes, mut others) = (vec![], 0);
-            for q in group.pending_proposals() {
-                let by = match q.sender() {
-                    Sender::Member(i) => member_identity(group, *i, ctx).ok().map(|w| w.identity),
-                    _ => None,
-                };
-                if sender.is_empty() || by.as_deref() != Some(sender.as_str()) {
-                    continue;
-                }
-                match q.proposal() {
-                    Proposal::Remove(r) => removes.push(leaf(r.removed()).unwrap_or(json!({"identity": "", "device": ""}))),
-                    _ => others += 1,
-                }
-            }
-            let roster: Vec<Value> = group.members().filter_map(|m| leaf(m.index)).collect();
-            Ok(Outcome::Proposal { proposer: json!({"identity": sender, "device": sender_device}), removes, others, roster })
-        }
-        _ => Ok(Outcome::Nothing),
-    }
-}
 
-/// The identities a staged commit removes by their own Remove proposals: a leave (M§7.3 "Leaving"), told apart from a
-/// removal by another member when the roster change is rendered.
-fn left_identities(group: &MlsGroup, staged: &StagedCommit, ctx: &Context) -> Vec<String> {
-    let mut out: Vec<String> = staged.remove_proposals().filter_map(|q| {
-        let removed = member_identity(group, q.remove_proposal().removed(), ctx).ok()?.identity;
-        let Sender::Member(by) = q.sender() else { return None };
-        (member_identity(group, *by, ctx).ok()?.identity == removed).then_some(removed)
-    }).collect();
-    out.sort();
-    out.dedup();
-    out
-}
 
 /// Seconds after which a deposit with no answer at all counts as the hub unreachable (M§9.4). Impl (spec-gap 72):
 /// the device's own answer timeout.

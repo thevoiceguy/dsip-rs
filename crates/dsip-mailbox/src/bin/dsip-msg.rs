@@ -52,12 +52,13 @@ use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, conversation_update, digest, external_commit, member_identity, message_header, Device, MlsError};
+use dsip_messaging_device::{process, Outcome, ProcessOptions};
+use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, message_header, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
 use dsip_transport::{now_s, tls};
 
-use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
+use openmls::prelude::tls_codec::Serialize as _;
 use openmls::prelude::*;
 
 #[derive(Parser)]
@@ -469,22 +470,6 @@ enum Fetched {
     GaveUp(String),
 }
 
-enum Outcome {
-    Joined { members: Vec<String>, group: String, conv: Value, epoch: u64 },
-    /// A welcome for another device of this identity: it holds none of our KeyPackages (M§12.3 step 5).
-    NotForDevice,
-    Object { sender: String, sender_device: String, object: Value },
-    Dropped(String),
-    /// M§6.2: content from a member leaf whose delegation no longer verifies (revoked, expired) is unauthenticated —
-    /// not rendered, not archived. Expected, not an error: a device can send just before its revocation is known.
-    Unauthenticated(String),
-    /// M§7.3: every roster change is rendered, attributed to the committing identity. `hub` is set when the commit
-    /// changed the group's hub reference (M§7.4).
-    Epoch { epoch: u64, by: String, added: Vec<String>, removed: Vec<String>, hub: Option<Value> },
-    /// This device was removed; `remaining` are the member identities left in the group.
-    Removed { by: String, remaining: Vec<String> },
-    Nothing,
-}
 
 impl Client {
     fn ctx<'a>(&self, resolver: &'a StaticResolver) -> Context<'a> {
@@ -2893,7 +2878,7 @@ impl Client {
                 let Conv { group, conversation, kind, .. } = c;
                 (group, conversation.as_str(), kind.as_str())
             });
-            let outcome = process(mls, target, &class, &bytes, &ctx, me)?;
+            let outcome = process(mls, target, &class, &bytes, &ctx, me, ProcessOptions::default())?;
             if crash {
                 // Processed, MLS state written inside the transaction, never committed.
                 println!("CRASH {class} {cursor} processed, not committed");
@@ -2925,7 +2910,7 @@ impl Client {
             }
         };
         match outcome {
-            Outcome::Joined { members, group, conv, epoch } => {
+            Outcome::Joined { members, group, conv, epoch, .. } => {
                 let joined = self.mls.load_group(&dsip_core::b64::decode(&group).unwrap_or_default()).map_err(Self::state_err)?.context("joined group not stored")?;
                 self.add_conv(joined, &conv);
                 self.history.step(&json!({"joined": {"group": group, "epoch": epoch}}));
@@ -2972,7 +2957,7 @@ impl Client {
             Outcome::Dropped(why) => println!("DROP {why}"),
             Outcome::Unauthenticated(what) => println!("UNAUTHENTICATED {what}"),
             Outcome::NotForDevice => println!("SIBLING welcome {cursor}"),
-            Outcome::Epoch { epoch, by, added, removed, hub } => {
+            Outcome::Epoch { epoch, by, added, removed, hub, .. } => {
                 let kind = self.conv(&gid).map(|c| c.kind.clone()).unwrap_or_default();
                 println!("EPOCH {epoch} kind={kind} by={by} added={added:?} removed={removed:?}");
                 if let Some(h) = hub {
@@ -3006,7 +2991,8 @@ impl Client {
                     self.send(&env).await?;
                 }
             }
-            Outcome::Nothing => {}
+            // dsip-msg does not store proposals (ProcessOptions::store_proposals is off)
+            Outcome::Nothing | Outcome::Proposal { .. } => {}
         }
         for held in released {
             // the gap filled: what was waiting behind it is processed now, in seq order
@@ -3117,10 +3103,6 @@ impl Client {
     }
 }
 
-fn mls_err<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> MlsError {
-    move |x| MlsError(format!("{what}: {x:?}"))
-}
-
 /// Duration of an Ogg Opus file from its last granule position less the pre-skip (RFC 7845 §4).
 fn ogg_opus_duration_ms(bytes: &[u8]) -> Option<i64> {
     let mut pos = 0;
@@ -3146,131 +3128,6 @@ fn ogg_opus_duration_ms(bytes: &[u8]) -> Option<i64> {
     Some((last_granule? - pre_skip?).max(0) * 1000 / 48_000)
 }
 
-/// The MLS side of one item, with no I/O, so it can run inside the item's transaction. `group` is the target group
-/// with its conversation id and kind; a welcome needs none.
-fn process(mls: &Device<SqliteProvider>, group: Option<(&mut MlsGroup, &str, &str)>, class: &str, bytes: &[u8], ctx: &Context, me: &str) -> Result<Outcome, MlsError> {
-    if class == "welcome" {
-        let joined = match mls.join(bytes) {
-            Ok(g) => g,
-            Err(e) if e.0.contains("NoMatchingKeyPackage") => return Ok(Outcome::NotForDevice),
-            Err(e) => return Err(e),
-        };
-        let members: Vec<String> = authenticate_members(&joined, ctx)?.into_iter().map(|m| m.identity).collect();
-        let conv: Value = serde_json::from_slice(&conversation_extension(&joined).ok_or_else(|| MlsError("no dsip_conversation".into()))?)
-            .map_err(mls_err("dsip_conversation"))?;
-        return Ok(Outcome::Joined { members, group: b64(joined.group_id().as_slice()), conv, epoch: joined.epoch().as_u64() });
-    }
-    let Some((group, conversation, kind)) = group else { return Ok(Outcome::Nothing) };
-    let msg = MlsMessageIn::tls_deserialize_exact(bytes).map_err(mls_err("mls bytes"))?;
-    let pm = msg.try_into_protocol_message().map_err(mls_err("protocol message"))?;
-    let processed = group.process_message(mls.provider(), pm).map_err(mls_err("undecryptable"))?;
-    let who = match processed.sender() {
-        Sender::Member(idx) => member_identity(group, *idx, ctx).ok(),
-        _ => None,
-    };
-    // M§6.2: a member leaf whose credential no longer authenticates (delegation revoked or expired)
-    let lapsed_leaf = match processed.sender() {
-        Sender::Member(idx) if who.is_none() => Some(
-            group
-                .public_group()
-                .leaf(*idx)
-                .and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
-                .map(|b| String::from_utf8_lossy(b.identity()).into_owned())
-                .unwrap_or_default(),
-        ),
-        _ => None,
-    };
-    let external = matches!(processed.sender(), Sender::NewMemberCommit);
-    let (mut sender, sender_device) = who.map(|w| (w.identity, w.device)).unwrap_or_default();
-    match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app) => {
-            let obj: Value = serde_json::from_slice(&app.into_bytes()).map_err(mls_err("content json"))?;
-            if let Some(device) = lapsed_leaf {
-                return Ok(Outcome::Unauthenticated(format!("{} from {device}: its delegation no longer verifies", obj["id"])));
-            }
-            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender});
-            let verdict = check_object(&obj, &octx);
-            if verdict["verdict"] != "accept" {
-                return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
-            }
-            if verdict["effective"]["render"] == "ignore" {
-                return Ok(Outcome::Nothing); // M§8.1: unknown objects and receipt kinds are ignored
-            }
-            Ok(Outcome::Object { sender, sender_device, object: obj })
-        }
-        ProcessedMessageContent::StagedCommitMessage(staged) => {
-            let mut joined_externally = vec![];
-            if external {
-                // M§6.8 (spec-gap 62): every member checks an external join as the hub did, before applying it
-                let described = match external_commit(group, &staged, ctx) {
-                    Ok(d) => d,
-                    Err(e) => return Ok(Outcome::Dropped(format!("external commit: {e}"))),
-                };
-                let mut roster: Vec<String> = group.members().filter_map(|m| member_identity(group, m.index, ctx).ok()).map(|w| w.identity).collect();
-                roster.sort();
-                roster.dedup();
-                let mut inp = described.clone();
-                inp["kind"] = json!(kind);
-                inp["owner"] = json!(if kind == "personal" { me } else { "" });
-                inp["roster"] = json!(roster);
-                let v = dsip_messaging::checks::check_external_join(&inp);
-                if v["verdict"] != "accept" {
-                    return Ok(Outcome::Dropped(format!("external join refused: {}", v["code"])));
-                }
-                sender = described["joiner"]["identity"].as_str().unwrap_or("").to_string();
-                joined_externally.push(format!("{}#{}", sender, described["joiner"]["device"].as_str().unwrap_or("")));
-            }
-            let rc = dsip_messaging::checks::check_roster_change(&dsip_mls::roster_change(group, &staged, ctx, &sender));
-            if rc["verdict"] != "accept" {
-                // M§7.3 (spec-gap 126): every member enforces the roster rules itself; a commit failing them is not merged
-                return Ok(Outcome::Dropped(format!("commit refused: {}", rc["code"])));
-            }
-            let added: Vec<String> = joined_externally.into_iter().chain(staged
-                .add_proposals()
-                .filter_map(|a| dsip_mls::authenticate_leaf_node(a.add_proposal().key_package().leaf_node(), ctx).ok())
-                .map(|w| format!("{}#{}", w.identity, w.device)))
-                .collect();
-            let removed_leaves: Vec<LeafNodeIndex> = staged.remove_proposals().map(|r| r.remove_proposal().removed()).collect();
-            // A removed leaf may no longer authenticate (a revoked delegation, spec-gap 57): render it by its credential.
-            let removed: Vec<String> = removed_leaves
-                .iter()
-                .map(|i| match member_identity(group, *i, ctx) {
-                    Ok(w) => format!("{}#{}", w.identity, w.device),
-                    Err(_) => {
-                        let device = group
-                            .public_group()
-                            .leaf(*i)
-                            .and_then(|l| BasicCredential::try_from(l.credential().clone()).ok())
-                            .map(|b| String::from_utf8_lossy(b.identity()).into_owned())
-                            .unwrap_or_default();
-                        format!("unverified#{device}")
-                    }
-                })
-                .collect();
-            let remaining: Vec<String> = group
-                .members()
-                .filter(|m| !removed_leaves.contains(&m.index))
-                .filter_map(|m| member_identity(group, m.index, ctx).ok())
-                .map(|w| w.identity)
-                .collect();
-            let before = conversation_extension(group);
-            let mut hub = None;
-            if let Some(update) = conversation_update(before.as_deref(), &staged) {
-                // M§6.3, M§7.4 (spec-gap 60): a commit may change the hub and nothing else in dsip_conversation
-                if update["verdict"] != "accept" {
-                    return Ok(Outcome::Dropped(format!("commit {} dsip_conversation", update["code"])));
-                }
-                hub = Some(update["effective"]["hub"].clone());
-            }
-            group.merge_staged_commit(mls.provider(), *staged).map_err(mls_err("merge commit"))?;
-            if !group.is_active() {
-                return Ok(Outcome::Removed { by: sender, remaining });
-            }
-            Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed, hub })
-        }
-        _ => Ok(Outcome::Nothing),
-    }
-}
 
 /// HTTPS for blobs, trusting the same anchors as the `wss` connections (M§5.6: TLS as in §13.2).
 fn http_client(ca: Option<&Path>) -> Result<reqwest::Client> {

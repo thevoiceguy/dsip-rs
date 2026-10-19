@@ -1425,6 +1425,7 @@ dependencies = [
  "dsip-dht",
  "dsip-events",
  "dsip-messaging",
+ "dsip-messaging-device",
  "dsip-mls",
  "dsip-recording",
  "dsip-transport",
@@ -1480,6 +1481,19 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "x25519-dalek 2.0.1",
+]
+
+[[package]]
+name = "dsip-messaging-device"
+version = "0.1.0"
+dependencies = [
+ "dsip-core",
+ "dsip-messaging",
+ "dsip-mls",
+ "openmls",
+ "openmls_rust_crypto",
+ "openmls_traits",
+ "serde_json",
 ]
 
 [[package]]
@@ -1620,6 +1634,7 @@ dependencies = [
  "dsip-dht",
  "dsip-endpoint",
  "dsip-messaging",
+ "dsip-messaging-device",
  "dsip-mls",
  "dsip-number",
  "dsip-recording",

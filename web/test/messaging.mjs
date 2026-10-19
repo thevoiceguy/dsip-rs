@@ -94,7 +94,10 @@ try {
   check('Alice: her message shows delivered', aThread.some((m) => m.mine && m.delivered && Object.keys(m.delivered).length), JSON.stringify(aThread.map((m) => [m.mine, m.seq, m.delivered])));
   check('Alice: thread has both messages with hub seqs, each once', aThread.length === 2 && aThread.every((m) => typeof m.seq === 'number'), JSON.stringify(aThread.map((m) => [m.mine, m.object.text, m.seq])));
 
-  // 6. Bob reloads: the conversation and its history survive; a new message after the reload decrypts
+  // 6. Bob reloads: the conversation and its history survive; a new message after the reload decrypts. His reply is
+  // accepted first (it has its hub seq): a `◇ sent` line can be an earlier deposit's, and a reload before the
+  // acceptance re-deposits the reply, which then comes back with its seq
+  await until(bob.page, (g) => window.dsip.thread(g).every((m) => typeof m.seq === 'number'), bConv.group, 20000);
   const before = await texts(bob, bConv.group);
   await bob.page.reload();
   await ready(bob.page);
