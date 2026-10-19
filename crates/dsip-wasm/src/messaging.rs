@@ -41,7 +41,7 @@ use dsip_core::version::Supported;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Inbound, MemoryStore, Outbox, Outcome, ProcessOptions, Route};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, Inbound, MemoryStore, Outbox, Outcome, ProcessOptions, Route};
 use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
@@ -226,7 +226,9 @@ pub struct Messenger {
     resume: Resume,
     /// Digests of this device's own deposits: the hub fans them back and MLS cannot decrypt them (spec-gap 47).
     own: HashSet<String>,
-    pending: BTreeMap<String, Pending>,
+    /// Deposits awaiting their answer, by deposit id: what each was, the hub it went to, when an application deposit
+    /// went out (M§9.4), and those the group's new hub refused before it hosted the group, due again (spec-gap 129).
+    pending: Deposits<Pending>,
     /// Application items not yet accepted, per group, oldest first: `{id, mls, obj}` (M§9.2).
     outbox: Outbox,
     /// The thread, every content object shown, in arrival order: `{group, key, sender, sender_device, object, seq, mine}`.
@@ -255,10 +257,6 @@ pub struct Messenger {
     /// M§7.4 (spec-gap 129): per group that moved, the vector-pinned wait for its new hub to host it, and the deposits
     /// it answered `mailbox.unknown-group` before then, due again at a time (the same bytes, M§9.3).
     arrivals: BTreeMap<String, MoveArrival>,
-    arrival_due: Vec<(i64, Pending)>,
-    /// The hub each group deposit was addressed to, by deposit id: an answer is judged against that hub, not the
-    /// group's current one (M§7.4 — the old hub's refusal can arrive after the move was processed).
-    to_hub: BTreeMap<String, String>,
     /// Introductions delivered through the mailbox, by id (M§14.1: requests, never messages).
     requests: BTreeMap<String, Value>,
     want_live: bool,
@@ -271,8 +269,6 @@ pub struct Messenger {
     restored: Vec<Value>,
     /// M§10.5: whether read watermarks are disclosed to the conversation (opt-in) or kept in the personal group.
     read_disclosed: bool,
-    /// When each application deposit went out, by deposit id: one with no answer at all counts as the hub down (M§9.4).
-    sent_at: BTreeMap<String, i64>,
     /// M§7.5: the successor groups this device knows of and converged on (vector-pinned, spec-gap 61).
     successors: SuccessorTracker,
     /// Objects of an abandoned group's outbox, by the group they go to: the dead group until its successor exists,
@@ -338,7 +334,15 @@ impl Messenger {
             resume: Resume::new(if st["resume"].is_object() { &st["resume"] } else { &Value::Null }),
             own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
             // M§9.3: deposits awaiting an answer are sent again at the next binding (redeposit_pending)
-            pending: st["pending"].as_object().into_iter().flatten().filter_map(|(id, p)| Some((id.clone(), Pending::from_json(p)?))).collect(),
+            pending: {
+                let mut d = Deposits::new(NO_ANSWER_S);
+                for (id, p) in st["pending"].as_object().into_iter().flatten() {
+                    if let Some(p) = Pending::from_json(p) {
+                        d.insert(id.clone(), p);
+                    }
+                }
+                d
+            },
             outbox: Outbox { items: serde_json::from_value(st["outbox"].clone()).unwrap_or_default(), ..Outbox::new(dsip_messaging::client::HUB_TIMEOUT_S) },
             messages: st["messages"].as_array().cloned().unwrap_or_default(),
             shown: st["messages"].as_array().into_iter().flatten().map(|m| s_of(&m["key"])).collect(),
@@ -353,8 +357,6 @@ impl Messenger {
             unknown_at: BTreeMap::new(),
             moved_items: BTreeMap::new(),
             arrivals: BTreeMap::new(),
-            arrival_due: vec![],
-            to_hub: BTreeMap::new(),
             requests: serde_json::from_value(st["requests"].clone()).unwrap_or_default(),
             want_live: false,
             gap_timeout: 60,
@@ -362,7 +364,6 @@ impl Messenger {
             held_archive: serde_json::from_value(st["held_archive"].clone()).unwrap_or_default(),
             restored: st["restored"].as_array().cloned().unwrap_or_default(),
             read_disclosed: st["read_disclosed"].as_bool().unwrap_or(false),
-            sent_at: BTreeMap::new(),
             successors: serde_json::from_value(st["successors"].clone()).unwrap_or_default(),
             handover: serde_json::from_value(st["handover"].clone()).unwrap_or_default(),
             moved_from: st["mailbox"].as_str().filter(|d| *d != mailbox_did).map(String::from),
@@ -491,19 +492,13 @@ impl Messenger {
             out.extend(self.receipt_sends(&gid, emissions, now_i));
         }
         // M§9.4: a deposit with no answer at all counts as the hub unreachable
-        let silent: Vec<(String, String, String)> = self.sent_at.iter().filter(|(_, at)| now_i - **at >= NO_ANSWER_S)
-            .filter_map(|(id, _)| match self.pending.get(id) { Some(Pending::Application { gid, item }) => Some((id.clone(), gid.clone(), item.clone())), _ => None })
-            .collect();
-        self.sent_at.retain(|id, at| now_i - *at < NO_ANSWER_S && self.pending.contains_key(id));
-        for (id, gid, item) in silent {
-            self.pending.remove(&id);
-            out.extend(self.hub_unreachable(&gid, &item, true, now_i));
+        for (_, p) in self.pending.silent(now_i) {
+            if let Pending::Application { gid, item } = p {
+                out.extend(self.hub_unreachable(&gid, &item, true, now_i));
+            }
         }
         // M§7.4 (spec-gap 129): deposits the new hub refused before it hosted the group, due again
-        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.arrival_due).into_iter().partition(|(at, _)| *at <= now_i);
-        self.arrival_due = later;
-        self.to_hub.retain(|id, _| self.pending.contains_key(id));
-        for (_, pending) in due {
+        for pending in self.pending.due(now_i) {
             out.extend(self.redeposit(pending, now_i));
         }
         for (gid, ems) in self.outbox.due(now_i) {
@@ -1015,7 +1010,7 @@ impl Messenger {
     /// identity's mailbox now; key packages are uploaded afresh by the host at every binding.
     fn redeposit_pending(&mut self, moved: bool, now: i64) -> Vec<String> {
         let mut frames = vec![];
-        for (id, p) in self.pending.clone() {
+        for (id, p) in self.pending.iter().map(|(id, p)| (id.clone(), p.clone())).collect::<Vec<_>>() {
             let frame = match &p {
                 Pending::GroupInfo { gid, .. } if self.convs.contains_key(gid) && !(self.outbox.is_down(gid) || self.outbox.is_abandoned(gid)) => {
                     self.group_info_frame(gid, now).ok()
@@ -1261,7 +1256,7 @@ impl Messenger {
         };
         let p = inb.payload().clone();
         self.seen.insert(&s_of(&p["id"]), now_i, now_i);
-        let answers_ours = p["in_reply_to"].as_str().is_some_and(|id| self.pending.contains_key(id));
+        let answers_ours = p["in_reply_to"].as_str().is_some_and(|id| self.pending.contains(id));
         if inb.device() != self.mailbox.0 && !(matches!(inb.msg_type(), "key-packages" | "error") || (inb.msg_type() == "accepted" && answers_ours)) {
             // Everything on this binding is the mailbox's (M§4.1), except what it relays unchanged: a hub's `accepted`
             // or `error` to a deposit it forwarded (M§5.2), and a peer mailbox's answer to a key-package-fetch (M§5.5).
@@ -1416,7 +1411,7 @@ impl Messenger {
         }
         let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &hub, now, gid, class, fields);
         if let Some(p) = wire::payload_of(&env) {
-            self.to_hub.insert(s_of(&p["id"]), hub);
+            self.pending.addressed(s_of(&p["id"]), hub);
         }
         env.frame()
     }
@@ -1549,7 +1544,7 @@ impl Messenger {
         }
         let frame = self.hub_deposit(gid, "application", fields, now);
         let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-        self.sent_at.insert(id.clone(), now);
+        self.pending.watch(id.clone(), now);
         self.pending.insert(id, Pending::Application { gid: gid.to_string(), item: s_of(&item["id"]) });
         frame
     }
@@ -1558,8 +1553,7 @@ impl Messenger {
     fn accepted(&mut self, p: &Value, now: i64) -> Vec<Value> {
         let mut out = vec![];
         let id = s_of(&p["in_reply_to"]);
-        let hub = self.to_hub.remove(&id);
-        let Some(pending) = self.pending.remove(&id) else { return out };
+        let Some((pending, hub)) = self.pending.answer(&id) else { return out };
         if let (Some(gid), Some(hub)) = (pending.gid(), hub) {
             if let Some(a) = self.arrivals.get_mut(gid) {
                 a.set_now(now);
@@ -1722,8 +1716,7 @@ impl Messenger {
         let mut out = vec![];
         let reason = s_of(&p["reason"]);
         let id = s_of(&p["in_reply_to"]);
-        let hub = self.to_hub.remove(&id);
-        let Some(pending) = self.pending.remove(&id) else {
+        let Some((pending, hub)) = self.pending.answer(&id) else {
             out.push(json!({"error": format!("{reason} {}", p["detail"])}));
             return out;
         };
@@ -1738,8 +1731,7 @@ impl Messenger {
             };
             if let Some(d) = ems.iter().find_map(|e| e["retry_in"].as_i64()) {
                 // M§7.4 (spec-gap 129): the hub the group moved to is not set up yet: the same deposit again later
-                self.sent_at.remove(&id);
-                self.arrival_due.push((now + d, pending));
+                self.pending.defer(pending, now + d);
                 out.push(json!({"ui": "hub_arriving", "group": gid, "in": d}));
                 return out;
             }

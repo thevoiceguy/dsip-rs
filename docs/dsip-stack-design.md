@@ -186,8 +186,10 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    answer arrives, while dsip-msg awaits each answer inline. 3e-1 is the shared `Outbox`: the items pending per group
    and their `HubOutage`, advanced on every tick. That fixes dsip-msg, whose outage clock stood still while the hub
    was up: an outage starting after more than `hub_timeout` from the group's first deposit triggered the successor at
-   once, with no retries. 3e-2 is the deposit registry (the browser's `Pending`); 3e-3 is dsip-msg no longer waiting
-   inline.
+   once, with no retries. 3e-2 is the deposit registry, `Deposits<P>`: what each deposit awaiting an answer was (`P`
+   stays the host's), the hub it was addressed to, the no-answer watch, and the deposits deferred until the group's
+   new hub hosts it; the browser's four maps become one. 3e-3 is dsip-msg no longer waiting inline, on the same
+   registry.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
