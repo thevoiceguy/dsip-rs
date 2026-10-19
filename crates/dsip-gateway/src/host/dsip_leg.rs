@@ -1,10 +1,11 @@
-//! DSIP leg: a `dsip-transport::Agent` (one identity, one relay) plus, per call, a forge-webrtc
-//! `PeerConnection` for media. SDP rides in `transports[].sdp` and candidates in signed `info`
-//! (§12.12), exactly as `dsip-media` does — the gateway is another host of the same core.
+//! DSIP leg: a `dsip-transport::Agent` (one identity, one relay) running the call glue
+//! (`dsip_endpoint::calls`), plus, per call, a forge-webrtc `PeerConnection` for media. The glue asks
+//! for the SDP that rides in `transports[].sdp` and sends the candidates in signed `info` (§12.12),
+//! as it does for the CLI and the browser — the gateway is another host of the same core.
 //!
-//! Spec: §16.3 (SDP as a transport binding object), §12.12 (ICE candidates in `info`, ACTIVE-only
-//! buffering), §14.1 (media only after a signed answer). Impl: one peer connection per call keyed
-//! by session id; decoded inbound Opus is forwarded to the media bridge, the bridge's Opus is
+//! Spec: §16.3 (SDP as a transport binding object), §12.12 (ICE candidates in `info`, ACTIVE-only:
+//! the glue holds them), §14.1 (media only after a signed answer). Impl: one peer connection per call
+//! keyed by session id; decoded inbound Opus is forwarded to the media bridge, the bridge's Opus is
 //! sent through the peer connection's `AudioSender`.
 
 use std::collections::HashMap;
@@ -17,15 +18,13 @@ use tokio::sync::mpsc;
 /// One call's WebRTC media on the DSIP side.
 pub struct DsipMedia {
     pc: PeerConnection,
-    /// Local ICE candidates gathered before ACTIVE (§12.12).
-    pub pending_candidates: Vec<serde_json::Value>,
 }
 
 impl DsipMedia {
     /// New peer connection (answerer or offerer decided by which of `create_offer`/`accept_offer` runs).
     pub async fn new() -> Result<DsipMedia> {
         let pc = PeerConnection::new(vec![]).await.webrtc("peer connection")?;
-        Ok(DsipMedia { pc, pending_candidates: vec![] })
+        Ok(DsipMedia { pc })
     }
 
     /// An `AudioSender` for the bridge to push transcoded Opus into.
@@ -54,17 +53,6 @@ impl DsipMedia {
     /// Add a remote ICE candidate from a verified `info`.
     pub async fn add_candidate(&mut self, cand: &str) -> Result<()> {
         self.pc.add_ice_candidate_str(cand).await.webrtc("candidate")
-    }
-
-    /// Local candidates gathered so far, in the §12.12 `info.data.candidates` shape.
-    pub fn drain_candidates(&mut self) -> Vec<serde_json::Value> {
-        let cands: Vec<serde_json::Value> = self
-            .pc
-            .local_candidates()
-            .into_iter()
-            .map(|c| serde_json::json!({"candidate": c.to_sdp_attribute(), "sdp_mid": "0", "sdp_m_line_index": 0}))
-            .collect();
-        cands
     }
 
     /// Whether media is established (DTLS-SRTP up).

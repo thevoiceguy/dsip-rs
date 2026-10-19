@@ -39,6 +39,10 @@ pub enum AnswerPolicy {
     Decline,
     /// Neither ring nor answer: the relay expires the leg with the invite and tells the caller (§12.7 rule 6).
     Silent,
+    /// The host decides: an incoming call is left OFFERED, with no event of its own (the host sees the core's
+    /// `Received`), for the host's [`CallCommand::Alert`], [`CallCommand::AcceptAs`] or a local event. A gateway
+    /// answers when its other leg does.
+    Host,
 }
 
 /// How [`Calls`] behaves.
@@ -141,6 +145,13 @@ pub enum MediaResult {
         /// The candidate (`{candidate, sdp_mid, sdp_m_line_index}`), or `None` at the end.
         candidate: Option<Value>,
     },
+    /// Local ICE candidates gathered together: once ACTIVE they go in one signed `info` (§12.12).
+    Candidates {
+        /// Session id.
+        session: String,
+        /// The candidates (`{candidate, sdp_mid, sdp_m_line_index}`).
+        candidates: Vec<Value>,
+    },
 }
 
 /// Something about a call the application shows or acts on.
@@ -229,6 +240,21 @@ pub enum CallCommand {
         /// Session id.
         session: String,
     },
+    /// Ring an incoming call left to the host ([`AnswerPolicy::Host`]): `progress ringing` goes out (§12.4).
+    Alert {
+        /// Session id.
+        session: String,
+        /// Seconds it rings before it is declined `user.no-answer` (T-Ring-Local); [`RING_TIMEOUT_S`] when `None`.
+        ring_timeout: Option<i64>,
+    },
+    /// Answer with this `answered_by` token (§14.3; a registry value, e.g. `gateway`). A call still OFFERED is
+    /// alerted first (§12.4).
+    AcceptAs {
+        /// Session id.
+        session: String,
+        /// The `answered_by` token.
+        answered_by: String,
+    },
     /// Decline a ringing call.
     Decline {
         /// Session id.
@@ -285,7 +311,7 @@ pub enum CallCommand {
 #[derive(Debug, Clone)]
 enum Awaiting {
     Place { to: String, invite: Box<Invite> },
-    Accept { answered_by: &'static str },
+    Accept { answered_by: String },
     Update { answered_by: Option<&'static str> },
     AnswerUpdate { in_reply_to: String },
 }
@@ -299,7 +325,7 @@ struct Call {
     candidates: Vec<Option<Value>>,
     consent: dsip_recording::Consent,
     /// An automatic answer held until the recording is accepted (C§4): `answered_by`.
-    deferred: Option<&'static str>,
+    deferred: Option<String>,
     awaiting: Option<Awaiting>,
     /// Already placed once more in clear (§10.4: once).
     in_clear: bool,
@@ -457,7 +483,7 @@ impl Calls {
         let call = self.calls.get_mut(sid).expect("call");
         match msg_type {
             "invite" if offered => {
-                let silent = self.cfg.answer == AnswerPolicy::Silent;
+                let silent = matches!(self.cfg.answer, AnswerPolicy::Silent | AnswerPolicy::Host);
                 if media && !silent && remote_sdp.is_none() {
                     out.push(CallOut::Call(CallEvent::NoOffer { session: sid.to_string() }));
                 }
@@ -465,7 +491,7 @@ impl Calls {
                     None // C§4: declined by standing policy — ring, then reject policy.recording-declined
                 } else if call.consent.pending() && matches!(self.cfg.answer, AnswerPolicy::Accept | AnswerPolicy::Screen) {
                     // C§4: never answer before acceptance
-                    call.deferred = Some(if self.cfg.answer == AnswerPolicy::Screen { "screening" } else { "user" });
+                    call.deferred = Some(if self.cfg.answer == AnswerPolicy::Screen { "screening" } else { "user" }.to_string());
                     Some(AnswerPolicy::Ring)
                 } else {
                     Some(self.cfg.answer)
@@ -486,6 +512,7 @@ impl Calls {
                         out.extend(self.local(core, LocalEvent::Decline { session: s, reason: None }, now)?);
                     }
                     Some(AnswerPolicy::Silent) => out.push(CallOut::Call(CallEvent::Silent { session: s })),
+                    Some(AnswerPolicy::Host) => {}
                     Some(AnswerPolicy::Ring) => {
                         out.extend(self.local(core, LocalEvent::Alert { session: s.clone(), ring_timeout: Some(RING_TIMEOUT_S) }, now)?);
                         out.push(CallOut::Call(CallEvent::Ringing { session: s }));
@@ -602,15 +629,25 @@ impl Calls {
     }
 
     /// Answer `sid`: with media and a remote offer, ask the host for the SDP answer first.
-    fn answer(&mut self, core: &mut Core, sid: &str, answered_by: &'static str, now: i64) -> Result<Vec<CallOut>> {
+    fn answer(&mut self, core: &mut Core, sid: &str, answered_by: &str, now: i64) -> Result<Vec<CallOut>> {
         let media = self.cfg.media;
         let Some(call) = self.calls.get_mut(sid) else { return Ok(vec![]) };
         if let (true, Some(offer)) = (media, call.remote_offer.take()) {
-            call.awaiting = Some(Awaiting::Accept { answered_by });
+            call.awaiting = Some(Awaiting::Accept { answered_by: answered_by.to_string() });
             let screening = answered_by == "screening";
             return Ok(vec![CallOut::Media(MediaRequest::Answer { session: sid.to_string(), offer, screening })]);
         }
-        self.run(core, Command::Accept { session: sid.to_string(), answered_by: Some(answered_by.into()), sdp: None }, now)
+        self.accept(core, sid.to_string(), answered_by.to_string(), None, now)
+    }
+
+    /// Answer now: a session still OFFERED is alerted first (§12.4: a callee answers from ALERTING).
+    fn accept(&mut self, core: &mut Core, session: String, answered_by: String, sdp: Option<String>, now: i64) -> Result<Vec<CallOut>> {
+        let mut out = vec![];
+        if core.endpoint().session(&session).map(|s| s.state) == Some(SessionState::Offered) {
+            out.extend(self.local(core, LocalEvent::Alert { session: session.clone(), ring_timeout: Some(AUTO_RING_TIMEOUT_S) }, now)?);
+        }
+        out.extend(self.run(core, Command::Accept { session, answered_by: Some(answered_by), sdp }, now)?);
+        Ok(out)
     }
 
     /// Hand back the result of a [`MediaRequest`], or a local candidate.
@@ -619,6 +656,11 @@ impl Calls {
             MediaResult::Candidate { session, candidate } => {
                 let Some(call) = self.calls.get_mut(&session) else { return Ok(vec![]) };
                 call.candidates.push(candidate);
+                self.flush(core, &session, now)
+            }
+            MediaResult::Candidates { session, candidates } => {
+                let Some(call) = self.calls.get_mut(&session) else { return Ok(vec![]) };
+                call.candidates.extend(candidates.into_iter().map(Some));
                 self.flush(core, &session, now)
             }
             MediaResult::Offer { session, sdp } | MediaResult::Answer { session, sdp } => {
@@ -630,7 +672,7 @@ impl Calls {
                         invite.sdp = sdp;
                         Command::PlaceCall { session, to, invite }
                     }
-                    Awaiting::Accept { answered_by } => Command::Accept { session, answered_by: Some(answered_by.into()), sdp },
+                    Awaiting::Accept { answered_by } => return self.accept(core, session, answered_by, sdp, now),
                     Awaiting::Update { answered_by } => {
                         let id = core.new_id(now);
                         Command::Update { session, id, answered_by: answered_by.map(String::from), sdp }
@@ -664,6 +706,10 @@ impl Calls {
         }
         match cmd {
             CallCommand::Accept { session } => self.answer(core, &session, "user", now),
+            CallCommand::AcceptAs { session, answered_by } => self.answer(core, &session, &answered_by, now),
+            CallCommand::Alert { session, ring_timeout } => {
+                self.local(core, LocalEvent::Alert { session, ring_timeout: Some(ring_timeout.unwrap_or(RING_TIMEOUT_S)) }, now)
+            }
             CallCommand::Screen { session } => self.answer(core, &session, "screening", now),
             CallCommand::Decline { session } => self.local(core, LocalEvent::Decline { session, reason: None }, now),
             CallCommand::Cancel { session } => self.local(core, LocalEvent::Cancel { session }, now),
@@ -694,7 +740,7 @@ impl Calls {
                 let mut out: Vec<CallOut> =
                     emitted.into_iter().map(|e| CallOut::Call(CallEvent::Recording { session: session.clone(), emission: e })).collect();
                 if let Some(answered_by) = deferred {
-                    out.extend(self.answer(core, &session, answered_by, now)?);
+                    out.extend(self.answer(core, &session, &answered_by, now)?);
                 } else if media && core.endpoint().session(&session).map(|s| s.state) == Some(SessionState::Active) {
                     out.push(CallOut::Media(MediaRequest::StartSending { session: session.clone() }));
                     out.push(CallOut::Call(CallEvent::SendingResumed { session }));

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::error::Result;
 use dsip_session::LocalEvent;
 use dsip_transport::agent::Agent;
-use dsip_transport::{Command, Invite};
+use dsip_transport::{CallCommand, Invite};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -34,10 +34,6 @@ pub struct Call {
     pub from_tn: Option<String>,
     /// Outbound: the RFC 8224 `Identity` header value, when the gateway signed a PASSporT (N§4.1).
     pub identity_header: Option<String>,
-    /// Outbound: our SDP answer to the caller's offer, given to the engine right before `accept` (§16.3).
-    pub answer_sdp: Option<String>,
-    /// Inbound: our SDP offer toward the DSIP callee, given to the engine right before `place_call` (§16.3).
-    pub offer_sdp: Option<String>,
     sip_call_id: Option<String>,
     media: Option<DsipMedia>,
     rtp: Option<Arc<RtpLeg>>,
@@ -82,7 +78,8 @@ pub async fn apply(call: &mut Call, emits: Vec<Value>, legs: &mut Legs<'_>) -> R
     Ok(())
 }
 
-/// The controller's `{dsip: {local: …}}` emission as an `Agent` local event (§12 engine vocabulary).
+/// The controller's `{dsip: {local: …}}` emission as a call-glue command or an `Agent` local event (§12 engine
+/// vocabulary). The glue asks the host for the SDP (an offer for the invite, an answer for the accept) and sends it.
 ///
 /// Spec: G§3.1–G§3.2 (the DSIP leg actions per crossing event), §14.1 (`answered_by: gateway`).
 async fn apply_dsip(call: &mut Call, d: &Value, agent: &mut Agent) -> Result<()> {
@@ -90,9 +87,9 @@ async fn apply_dsip(call: &mut Call, d: &Value, agent: &mut Agent) -> Result<()>
     if local == "place_call" {
         let Some(target) = call.dsip_target.clone() else { return Ok(()) };
         let claims = d.get("claims").and_then(Value::as_array).cloned().unwrap_or_default();
-        let invite = Invite { sdp: call.offer_sdp.take(), claims, ..Default::default() };
-        let sid = agent.place_call_with(&target, invite).await?;
-        println!("→ invite   to {target}  session …{}  (G§5 claim: {})", &sid[sid.len().saturating_sub(8)..], d.get("trust_basis").and_then(Value::as_str).unwrap_or(""));
+        let invite = Invite { claims, ..Default::default() };
+        let sid = agent.place(&target, invite).await?;
+        println!("place     to {target}  session …{}  (G§5 claim: {}); the invite goes with our SDP offer", &sid[sid.len().saturating_sub(8)..], d.get("trust_basis").and_then(Value::as_str).unwrap_or(""));
         call.dsip_session = Some(sid);
         return Ok(());
     }
@@ -101,25 +98,20 @@ async fn apply_dsip(call: &mut Call, d: &Value, agent: &mut Agent) -> Result<()>
     let offered = agent.endpoint().session(&session).map(|s| s.state) == Some(dsip_session::SessionState::Offered);
     println!("→ dsip     {local}{}", reason.as_deref().map(|r| format!(" {r}")).unwrap_or_default());
     let ev = match local {
-        "alert" => LocalEvent::Alert { session, ring_timeout: Some(60) }.into(),
-        "accept" => {
-            if offered {
-                // the SIP side answered without ringing first: the §12 engine alerts before it answers
-                agent.local(LocalEvent::Alert { session: session.clone(), ring_timeout: Some(60) }).await?;
-            }
-            Command::Accept { session, answered_by: Some("gateway".into()), sdp: call.answer_sdp.take() } // §14.1
-        }
+        "alert" => return Ok(agent.call(CallCommand::Alert { session, ring_timeout: Some(60) }).await?),
+        // §14.1; the SIP side may answer without ringing first: the glue alerts before it answers (§12.4)
+        "accept" => return Ok(agent.call(CallCommand::AcceptAs { session, answered_by: "gateway".into() }).await?),
         // a pre-answer refusal with the G§4 reason: `auto_reject` is the engine's own event for an offered session
-        "auto_reject" if offered => LocalEvent::AutoReject { session, reason: reason.unwrap_or_else(|| "session.failed".into()) }.into(),
-        "auto_reject" => LocalEvent::Decline { session, reason }.into(),
-        "cancel" => LocalEvent::Cancel { session }.into(),
-        "hangup" => LocalEvent::Hangup { session, reason }.into(),
+        "auto_reject" if offered => LocalEvent::AutoReject { session, reason: reason.unwrap_or_else(|| "session.failed".into()) },
+        "auto_reject" => LocalEvent::Decline { session, reason },
+        "cancel" => LocalEvent::Cancel { session },
+        "hangup" => LocalEvent::Hangup { session, reason },
         _ => {
             info!("dsip emit not carried by this host: {d}");
             return Ok(());
         }
     };
-    Ok(agent.command(ev).await?)
+    Ok(agent.local(ev).await?)
 }
 
 async fn apply_sip(call: &mut Call, s: &Value, legs: &mut Legs<'_>) -> Result<()> {
@@ -227,8 +219,6 @@ impl Call {
             dsip_target: None,
             from_tn: None,
             identity_header: None,
-            answer_sdp: None,
-            offer_sdp: None,
         }
     }
 
@@ -253,8 +243,6 @@ impl Call {
             dsip_target: None,
             from_tn: None,
             identity_header: None,
-            answer_sdp: None,
-            offer_sdp: None,
         }
     }
 
