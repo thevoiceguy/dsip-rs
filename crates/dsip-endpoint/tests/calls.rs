@@ -332,3 +332,50 @@ fn a_sealed_call_refused_as_an_unknown_critical_extension_is_placed_once_more_in
     assert_eq!(a.sent_of("invite").len(), 2);
 }
 
+
+#[test]
+fn with_one_call_a_second_invite_is_declined_busy_without_asking_the_user() {
+    let mut a = Side::new(1, "Alice", CallsConfig::default(), CoreConfig::default());
+    let mut c = Side::new(3, "Carol", CallsConfig::default(), CoreConfig::default());
+    let mut b = Side::new(2, "Bob", CallsConfig { one_call: true, ..Default::default() }, CoreConfig::default());
+    let first = place(&mut a, &b);
+    pump(&mut a, &mut b);
+    assert_eq!(b.events, vec![CallEvent::Ringing { session: first.clone() }]);
+    let second = place(&mut c, &b);
+    pump(&mut c, &mut b);
+    assert_eq!(b.events.len(), 1, "the second call is not put to the user: {:?}", b.events);
+    assert_eq!(b.sent_types(), vec!["progress", "progress", "reject"], "§12.4: rejected from ALERTING");
+    assert_eq!(b.sent_of("reject")[0]["reason"], "user.busy");
+    assert_eq!(b.sent_of("reject")[0]["session"], second.as_str());
+    assert_eq!(b.state(&first), Some(SessionState::Alerting), "the first call still rings");
+}
+
+#[test]
+fn a_call_cancelled_before_its_offer_is_dropped_and_does_not_make_us_busy() {
+    let mut a = Side::new(1, "Alice", CallsConfig { one_call: true, ..Default::default() }, CoreConfig::default());
+    let mut b = Side::new(2, "Bob", CallsConfig::default(), CoreConfig::default());
+    a.auto_media = false;
+    let (sid, out) = a.calls.place(&mut a.core, &b.did(), Invite::default(), NOW).unwrap();
+    a.take(out);
+    a.command(CallCommand::Cancel { session: sid.clone() });
+    assert_eq!(a.media.last(), Some(&MediaRequest::Close { session: sid.clone() }));
+    assert!(a.sent.is_empty(), "nothing went out");
+    a.result(MediaResult::Offer { session: sid, sdp: sdp("actpass", "sendrecv") });
+    assert!(a.sent.is_empty(), "a late offer for the dropped call places nothing");
+    a.auto_media = true;
+    let back = place(&mut b, &a);
+    pump(&mut b, &mut a);
+    assert_eq!(a.events, vec![CallEvent::Ringing { session: back }], "not busy");
+}
+
+#[test]
+fn consent_says_a_declared_recording_is_pending() {
+    let (mut a, mut b) = pair(AnswerPolicy::Ring);
+    a.core.set_recording(Some(json!({"state": "on", "recorder": a.did()})));
+    let sid = place(&mut a, &b);
+    pump(&mut a, &mut b);
+    assert_eq!(b.calls.consent(&sid).map(|c| c["pending"].clone()), Some(json!(true)));
+    b.command(CallCommand::AcceptRecording { session: sid.clone() });
+    assert_eq!(b.calls.consent(&sid).map(|c| c["pending"].clone()), Some(json!(false)));
+    assert_eq!(b.calls.consent("nope"), None);
+}

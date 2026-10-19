@@ -22,7 +22,9 @@ use dsip_core::envelope::{sign, Context, Envelope};
 use dsip_core::keys::KeyPair;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
-use dsip_endpoint::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite, InvitePatch};
+use dsip_endpoint::calls::AcceptPolicy;
+use dsip_endpoint::{AnswerPolicy, CallCommand, CallEvent, CallOut, Calls, CallsConfig, Command, ContactFile, Core, CoreConfig, CoreEvent,
+                    IdentityKeys, Invite, InvitePatch, MediaRequest, MediaResult};
 use dsip_session::LocalEvent;
 
 fn hex(b: &[u8]) -> String {
@@ -80,6 +82,80 @@ fn core_event_json(e: &CoreEvent) -> Value {
         CoreEvent::Rejected { code, detail } => json!({"rejected": {"code": code, "detail": detail}}),
         CoreEvent::Resolve { did } => json!({"resolve": {"did": did}}),
     }
+}
+
+fn media_request_json(m: &MediaRequest) -> Value {
+    match m {
+        MediaRequest::Offer { session, add_source } => json!({"kind": "offer", "session": session, "add_source": add_source}),
+        MediaRequest::Answer { session, offer, screening } => json!({"kind": "answer", "session": session, "offer": offer, "screening": screening}),
+        MediaRequest::ApplyAnswer { session, sdp } => json!({"kind": "apply_answer", "session": session, "sdp": sdp}),
+        MediaRequest::RemoteCandidates { session, candidates } => json!({"kind": "remote_candidates", "session": session, "candidates": candidates}),
+        MediaRequest::StartSending { session } => json!({"kind": "start_sending", "session": session}),
+        MediaRequest::HoldSending { session } => json!({"kind": "hold_sending", "session": session}),
+        MediaRequest::Close { session } => json!({"kind": "close", "session": session}),
+        other => json!({"kind": "unknown", "debug": format!("{other:?}")}),
+    }
+}
+
+fn call_event_json(e: &CallEvent) -> Value {
+    match e {
+        CallEvent::Ringing { session } => json!({"event": "ringing", "session": session}),
+        CallEvent::Silent { session } => json!({"event": "silent", "session": session}),
+        CallEvent::NoOffer { session } => json!({"event": "no_offer", "session": session}),
+        CallEvent::UpdateOffered { session, id } => json!({"event": "update_offered", "session": session, "id": id}),
+        CallEvent::Recording { session, emission } => json!({"event": "recording", "session": session, "emission": emission}),
+        CallEvent::RecordingHeld { session } => json!({"event": "recording_held", "session": session}),
+        CallEvent::SendingResumed { session } => json!({"event": "sending_resumed", "session": session}),
+        CallEvent::NothingToAccept { session } => json!({"event": "nothing_to_accept", "session": session}),
+        CallEvent::ResentInClear { old, new, by } => json!({"event": "resent_in_clear", "old": old, "new": new, "by": by}),
+        other => json!({"event": "unknown", "debug": format!("{other:?}")}),
+    }
+}
+
+fn outs_json(out: &[CallOut]) -> String {
+    Value::Array(
+        out.iter()
+            .map(|o| match o {
+                CallOut::Core(e) => core_event_json(e),
+                CallOut::Media(m) => json!({"media_request": media_request_json(m)}),
+                CallOut::Call(e) => json!({"call": call_event_json(e)}),
+            })
+            .collect(),
+    )
+    .to_string()
+}
+
+/// A `call` command's JSON (`{"command": "accept"|"screen"|…, "session"}`) as a [`CallCommand`].
+fn call_command(v: &Value) -> Result<CallCommand, JsValue> {
+    let session = v["session"].as_str().ok_or_else(|| JsValue::from_str("no session"))?.to_string();
+    Ok(match v["command"].as_str().unwrap_or("") {
+        "accept" => CallCommand::Accept { session },
+        "screen" => CallCommand::Screen { session },
+        "decline" => CallCommand::Decline { session },
+        "cancel" => CallCommand::Cancel { session },
+        "hangup" => CallCommand::Hangup { session },
+        "update" => CallCommand::Update { session },
+        "escalate" => CallCommand::Escalate { session },
+        "answer_update" => CallCommand::AnswerUpdate { session },
+        "reject_update" => CallCommand::RejectUpdate { session },
+        "info" => CallCommand::Info { session },
+        "accept_recording" => CallCommand::AcceptRecording { session },
+        "decline_recording" => CallCommand::DeclineRecording { session },
+        other => return Err(JsValue::from_str(&format!("unknown call command {other:?}"))),
+    })
+}
+
+/// A `media` result's JSON (`{"kind": "offer"|"answer", "session", "sdp"}` or `{"kind": "candidate", "session",
+/// "candidate": {…}|null}`) as a [`MediaResult`].
+fn media_result(v: &Value) -> Result<MediaResult, JsValue> {
+    let session = v["session"].as_str().ok_or_else(|| JsValue::from_str("no session"))?.to_string();
+    let sdp = || v["sdp"].as_str().map(String::from).ok_or_else(|| JsValue::from_str("no sdp"));
+    Ok(match v["kind"].as_str().unwrap_or("") {
+        "offer" => MediaResult::Offer { session, sdp: sdp()? },
+        "answer" => MediaResult::Answer { session, sdp: sdp()? },
+        "candidate" => MediaResult::Candidate { session, candidate: Some(v["candidate"].clone()).filter(|c| !c.is_null()) },
+        other => return Err(JsValue::from_str(&format!("unknown media result {other:?}"))),
+    })
 }
 
 /// Install the panic hook (better errors in the browser console).
@@ -179,6 +255,17 @@ pub fn did_document(identity_json: &str, also_known_as_json: &str) -> Result<Str
         doc["alsoKnownAs"] = json!(aka);
     }
     serde_json::to_string_pretty(&doc).map_err(js)
+}
+
+/// The X25519 secrets sealed bodies addressed to this identity and this device open with (§10.4): the identity's
+/// when its key is on this device, and the device's.
+fn unseal_keys(id: &Value, keys: &IdentityKeys) -> Result<Vec<(String, [u8; 32])>, JsValue> {
+    let mut out = vec![];
+    if let Some(seed) = id["controller_seed_hex"].as_str().filter(|s| !s.is_empty()) {
+        out.push((keys.identity.clone(), dsip_core::hpke::x25519_from_ed25519_seed(&unhex(seed)?)));
+    }
+    out.push((keys.device.did(), dsip_core::hpke::x25519_from_ed25519_seed(&keys.device.seed())));
+    Ok(out)
 }
 
 fn policy_of(policy_json: &str) -> dsip_number::Policy {
@@ -334,10 +421,12 @@ pub fn downgrade_summary(losses_json: &str) -> String {
     dsip_core::trust::downgrade_summary(&losses.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
-/// A browser endpoint: the engine + verifier + builder behind a JSON API.
+/// A browser endpoint: the engine + verifier + builder behind a JSON API, with the call glue
+/// ([`dsip_endpoint::calls`]): the page is the media host, doing the media work the glue asks for.
 #[wasm_bindgen]
 pub struct Endpoint {
     core: Core,
+    calls: Calls,
     supported: dsip_core::version::Supported,
     resolver: StaticResolver,
     seen: SeenIds,
@@ -346,7 +435,11 @@ pub struct Endpoint {
 
 #[wasm_bindgen]
 impl Endpoint {
-    /// `identity_json` as returned by [`create_identity`]; `config_json` = `{"video":bool,"first_contact_required":bool,"t_establish":…}`.
+    /// `identity_json` as returned by [`create_identity`]; `config_json` = `{"video":bool,"first_contact_required":bool,
+    /// "t_establish":…, "seal":bool, "answer": "ring"|"accept"|"screen"|"decline"|"silent", "recording":
+    /// "ask"|"always"|"never", "one_call":bool}`. Sealed bodies addressed to this identity or device open with their
+    /// keys (§10.4); `did:web` signers whose documents are not held are asked for (`resolve` events, answered with
+    /// [`Endpoint::resolved`]).
     #[wasm_bindgen(constructor)]
     pub fn new(identity_json: &str, config_json: &str, now: f64) -> Result<Endpoint, JsValue> {
         let id: Value = serde_json::from_str(identity_json).map_err(js)?;
@@ -365,11 +458,30 @@ impl Endpoint {
             t_ring: cfgv["t_ring"].as_i64(),
             t_ring_local: cfgv["t_ring_local"].as_i64(),
             first_contact_required: cfgv["first_contact_required"].as_bool().unwrap_or(false),
-            ..Default::default()
+            seal: cfgv["seal"].as_bool().unwrap_or(false),
+            resolve_on_demand: true,
+            unseal_keys: unseal_keys(&id, &keys)?,
+        };
+        let calls = CallsConfig {
+            media: true,
+            answer: match cfgv["answer"].as_str().unwrap_or("ring") {
+                "accept" => AnswerPolicy::Accept,
+                "screen" => AnswerPolicy::Screen,
+                "decline" => AnswerPolicy::Decline,
+                "silent" => AnswerPolicy::Silent,
+                _ => AnswerPolicy::Ring,
+            },
+            recording: match cfgv["recording"].as_str().unwrap_or("ask") {
+                "always" => AcceptPolicy::Always,
+                "never" => AcceptPolicy::Never,
+                _ => AcceptPolicy::Ask,
+            },
+            one_call: cfgv["one_call"].as_bool().unwrap_or(false),
         };
         let resolver = StaticResolver::default();
         Ok(Endpoint {
             core: Core::new(keys, cfg, resolver.clone(), now as i64),
+            calls: Calls::new(calls),
             supported: dsip_core::version::Supported::all_known(),
             resolver,
             seen: SeenIds::default(),
@@ -423,19 +535,93 @@ impl Endpoint {
     pub fn local(&mut self, event_json: &str, now: f64) -> Result<String, JsValue> {
         let v: Value = serde_json::from_str(event_json).map_err(js)?;
         let out = self.core.command(command_from_json(&v).map_err(js)?, now as i64).map_err(js)?;
-        Ok(Value::Array(out.iter().map(core_event_json).collect()).to_string())
+        self.observe(out, now)
     }
 
     /// An inbound frame. Returns a JSON array of events.
     pub fn inbound(&mut self, frame: &str, now: f64) -> Result<String, JsValue> {
         let out = self.core.inbound(frame, now as i64).map_err(js)?;
-        Ok(Value::Array(out.iter().map(core_event_json).collect()).to_string())
+        self.observe(out, now)
     }
 
     /// Advance the clock; due timers fire. Returns a JSON array of events.
     pub fn tick(&mut self, now: f64) -> Result<String, JsValue> {
         let out = self.core.tick(now as i64).map_err(js)?;
-        Ok(Value::Array(out.iter().map(core_event_json).collect()).to_string())
+        self.observe(out, now)
+    }
+
+    fn observe(&mut self, events: Vec<CoreEvent>, now: f64) -> Result<String, JsValue> {
+        let out = self.calls.observe(&mut self.core, events, now as i64).map_err(js)?;
+        Ok(outs_json(&out))
+    }
+
+    /// Place a call to `to`: `invite_json` is `{claims?, patch?}` (as `place_call` takes them). Returns
+    /// `{"session", "events"}`; the events ask for the SDP offer (`media_request` `offer`), and the invite goes out
+    /// once [`Endpoint::media`] hands it back (§16.3).
+    pub fn place(&mut self, to: &str, invite_json: &str, now: f64) -> Result<String, JsValue> {
+        let v: Value = serde_json::from_str(invite_json).unwrap_or(json!({}));
+        let claims = v.get("claims").and_then(Value::as_array).cloned().unwrap_or_default();
+        let patch = match v.get("patch") {
+            Some(p) if p.is_object() => serde_json::from_value(p.clone()).map_err(js)?,
+            _ => InvitePatch::default(),
+        };
+        let (session, out) = self.calls.place(&mut self.core, to, Invite { sdp: None, claims, patch }, now as i64).map_err(js)?;
+        Ok(json!({"session": session, "events": serde_json::from_str::<Value>(&outs_json(&out)).map_err(js)?}).to_string())
+    }
+
+    /// What the user asks of a call: `{"command": "accept"|"screen"|"decline"|"cancel"|"hangup"|"update"|"escalate"|
+    /// "answer_update"|"reject_update"|"info"|"accept_recording"|"decline_recording", "session"}`. Returns a JSON
+    /// array of events.
+    pub fn call(&mut self, command_json: &str, now: f64) -> Result<String, JsValue> {
+        let v: Value = serde_json::from_str(command_json).map_err(js)?;
+        let out = self.calls.command(&mut self.core, call_command(&v)?, now as i64).map_err(js)?;
+        Ok(outs_json(&out))
+    }
+
+    /// The page's answer to a `media_request` (`{"kind": "offer"|"answer", "session", "sdp"}`), or a local ICE
+    /// candidate (`{"kind": "candidate", "session", "candidate": {candidate, sdp_mid, sdp_m_line_index}|null}`, null at
+    /// the end). Returns a JSON array of events.
+    pub fn media(&mut self, result_json: &str, now: f64) -> Result<String, JsValue> {
+        let v: Value = serde_json::from_str(result_json).map_err(js)?;
+        let out = self.calls.media(&mut self.core, media_result(&v)?, now as i64).map_err(js)?;
+        Ok(outs_json(&out))
+    }
+
+    /// The outcome of a `resolve` event: the DID document fetched for `did` (JSON), or `""` when the fetch failed
+    /// (`error` says why). A document is held from now on, for calls and for relay `hello`s alike (§8.1, §8.4); the
+    /// frames that waited for it are verified. Returns a JSON array of events.
+    pub fn resolved(&mut self, did: &str, doc_json: &str, error: &str, now: f64) -> Result<String, JsValue> {
+        let result = match serde_json::from_str::<dsip_core::did::DidDocument>(doc_json) {
+            Ok(d) if d.id == did => {
+                self.resolver.insert(d.clone());
+                Ok(d)
+            }
+            Ok(d) => Err(dsip_core::did::ResolveError::Fetch { did: did.into(), detail: format!("the document is for {}", d.id) }),
+            Err(e) => Err(dsip_core::did::ResolveError::Fetch { did: did.into(), detail: if error.is_empty() { e.to_string() } else { error.into() } }),
+        };
+        let out = self.core.resolved(did, result, now as i64).map_err(js)?;
+        self.observe(out, now)
+    }
+
+    /// Whether outbound session bodies are sealed (§10.4); a sealed call refused as an unknown critical extension is
+    /// placed once more in clear, and sealing stays off afterwards.
+    pub fn seal(&self) -> bool {
+        self.core.seal()
+    }
+
+    /// Seal outbound session bodies to the addressee's key agreement key when it resolves (§10.4).
+    pub fn set_seal(&mut self, on: bool) {
+        self.core.set_seal(on);
+    }
+
+    /// The other side's recording in `session` (C§4): `{disclosure, pending, hold_media, …}`, or `null`.
+    pub fn recording(&self, session: &str) -> String {
+        self.calls.consent(session).unwrap_or(Value::Null).to_string()
+    }
+
+    /// Whether the other side's recording holds our media in `session` (C§4).
+    pub fn holds_media(&self, session: &str) -> bool {
+        self.calls.holds_media(session)
     }
 
     /// Seconds until the next timer, or -1.

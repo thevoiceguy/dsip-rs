@@ -119,6 +119,8 @@
   <div class="row"><label>state</label><span id="call-state" class="tag"></span> <span id="call-note" class="muted small"></span></div>
   <div class="row"><label>mode</label><span id="call-mode" class="warn small"></span></div>
   <div id="call-downgrade" class="warn small hidden"></div>
+  <div id="call-recording" class="warn small hidden"><span id="call-recording-text"></span>
+    <span id="call-recording-choices"><button id="call-recording-accept">Accept being recorded</button> <button id="call-recording-decline" class="danger">Decline and hang up</button></span></div>
   <div class="videos">
     <div><div class="small muted">you</div><video id="local" autoplay muted playsinline></video></div>
     <div><div class="small muted">them</div><video id="remote" autoplay playsinline></video></div>
@@ -145,6 +147,8 @@
     <div class="row"><label>contact</label><span id="in-contact" class="small"></span></div>
     <div id="in-policy" class="muted small"></div>
     <div id="in-downgrade" class="warn small hidden"></div>
+    <div id="in-recording" class="warn small hidden"><span id="in-recording-text"></span>
+      <span id="in-recording-choices"><button id="in-recording-accept">Accept being recorded</button> <button id="in-recording-decline" class="danger">Decline</button></span></div>
     <div class="row">
       <button id="btn-accept" class="primary">Answer</button>
       <button id="btn-screen">Screen</button>
@@ -188,6 +192,9 @@
   <ul id="revoked-list" class="list"></ul>
   <h3>Policy</h3>
   <div class="row"><label class="small"><input type="checkbox" id="set-first-contact"> require first contact: refuse calls from identities that hold no grant (§19.4)</label></div>
+  <div class="row"><label class="small"><input type="checkbox" id="set-seal"> seal call bodies to the callee's key (§10.4); a callee or relay that cannot open them gets the call once more in clear</label></div>
+  <div class="row"><label class="small">when the other side records a call (C§4)
+    <select id="set-recording-accept"><option value="ask">ask me</option><option value="always">accept</option><option value="never">decline</option></select></label></div>
   <div class="row"><label class="small"><input type="checkbox" id="set-read-disclosed"> disclose read receipts: tell the other side how far you have read (M§10.3); off, your read position goes only to your own devices (M§10.5)</label></div>
   <h3>Call records</h3>
   <p class="muted small">When your organisation names a record-keeper, this device sends it a record after every call: who, when,

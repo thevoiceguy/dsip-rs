@@ -34,7 +34,8 @@ invite's `destination` (N§4.1). A binding from the person's carrier (Settings, 
 the number "(unverified)" with the refusal; a number that a stored contact lists but that now belongs to another
 identity is said out loud (N§5, `identity_change`). A bound number needs a `did:web` identity whose document lists it
 (N§3.3): Settings rehomes the identity to a `did:web` name (the same keys, §7.2) and gives the document to host. DID
-documents of `did:web` peers are held in Settings as the CLI holds `--did-document`; the browser does not fetch them.
+documents of `did:web` peers are held in Settings as the CLI holds `--did-document`, and a signer whose document is not
+held is fetched from where its DID says (§8.4) while its frame waits (see "Numbers and did:web").
 
 **Stage 5:** deployment. The relay serves the client under a real certificate (`--cert`/`--key`, Let's Encrypt on
 the WAN testbed) and, beside it, what a deployed client needs from its origin and nothing in the protocol carries
@@ -193,9 +194,9 @@ TURN sees the media's endpoints, not its content (DTLS-SRTP). A public relay log
 ```
 index.html, style.css   the screens: welcome, contacts, call, incoming, settings, log
 app.js                  the screens' logic and the one current call; drives the host layer
-host/engine.js          the wasm Endpoint behind callbacks (send, received, emission, rejected)
+host/engine.js          the wasm Endpoint behind callbacks (send, received, emission, rejected, call, mediaRequest, resolve)
 host/relay.js           the WebSocket: hello first, the relay's hello verified by the engine, reconnect
-host/media.js           RTCPeerConnection per call; candidate buffering (§12.12: info is ACTIVE-only)
+host/media.js           RTCPeerConnection per call: offers, answers, remote candidates, hold/resume (C§4)
 host/store.js           IndexedDB (localStorage fallback) for identity, contacts, engine state, settings
 host/identity-file.js   the identity export: PBKDF2 + AES-GCM under a passphrase, version 1
 ../crates/dsip-wasm/src/messaging.rs   the messaging device (stage 6): OpenMLS + the profile's client rules, driven by app.js
@@ -233,6 +234,9 @@ test/messaging-hub-move.mjs  moving a live hub (M§7.4): Bob hosts Alice's conve
                         follow, text flows; Alice moves it back while Bob's page holds its pushes, so his message
                         meets the old hub and is re-sent to the new one; the group returns to a hub it left (spec-gap 128);
                         Alice reaches a new hub before the GroupInfo that sets it up and waits for it (spec-gap 129)
+test/call-recording.mjs  the call glue against the CLI: a recorded caller is answered only once accepted, or declined
+                        (policy.recording-declined); a recorded callee holds our media until accepted (C§4); a
+                        sealed call between browsers (§10.4)
 test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
                         yields a record, held until that conversation exists (spec-gaps 121, 123); a party accepts
                         the recorder before writing there (C§5)
@@ -338,7 +342,18 @@ group as a `recording-acceptance`, so the identity's other devices accept them t
 asks again (C§5). Declining is leaving: "Leave" (also on any conversation's header) proposes the removal of every
 leaf of the identity, since MLS forbids committing one's own removal, and another member's device commits it
 (M§7.3, spec-gap 125). Not done: `ended_by: transport` (a relay that drops mid-call does not end the session here)
-and the `recording` field (the browser declares no recording).
+and declaring recording (the browser declares none; it renders and consents to the other side's, below).
+
+**The call glue (dsip-rs stage 2b).** The calls run on `dsip_endpoint::calls` inside the wasm, as the CLI's do: the
+page is the media host. The glue asks for an SDP offer or answer, for remote candidates to be applied, for sending to
+start, hold or stop, and the page hands back the SDP and its local candidates; the glue sends those in signed `info`
+once the call is ACTIVE (§12.12), starts media on the signed answer (§14.1), rings or declines by policy (one call at a
+time: a second invite is declined `user.busy`), and runs recording consent (C§3–C§4): the other side's declaration is
+shown on the incoming and call screens, a callee cannot answer before accepting it, a caller's media is held until it
+accepts, and declining rejects the call or ends it with `policy.recording-declined` ("when the other side records a
+call" in Settings: ask, accept or decline). "Seal call bodies" (Settings) seals session bodies to the callee's key
+(§10.4); sealed bodies addressed to this identity or device open here, and a sealed call refused as an unknown critical
+extension is placed once more in clear, as a new session (§10.4, §11.3).
 
 ## Identity
 
@@ -357,7 +372,9 @@ A `did:key` identity cannot present a bound number: the binding's DID must list 
 device delegation re-signed under `<did>#key-1`, and a `did.json` to host at the DID's URL (with `alsoKnownAs` for the
 bound number). Until it is served there, a verifier that does not hold the document refuses the identity, and the
 client says so. Documents of `did:web` peers (a gateway, a contact) are held in Settings, as the CLI holds
-`--did-document`: the browser does not fetch `did.json` files (CORS and a host's TLS are the host's to arrange).
+`--did-document`. A frame from a `did:web` signer whose document is not held waits (up to 10 s) while the page fetches
+the DID's `did.json` (§8.4); the document is then held for the session (§8.1), or, when the fetch fails (CORS and a
+host's TLS are the host's to arrange), the frame is verified without it and refused, as before.
 The number policy (the STI-CA trust list and `x5u` chains, N§3.2) is pasted the same way; without it every binding is
 `untrusted-certificate`, which is shown rather than hidden. The wasm package is 5.0 MB uncompressed with the number
 crate in it (stage 4); the plan's size risk is measured at each stage.
