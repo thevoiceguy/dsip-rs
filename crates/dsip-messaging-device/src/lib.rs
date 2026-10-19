@@ -3,7 +3,7 @@
 //! `impl/docs/dsip-stack-design.md`) from the logic the two clients each carried; the vector-pinned machines stay in
 //! `dsip_messaging::client`, the MLS wrapper in `dsip_mls`. It does no I/O: hosts hand it bytes and time.
 //!
-//! Spec: M§6.2 (every leaf authenticated), M§6.5 (commits checked, then merged), M§6.8 (an external join checked by
+//! Spec: M§5.4 (items routed and acknowledged), M§6.2 (every leaf authenticated), M§6.5 (commits checked, then merged), M§6.8 (an external join checked by
 //! every member, spec-gap 62), M§7.3 (roster rules, spec-gap 126; leaving, spec-gap 125), M§7.4 (the hub reference,
 //! spec-gap 60), M§5.5 (KeyPackages selected), M§8.1 (content objects checked before rendering), M§8.4 (blobs), M§12.2
 //! (archive records), M§13.3 (call events), C§5 (content from a recorder leaf; recorded conversations), C§9 (call
@@ -15,10 +15,12 @@
 pub mod archive;
 pub mod blob;
 pub mod calls;
+pub mod inbound;
 pub mod key_packages;
 pub mod process;
 pub mod recording;
 pub mod store;
 
+pub use inbound::{Inbound, Route};
 pub use process::{process, Outcome, ProcessOptions};
 pub use store::{MemoryStore, Store};

@@ -53,8 +53,8 @@ use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Outcome, ProcessOptions};
-use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, message_header, Device, MlsError};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Inbound, Outcome, ProcessOptions, Route};
+use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
 use dsip_transport::{now_s, tls};
@@ -1895,12 +1895,7 @@ impl Client {
     /// just joined and processed nothing — from the item at hand: what came before its welcome is not its gap
     /// (M§6.5, M§12.3 step 5; spec-gap 69).
     fn gap_of_from(&mut self, group: &str, first_seq: i64) -> &mut GapTracker {
-        let committed = self.resume.snapshot()["groups"][group]["contiguous"].as_i64().unwrap_or(0);
-        let contiguous = if committed == 0 { (first_seq - 1).max(0) } else { committed };
-        let (now, timeout) = (now_s(), self.gap_timeout);
-        self.gaps
-            .entry(group.to_string())
-            .or_insert_with(|| GapTracker::new(&json!({"now": now, "contiguous": contiguous, "gap_timeout": timeout})))
+        dsip_messaging_device::inbound::gap_tracker(&mut self.gaps, &self.resume, self.gap_timeout, group, first_seq, now_s())
     }
 
 
@@ -2322,73 +2317,52 @@ impl Client {
     async fn item(&mut self, item: &Value) -> Result<()> {
         let cursor = item["cursor"].as_str().unwrap_or("").to_string();
         let class = item["class"].as_str().unwrap_or("").to_string();
-        if class == "ephemeral" {
-            // Never stored, no cursor: nothing to commit (M§11.2).
-            return self.activity_in(item);
-        }
-        if self.resume.is_duplicate(item) {
-            // M§8.5: already durably processed; collapse silently, but acknowledge it.
-            self.resume.commit(item, true);
-            self.save_resume()?;
-            println!("DUP {class} {cursor}");
-            return Ok(());
-        }
-        if class == "archive" {
-            return self.archive_in(item);
-        }
-        if matches!(class.as_str(), "introduction" | "grant") {
-            self.first_contact_in(item)?;
-            self.resume.commit(item, false);
-            return self.save_resume();
-        }
-        if class == "group-info" {
-            // M§6.8: the latest GroupInfo per group is what this device can join by external commit from
-            let gid = item["group"].as_str().unwrap_or("").to_string();
-            self.resume.commit(item, false);
-            let p = self.mls.provider();
-            p.atomically(|| {
-                p.put_state(&format!("group_info:{gid}"), &item["mls"])?;
-                p.put_state("resume", &self.resume.snapshot())
-            })
-            .map_err(Self::state_err)?;
-            return Ok(());
-        }
-        if !matches!(class.as_str(), "welcome" | "handshake" | "application") {
-            self.resume.commit(item, false);
-            return self.save_resume();
-        }
         let gid = item["group"].as_str().unwrap_or("").to_string();
-        let bytes = unb64(&item["mls"]);
-        if class != "welcome" && self.own.contains(&digest(&bytes)) {
-            // Our own deposit fanned back to our identity (M§6.5 rule 5); arrived before its `accepted` (spec-gap 47).
-            self.resume.commit(item, false);
-            self.save_resume()?;
-            println!("SELF {class} seq={}", item["seq"]);
-            return Ok(());
-        }
-        if class != "welcome" {
-            // M§12.3 step 5: MLS items from before this device joined the group are history, read from archive.
-            let pre = match message_header(&bytes) {
-                Ok((_, epoch, _)) => !self.convs.contains_key(&gid) || self.history.is_prejoin(&gid, epoch as i64),
-                Err(_) => false,
-            };
-            if pre {
+        let member = self.convs.contains_key(&gid);
+        let history = &self.history;
+        let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
+                                     gap_timeout: self.gap_timeout };
+        // M§12.3 step 5: MLS items from before this device joined the group are history, read from archive.
+        let route = delivery.route(item, member, |epoch| history.is_prejoin(&gid, epoch as i64), now_s());
+        let (bytes, released) = match route {
+            // Never stored, no cursor: nothing to commit (M§11.2).
+            Route::Ephemeral => return self.activity_in(item),
+            Route::Duplicate => {
+                // M§8.5: already durably processed; collapse silently, but acknowledge it.
+                self.save_resume()?;
+                println!("DUP {class} {cursor}");
+                return Ok(());
+            }
+            Route::Archive => return self.archive_in(item),
+            Route::FirstContact => {
+                self.first_contact_in(item)?;
                 self.resume.commit(item, false);
+                return self.save_resume();
+            }
+            Route::GroupInfo { group, mls } => {
+                // M§6.8: the latest GroupInfo per group is what this device can join by external commit from
+                let p = self.mls.provider();
+                p.atomically(|| {
+                    p.put_state(&format!("group_info:{group}"), &mls)?;
+                    p.put_state("resume", &self.resume.snapshot())
+                })
+                .map_err(Self::state_err)?;
+                return Ok(());
+            }
+            Route::Other => return self.save_resume(),
+            Route::Own => {
+                // Our own deposit fanned back to our identity (M§6.5 rule 5); arrived before its `accepted` (spec-gap 47).
+                self.save_resume()?;
+                println!("SELF {class} seq={}", item["seq"]);
+                return Ok(());
+            }
+            Route::PreJoin => {
                 self.save_resume()?;
                 println!("PREJOIN {class} seq={}", item["seq"]);
                 return Ok(());
             }
-        }
-        // M§6.5 (spec-gap 69): a handshake beyond a seq gap, and anything after a held item, waits for the gap to fill
-        let mut released = vec![];
-        if matches!(class.as_str(), "handshake" | "application") && item["held_release"] != json!(true) && self.convs.contains_key(&gid) {
-            let seq = item["seq"].as_i64().unwrap_or(0);
-            let decisions = self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": class}}));
-            if decisions.iter().any(|d| d["hold"] == json!(seq)) {
-                let mut held = item.clone();
-                held["held_release"] = json!(true);
-                self.held_items.entry(gid.clone()).or_default().push(held);
-                self.resume.commit(item, true); // acknowledged: this device holds it durably, unprocessed
+            Route::Held => {
+                // M§6.5 (spec-gap 69): acknowledged, since this device holds it durably, unprocessed, until the gap fills
                 let held_json = serde_json::to_value(&self.held_items)?;
                 let p = self.mls.provider();
                 p.atomically(|| {
@@ -2396,19 +2370,11 @@ impl Client {
                     p.put_state("resume", &self.resume.snapshot())
                 })
                 .map_err(Self::state_err)?;
-                println!("HOLD {class} seq={seq} (waiting for the gap to fill)");
+                println!("HOLD {class} seq={} (waiting for the gap to fill)", item["seq"]);
                 return Ok(());
             }
-            for d in &decisions {
-                if let Some(s) = d["process"].as_i64().filter(|s| *s != seq) {
-                    if let Some(items) = self.held_items.get_mut(&gid) {
-                        if let Some(i) = items.iter().position(|h| h["seq"] == json!(s)) {
-                            released.push(items.remove(i));
-                        }
-                    }
-                }
-            }
-        }
+            Route::Process { bytes, released, .. } => (bytes, released),
+        };
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
         let before = self.resume.clone();
@@ -2507,15 +2473,15 @@ impl Client {
                 }
             }
             Outcome::Removed { by, remaining } => {
-                self.resume.removed(&gid); // spec-gap 127: a member may add this identity back with a new welcome
+                // spec-gap 127: a member may add this identity back with a new welcome; its seq gaps here start afresh
+                Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
+                          gap_timeout: self.gap_timeout }
+                    .removed(&gid);
                 let mut c = self.convs.remove(&gid);
                 if let Some(c) = c.as_mut() {
                     // spec-gap 127: the group's MLS state goes too, so a welcome back into the same group id can be joined
                     let _ = c.group.delete(self.mls.provider().storage());
                 }
-                // and the seq gaps it tracked there: a welcome back starts counting afresh from its own seq (spec-gap 83)
-                self.gaps.remove(&gid);
-                self.held_items.remove(&gid);
                 let kind = c.as_ref().map(|c| c.kind.clone()).unwrap_or_default();
                 println!("REMOVED from {} kind={kind} by={by}", c.map(|c| c.conversation).unwrap_or_default());
                 if self.active.as_deref() == Some(gid.as_str()) {

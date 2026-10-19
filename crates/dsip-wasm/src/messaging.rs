@@ -41,11 +41,11 @@ use dsip_core::version::Supported;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, MemoryStore, Outcome, ProcessOptions};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Inbound, MemoryStore, Outcome, ProcessOptions, Route};
 use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
-use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, message_header, Device, MlsError};
+use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
 use openmls::prelude::tls_codec::Serialize as _;
 use openmls::prelude::*;
 use openmls_traits::OpenMlsProvider;
@@ -1910,86 +1910,59 @@ impl Messenger {
     }
 
     fn gap_of_from(&mut self, gid: &str, first_seq: i64) -> &mut GapTracker {
-        let committed = self.resume.snapshot()["groups"][gid]["contiguous"].as_i64().unwrap_or(0);
-        let contiguous = if committed == 0 { (first_seq - 1).max(0) } else { committed };
-        let timeout = self.gap_timeout;
-        self.gaps.entry(gid.to_string()).or_insert_with(|| GapTracker::new(&json!({"now": 0, "contiguous": contiguous, "gap_timeout": timeout})))
+        self.delivery().gap_of_from(gid, first_seq, 0)
+    }
+
+    /// The delivery state inbound routing reads and writes (M§5.4).
+    fn delivery(&mut self) -> Inbound<'_> {
+        Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items, gap_timeout: self.gap_timeout }
     }
 
     /// One `items[]` element (M§5.4): committed with the MLS change it caused (spec-gap 44).
     fn item(&mut self, item: &Value, now: i64) -> Result<Vec<Value>, MlsError> {
         let mut out = vec![];
         let class = s_of(&item["class"]);
-        if class == "ephemeral" {
-            return Ok(out);
-        }
-        if self.resume.is_duplicate(item) {
-            self.resume.commit(item, true);
-            out.push(json!({"ui": "duplicate", "class": class, "cursor": item["cursor"]}));
-            return Ok(out);
-        }
-        if matches!(class.as_str(), "introduction" | "grant") {
-            out.extend(self.first_contact_in(item, now));
-            self.resume.commit(item, false);
-            return Ok(out);
-        }
         let gid = s_of(&item["group"]);
-        if class == "archive" {
-            out.extend(self.archive_in(item, now));
-            self.resume.commit(item, false);
-            return Ok(out);
-        }
-        if class == "group-info" {
-            self.group_info.insert(gid, s_of(&item["mls"]));
-            self.resume.commit(item, false);
-            return Ok(out);
-        }
-        if !matches!(class.as_str(), "welcome" | "handshake" | "application") {
-            self.resume.commit(item, false);
-            return Ok(out);
-        }
-        let bytes = unb64(&item["mls"]);
-        if class != "welcome" && self.own.contains(&digest(&bytes)) {
-            // our own deposit fanned back (M§6.5 rule 5), arriving before its accepted (spec-gap 47)
-            self.resume.commit(item, false);
-            out.push(json!({"ui": "self", "class": class, "seq": item["seq"]}));
-            return Ok(out);
-        }
-        if class != "welcome" {
-            // M§12.3: items from before this device joined are history; a group it is not in is skipped
-            let pre = match message_header(&bytes) {
-                Ok((_, epoch, _)) => self.convs.get(&gid).is_none_or(|c| epoch < c.joined_epoch),
-                Err(_) => false,
-            };
-            if pre {
+        let joined = self.convs.get(&gid).map(|c| c.joined_epoch);
+        // M§12.3: items from before this device joined are history; a group it is not in is skipped. Its gap trackers
+        // are never advanced (a gap that does not fill is not timed out here), so their clock starts at 0.
+        let route = self.delivery().route(item, joined.is_some(), |epoch| joined.is_some_and(|j| epoch < j), 0);
+        let (bytes, released) = match route {
+            Route::Ephemeral | Route::Other => return Ok(out),
+            Route::Duplicate => {
+                out.push(json!({"ui": "duplicate", "class": class, "cursor": item["cursor"]}));
+                return Ok(out);
+            }
+            Route::FirstContact => {
+                out.extend(self.first_contact_in(item, now));
                 self.resume.commit(item, false);
+                return Ok(out);
+            }
+            Route::Archive => {
+                out.extend(self.archive_in(item, now));
+                self.resume.commit(item, false);
+                return Ok(out);
+            }
+            Route::GroupInfo { group, mls } => {
+                self.group_info.insert(group, s_of(&mls));
+                return Ok(out);
+            }
+            Route::Own => {
+                // our own deposit fanned back (M§6.5 rule 5), arriving before its accepted (spec-gap 47)
+                out.push(json!({"ui": "self", "class": class, "seq": item["seq"]}));
+                return Ok(out);
+            }
+            Route::PreJoin => {
                 out.push(json!({"ui": "prejoin", "class": class, "seq": item["seq"]}));
                 return Ok(out);
             }
-        }
-        // M§6.5 (spec-gap 69): a handshake beyond a seq gap, and anything after a held item, waits for the gap
-        let mut released = vec![];
-        if class != "welcome" && item["held_release"] != json!(true) && self.convs.contains_key(&gid) {
-            let seq = item["seq"].as_i64().unwrap_or(0);
-            let decisions = self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": class}}));
-            if decisions.iter().any(|d| d["hold"] == json!(seq)) {
-                let mut held = item.clone();
-                held["held_release"] = json!(true);
-                self.held_items.entry(gid.clone()).or_default().push(held);
-                self.resume.commit(item, true);
-                out.push(json!({"ui": "hold", "class": class, "seq": seq}));
+            Route::Held => {
+                // M§6.5 (spec-gap 69): a handshake beyond a seq gap, and anything after a held item, waits for the gap
+                out.push(json!({"ui": "hold", "class": class, "seq": item["seq"]}));
                 return Ok(out);
             }
-            for d in &decisions {
-                if let Some(s) = d["process"].as_i64().filter(|s| *s != seq) {
-                    if let Some(items) = self.held_items.get_mut(&gid) {
-                        if let Some(i) = items.iter().position(|h| h["seq"] == json!(s)) {
-                            released.push(items.remove(i));
-                        }
-                    }
-                }
-            }
-        }
+            Route::Process { bytes, released, .. } => (bytes, released),
+        };
         let before_ids = self.member_identities(&gid, now);
         let outcome = {
             let ctx = Context::new(now, &self.resolver);
@@ -2049,15 +2022,13 @@ impl Messenger {
             }
             Outcome::Removed { by, remaining } => {
                 let was_leaving = self.leaving.remove(&gid);
-                self.resume.removed(&gid); // spec-gap 127: a member may add this identity back with a new welcome
+                // spec-gap 127: a member may add this identity back with a new welcome; its seq gaps here start afresh
+                self.delivery().removed(&gid);
                 let mut c = self.convs.remove(&gid);
                 if let Some(c) = c.as_mut() {
                     // spec-gap 127: the group's MLS state goes too, so a welcome back into the same group id can be joined
                     let _ = c.group.delete(self.mls.provider().storage());
                 }
-                // and the seq gaps it tracked there: a welcome back starts counting afresh from its own seq (spec-gap 83)
-                self.gaps.remove(&gid);
-                self.held_items.remove(&gid);
                 if self.personal.as_deref() == Some(gid.as_str()) {
                     self.personal = None;
                 }
