@@ -53,7 +53,7 @@ use dsip_messaging::checks::check_object;
 use dsip_messaging::client::{select_mailbox, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_messaging_device::{process, Outcome, ProcessOptions};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Outcome, ProcessOptions};
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, message_header, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
@@ -744,27 +744,10 @@ impl Client {
             bail!("key-package-fetch refused: {} {}", payload["type"], payload["reason"]);
         }
         let r = resolver(&self.resolver_files);
-        let ctx = self.ctx(&r);
-        let mut found: Vec<(KeyPackage, dsip_messaging::mls_wire::LeafIdentity)> = vec![];
-        let candidates = payload["key_packages"].as_array().cloned().unwrap_or_default().into_iter().chain(payload.get("last_resort").cloned());
-        for c in candidates {
-            if let Ok((kp, who)) = authenticate_key_package(&unb64(&c), self.mls.provider(), &ctx) {
-                found.push((kp, who));
-            }
-        }
-        let listed: Vec<Value> = found.iter().map(|(_, w)| json!({"device": w.device, "identity": w.identity, "capabilities": w.capabilities})).collect();
-        let pick = dsip_recording::add_devices(&json!({"target": target, "self_identity": self.identity, "self_device": self.keys.device.did(),
-                                                         "purpose": purpose, "key_packages": listed}));
-        if let Some(why) = pick["refused"].as_str() {
-            bail!("no device of {target} to add: {why} (C§5)");
-        }
-        let mut out = vec![];
-        for d in pick["add"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            if let Some(i) = found.iter().position(|(_, w)| w.device == d) {
-                out.push(found.swap_remove(i).0);
-            }
-        }
-        Ok(out)
+        let me = key_packages::Me { identity: &self.identity, device: &self.keys.device.did() };
+        let picked = key_packages::select(&payload, target, &me, purpose, self.mls.provider(), &self.ctx(&r))
+            .map_err(|why| anyhow::anyhow!("no device of {target} to add: {why} (C§5)"))?;
+        Ok(picked.into_iter().map(|(_, kp)| kp).collect())
     }
 
     fn conv(&self, group: &str) -> Result<&Conv> {
@@ -777,13 +760,8 @@ impl Client {
         let c = self.convs.get(gid)?;
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
-        let leaves: Vec<Value> = c.group.members()
-            .filter_map(|m| member_identity(&c.group, m.index, &ctx).ok())
-            .map(|l| json!({"device": l.device, "subject": l.identity, "capabilities": l.capabilities}))
-            .collect();
-        let mut accepted: Vec<String> = self.rec_accepted.get(gid).into_iter().flatten().cloned().collect();
-        accepted.extend(leaves.iter().filter(|l| l["subject"] == json!(self.identity)).filter_map(|l| l["device"].as_str().map(String::from)));
-        Some(dsip_recording::conversation(&json!({"leaves": leaves, "accepted": accepted})))
+        let leaves: Vec<_> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect();
+        Some(recording::state(&leaves, &self.identity, self.rec_accepted.get(gid).unwrap_or(&std::collections::BTreeSet::new())))
     }
 
     /// Whether `device` is a recorder leaf of the group (C§5: its content is never rendered).
@@ -1738,8 +1716,7 @@ impl Client {
         // M§8.4 rule 1: a fresh single-use key, AES-256-GCM, nonce ‖ ciphertext ‖ tag.
         let key: [u8; 32] = rand::random();
         let nonce: [u8; 12] = rand::random();
-        let sealed = seal(&key, &nonce, &plain, SealUse::Blob);
-        let sha = digest(&sealed);
+        let blob::Sealed { bytes: sealed, sha256: sha } = blob::seal_blob(&key, &nonce, &plain);
         let conn = self.conn.as_ref().context("offline")?;
         let endpoint = conn.relay.capabilities["mailbox"]["blob_endpoint"].as_str().context("mailbox advertises no blob_endpoint")?;
         let uri = format!("{endpoint}/{sha}");
@@ -1752,13 +1729,9 @@ impl Client {
         anyhow::ensure!(matches!(status, 200 | 201) && answer["type"] == "accepted", "blob upload refused: {status} {}", answer["reason"]);
 
         let now = now_s();
-        let mut obj = json!({"object": "content", "id": wire::new_id(now), "conversation": conversation,
-            "sender": self.identity, "sent_at": now, "kind": "audio", "purpose": purpose, "duration_ms": duration_ms,
-            "blob": {"uri": uri, "sha256": sha, "size": sealed.len(), "key": b64(&key), "alg": "A256GCM",
-                     "content_type": "audio/ogg; codecs=opus"}});
-        if let Some(s) = session {
-            obj["session"] = json!(s);
-        }
+        let key_b64 = b64(&key);
+        let uploaded = blob::Uploaded { uri: &uri, sha256: &sha, size: sealed.len() as u64, key: &key_b64, content_type: "audio/ogg; codecs=opus" };
+        let obj = blob::audio_content(&wire::new_id(now), &conversation, &self.identity, now, purpose, duration_ms, &uploaded, session.as_deref());
         // M§8.4 rule 4: the deposit's manifest names the blob without its key.
         let manifest = json!([{"uri": uri, "sha256": sha, "size": sealed.len()}]);
         let reply = self.send_object(&group, &obj, json!({"blobs": manifest})).await?;
@@ -1800,10 +1773,10 @@ impl Client {
     /// copy first when the item's manifest names one, then the content's own `uri` (M§8.4 rule 6, spec-gap 65).
     async fn fetch_media(&self, object: &Value, manifest: &Value, attempt: i64) -> Result<Fetched> {
         let b = &object["blob"];
-        let key: [u8; 32] = unb64(&b["key"]).try_into().ok().context("blob key")?;
-        let sources = dsip_messaging::client::blob_sources(&json!({"blob": b, "manifest": manifest}));
+        let _: [u8; 32] = unb64(&b["key"]).try_into().ok().context("blob key")?;
         let mut tried = vec![];
-        for uri in sources["sources"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        for uri in &blob::sources(object, manifest) {
+            let uri = uri.as_str();
             let stored = match self.http.get(uri).send().await {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                     Ok(body) => body,
@@ -1825,7 +1798,7 @@ impl Client {
                 }
             };
             // M§8.4 rule 7: whichever source, the hash and size must match before decrypting
-            match dsip_messaging::mls_wire::open_blob(&key, &stored, b["size"].as_u64().unwrap_or(0) as usize, b["sha256"].as_str().unwrap_or("")) {
+            match blob::open(object, &stored) {
                 Ok(plain) => {
                     let dir = self.state.join("media");
                     std::fs::create_dir_all(&dir)?;
@@ -1841,9 +1814,12 @@ impl Client {
             }
         }
         // M§8.4 "Fetching" (spec-gap 106): try again when a source had nothing to serve; never when all served other bytes
-        let decision = dsip_messaging::client::blob_fetch(&json!({"blob": {"sha256": b["sha256"], "size": b["size"]}, "tried": tried,
-            "attempt": attempt}));
-        Ok(if decision["action"] == "retry" { Fetched::Retry } else { Fetched::GaveUp(decision["reason"].as_str().unwrap_or("").to_string()) })
+        Ok(match blob::fetch_decision(object, &json!(tried), attempt) {
+            blob::Fetch::Retry => Fetched::Retry,
+            blob::Fetch::GiveUp(reason) => Fetched::GaveUp(reason),
+            // a source served the content's size and hash but it did not decrypt: nothing to play
+            blob::Fetch::Play(_) => Fetched::GaveUp(String::new()),
+        })
     }
 
     /// Fetch a received content's blob now; a fetch that found nothing is kept and tried again (spec-gap 106).
@@ -1909,8 +1885,7 @@ impl Client {
         let Some(conversation) = self.convs.get(group).map(|c| c.conversation.clone()) else { return };
         for e in emissions {
             if let Some(a) = e.get("archive") {
-                let record = json!({"object": "archive-record", "conversation": conversation, "group": group, "seq": seq,
-                    "sender": sender, "sender_device": sender_device, "received_at": now_s(), "payload": obj});
+                let record = archive::record(&archive::Received { conversation: &conversation, group, seq, sender, sender_device, received_at: now_s() }, obj);
                 self.outbox.push((group.to_string(), json!({"archive": {"akid": a["akid"], "record": record}})));
             }
         }
@@ -2052,11 +2027,9 @@ impl Client {
         let Some((key, _)) = self.archive_keys.get(&akid).copied() else { return Ok(()) };
         let record = &a["record"];
         let seq = record["seq"].as_u64().unwrap_or(0);
-        let group_bytes = dsip_core::b64::decode(group).context("group id")?;
         let nonce: [u8; 12] = rand::random();
-        let sealed = seal(&key, &nonce, &serde_json::to_vec(record)?, SealUse::Archive { group: &group_bytes, seq });
-        let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], &self.mailbox.0, now_s(), group, "archive",
-            json!({"archive": b64(&sealed), "akid": akid, "ref_group": group, "ref_seq": seq}));
+        let fields = archive::seal_record(&key, &nonce, &akid, record).context("group id")?;
+        let env = wire::deposit_delegated(&self.keys.device, vec![self.delegation.clone()], &self.mailbox.0, now_s(), group, "archive", fields);
         self.send(&env).await?;
         println!("ARCHIVED seq={seq} akid={akid}");
         Ok(())
@@ -2260,20 +2233,17 @@ impl Client {
 
     /// A callee leg ended: send the personal group a `call-event` if the pinned decision says so (M§13.3, spec-gap 63).
     async fn call_ended(&mut self, session: &str, peer: &str, alerted: bool, answered_here: bool, ended_by: &str, reason: &str) -> Result<()> {
-        let d = dsip_messaging::client::call_event_decision(&json!({"alerted": alerted, "answered_here": answered_here,
-            "ended_by": ended_by, "reason": reason}));
-        if d["send"] != json!(true) {
+        let Some(obj) = calls::call_event(&calls::Ended { session, peer, alerted, answered_here, ended_by, reason }, now_s()) else {
             println!("NO-CALL-EVENT session={session} reason={reason}");
             return Ok(());
-        }
+        };
         let personal = self.personal.clone().context("no personal group")?;
-        let obj = json!({"object": "call-event", "session": session, "peer": peer, "direction": "inbound", "outcome": d["outcome"], "at": now_s()});
         let reply = self.send_object(&personal, &obj, json!({})).await?;
         anyhow::ensure!(reply["type"] == "accepted", "call-event refused: {}", reply["reason"]);
         if self.calls.contains_key(session) {
-            println!("SENT-CALL-EVENT {} session={session} (already recorded)", d["outcome"].as_str().unwrap_or(""));
+            println!("SENT-CALL-EVENT {} session={session} (already recorded)", obj["outcome"].as_str().unwrap_or(""));
         } else {
-            println!("SENT-CALL-EVENT {} session={session}", d["outcome"].as_str().unwrap_or(""));
+            println!("SENT-CALL-EVENT {} session={session}", obj["outcome"].as_str().unwrap_or(""));
             self.calls.insert(session.to_string(), obj.clone());
             self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls)?).map_err(Self::state_err)?;
             let (me, device) = (self.identity.clone(), self.keys.device.did());
@@ -2313,18 +2283,18 @@ impl Client {
     fn open_archive(&mut self, item: &Value) {
         let akid = item["akid"].as_str().unwrap_or("");
         let Some((key, _)) = self.archive_keys.get(akid).copied() else { return };
-        let group = item["group"].as_str().unwrap_or("").to_string();
-        let seq = item["seq"].as_u64().unwrap_or(0);
-        let group_bytes = dsip_core::b64::decode(&group).unwrap_or_default();
-        let Ok(plain) = open(&key, &unb64(&item["archive"]), SealUse::Archive { group: &group_bytes, seq }) else {
-            println!("DROP archive {}: does not open for group/seq", item["cursor"]);
-            return;
+        let opened = match archive::open_item(&key, item) {
+            Ok(o) => o,
+            Err(archive::OpenError::DoesNotOpen) => {
+                println!("DROP archive {}: does not open for group/seq", item["cursor"]);
+                return;
+            }
+            Err(archive::OpenError::NotJson) => return,
         };
-        let Ok(record) = serde_json::from_slice::<Value>(&plain) else { return };
+        let (seq, record) = (opened.seq, &opened.record);
         let obj = &record["payload"];
         let key_id = object_key(obj);
-        let e = self.history.step(&json!({"archive": {"cursor": item["cursor"], "akid": akid, "group": group, "seq": seq, "id": key_id,
-            "object": obj["object"]}}));
+        let e = self.history.step(&archive::history_event(item, &opened, &key_id));
         if e.iter().any(|x| x.get("show").is_some()) {
             let line = format!("{}: {}", record["sender"].as_str().unwrap_or(""), display(obj));
             println!("HISTORY seq={seq} {line}");

@@ -42,10 +42,8 @@ use dsip_core::version::Supported;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
-use dsip_messaging::checks::check_object;
-use dsip_messaging_device::{process, Outcome, ProcessOptions};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Outcome, ProcessOptions};
 use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, HubOutage, MoveArrival, Resume, SuccessorTracker};
-use dsip_messaging::mls_wire::{open as open_sealed, open_blob, seal, SealUse};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, message_header, Device, MlsError};
@@ -739,13 +737,11 @@ impl Messenger {
     /// answered_here, ended_by: "local"|"remote", reason}`. Frames to send (`[]` when none).
     pub fn call_ended(&mut self, leg_json: &str, now: f64) -> Result<String, JsValue> {
         let leg: Value = serde_json::from_str(leg_json).map_err(js)?;
-        let d = dsip_messaging::client::call_event_decision(&json!({"alerted": leg["alerted"], "answered_here": leg["answered_here"],
-            "ended_by": leg["ended_by"], "reason": leg["reason"]}));
-        if d["send"] != json!(true) {
-            return Ok("[]".into());
-        }
+        let ended = calls::Ended { session: leg["session"].as_str().unwrap_or(""), peer: leg["peer"].as_str().unwrap_or(""),
+            alerted: leg["alerted"] == json!(true), answered_here: leg["answered_here"] == json!(true),
+            ended_by: leg["ended_by"].as_str().unwrap_or(""), reason: leg["reason"].as_str().unwrap_or("") };
+        let Some(obj) = calls::call_event(&ended, now as i64) else { return Ok("[]".into()) };
         let personal = self.personal.clone().ok_or_else(|| JsValue::from_str("no personal group yet"))?;
-        let obj = json!({"object": "call-event", "session": leg["session"], "peer": leg["peer"], "direction": "inbound", "outcome": d["outcome"], "at": now as i64});
         self.record_call(&obj);
         Ok(json!([self.send_object(&personal, &obj, now as i64)?]).to_string())
     }
@@ -760,31 +756,8 @@ impl Messenger {
     /// Spec: C§9 (v0.13, spec-gaps 121 and 123).
     pub fn call_record(&mut self, keeper: &str, leg_json: &str, now: f64) -> Result<String, JsValue> {
         let leg: Value = serde_json::from_str(leg_json).map_err(js)?;
-        let outcome = dsip_recording::call_record_outcome(&json!({"direction": leg["direction"], "answered": leg["answered"] == json!(true),
-            "ended_by": leg["ended_by"], "reason": leg["reason"]}));
-        let mut rec = json!({"object": "call-record", "session": leg["session"], "device": self.keys.device.did(), "direction": leg["direction"],
-            "peer": leg["peer"], "invited_at": leg["invited_at"], "outcome": outcome, "ended_by": leg["ended_by"]});
-        let mut last = leg["invited_at"].as_i64().unwrap_or(0);
-        if outcome == "answered" {
-            rec["answered_at"] = leg["answered_at"].clone();
-            last = last.max(leg["answered_at"].as_i64().unwrap_or(0));
-        }
-        // C§9: the times never decrease; an invite or answer stamped by a peer's clock ahead of ours ends no earlier
-        rec["ended_at"] = json!((now as i64).max(last));
-        for k in ["relay", "reason"] {
-            if leg[k].as_str().is_some_and(|v| !v.is_empty()) {
-                rec[k] = leg[k].clone();
-            }
-        }
-        for k in ["media", "evidence"] {
-            if leg[k].as_array().is_some_and(|a| !a.is_empty()) {
-                rec[k] = leg[k].clone();
-            }
-        }
-        let v = check_object(&rec, &json!({"conversation_kind": "direct", "leaf_device": self.keys.device.did()}));
-        if v["verdict"] != "accept" {
-            return Err(JsValue::from_str(&format!("call record not sent: {}", v["code"].as_str().unwrap_or("invalid"))));
-        }
+        let rec = calls::call_record(&leg, &self.keys.device.did(), now as i64)
+            .map_err(|code| JsValue::from_str(&format!("call record not sent: {code}")))?;
         self.records_held.push(rec.clone());
         let frames: Value = serde_json::from_str(&self.flush_records(keeper, now)?).map_err(js)?;
         Ok(json!({"record": rec, "frames": frames}).to_string())
@@ -937,8 +910,8 @@ impl Messenger {
         let plain = dsip_core::b64::decode(plain_b64).unwrap_or_default();
         let key = KeyPair::generate().seed();
         let nonce: [u8; 12] = KeyPair::generate().seed()[..12].try_into().expect("12 bytes");
-        let sealed = seal(&key, &nonce, &plain, SealUse::Blob);
-        json!({"sealed": b64(&sealed), "key": b64(&key), "sha256": digest(&sealed), "size": sealed.len()}).to_string()
+        let sealed = blob::seal_blob(&key, &nonce, &plain);
+        json!({"sealed": b64(&sealed.bytes), "key": b64(&key), "sha256": sealed.sha256, "size": sealed.bytes.len()}).to_string()
     }
 
     /// The `blob-put` that authorizes one upload of `sha256`/`size` to this identity's mailbox (M§5.6), as the compact
@@ -958,13 +931,10 @@ impl Messenger {
         let b: Value = serde_json::from_str(blob_json).map_err(js)?;
         let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
         self.may_send_content(gid, now_i)?;
-        let mut obj = json!({"object": "content", "id": self.fresh_id(now_i), "conversation": conversation, "sender": self.keys.identity,
-            "sent_at": now_i, "kind": "audio", "purpose": purpose, "duration_ms": duration_ms as i64,
-            "blob": {"uri": b["uri"], "sha256": b["sha256"], "size": b["size"], "key": b["key"], "alg": "A256GCM",
-                     "content_type": b["content_type"]}});
-        if let Some(sid) = session {
-            obj["session"] = json!(sid);
-        }
+        let id = self.fresh_id(now_i);
+        let uploaded = blob::Uploaded { uri: b["uri"].as_str().unwrap_or(""), sha256: b["sha256"].as_str().unwrap_or(""),
+            size: b["size"].as_u64().unwrap_or(0), key: b["key"].as_str().unwrap_or(""), content_type: b["content_type"].as_str().unwrap_or("") };
+        let obj = blob::audio_content(&id, &conversation, &self.keys.identity, now_i, purpose, duration_ms as i64, &uploaded, session.as_deref());
         self.send_object(gid, &obj, now_i)
     }
 
@@ -974,17 +944,15 @@ impl Messenger {
     pub fn blob_sources(&self, object_json: &str, manifest_json: &str) -> String {
         let object: Value = serde_json::from_str(object_json).unwrap_or(Value::Null);
         let manifest: Value = serde_json::from_str(manifest_json).unwrap_or(Value::Null);
-        dsip_messaging::client::blob_sources(&json!({"blob": object["blob"], "manifest": manifest}))["sources"].to_string()
+        json!(blob::sources(&object, &manifest)).to_string()
     }
 
     /// Open a fetched blob for a content object (M§8.4 rule 7): the size and SHA-256 must match the content's `blob`
     /// before it is decrypted under the key the content carries. The plaintext, base64url, or the refusal code.
     pub fn open_blob(&self, object_json: &str, stored_b64: &str) -> Result<String, JsValue> {
         let object: Value = serde_json::from_str(object_json).map_err(js)?;
-        let b = &object["blob"];
-        let key: [u8; 32] = unb64(&b["key"]).try_into().map_err(|_| JsValue::from_str("blob key"))?;
         let stored = dsip_core::b64::decode(stored_b64).unwrap_or_default();
-        let plain = open_blob(&key, &stored, b["size"].as_u64().unwrap_or(0) as usize, b["sha256"].as_str().unwrap_or("")).map_err(JsValue::from_str)?;
+        let plain = blob::open(&object, &stored).map_err(|c| JsValue::from_str(if c == "blob-key" { "blob key" } else { c }))?;
         Ok(b64(&plain))
     }
 
@@ -993,8 +961,12 @@ impl Messenger {
     pub fn blob_fetch_decision(&self, object_json: &str, tried_json: &str, attempt: f64) -> String {
         let object: Value = serde_json::from_str(object_json).unwrap_or(Value::Null);
         let tried: Value = serde_json::from_str(tried_json).unwrap_or(Value::Null);
-        dsip_messaging::client::blob_fetch(&json!({"blob": {"sha256": object["blob"]["sha256"], "size": object["blob"]["size"]}, "tried": tried,
-            "attempt": attempt as i64})).to_string()
+        match blob::fetch_decision(&object, &tried, attempt as i64) {
+            blob::Fetch::Play(source) => json!({"action": "play", "source": source}),
+            blob::Fetch::Retry => json!({"action": "retry", "reason": "unavailable"}),
+            blob::Fetch::GiveUp(reason) => json!({"action": "give-up", "reason": reason}),
+        }
+        .to_string()
     }
 
     /// The user played an `audio` or `video` content (M§10.4): a `played` receipt under the same opt-in as `read`
@@ -1408,28 +1380,10 @@ impl Messenger {
         if payload["type"] != "key-packages" {
             return Err(JsValue::from_str(&format!("key-package-fetch refused: {} {}", payload["reason"], payload["detail"])));
         }
-        let ctx = self.ctx(now);
-        let mut found: Vec<(Vec<u8>, dsip_messaging::mls_wire::LeafIdentity)> = vec![];
-        let candidates = payload["key_packages"].as_array().cloned().unwrap_or_default().into_iter().chain(payload.get("last_resort").cloned());
-        for c in candidates {
-            let bytes = unb64(&c);
-            if let Ok((_, who)) = authenticate_key_package(&bytes, self.mls.provider(), &ctx) {
-                found.push((bytes, who));
-            }
-        }
-        let listed: Vec<Value> = found.iter().map(|(_, w)| json!({"device": w.device, "identity": w.identity, "capabilities": w.capabilities})).collect();
-        let pick = dsip_recording::add_devices(&json!({"target": target, "self_identity": self.keys.identity, "self_device": self.keys.device.did(),
-            "purpose": "conversation", "key_packages": listed}));
-        if let Some(why) = pick["refused"].as_str() {
-            return Err(JsValue::from_str(&format!("no device of {target} to add: {why} (C§5)")));
-        }
-        let mut out = vec![];
-        for d in pick["add"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            if let Some(i) = found.iter().position(|(_, w)| w.device == d) {
-                out.push(found.swap_remove(i).0);
-            }
-        }
-        Ok(out)
+        let me = key_packages::Me { identity: &self.keys.identity, device: &self.keys.device.did() };
+        let picked = key_packages::select(&payload, target, &me, "conversation", self.mls.provider(), &self.ctx(now))
+            .map_err(|why| JsValue::from_str(&format!("no device of {target} to add: {why} (C§5)")))?;
+        Ok(picked.into_iter().map(|(bytes, _)| bytes).collect())
     }
 
     /// A group of `kind` hubbed at this identity's mailbox (M§6.5 rule 6, M§6.6): registered with `mailbox-config`,
@@ -1580,15 +1534,7 @@ impl Messenger {
     /// check), with the recorders accepted: this identity's own (C§5: they need none) and those its devices accepted
     /// for this conversation. `pending` lists the recorders still to accept: a new one asks again.
     fn recording_of(&self, leaves: &[dsip_messaging::mls_wire::LeafIdentity], conversation: &str) -> Value {
-        let leaves_json: Vec<Value> = leaves.iter().map(|w| json!({"device": w.device, "subject": w.identity, "capabilities": w.capabilities})).collect();
-        let mine = self.recording_accepted.get(conversation);
-        let accepted: Vec<&str> = leaves.iter().filter(|w| w.is_recorder())
-            .filter(|w| w.identity == self.keys.identity || mine.is_some_and(|m| m.contains(&w.device))).map(|w| w.device.as_str()).collect();
-        let mut out = dsip_recording::conversation(&json!({"leaves": leaves_json, "accepted": accepted}));
-        let pending: Vec<Value> = out["recorders"].as_array().into_iter().flatten()
-            .filter(|r| !r["device"].as_str().is_some_and(|d| accepted.contains(&d))).cloned().collect();
-        out["pending"] = json!(pending);
-        out
+        recording::state(leaves, &self.keys.identity, self.recording_accepted.get(conversation).unwrap_or(&BTreeSet::new()))
     }
 
     /// The members' leaves of a group this device is in, authenticated at `now` (M§6.2).
@@ -2588,13 +2534,10 @@ impl Messenger {
         for a in emissions.iter().filter_map(|e| e.get("archive")) {
             let akid = s_of(&a["akid"]);
             let Some((key, _)) = self.archive_keys.get(&akid).cloned() else { continue };
-            let record = json!({"object": "archive-record", "conversation": conversation, "group": gid, "seq": seq,
-                "sender": sender, "sender_device": sender_device, "received_at": now, "payload": obj});
+            let record = archive::record(&archive::Received { conversation: &conversation, group: gid, seq, sender, sender_device, received_at: now }, obj);
             let key: [u8; 32] = match key.as_slice().try_into() { Ok(k) => k, Err(_) => continue };
             let nonce: [u8; 12] = KeyPair::generate().seed()[..12].try_into().expect("12 bytes");
-            let group_bytes = dsip_core::b64::decode(gid).unwrap_or_default();
-            let sealed = seal(&key, &nonce, &serde_json::to_vec(&record).unwrap_or_default(), SealUse::Archive { group: &group_bytes, seq: seq as u64 });
-            let fields = json!({"archive": b64(&sealed), "akid": akid, "ref_group": gid, "ref_seq": seq});
+            let Some(fields) = archive::seal_record(&key, &nonce, &akid, &record) else { continue };
             let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &self.mailbox.0, now, gid, "archive", fields.clone());
             self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Archive { fields });
             out.push(json!({"send": env.frame()}));
@@ -2622,18 +2565,18 @@ impl Messenger {
         let akid = s_of(&item["akid"]);
         let Some((key, _)) = self.archive_keys.get(&akid).cloned() else { return out };
         let key: [u8; 32] = match key.as_slice().try_into() { Ok(k) => k, Err(_) => return out };
-        let gid = s_of(&item["group"]);
-        let seq = item["seq"].as_i64().unwrap_or(0);
-        let group_bytes = dsip_core::b64::decode(&gid).unwrap_or_default();
-        let Ok(plain) = open_sealed(&key, &unb64(&item["archive"]), SealUse::Archive { group: &group_bytes, seq: seq as u64 }) else {
-            out.push(json!({"ui": "dropped", "why": format!("archive {}: does not open for its group and seq", item["cursor"])}));
-            return out;
+        let opened = match archive::open_item(&key, item) {
+            Ok(o) => o,
+            Err(archive::OpenError::DoesNotOpen) => {
+                out.push(json!({"ui": "dropped", "why": format!("archive {}: does not open for its group and seq", item["cursor"])}));
+                return out;
+            }
+            Err(archive::OpenError::NotJson) => return out,
         };
-        let Ok(record) = serde_json::from_slice::<Value>(&plain) else { return out };
-        let obj = record["payload"].clone();
+        let obj = opened.record["payload"].clone();
         let key_id = object_key(&obj);
-        let decisions = self.history.step(&json!({"archive": {"cursor": item["cursor"], "akid": akid, "group": gid, "seq": seq, "id": key_id,
-            "object": obj["object"]}}));
+        let decisions = self.history.step(&archive::history_event(item, &opened, &key_id));
+        let (gid, seq, record) = (opened.group, opened.seq, opened.record);
         let sender = s_of(&record["sender"]);
         if decisions.iter().any(|d| d.get("show").is_some()) && self.shown.insert(key_id.clone()) {
             self.messages.push(json!({"group": gid, "key": key_id, "sender": sender, "sender_device": record["sender_device"], "object": obj,

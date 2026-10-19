@@ -1490,6 +1490,7 @@ dependencies = [
  "dsip-core",
  "dsip-messaging",
  "dsip-mls",
+ "dsip-recording",
  "openmls",
  "openmls_rust_crypto",
  "openmls_traits",

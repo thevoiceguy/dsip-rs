@@ -5,12 +5,18 @@
 //!
 //! Spec: M§6.2 (every leaf authenticated), M§6.5 (commits checked, then merged), M§6.8 (an external join checked by
 //! every member, spec-gap 62), M§7.3 (roster rules, spec-gap 126; leaving, spec-gap 125), M§7.4 (the hub reference,
-//! spec-gap 60), M§8.1 (content objects checked before rendering), C§5 (content from a recorder leaf), C§9 (call
+//! spec-gap 60), M§5.5 (KeyPackages selected), M§8.1 (content objects checked before rendering), M§8.4 (blobs), M§12.2
+//! (archive records), M§13.3 (call events), C§5 (content from a recorder leaf; recorded conversations), C§9 (call
 //! records).
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod archive;
+pub mod blob;
+pub mod calls;
+pub mod key_packages;
 pub mod process;
+pub mod recording;
 
 pub use process::{process, Outcome, ProcessOptions};
