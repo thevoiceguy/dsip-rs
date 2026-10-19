@@ -954,7 +954,7 @@ impl Client {
 
     /// Encrypt an application object for a group and deposit it; returns the hub's answer.
     ///
-    /// A refusal is handled as the vector-pinned [`CommitRetry`] decides: in particular `mailbox.unknown-group` from a
+    /// A refusal is handled as the vector-pinned [`CommitRetry`](dsip_messaging::client::CommitRetry) decides: in particular `mailbox.unknown-group` from a
     /// hub the group has left is followed by a sync and, if it shows the move, the object is encrypted again and sent to
     /// the new hub (M§7.4, spec-gap 60).
     async fn send_object(&mut self, group: &str, obj: &Value, extra: Value) -> Result<Value> {
@@ -1251,7 +1251,7 @@ impl Client {
     }
 
     /// Commit `op` to a group, applying it only once the hub has accepted it, and handling refusals as the vector-pinned
-    /// [`CommitRetry`] decides (M§6.5, spec-gap 58): a conflict or stale epoch is discarded, the device syncs past the
+    /// [`CommitRetry`](dsip_messaging::client::CommitRetry) decides (M§6.5, spec-gap 58): a conflict or stale epoch is discarded, the device syncs past the
     /// winning commit and re-proposes while still needed, boundedly; any other refusal is surfaced.
     async fn commit_op(&mut self, group: &str, op: CommitOp, what: &str) -> Result<()> {
         let mut retry = Retry::default();
@@ -1592,7 +1592,7 @@ impl Client {
 
     /// Join a group by external commit from the latest GroupInfo in this identity's mailbox: a new device with no
     /// sibling online, or a device that lost its group state (M§6.8, spec-gap 62). Refusals are handled as the pinned
-    /// [`CommitRetry`] decides; a stale GroupInfo is replaced by syncing.
+    /// [`CommitRetry`](dsip_messaging::client::CommitRetry) decides; a stale GroupInfo is replaced by syncing.
     async fn rejoin(&mut self, gid: &str) -> Result<()> {
         let mut retry = Retry::default();
         loop {
