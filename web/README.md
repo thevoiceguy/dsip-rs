@@ -234,6 +234,9 @@ test/messaging-hub-move.mjs  moving a live hub (M§7.4): Bob hosts Alice's conve
                         follow, text flows; Alice moves it back while Bob's page holds its pushes, so his message
                         meets the old hub and is re-sent to the new one; the group returns to a hub it left (spec-gap 128);
                         Alice reaches a new hub before the GroupInfo that sets it up and waits for it (spec-gap 129)
+test/messaging-interop.mjs  the browser and the native client, dsip-msg, in one conversation at a mailbox the test
+                        starts: the browser opens it with dsip-msg's did:web identity, which joins; text, delivered
+                        receipts and a voice message each way (M§5.5, M§6.7, M§8.4, M§10.2)
 test/call-recording.mjs  the call glue against the CLI: a recorded caller is answered only once accepted, or declined
                         (policy.recording-declined); a recorded callee holds our media until accepted (C§4); a
                         sealed call between browsers (§10.4)
@@ -326,8 +329,10 @@ a conversation's hub to the member's own mailbox (M§7.4); every member's device
 `handover_seq`, so the mailbox admits the new hub's fan-out; a device that writes before it has seen a move syncs on
 `mailbox.unknown-group` and re-sends to the new hub; a group can move back to a hub it left (spec-gap 128); and a
 member that reaches the new hub before the committer's GroupInfo has set it up retries the same deposit with the
-§13.2 backoff until the hub hosts the group (spec-gap 129). CI runs
-all sixteen in Firefox and Chromium.
+§13.2 backoff until the hub hosts the group (spec-gap 129). `messaging-interop.mjs` holds the two messaging clients,
+the browser's Messenger and dsip-msg, to the same wire while dsip-rs stage 3 moves both onto one library; its mailbox
+admits KeyPackage fetches without a grant (M§5.7 `open`), and `test/tone.ogg` is the Ogg Opus file dsip-msg sends. CI
+runs all eighteen in Firefox and Chromium.
 
 **Call records (v0.13, Recording Profile C§9).** With a record-keeper named in Settings, the client sends a
 `call-record` after every session leg. It holds the leg's frames as sent or accepted (`evidence` is the SHA-256 of
