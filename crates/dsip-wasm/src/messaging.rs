@@ -41,8 +41,9 @@ use dsip_core::version::Supported;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, Inbound, MemoryStore, Outbox, Outcome, ProcessOptions, Route};
-use dsip_messaging::client::{registration_on_removal, Client, CommitRetry, GapTracker, History, MoveArrival, Resume, SuccessorTracker};
+use dsip_messaging_device::commits::{self, Answer, Change, Synced};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, Inbound, MemoryStore, Outbox, Outcome, ProcessOptions, Retry, Route};
+use dsip_messaging::client::{registration_on_removal, Client, GapTracker, History, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
@@ -247,7 +248,7 @@ pub struct Messenger {
     gaps: BTreeMap<String, GapTracker>,
     held_items: BTreeMap<String, Vec<Value>>,
     /// Membership changes refused by the hub and waiting for a sync before re-proposal (spec-gap 58).
-    retries: BTreeMap<String, (CommitRetry, Op)>,
+    retries: BTreeMap<String, (Retry, Op)>,
     /// The hub that answered a deposit `mailbox.unknown-group`, by group: after the sync, a different hub means the
     /// group moved (M§7.4 "A member that missed the move").
     unknown_at: BTreeMap<String, String>,
@@ -671,7 +672,7 @@ impl Messenger {
             return Err(JsValue::from_str("this device is in that group already"));
         }
         let frame = self.external_commit(gid, now as i64)?;
-        self.retries.insert(gid.to_string(), (CommitRetry::new(&json!({})), Op::Rejoin));
+        self.retries.insert(gid.to_string(), (Retry::default(), Op::Rejoin));
         Ok(json!([frame]).to_string())
     }
 
@@ -750,8 +751,7 @@ impl Messenger {
         let mut errors = vec![];
         if let Some(c) = self.convs.get_mut(gid) {
             let own = c.group.own_leaf_index();
-            let mine: Vec<LeafNodeIndex> = c.group.members().filter(|m| member_identity(&c.group, m.index, &ctx).ok().is_some_and(|w| w.identity == me))
-                .map(|m| m.index).collect();
+            let mine = commits::identity_leaves(&c.group, &ctx, &me);
             for idx in mine {
                 let msg = if idx == own {
                     c.group.leave_group(provider, &signer).map_err(|e| format!("{e:?}"))
@@ -1419,55 +1419,37 @@ impl Messenger {
     /// Stage a commit for `op` and deposit it (M§6.5); merged on `accepted`.
     fn propose(&mut self, gid: &str, op: &Op, now: i64) -> Result<String, JsValue> {
         let ctx = Context::new(now, &self.resolver);
-        let (provider, signer) = (self.mls.provider(), self.mls.signer());
         if matches!(op, Op::Rejoin) {
             return self.external_commit(gid, now);
         }
         let c = self.convs.get_mut(gid).ok_or_else(|| JsValue::from_str("group"))?;
-        if let Op::Leave { .. } = op {
-            // M§7.3 "Leaving": the leaver's Remove proposals, committed by reference
-            let (commit, _, _) = c.group.commit_to_pending_proposals(provider, &signer).map_err(|e| js(format!("{e:?}")))?;
-            let fields = json!({"mls": b64(&commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?)});
-            let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
-            let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-            self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
-            return Ok(frame);
-        }
-        if let Op::Remove { identity } = op {
-            // M§7.3: another identity is removed whole, every leaf of it (the rule every member checks, spec-gap 126)
-            let leaves: Vec<LeafNodeIndex> = c.group.members()
-                .filter(|m| member_identity(&c.group, m.index, &ctx).ok().is_some_and(|w| &w.identity == identity)).map(|m| m.index).collect();
-            if leaves.is_empty() {
-                return Err(JsValue::from_str(&format!("{identity} is not a member")));
-            }
-            let (commit, _, _) = c.group.remove_members(provider, &signer, &leaves).map_err(|e| js(format!("{e:?}")))?;
-            let fields = json!({"mls": b64(&commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?)});
-            let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
-            let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-            self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
-            return Ok(frame);
-        }
-        if let Op::MoveHub { hub } = op {
-            // M§7.4: a GroupContextExtensions commit changing the hub and nothing else, ordered by the old hub
-            let commit = self.mls.move_hub_commit(&mut c.group, hub).map_err(|e| js(e.0))?;
-            let fields = json!({"mls": b64(&commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?)});
-            let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
-            let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-            self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
-            return Ok(frame);
-        }
-        let Op::Add { kps, grants, .. } = op else { unreachable!("Rejoin, Leave, Remove and MoveHub are handled above") };
+        // M§7.3: another identity is removed whole, every leaf of it (the rule every member checks, spec-gap 126)
+        let leaves = match op {
+            Op::Remove { identity } => commits::identity_leaves(&c.group, &ctx, identity),
+            _ => vec![],
+        };
         let mut packages = vec![];
-        for bytes in kps {
-            let (kp, _) = authenticate_key_package(bytes, provider, &ctx).map_err(|e| js(e.0))?;
-            packages.push(kp);
+        let (change, grants) = match op {
+            Op::Rejoin => unreachable!("handled above"),
+            // M§7.3 "Leaving": the leaver's Remove proposals, committed by reference
+            Op::Leave { .. } => (Change::Proposals, &[][..]),
+            Op::Remove { identity } if leaves.is_empty() => return Err(JsValue::from_str(&format!("{identity} is not a member"))),
+            Op::Remove { .. } => (Change::Remove(&leaves), &[][..]),
+            // M§7.4: a GroupContextExtensions commit changing the hub and nothing else, ordered by the old hub
+            Op::MoveHub { hub } => (Change::MoveHub(hub), &[][..]),
+            Op::Add { kps, grants, .. } => {
+                for bytes in kps {
+                    let (kp, _) = authenticate_key_package(bytes, self.mls.provider(), &ctx).map_err(|e| js(e.0))?;
+                    packages.push(kp);
+                }
+                (Change::Add(&packages), grants.as_slice())
+            }
+        };
+        let mut built = commits::build(&self.mls, &mut c.group, change).map_err(js)?;
+        if !matches!(op, Op::Add { .. }) {
+            built.welcome = None; // only an Add's welcome is deposited
         }
-        let (commit, welcome, _) = c.group.add_members(provider, &signer, &packages).map_err(|e| js(format!("{e:?}")))?;
-        let mut fields = json!({"mls": b64(&commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?)});
-        fields["welcome"] = json!(b64(&welcome.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?));
-        if !grants.is_empty() {
-            fields["grants"] = json!(grants);
-        }
+        let fields = built.fields(grants);
         let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
         let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
         self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
@@ -1741,20 +1723,19 @@ impl Messenger {
         }
         match pending {
             Pending::Commit { gid, op, .. } => {
-                let mut retry = self.retries.remove(&gid).map(|(r, _)| r).unwrap_or_else(|| CommitRetry::new(&json!({})));
-                for action in retry.answer(Some(&reason)) {
-                    if action.get("discard").is_some() {
-                        if matches!(op, Some(Op::Rejoin)) {
-                            // M§6.8: the joined state from a GroupInfo that was not the latest is discarded
-                            if let Some(mut c) = self.convs.remove(&gid) {
-                                let _ = c.group.delete(self.mls.provider().storage());
-                            }
-                        } else if let Some(c) = self.convs.get_mut(&gid) {
-                            let _ = c.group.clear_pending_commit(self.mls.provider().storage());
+                let mut retry = self.retries.remove(&gid).map(|(r, _)| r).unwrap_or_default();
+                if let Answer::Discard { surface } = retry.answer(Some(&reason)) {
+                    if matches!(op, Some(Op::Rejoin)) {
+                        // M§6.8: the joined state from a GroupInfo that was not the latest is discarded
+                        if let Some(mut c) = self.convs.remove(&gid) {
+                            let _ = c.group.delete(self.mls.provider().storage());
                         }
-                    } else if let Some(r) = action.get("surface") {
-                        out.push(json!({"refused": format!("commit in {gid}: {}", r.as_str().unwrap_or(""))}));
-                    } else if action.get("sync").is_some() {
+                    } else if let Some(c) = self.convs.get_mut(&gid) {
+                        let _ = c.group.clear_pending_commit(self.mls.provider().storage());
+                    }
+                    if let Some(r) = surface {
+                        out.push(json!({"refused": format!("commit in {gid}: {r}")}));
+                    } else {
                         if reason == "mailbox.unknown-group" {
                             // M§7.4: the group may have moved; the sync shows whether it did
                             if let Some(c) = self.convs.get(&gid) {
@@ -1816,25 +1797,20 @@ impl Messenger {
                 Op::MoveHub { hub } => self.convs.get(&gid).is_some_and(|c| c.hub.0 != s_of(&hub["did"])),
                 Op::Add { peer, device, .. } => {
                     let ctx = self.ctx(now);
-                    self.convs.get(&gid).is_some_and(|c| !c.group.members().any(|m| member_identity(&c.group, m.index, &ctx).ok()
-                        .is_some_and(|w| &w.identity == peer && device.as_ref().is_none_or(|d| &w.device == d))))
+                    self.convs.get(&gid).is_some_and(|c| !commits::has_member(&c.group, &ctx, peer, device.as_deref()))
                 }
             };
             let moved = self.hub_moved_since(&gid);
-            for action in retry.synced(needed, moved) {
-                if action.get("done").is_some() {
-                    out.push(json!({"ui": "no_longer_needed", "group": gid}));
-                } else if let Some(r) = action.get("surface") {
-                    out.push(json!({"refused": format!("commit in {gid}: {}", r.as_str().unwrap_or(""))}));
-                } else if action.get("repropose").is_some() {
-                    match self.propose(&gid, &op, now) {
-                        Ok(f) => {
-                            self.retries.insert(gid.clone(), (retry.clone(), op.clone()));
-                            out.push(json!({"send": f}));
-                        }
-                        Err(e) => out.push(json!({"refused": e.as_string().unwrap_or_default()})),
+            match retry.synced(needed, moved) {
+                Synced::Done => out.push(json!({"ui": "no_longer_needed", "group": gid})),
+                Synced::Surface(r) => out.push(json!({"refused": format!("commit in {gid}: {r}")})),
+                Synced::Repropose(_) => match self.propose(&gid, &op, now) {
+                    Ok(f) => {
+                        self.retries.insert(gid.clone(), (retry.clone(), op.clone()));
+                        out.push(json!({"send": f}));
                     }
-                }
+                    Err(e) => out.push(json!({"refused": e.as_string().unwrap_or_default()})),
+                },
             }
         }
         for (gid, items) in std::mem::take(&mut self.moved_items) {

@@ -195,6 +195,12 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    arrives, a deposit unanswered after 20 s counts as the hub unreachable, and a moved group's new hub that does not
    host it yet gets the same bytes again from the tick, as in the browser. `hub-return-demo.sh` covers the flush when
    the hub comes back, which no demo did. Commits keep waiting inline until 3f.
+   3f: commits. The retry decisions were already shared (the vector-pinned `CommitRetry`); what each client repeated
+   around them is now `commits`: `build` for a change (Add, Remove, Update, MoveHub, the pending proposals of a leave),
+   the deposit fields with the welcome and grants, the leaves of an identity (authenticated) or of a device (by
+   credential), and `Retry`, which reads `CommitRetry`'s actions as types. How a client drives the retries stays its
+   own: dsip-msg's command waits through the sync and re-proposal, the browser re-proposes from `after_sync`; they
+   become one with the thin hosts (3j).
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
@@ -204,7 +210,9 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    epoch to move after a conflict (dsip-msg); 20 s or 60 s before a deposit with no answer is an outage; re-deposits of
    commits, GroupInfo and config on reconnect (browser); `mailbox-config joined` after an external join (browser); a
    successor made with one commit per peer (dsip-msg) or one for all (browser); proposals stored (browser); recorder
-   content and acceptance keys; archive keys overwritten or kept; when a call event is recorded; the blob `tried`
+   content and acceptance keys; a welcome produced by a Remove deposited (dsip-msg) or dropped (browser); an Add of a
+   named device still needed while no leaf has its credential (dsip-msg) or no authenticated leaf is that device
+   (browser); archive keys overwritten or kept; when a call event is recorded; the blob `tried`
    input; a sealed introduction opened without the identity key.
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
