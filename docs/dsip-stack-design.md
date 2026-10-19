@@ -172,7 +172,8 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    browser↔dsip-msg demo comes before 3d: nothing tests the two clients against each other today.
 
    *Status (2026-10-19):* 3a the shared `process` (#204); 3a′ dsip-msg's `events` module, which holds the gateway and
-   the alarm lists (E§3–E§6), so what remains in `dsip-msg.rs` is the messaging client and its host.
+   the alarm lists (E§3–E§6), so what remains in `dsip-msg.rs` is the messaging client and its host (#205); 3b the pure
+   helpers both clients now call: `key_packages`, `recording`, `blob`, `archive`, `calls`.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
