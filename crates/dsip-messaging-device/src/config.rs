@@ -17,6 +17,7 @@ use openmls::prelude::MlsGroup;
 use serde_json::Value;
 
 use crate::commits;
+use crate::ProcessOptions;
 
 /// The key a received object is shown and deduplicated by (M§8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,9 @@ pub struct Config {
     /// Whether a received receipt joins the sync's [`crate::receipts::Batch`], one in the personal group under the
     /// conversation it names (dsip-msg), or is stepped at once in the group it arrived in (browser).
     pub batch_receipts: bool,
+    /// How items are processed: what the object check sees, recorder content (C§5), call records kept (C§9), and
+    /// proposals stored for a leave (M§7.3).
+    pub process: ProcessOptions,
 }
 
 impl Config {
@@ -83,6 +87,8 @@ impl Config {
         rejoin_gaps: true,
         roll_back_unprocessable: true,
         batch_receipts: true,
+        process: ProcessOptions { leaf_device_in_check: false, recorder_content_unauthenticated: false, keep_call_records: false,
+                                  store_proposals: false },
     };
 
     /// What the browser did.
@@ -96,6 +102,8 @@ impl Config {
         rejoin_gaps: false,
         roll_back_unprocessable: false,
         batch_receipts: false,
+        process: ProcessOptions { leaf_device_in_check: true, recorder_content_unauthenticated: true, keep_call_records: true,
+                                  store_proposals: true },
     };
 
     /// The key `obj` is shown and deduplicated by.

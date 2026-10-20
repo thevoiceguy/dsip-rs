@@ -46,7 +46,7 @@ use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
 use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
-    ProcessOptions, Receipts, Retry, Route};
+    Receipts, Retry, Route};
 use dsip_messaging_device::Config;
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
 use dsip_messaging::verify::verify_frame;
@@ -203,13 +203,6 @@ impl Pending {
         v.get("archive").map(|f| Pending::Archive { fields: f.clone() })
     }
 }
-
-
-/// How this device processes items (dsip-messaging-device): the object check sees the sender's device, a recorder's
-/// content is unauthenticated (C§5), call records are kept for a record-keeper (C§9), and proposals are stored for a
-/// leave (M§7.3).
-const BROWSER: ProcessOptions =
-    ProcessOptions { leaf_device_in_check: true, recorder_content_unauthenticated: true, keep_call_records: true, store_proposals: true };
 
 /// A messaging device: this identity's device key under its delegation, its MLS groups, and the state the
 /// Messaging Profile asks a device to keep (M§5.4, M§8.5). The host moves frames between it and the mailbox.
@@ -1919,7 +1912,7 @@ impl Messenger {
             let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
                                          gap_timeout: self.gap_timeout };
             // committed: the delivery state records the item with its MLS effect (the host saves both together)
-            delivery.commit_processed(mls.provider(), item, self.config.roll_back_unprocessable, || process(mls, target, &class, &bytes, &ctx, &me, BROWSER))
+            delivery.commit_processed(mls.provider(), item, self.config.roll_back_unprocessable, || process(mls, target, &class, &bytes, &ctx, &me, self.config.process))
         };
         let outcome = match result {
             Ok(o) => o,

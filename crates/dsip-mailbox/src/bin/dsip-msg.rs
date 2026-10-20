@@ -58,7 +58,7 @@ use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
 use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, Outbox, Outcome,
-    ProcessOptions, Receipts, Retry, Route};
+    Receipts, Retry, Route};
 use dsip_messaging_device::Config;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
@@ -2422,7 +2422,7 @@ impl Client {
                 let Conv { group, conversation, kind, .. } = c;
                 (group, conversation.as_str(), kind.as_str())
             });
-            let outcome = process(mls, target, &class, &bytes, &ctx, me, ProcessOptions::default())?;
+            let outcome = process(mls, target, &class, &bytes, &ctx, me, self.config.process)?;
             if crash {
                 // Processed, MLS state written inside the transaction, never committed.
                 println!("CRASH {class} {cursor} processed, not committed");
@@ -2528,7 +2528,7 @@ impl Client {
                     self.send(&env).await?;
                 }
             }
-            // dsip-msg does not store proposals (ProcessOptions::store_proposals is off)
+            // dsip-msg does not store proposals (`Config::DSIP_MSG.process.store_proposals` is off)
             Outcome::Nothing | Outcome::Proposal { .. } => {}
         }
         self.released(released).await

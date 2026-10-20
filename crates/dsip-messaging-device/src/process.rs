@@ -89,7 +89,8 @@ pub enum Outcome {
 
 /// Where the two clients differ today; stage 3 keeps each client's behaviour, and each option goes once it is decided.
 ///
-/// Impl: the browser sets every option, `dsip-msg` none (the stage 3 plan's behaviour differences 12 and 13).
+/// Impl: the browser sets every option, `dsip-msg` none (the stage 3 plan's behaviour differences 12 and 13); each
+/// client's are in its [`crate::Config`] preset.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessOptions {
     /// Give the object check the sender's device (`leaf_device`) as well as its identity.
