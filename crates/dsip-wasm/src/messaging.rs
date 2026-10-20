@@ -1911,14 +1911,31 @@ impl Messenger {
             Route::Process { bytes, released, .. } => (bytes, released),
         };
         let before_ids = self.member_identities(&gid, now);
-        let outcome = {
+        let result = {
             let ctx = Context::new(now, &self.resolver);
             let me = self.keys.identity.clone();
             let target = self.convs.get_mut(&gid).filter(|_| class != "welcome").map(|c| (&mut c.group, c.conversation.as_str(), c.kind.as_str()));
-            process(&self.mls, target, &class, &bytes, &ctx, &me, BROWSER)?
+            let mls = &self.mls;
+            let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
+                                         gap_timeout: self.gap_timeout };
+            // committed: the delivery state records the item with its MLS effect (the host saves both together)
+            delivery.commit_processed(mls.provider(), item, self.config.roll_back_unprocessable, || process(mls, target, &class, &bytes, &ctx, &me, BROWSER))
         };
-        // committed: the delivery state records the item with its MLS effect (the host saves both together)
-        self.resume.commit(item, matches!(outcome, Outcome::NotForDevice));
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) if self.config.roll_back_unprocessable => {
+                // rolled back, and committed as handled (spec-gap 138): the in-memory group may be ahead of the store
+                if let Some(c) = self.convs.get_mut(&gid) {
+                    if let Some(g) = self.mls.load_group(&dsip_core::b64::decode(&gid).unwrap_or_default())? {
+                        c.group = g;
+                    }
+                }
+                out.push(json!({"ui": "unprocessable", "class": class, "cursor": item["cursor"], "why": e.0}));
+                out.extend(self.released(released, now)?);
+                return Ok(out);
+            }
+            Err(e) => return Err(e),
+        };
         match outcome {
             Outcome::Joined { members, group, conv, epoch, by } => {
                 let joined = self.mls.load_group(&dsip_core::b64::decode(&group).unwrap_or_default())?.ok_or_else(|| MlsError("joined group not stored".into()))?;
@@ -2008,6 +2025,13 @@ impl Messenger {
             }
             Outcome::Nothing => {}
         }
+        out.extend(self.released(released, now)?);
+        Ok(out)
+    }
+
+    /// The gap filled: what was held behind it is processed now, in seq order (M§6.5, spec-gap 69).
+    fn released(&mut self, released: Vec<Value>, now: i64) -> Result<Vec<Value>, MlsError> {
+        let mut out = vec![];
         for held in released {
             out.push(json!({"ui": "released", "class": held["class"], "seq": held["seq"]}));
             out.extend(self.item(&held, now)?);
