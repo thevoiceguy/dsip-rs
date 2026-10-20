@@ -103,9 +103,14 @@ impl History {
         decisions(self.0.step(&archive::history_event(item, opened, id)))
     }
 
-    /// An object shown from MLS: `group`'s item `seq` at `epoch`, keyed `id`.
-    pub fn mls(&mut self, group: &str, seq: i64, epoch: u64, id: &str) -> Vec<Decision> {
-        decisions(self.0.step(&json!({"mls": {"group": group, "seq": seq, "epoch": epoch, "id": id}})))
+    /// An object received from MLS: `group`'s item `seq` at `epoch`, keyed `id`. Content is shown and archived; a call
+    /// event is state, archived once (spec-gap 63).
+    pub fn mls(&mut self, group: &str, seq: i64, epoch: u64, id: &str, object: &Value) -> Vec<Decision> {
+        let mut e = json!({"group": group, "seq": seq, "epoch": epoch, "id": id});
+        if object["object"] == "call-event" {
+            e["object"] = json!("call-event");
+        }
+        decisions(self.0.step(&json!({"mls": e})))
     }
 
     /// This device's own `object`, keyed `id`, accepted at `group`'s `seq`: content is shown and archived (spec-gap

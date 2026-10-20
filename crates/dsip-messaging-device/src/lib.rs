@@ -30,6 +30,7 @@ pub mod recording;
 pub mod store;
 pub mod successors;
 
+pub use calls::CallLog;
 pub use commits::Retry;
 pub use config::Config;
 pub use deposits::Deposits;

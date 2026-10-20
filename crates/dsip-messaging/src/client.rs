@@ -1293,12 +1293,13 @@ impl History {
                 if self.is_prejoin(&group, e["epoch"].as_i64().unwrap_or(0)) {
                     return vec![json!({"prejoin": e["seq"]})];
                 }
-                self.show_from_mls(e)
+                self.step(&json!({"sent": e}))
             }
             "sent" => {
                 if e["object"] == "receipt" || e["object"] == "call-event" {
                     // spec-gap 68: the read watermark a device sends is archived, so a device added later knows where
-                    // its user had read (M§10.3, M§10.5); like any archived receipt it is state, not a timeline entry
+                    // its user had read (M§10.3, M§10.5); like any archived receipt it is state, not a timeline entry;
+                    // a call event too, sent or received (spec-gap 63)
                     let id = s(&e["id"]);
                     if !self.applied.insert(id.clone()) {
                         return vec![json!({"duplicate": id})];

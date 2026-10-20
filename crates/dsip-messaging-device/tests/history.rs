@@ -74,8 +74,13 @@ fn history_as_types() {
     assert!(h.sent("g", 8, "a8", &json!({"object": "archive-key"})).is_empty());
 
     // MLS items from before this device joined are not its (M§12.3); a copy already shown is a duplicate (M§8.5)
-    assert_eq!(h.mls("g", 1, 2, "k1"), vec![Decision::Prejoin(json!(1))]);
-    assert_eq!(h.mls("g", 7, 3, "k7"), vec![Decision::Duplicate("k7".into())]);
+    assert_eq!(h.mls("g", 1, 2, "k1", &content("c1", "bob")), vec![Decision::Prejoin(json!(1))]);
+    assert_eq!(h.mls("g", 7, 3, "k7", &content("c7", "me")), vec![Decision::Duplicate("k7".into())]);
+    // a sibling's call event is state, as our own is: archived once, never shown (spec-gap 63)
+    let call = json!({"object": "call-event", "session": "s2"});
+    let archive9 = Decision::Archive { group: "g".into(), seq: 9, akid: "ak1".into() };
+    assert_eq!(h.mls("g", 9, 3, "call:s2", &call), vec![archive9]);
+    assert_eq!(h.mls("g", 10, 3, "call:s2", &call), vec![Decision::Duplicate("call:s2".into())]);
 
     // the records those decisions ask for
     let at = Received { conversation: CONV, group: "g", seq: 7, sender: "me", sender_device: "did:key:z6Mk", received_at: NOW };
