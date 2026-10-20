@@ -1400,7 +1400,7 @@ async function driveMailbox(result) {
 
 function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
-    key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
+    key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', archive_key_created: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
     archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5',
     call_record: 'C§9', recording_accepted: 'C§5', receipt_withheld: 'C§5', left: 'M§7.3', leave_proposed: 'M§7.3', leave_committing: 'M§7.3', leave_proposals: 'M§7.3', leave_proposal_refused: 'M§7.3', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5', hub_moved: 'M§7.4', moved_check: 'M§7.4', hub_arriving: 'M§7.4', hub_arrival_expired: 'M§7.4' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
@@ -1638,7 +1638,11 @@ async function reconcileDevices() {
           const r = await done;
           if (r.refused) { log(`device ${short(d)}: ${r.refused}`, 'M§12.3'); return; }
           if (r.personal) { await driveMailbox(messenger.resend_archive_keys(now())); log(`re-sent ${JSON.parse(messenger.archive_keys()).length} archive key(s) to the personal group for ${short(d)}`, 'M§12.3'); }
-        } catch (e) { log(`device ${short(d)}: ${e.message || e}`, 'M§12.3'); return; }
+        } catch (e) {
+          log(`device ${short(d)}: ${e.message || e}`, 'M§12.3');
+          if (/is a recorder device/.test(e.message || e)) continue;   // C§5: it still joins the conversations
+          return;
+        }
       }
     }
   })().finally(() => { reconciling = null; renderMessages(); });

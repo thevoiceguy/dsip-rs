@@ -252,6 +252,26 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    key, kept unread when it does not), and what each blob source answered (`blob::tried`, `blob::retry_delay_s`). One
    fix came with it: the browser read a plain purpose without checking the introduction, so one carrying both
    `purpose` and `sealed` became a request.
+   3j-2: the browser's `Messenger`, already sans-I/O, is `dsip_messaging_device::messenger::Messenger`, its refusals a
+   plain `Error`; `dsip-wasm` keeps the same JavaScript API as a wrapper that forwards every method. Nothing changes
+   for the browser. dsip-msg moves onto it next, its differences behind `Config`.
+   3j-3, dsip-msg onto the `Messenger`, is in four parts, since the `Messenger` has to do everything dsip-msg does
+   before dsip-msg can hand it its groups. 3j-3a: the `Messenger` is opened over any `Store` with a `Config` and a gap
+   timeout, and its delivery state is a value (`state`) a native host keeps with its MLS state in one transaction; the
+   browser's `new` and `save` are that over `MemoryStore`, their record unchanged. A fix came with it: the browser
+   added a recorder sibling to the personal group, where it would hold every archive key (C§5); it now joins the
+   conversations only. 3j-3b: what only dsip-msg does (rekey, removing a device or a lapsed leaf by credential and
+   rotating the archive key, a move to any hub, any content object sent with its item id, issuing grants and answering
+   requests, introductions, release, activity). 3j-3c: events carrying what dsip-msg prints (item ids, a call's
+   direction, a removed group's kind, re-proposals, recording changes). 3j-3d: dsip-msg hosts the `Messenger`; its
+   saved state is migrated on first load (decided 2026-10-20) and its output lines stay as the demos read them.
+   3j-3b is in two halves. The first: rekey, removal by credential (a lapsed leaf; a device of this identity from
+   every group, its new archive key sent once the personal group's commit is merged), and a move to any hub. The
+   second: `send` for any object, naming the outbox item the hub's `sent` answers; activity sealed and opened
+   (M§11) under a receipt policy the host sets (`set_receipt_policy`; the browser's `set_read_disclosed` is that
+   policy's read and played); grants, introductions (sealed to a `did:key`'s converted key too, which dsip-msg could
+   not do), answering requests, and release, with the peer mailbox's connection left to the host as for KeyPackage
+   fetches. The browser now opens activity a peer sends; it sends none, its policy's activity being off.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

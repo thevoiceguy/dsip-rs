@@ -10,6 +10,7 @@ rust-version = "1.91"
 
 [dependencies]
 dsip-core.workspace = true
+dsip-endpoint.workspace = true
 dsip-messaging.workspace = true
 dsip-mls.workspace = true
 dsip-recording.workspace = true

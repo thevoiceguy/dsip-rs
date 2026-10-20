@@ -1488,6 +1488,7 @@ name = "dsip-messaging-device"
 version = "0.1.0"
 dependencies = [
  "dsip-core",
+ "dsip-endpoint",
  "dsip-messaging",
  "dsip-mls",
  "dsip-recording",
