@@ -3,7 +3,8 @@
 //! did; an option goes once it is decided, with a vector where a rule is involved.
 //!
 //! Spec: M§8.5 (duplicates collapse), M§9.4 (no answer at all: the hub unreachable), M§6.5 ("if still needed"), M§7.2
-//! (a welcome for the devices an Add adds), M§7.5 (the last roster this device processed), M§12.1 (archive keys).
+//! (a welcome for the devices an Add adds), M§7.5 (the last roster this device processed), M§12.1 (archive keys),
+//! M§6.5 (a gap that does not fill in time: the device re-joins, M§6.8; spec-gap 69).
 //!
 //! Impl: none of these is a reading of the spec the other contradicts; each is a choice the spec leaves to the device
 //! (the no-answer timeout is spec-gap 72's). They are listed with the rest in `impl/docs/dsip-stack-design.md` §6.
@@ -57,6 +58,9 @@ pub struct Config {
     pub roster: Roster,
     /// Whether a received archive key replaces one already held under its `akid` (dsip-msg) or is ignored (browser).
     pub replace_archive_keys: bool,
+    /// Whether a seq gap that has not filled in time makes this device re-join by external commit (dsip-msg), or it
+    /// stays held and reported (browser).
+    pub rejoin_gaps: bool,
 }
 
 impl Config {
@@ -68,6 +72,7 @@ impl Config {
         named_device: NamedDevice::ByCredential,
         roster: Roster::AllLeaves,
         replace_archive_keys: true,
+        rejoin_gaps: true,
     };
 
     /// What the browser did.
@@ -78,6 +83,7 @@ impl Config {
         named_device: NamedDevice::Authenticated,
         roster: Roster::Authenticated,
         replace_archive_keys: false,
+        rejoin_gaps: false,
     };
 
     /// The key `obj` is shown and deduplicated by.
