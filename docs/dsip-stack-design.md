@@ -221,6 +221,11 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    successor checks, and whether a received archive key replaces one held. Each client reads its own preset, so
    nothing changes. The other options are in code each client still has to itself; they go behind `Config` as that
    code is shared, the last with the thin hosts (3j).
+   3i-2: the gap timeout. Advancing the gap trackers and clearing a group whose gap did not fill in time (its held
+   items dropped, its seq positions passing everything seen) is now `Inbound::gap_timeouts`, and `Config::rejoin_gaps`
+   says whether the device then re-joins by external commit. M§6.5 says it does, so the browser's `false` is a
+   shortfall to close rather than a choice: its gap trackers now keep wall time like dsip-msg's, so turning the option
+   on, with a web test of it, is what is left.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

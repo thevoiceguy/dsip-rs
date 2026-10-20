@@ -147,6 +147,33 @@ impl<'a> Inbound<'a> {
         Route::Process { group, bytes, released }
     }
 
+    /// Advance every gap tracker to `now`. A group whose gap has not filled in time (M§6.5, spec-gap 69) loses its
+    /// held items and tracker, and its seq positions pass everything seen (the items behind the gap are for epochs
+    /// this device can no longer reach); it is returned, with the seqs it held, for the host to re-join by external
+    /// commit (M§6.8).
+    pub fn gap_timeouts(&mut self, now: i64) -> Vec<(String, Value)> {
+        let mut out = vec![];
+        for (group, g) in self.gaps.iter_mut() {
+            let delta = now - g.now();
+            if delta <= 0 {
+                continue;
+            }
+            for e in g.step(&json!({"advance": delta})) {
+                if let Some(r) = e.get("rejoin") {
+                    out.push((group.clone(), r["held"].clone(), g.snapshot()["contiguous"].as_i64().unwrap_or(0)));
+                }
+            }
+        }
+        out.into_iter()
+            .map(|(group, held, through)| {
+                self.held_items.remove(&group);
+                self.resume.rejoined(&group, through);
+                self.gaps.remove(&group);
+                (group, held)
+            })
+            .collect()
+    }
+
     /// This device was removed from `group` (spec-gap 127): a welcome adding it back is a join again, and its gap
     /// tracker and held items there go, so a welcome back starts counting afresh (spec-gap 83). The seq positions
     /// stay: what was processed remains a duplicate.

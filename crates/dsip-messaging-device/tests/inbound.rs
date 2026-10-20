@@ -124,3 +124,21 @@ fn a_gap_holds_then_releases() {
     assert!(!p.resume.is_duplicate(&welcome));
     assert_eq!(p.route(&item("c6", "application", 6, b"msg"), true, false), Route::Duplicate);
 }
+
+#[test]
+fn a_gap_that_does_not_fill_is_re_joined() {
+    let mut p = Parts::new(json!({"groups": {G: {"contiguous": 5}}}));
+    // seq 7 and 8 beyond the gap at 6, held from NOW
+    assert_eq!(p.route(&item("c7", "handshake", 7, b"commit"), true, false), Route::Held);
+    assert_eq!(p.route(&item("c8", "application", 8, b"msg"), true, false), Route::Held);
+    // within the timeout (60 s here): nothing
+    assert!(p.inbound().gap_timeouts(NOW + 59).is_empty());
+    assert_eq!(p.held[G].len(), 2);
+    // past it (M§6.5, spec-gap 69): re-join, the held items dropped, every seq seen passed
+    assert_eq!(p.inbound().gap_timeouts(NOW + 60), vec![(G.to_string(), json!([7, 8]))]);
+    assert!(!p.held.contains_key(G) && !p.gaps.contains_key(G));
+    assert_eq!(p.route(&item("c6", "application", 6, b"msg"), true, false), Route::Duplicate);
+    assert_eq!(p.route(&item("c8", "application", 8, b"msg"), true, false), Route::Duplicate);
+    // and only once
+    assert!(p.inbound().gap_timeouts(NOW + 600).is_empty());
+}

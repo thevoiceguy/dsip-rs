@@ -38,6 +38,7 @@ fn keys_welcomes_and_timeouts() {
     assert!(m.deposits_welcome(true) && b.deposits_welcome(true));
     assert!(m.deposits_welcome(false) && !b.deposits_welcome(false));
     assert!(m.replace_archive_keys && !b.replace_archive_keys);
+    assert!(m.rejoin_gaps && !b.rejoin_gaps);
 }
 
 #[test]

@@ -1975,31 +1975,24 @@ impl Client {
 
     /// Advance the gap trackers to wall time and re-join any group whose gap has not filled in time (M§6.5, M§6.8).
     async fn check_gaps(&mut self) -> Result<()> {
-        let now = now_s();
-        let mut rejoin = vec![];
-        for (gid, g) in self.gaps.iter_mut() {
-            let delta = now - g.now();
-            if delta <= 0 {
-                continue;
-            }
-            for e in g.step(&json!({"advance": delta})) {
-                if let Some(held) = e.get("rejoin") {
-                    rejoin.push((gid.clone(), held["held"].clone(), g.snapshot()["contiguous"].as_i64().unwrap_or(0)));
-                }
-            }
+        if !self.config.rejoin_gaps {
+            return Ok(());
         }
-        for (gid, held, through) in rejoin {
+        let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
+                                     gap_timeout: self.gap_timeout };
+        let timeouts = delivery.gap_timeouts(now_s());
+        if timeouts.is_empty() {
+            return Ok(());
+        }
+        let held_json = serde_json::to_value(&self.held_items)?;
+        let p = self.mls.provider();
+        p.atomically(|| {
+            p.put_state("held_items", &held_json)?;
+            p.put_state("resume", &self.resume.snapshot())
+        })
+        .map_err(Self::state_err)?;
+        for (gid, held) in timeouts {
             println!("GAP-TIMEOUT group={gid} held={held}: re-joining by external commit");
-            self.held_items.remove(&gid);
-            self.resume.rejoined(&gid, through);
-            let held_json = serde_json::to_value(&self.held_items)?;
-            let p = self.mls.provider();
-            p.atomically(|| {
-                p.put_state("held_items", &held_json)?;
-                p.put_state("resume", &self.resume.snapshot())
-            })
-            .map_err(Self::state_err)?;
-            self.gaps.remove(&gid);
             if let Err(e) = self.rejoin(&gid).await {
                 println!("ERR re-joining {gid}: {e}");
             }

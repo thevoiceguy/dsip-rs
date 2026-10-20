@@ -26,7 +26,7 @@
 //! the host writes as one record after each step — the atomic commit of spec-gap 44 in a browser. A reload restores
 //! both. Pending deposits (not yet `accepted`) are kept with their bytes and re-deposited on the next bind (M§9.3:
 //! idempotent at the hub by digest). What this device does not do yet: a seq gap that does not fill is reported, not
-//! re-joined (M§6.8). The item processing is `dsip_messaging_device::process`, shared with `dsip-msg` (dsip-rs
+//! re-joined (M§6.8; `Config::rejoin_gaps`, off in `Config::BROWSER`). The item processing is `dsip_messaging_device::process`, shared with `dsip-msg` (dsip-rs
 //! stage 3).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -508,6 +508,19 @@ impl Messenger {
         }
         for (gid, ems) in self.outbox.due(now_i) {
             out.extend(self.outage_emissions(&gid, ems, now_i));
+        }
+        // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8), when configured
+        if self.config.rejoin_gaps {
+            for (gid, held) in self.delivery().gap_timeouts(now_i) {
+                out.push(json!({"ui": "gap_timeout", "group": gid, "held": held}));
+                match self.external_commit(&gid, now_i) {
+                    Ok(frame) => {
+                        self.retries.insert(gid, (Retry::default(), Op::Rejoin));
+                        out.push(json!({"send": frame}));
+                    }
+                    Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default(), "group": gid})),
+                }
+            }
         }
         json!(out).to_string()
     }
@@ -1548,7 +1561,7 @@ impl Messenger {
             Pending::Proposal { gid } => {
                 if let Some(seq) = p["seq"].as_i64() {
                     self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
+                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
                 }
                 out.push(json!({"ui": "leave_proposed", "group": gid, "seq": p["seq"]}));
             }
@@ -1563,7 +1576,7 @@ impl Messenger {
                 self.history.joined(&gid, epoch);
                 if let Some(seq) = p["seq"].as_i64() {
                     self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
+                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
                 }
                 self.retries.remove(&gid);
                 let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined"}]}), now);
@@ -1599,7 +1612,7 @@ impl Messenger {
                 }
                 if let Some(seq) = p["seq"].as_i64() {
                     self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
+                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
                 }
                 self.retries.remove(&gid);
                 self.unknown_at.remove(&gid);
@@ -1661,7 +1674,7 @@ impl Messenger {
                 if let Some(seq) = p["seq"].as_i64() {
                     // spec-gap 47: our own copy is processed by its accepted seq
                     self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "application"}}));
+                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "application"}}));
                     for m in self.messages.iter_mut().filter(|m| m["item"] == item) {
                         m["seq"] = json!(seq);
                     }
@@ -1844,8 +1857,8 @@ impl Messenger {
         Some(self.deposit_item(gid, &item, now))
     }
 
-    fn gap_of_from(&mut self, gid: &str, first_seq: i64) -> &mut GapTracker {
-        self.delivery().gap_of_from(gid, first_seq, 0)
+    fn gap_of_from(&mut self, gid: &str, first_seq: i64, now: i64) -> &mut GapTracker {
+        self.delivery().gap_of_from(gid, first_seq, now)
     }
 
     /// The delivery state inbound routing reads and writes (M§5.4).
@@ -1859,9 +1872,8 @@ impl Messenger {
         let class = s_of(&item["class"]);
         let gid = s_of(&item["group"]);
         let joined = self.convs.get(&gid).map(|c| c.joined_epoch);
-        // M§12.3: items from before this device joined are history; a group it is not in is skipped. Its gap trackers
-        // are never advanced (a gap that does not fill is not timed out here), so their clock starts at 0.
-        let route = self.delivery().route(item, joined.is_some(), |epoch| joined.is_some_and(|j| epoch < j), 0);
+        // M§12.3: items from before this device joined are history; a group it is not in is skipped
+        let route = self.delivery().route(item, joined.is_some(), |epoch| joined.is_some_and(|j| epoch < j), now);
         let (bytes, released) = match route {
             Route::Ephemeral | Route::Other => return Ok(out),
             Route::Duplicate => {
