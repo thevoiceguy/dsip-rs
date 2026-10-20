@@ -5,7 +5,8 @@
 //! Spec: M§8.5 (duplicates collapse), M§9.4 (no answer at all: the hub unreachable), M§6.5 ("if still needed"), M§7.2
 //! (a welcome for the devices an Add adds), M§7.5 (the last roster this device processed), M§12.1 (archive keys),
 //! M§6.5 (a gap that does not fill in time: the device re-joins, M§6.8; spec-gap 69), M§5.4 (an item that cannot be
-//! processed: spec-gaps 44 and 138).
+//! processed: spec-gaps 44 and 138), M§10.2 (receipts decided once per sync batch), M§10.5 (a sibling's undisclosed
+//! read watermark, spec-gap 52).
 //!
 //! Impl: none of these is a reading of the spec the other contradicts; each is a choice the spec leaves to the device
 //! (the no-answer timeout is spec-gap 72's). They are listed with the rest in `impl/docs/dsip-stack-design.md` §6.
@@ -65,6 +66,9 @@ pub struct Config {
     /// Whether an item that fails processing is rolled back with its delivery state and then committed as handled, so
     /// it is acknowledged (dsip-msg), or left as processing left it, uncommitted (browser).
     pub roll_back_unprocessable: bool,
+    /// Whether a received receipt joins the sync's [`crate::receipts::Batch`], one in the personal group under the
+    /// conversation it names (dsip-msg), or is stepped at once in the group it arrived in (browser).
+    pub batch_receipts: bool,
 }
 
 impl Config {
@@ -78,6 +82,7 @@ impl Config {
         replace_archive_keys: true,
         rejoin_gaps: true,
         roll_back_unprocessable: true,
+        batch_receipts: true,
     };
 
     /// What the browser did.
@@ -90,6 +95,7 @@ impl Config {
         replace_archive_keys: false,
         rejoin_gaps: false,
         roll_back_unprocessable: false,
+        batch_receipts: false,
     };
 
     /// The key `obj` is shown and deduplicated by.

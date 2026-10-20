@@ -1,6 +1,7 @@
 //! Receipts and history as both messaging clients drive them: the receipts machine's decisions as types, a read
 //! watermark held back by the interval coming back with the next event, what of a device's own objects is history,
-//! archive records opened once, and restored history waiting for its conversation.
+//! archive records opened once, restored history waiting for its conversation, and a sync's batch collected per
+//! conversation, a sibling's watermark in the personal group under the conversation it names.
 //!
 //! Spec: M§10.2, M§10.3, M§10.5 (spec-gap 52), M§11.2, M§12.2 (spec-gaps 51, 64, 68, 63), M§12.3, M§8.5.
 
@@ -110,4 +111,28 @@ fn restored_history_waits_for_its_conversation() {
     assert_eq!(ready["direct"][0]["seq"], 4);
     // the other waits, and is kept as the browser persists it
     assert_eq!(r.items(), [json!({"seq": 5, "object": {"object": "content", "id": "c5", "conversation": "other"}, "conversation": "other"})]);
+}
+
+#[test]
+fn a_batch_collects_per_group_and_a_personal_group_receipt_goes_to_its_conversation() {
+    let convs = [("G-personal", "P"), ("G-chat", CONV)];
+    let watermark = json!({"object": "receipt", "kind": "read", "conversation": CONV, "through": {"G-chat": 4}});
+    // spec-gap 52: a sibling's undisclosed watermark, received in the personal group, describes the conversation
+    assert_eq!(receipts::receipt_target("G-personal", true, &watermark, convs.into_iter()).as_deref(), Some("G-chat"));
+    let elsewhere = json!({"object": "receipt", "kind": "read", "conversation": "01K742SG00XZRF7H1Z8WN9CGZZ"});
+    assert_eq!(receipts::receipt_target("G-personal", true, &elsewhere, convs.into_iter()), None);
+    assert_eq!(receipts::receipt_target("G-chat", false, &watermark, convs.into_iter()).as_deref(), Some("G-chat"));
+
+    let mut batch = receipts::Batch::default();
+    assert!(batch.is_empty());
+    batch.content("G-chat", 3, &content("m1", "did:web:bob"));
+    batch.receipt("G-personal", "G-chat", 7, &watermark, "did:key:z6Sibling");
+    let taken = batch.take();
+    assert!(batch.is_empty());
+    let items = &taken["G-chat"];
+    assert_eq!(taken.len(), 1);
+    assert_eq!(items[0]["seq"], json!(3));
+    // spec-gap 64: archived under the group it arrived in
+    assert_eq!(items[1], json!({"seq": 7, "object": watermark, "src": "G-personal", "sender_device": "did:key:z6Sibling"}));
+    assert_eq!(receipts::archived(items, 7).count(), 1);
 }
