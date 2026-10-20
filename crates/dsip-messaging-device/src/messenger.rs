@@ -101,6 +101,11 @@ enum Op {
     Remove { identity: String },
     /// Move the group to another hub, `{did, uri}`: a commit changing `dsip_conversation.hub` and nothing else (M§7.4).
     MoveHub { hub: Value },
+    /// Refresh this device's own leaf key material (post-compromise security).
+    Update,
+    /// Remove the leaves whose credential names `device`, whether or not they still authenticate (M§7.3, M§12.4:
+    /// a revoked device's leaf no longer does, spec-gap 57). `rotate`: a new archive key follows the merge (M§12.4).
+    RemoveDevice { device: String, rotate: bool },
 }
 
 /// A deposit awaiting the hub's answer, by deposit id (M§9.2).
@@ -135,12 +140,20 @@ impl Op {
             Op::Leave { identity } => json!({"leave": identity}),
             Op::Remove { identity } => json!({"remove": identity}),
             Op::MoveHub { hub } => json!({"move_hub": hub}),
+            Op::Update => json!("update"),
+            Op::RemoveDevice { device, rotate } => json!({"remove_device": device, "rotate": rotate}),
         }
     }
 
     fn from_json(v: &Value) -> Option<Op> {
         if v == "rejoin" {
             return Some(Op::Rejoin);
+        }
+        if v == "update" {
+            return Some(Op::Update);
+        }
+        if let Some(d) = v.get("remove_device").and_then(Value::as_str) {
+            return Some(Op::RemoveDevice { device: d.to_string(), rotate: v["rotate"].as_bool().unwrap_or(false) });
         }
         if let Some(i) = v.get("leave").and_then(Value::as_str) {
             return Some(Op::Leave { identity: i.to_string() });
@@ -1195,13 +1208,87 @@ impl<S: Store> Messenger<S> {
     /// MAY move the group): the commit to deposit at the current hub. On `accepted` this device's mailbox follows and
     /// the new hub is bootstrapped with the GroupInfo and `handover_seq`.
     pub fn move_hub(&mut self, gid: &str, now: f64) -> Result<String, Error> {
-        let gid = self.live(gid);
-        let c = self.convs.get(&gid).ok_or_else(|| Error::from("not a member of that group"))?;
-        if c.hub.0 == self.mailbox.0 {
+        let (did, uri) = self.mailbox.clone();
+        if self.convs.get(&self.live(gid)).is_some_and(|c| c.hub.0 == did) {
             return Err(Error::from("the conversation is already hubbed at this identity's mailbox"));
         }
-        let hub = json!({"did": self.mailbox.0, "uri": self.mailbox.1});
-        self.propose(&gid, &Op::MoveHub { hub }, now as i64)
+        self.move_hub_to(gid, &did, &uri, now)
+    }
+
+    /// Move a conversation to the hub `did` at `uri` (M§7.4: a commit changing `dsip_conversation.hub` and nothing
+    /// else, ordered by the old hub). The commit frame to send.
+    pub fn move_hub_to(&mut self, gid: &str, did: &str, uri: &str, now: f64) -> Result<String, Error> {
+        let gid = self.live(gid);
+        let c = self.convs.get(&gid).ok_or_else(|| Error::from("not a member of that group"))?;
+        if c.hub.0 == did {
+            return Err(Error::from("the conversation is hubbed there already"));
+        }
+        self.propose(&gid, &Op::MoveHub { hub: json!({"did": did, "uri": uri}) }, now as i64)
+    }
+
+    /// Refresh this device's own leaf key material in `gid` (post-compromise security): an Update commit. The frame.
+    pub fn rekey(&mut self, gid: &str, now: f64) -> Result<String, Error> {
+        let gid = self.live(gid);
+        if !self.convs.contains_key(&gid) {
+            return Err(Error::from("not a member of that group"));
+        }
+        self.propose(&gid, &Op::Update, now as i64)
+    }
+
+    /// Remove another member's leaf whose delegation no longer verifies, by its credential (M§7.3, M§12.4: any member
+    /// MAY). Refused while it still verifies: then only its own identity may remove it. The commit frame.
+    pub fn remove_lapsed_leaf(&mut self, gid: &str, device: &str, now: f64) -> Result<String, Error> {
+        let now = now as i64;
+        let gid = self.live(gid);
+        let ctx = Context::new(now, &self.resolver);
+        let c = self.convs.get(&gid).ok_or_else(|| Error::from("not a member of that group"))?;
+        let leaves = commits::device_leaves(&c.group, device);
+        if leaves.is_empty() {
+            return Err(Error::from("no leaf for that device"));
+        }
+        if leaves.iter().any(|l| member_identity(&c.group, *l, &ctx).is_ok()) {
+            return Err(Error::from("the leaf's delegation still verifies: only its own identity may remove it (M§7.3)"));
+        }
+        self.propose(&gid, &Op::RemoveDevice { device: device.to_string(), rotate: false }, now)
+    }
+
+    /// Remove a device of this identity from every group it is in, by credential (a revoked device's leaf no longer
+    /// authenticates, spec-gap 57), and rotate the archive key once the personal group no longer holds it (M§12.4).
+    /// Frames to send: one commit per group (and the new archive key at once when the personal group never held it).
+    pub fn remove_device(&mut self, device: &str, now: f64) -> Result<String, Error> {
+        let now = now as i64;
+        let personal = self.personal.clone().ok_or_else(|| Error::from("no personal group yet"))?;
+        let groups: Vec<String> = self.convs.iter().filter(|(_, c)| !commits::device_leaves(&c.group, device).is_empty()).map(|(g, _)| g.clone()).collect();
+        if groups.is_empty() {
+            return Err(Error::from(format!("no group holds a leaf of {device}")));
+        }
+        let mut out = vec![];
+        for gid in &groups {
+            let op = Op::RemoveDevice { device: device.to_string(), rotate: *gid == personal };
+            out.push(match self.propose(gid, &op, now) {
+                Ok(f) => json!({"send": f}),
+                Err(e) => json!({"refused": format!("remove {device} from {gid}: {}", e.0)}),
+            });
+        }
+        if !groups.contains(&personal) {
+            out.extend(self.new_archive_key(&personal, now));
+        }
+        Ok(json!(out).to_string())
+    }
+
+    /// A fresh archive key, current from now on, sent to the personal group `personal` as an object (M§12.1).
+    fn new_archive_key(&mut self, personal: &str, now: i64) -> Vec<Value> {
+        let akid = self.fresh_id(now);
+        let key = KeyPair::generate().seed(); // 32 random bytes (M§12.1)
+        self.archive_keys.insert(akid.clone(), (key.to_vec(), now));
+        self.history.archive_key(&akid, now); // the current key, from now on
+        let obj = json!({"object": "archive-key", "akid": akid, "key": b64(&key), "created_at": now});
+        let mut out = vec![match self.send_object(personal, &obj, now) {
+            Ok(f) => json!({"send": f}),
+            Err(e) => json!({"error": e.0}),
+        }];
+        out.push(json!({"ui": "archive_key_created", "group": personal, "akid": akid}));
+        out
     }
 
     /// The roster changes of a conversation and its predecessors, oldest first: `[{group, seq, epoch, by, added,
@@ -1467,6 +1554,7 @@ impl<S: Store> Messenger<S> {
         // M§7.3: another identity is removed whole, every leaf of it (the rule every member checks, spec-gap 126)
         let leaves = match op {
             Op::Remove { identity } => commits::identity_leaves(&c.group, &ctx, identity),
+            Op::RemoveDevice { device, .. } => commits::device_leaves(&c.group, device),
             _ => vec![],
         };
         let mut packages = vec![];
@@ -1476,6 +1564,9 @@ impl<S: Store> Messenger<S> {
             Op::Leave { .. } => (Change::Proposals, &[][..]),
             Op::Remove { identity } if leaves.is_empty() => return Err(Error::from(format!("{identity} is not a member"))),
             Op::Remove { .. } => (Change::Remove(&leaves), &[][..]),
+            Op::RemoveDevice { device, .. } if leaves.is_empty() => return Err(Error::from(format!("no leaf of {device} in that group"))),
+            Op::RemoveDevice { .. } => (Change::Remove(&leaves), &[][..]),
+            Op::Update => (Change::Update, &[][..]),
             // M§7.4: a GroupContextExtensions commit changing the hub and nothing else, ordered by the old hub
             Op::MoveHub { hub } => (Change::MoveHub(hub), &[][..]),
             Op::Add { kps, grants, .. } => {
@@ -1651,6 +1742,10 @@ impl<S: Store> Messenger<S> {
                     handover_seq = Some(seq);
                 }
                 out.extend(self.flush_handover(&gid, now)); // M§9.4: the successor holds its members: the pending items go in
+                if let Some(Op::RemoveDevice { rotate: true, .. }) = &op {
+                    // M§12.4: the new archive key goes out in the epoch the removed device is no longer in
+                    out.extend(self.new_archive_key(&gid, now));
+                }
                 match self.group_info_frame_at(&gid, handover_seq, now) {
                     Ok(f) => {
                         let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
@@ -1671,16 +1766,8 @@ impl<S: Store> Messenger<S> {
                     }
                 }
                 if let Some(Pending::PersonalReady { gid: g }) = self.pending.remove(&format!("personal:{gid}")) {
-                    // M§7.1, M§12.1: the first archive key, sent to the personal group as an object
-                    let akid = self.fresh_id(now);
-                    let key = KeyPair::generate().seed(); // 32 random bytes (M§12.1)
-                    self.archive_keys.insert(akid.clone(), (key.to_vec(), now));
-                    self.history.archive_key(&akid, now); // the current key, from now on
-                    let obj = json!({"object": "archive-key", "akid": akid, "key": b64(&key), "created_at": now});
-                    match self.send_object(&g, &obj, now) {
-                        Ok(f) => out.push(json!({"send": f})),
-                        Err(e) => out.push(json!({"error": e.0})),
-                    }
+                    // M§7.1, M§12.1: the first archive key
+                    out.extend(self.new_archive_key(&g, now));
                     out.push(json!({"ui": "personal", "group": g}));
                 }
             }
@@ -1823,6 +1910,10 @@ impl<S: Store> Messenger<S> {
                 Op::Remove { identity } => self.member_identities(&gid, now).contains(identity),
                 // M§7.4: still needed while the group is hubbed elsewhere
                 Op::MoveHub { hub } => self.convs.get(&gid).is_some_and(|c| c.hub.0 != s_of(&hub["did"])),
+                // fresh key material is always still wanted
+                Op::Update => true,
+                // M§12.4: still needed while a leaf names the device
+                Op::RemoveDevice { device, .. } => self.convs.get(&gid).is_some_and(|c| !commits::device_leaves(&c.group, device).is_empty()),
                 Op::Add { peer, device, .. } => {
                     let ctx = self.ctx(now);
                     self.convs.get(&gid).is_some_and(|c| self.config.add_needed(&c.group, &ctx, peer, device.as_deref()))
