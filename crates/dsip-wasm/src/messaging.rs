@@ -47,6 +47,7 @@ use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
 use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
     ProcessOptions, Receipts, Retry, Route};
+use dsip_messaging_device::Config;
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
@@ -234,6 +235,8 @@ pub struct Messenger {
     /// Deposits awaiting their answer, by deposit id: what each was, the hub it went to, when an application deposit
     /// went out (M§9.4), and those the group's new hub refused before it hosted the group, due again (spec-gap 129).
     pending: Deposits<Pending>,
+    /// Where this client still behaves differently from dsip-msg (dsip-rs stage 3i): the browser's own behaviour.
+    config: Config,
     /// Application items not yet accepted, per group, oldest first: `{id, mls, obj}` (M§9.2).
     outbox: Outbox,
     /// The thread, every content object shown, in arrival order: `{group, key, sender, sender_device, object, seq, mine}`.
@@ -338,9 +341,10 @@ impl Messenger {
             personal: st["personal"].as_str().map(String::from),
             resume: Resume::new(if st["resume"].is_object() { &st["resume"] } else { &Value::Null }),
             own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
+            config: Config::BROWSER,
             // M§9.3: deposits awaiting an answer are sent again at the next binding (redeposit_pending)
             pending: {
-                let mut d = Deposits::new(NO_ANSWER_S);
+                let mut d = Deposits::new(Config::BROWSER.no_answer_s);
                 for (id, p) in st["pending"].as_object().into_iter().flatten() {
                     if let Some(p) = Pending::from_json(p) {
                         d.insert(id.clone(), p);
@@ -1444,8 +1448,8 @@ impl Messenger {
             }
         };
         let mut built = commits::build(&self.mls, &mut c.group, change).map_err(js)?;
-        if !matches!(op, Op::Add { .. }) {
-            built.welcome = None; // only an Add's welcome is deposited
+        if !self.config.deposits_welcome(matches!(op, Op::Add { .. })) {
+            built.welcome = None;
         }
         let fields = built.fields(grants);
         let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
@@ -1505,7 +1509,7 @@ impl Messenger {
         };
         if obj["object"] == "content" {
             // shown at once as ours; its seq is filled in by the hub's accepted (M§8.5)
-            let key = format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""));
+            let key = self.config.object_key(obj);
             self.shown.insert(key.clone());
             self.messages.push(json!({"group": gid, "key": key, "sender": self.keys.identity, "sender_device": self.keys.device.did(),
                 "object": obj, "seq": null, "mine": true, "item": item["id"]}));
@@ -1650,7 +1654,7 @@ impl Messenger {
                     out.extend(self.receipt_sends(&gid, emissions, now));
                     // M§12.2: our own content is archived under the seq of its accepted (spec-gap 51); our read watermark
                     // (spec-gap 68) and call events (spec-gap 63) too, as state for a device added later
-                    let decisions = self.history.sent(&gid, seq, &object_key(&obj), &obj);
+                    let decisions = self.history.sent(&gid, seq, &self.config.object_key(&obj), &obj);
                     let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
                     out.extend(self.archive_requests(&gid, &decisions, &obj, &me, &dev, seq, now));
                 }
@@ -1782,7 +1786,7 @@ impl Messenger {
                 Op::MoveHub { hub } => self.convs.get(&gid).is_some_and(|c| c.hub.0 != s_of(&hub["did"])),
                 Op::Add { peer, device, .. } => {
                     let ctx = self.ctx(now);
-                    self.convs.get(&gid).is_some_and(|c| !commits::has_member(&c.group, &ctx, peer, device.as_deref()))
+                    self.convs.get(&gid).is_some_and(|c| self.config.add_needed(&c.group, &ctx, peer, device.as_deref()))
                 }
             };
             let moved = self.hub_moved_since(&gid);
@@ -2008,7 +2012,9 @@ impl Messenger {
                 let akid = s_of(&object["akid"]);
                 let created = object["created_at"].as_i64().unwrap_or(0);
                 let fresh = !self.archive_keys.contains_key(&akid);
-                self.archive_keys.entry(akid.clone()).or_insert((unb64(&object["key"]), created));
+                if fresh || self.config.replace_archive_keys {
+                    self.archive_keys.insert(akid.clone(), (unb64(&object["key"]), created));
+                }
                 // M§12.3 step 5 (spec-gap 51): records kept for this key open now
                 // what the machine held for this key is released from held_archive below
                 let _ = self.history.archive_key(&akid, created);
@@ -2022,7 +2028,7 @@ impl Messenger {
             }
             Some("call-event") => {
                 // M§13.3: every device of the identity shows one entry per call, whichever device sent it
-                let key = object_key(&object);
+                let key = self.config.object_key(&object);
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
                 let decisions = self.history.mls(gid, seq, epoch, &key);
                 out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
@@ -2054,7 +2060,7 @@ impl Messenger {
                 out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
             }
             Some("content") => {
-                let key = format!("{}:{}", object["conversation"].as_str().unwrap_or(""), object["id"].as_str().unwrap_or(""));
+                let key = self.config.object_key(&object);
                 if !self.shown.insert(key.clone()) {
                     out.push(json!({"ui": "duplicate_content", "seq": seq}));
                     return out;
@@ -2183,7 +2189,7 @@ impl Messenger {
                 let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
                 self.messages.retain(|m| !ids.contains(&m["item"]));
                 for i in &items {
-                    self.shown.remove(&object_key(&i["obj"]));
+                    self.shown.remove(&self.config.object_key(&i["obj"]));
                 }
                 self.handover.entry(gid.to_string()).or_default().extend(items.into_iter().map(|i| i["obj"].clone()));
                 self.track_rosters(now);
@@ -2206,12 +2212,7 @@ impl Messenger {
             self.convs.get(group).map(|c| successors::creator(&c.group, &ctx)).unwrap_or_default()
         };
         // the predecessor's roster as this device last processed it; the new group itself is not tracked yet
-        for gid in self.convs.keys().filter(|g| g.as_str() != group).cloned().collect::<Vec<_>>() {
-            let ids = self.member_identities(&gid, now);
-            if !ids.is_empty() {
-                self.successors.member_of(&gid, &ids);
-            }
-        }
+        self.track_rosters_but(Some(group), now);
         for d in self.successors.welcome(group, pred, &creator, &roster) {
             if let Converge::Join(_) = d {
                 out.push(json!({"ui": "successor", "group": group, "of": pred, "creator": creator}));
@@ -2220,7 +2221,7 @@ impl Messenger {
                 let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
                 self.messages.retain(|m| !ids.contains(&m["item"]));
                 for i in &items {
-                    self.shown.remove(&object_key(&i["obj"]));
+                    self.shown.remove(&self.config.object_key(&i["obj"]));
                 }
                 let mut waiting = self.handover.remove(pred).unwrap_or_default();
                 waiting.extend(items.into_iter().map(|i| i["obj"].clone()));
@@ -2263,11 +2264,16 @@ impl Messenger {
 
     /// Record every group's roster by identity for the successor checks (M§7.5: the last roster this device processed).
     fn track_rosters(&mut self, now: i64) {
-        for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
-            let ids = self.member_identities(&gid, now);
-            if !ids.is_empty() {
-                self.successors.member_of(&gid, &ids);
-            }
+        self.track_rosters_but(None, now);
+    }
+
+    /// [`Self::track_rosters`], except for `skip`.
+    fn track_rosters_but(&mut self, skip: Option<&str>, now: i64) {
+        let ctx = Context::new(now, &self.resolver);
+        let rosters: Vec<(String, Vec<String>)> = self.convs.iter().filter(|(g, _)| Some(g.as_str()) != skip)
+            .filter_map(|(g, c)| self.config.roster(&c.group, &ctx).map(|r| (g.clone(), r))).collect();
+        for (g, r) in rosters {
+            self.successors.member_of(&g, &r);
         }
     }
 
@@ -2408,7 +2414,7 @@ impl Messenger {
             Err(archive::OpenError::NotJson) => return out,
         };
         let obj = opened.record["payload"].clone();
-        let key_id = object_key(&obj);
+        let key_id = self.config.object_key(&obj);
         let decisions = self.history.opened(item, &opened, &key_id);
         let (gid, seq, record) = (opened.group, opened.seq, opened.record);
         let sender = s_of(&record["sender"]);
@@ -2510,23 +2516,11 @@ impl Conv {
 
 
 
-/// Seconds after which a deposit with no answer at all counts as the hub unreachable (M§9.4). Impl (spec-gap 72):
-/// the device's own answer timeout.
-const NO_ANSWER_S: i64 = 60;
-
 /// Whether a refusal of a deposit to the hub is an outage (M§9.4): unreachable, or unable to store (spec-gap 99).
 fn is_outage(reason: &str) -> bool {
     matches!(reason, "mailbox.hub-unreachable" | "mailbox.quota-exceeded")
 }
 
-/// The key an object is shown and archived under (M§8.5): `conversation:id`, or `call:session` for a call event,
-/// which has no `id` (M§13.3).
-fn object_key(obj: &Value) -> String {
-    if obj["object"] == "call-event" {
-        return format!("call:{}", obj["session"].as_str().unwrap_or(""));
-    }
-    format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""))
-}
 
 /// Re-issue this identity's delegation to its device with `dsip.messaging`, and `extra` when given (`dsip.record` for
 /// a record-keeper, C§9), beside the capabilities it has (M§4.3, §7.4), signed by the identity key this browser

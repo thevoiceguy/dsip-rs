@@ -215,6 +215,12 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    tracker itself, so both saved formats are unchanged. It also answers where a conversation lives now and which
    groups make up its thread, and `creator` gives the identity a successor's welcome is checked against (leaf 0).
    How each client hands the dead group's pending items over stays its own (below).
+   3i is in parts, as 3e was. 3i-1 is `Config` with a preset per client (`Config::DSIP_MSG`, `Config::BROWSER`),
+   holding the options whose code is now shared: the no-answer timeout, the object key, whether a commit other than
+   an Add deposits its welcome, the still-needed test for an Add of a named device, the roster recorded for the
+   successor checks, and whether a received archive key replaces one held. Each client reads its own preset, so
+   nothing changes. The other options are in code each client still has to itself; they go behind `Config` as that
+   code is shared, the last with the thin hosts (3j).
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
