@@ -255,6 +255,16 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    3j-2: the browser's `Messenger`, already sans-I/O, is `dsip_messaging_device::messenger::Messenger`, its refusals a
    plain `Error`; `dsip-wasm` keeps the same JavaScript API as a wrapper that forwards every method. Nothing changes
    for the browser. dsip-msg moves onto it next, its differences behind `Config`.
+   3j-3, dsip-msg onto the `Messenger`, is in four parts, since the `Messenger` has to do everything dsip-msg does
+   before dsip-msg can hand it its groups. 3j-3a: the `Messenger` is opened over any `Store` with a `Config` and a gap
+   timeout, and its delivery state is a value (`state`) a native host keeps with its MLS state in one transaction; the
+   browser's `new` and `save` are that over `MemoryStore`, their record unchanged. A fix came with it: the browser
+   added a recorder sibling to the personal group, where it would hold every archive key (C§5); it now joins the
+   conversations only. 3j-3b: what only dsip-msg does (rekey, removing a device or a lapsed leaf by credential and
+   rotating the archive key, a move to any hub, any content object sent with its item id, issuing grants and answering
+   requests, introductions, release, activity). 3j-3c: events carrying what dsip-msg prints (item ids, a call's
+   direction, a removed group's kind, re-proposals, recording changes). 3j-3d: dsip-msg hosts the `Messenger`; its
+   saved state is migrated on first load (decided 2026-10-20) and its output lines stay as the demos read them.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

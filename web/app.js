@@ -1638,7 +1638,11 @@ async function reconcileDevices() {
           const r = await done;
           if (r.refused) { log(`device ${short(d)}: ${r.refused}`, 'M§12.3'); return; }
           if (r.personal) { await driveMailbox(messenger.resend_archive_keys(now())); log(`re-sent ${JSON.parse(messenger.archive_keys()).length} archive key(s) to the personal group for ${short(d)}`, 'M§12.3'); }
-        } catch (e) { log(`device ${short(d)}: ${e.message || e}`, 'M§12.3'); return; }
+        } catch (e) {
+          log(`device ${short(d)}: ${e.message || e}`, 'M§12.3');
+          if (/is a recorder device/.test(e.message || e)) continue;   // C§5: it still joins the conversations
+          return;
+        }
       }
     }
   })().finally(() => { reconciling = null; renderMessages(); });

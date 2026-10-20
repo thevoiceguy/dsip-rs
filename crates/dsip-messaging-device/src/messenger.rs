@@ -47,14 +47,13 @@ use crate::receipts::{self, Emission};
 use crate::successors::{self, Converge, Create, Successors};
 use crate::{archive, blob, calls, first_contact, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
     Receipts, Retry, Route};
-use crate::Config;
+use crate::{Config, Store};
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
 use openmls::prelude::tls_codec::Serialize as _;
 use openmls::prelude::*;
-use openmls_traits::OpenMlsProvider;
 
 
 fn b64(bytes: &[u8]) -> String {
@@ -205,10 +204,10 @@ impl Pending {
 
 /// A messaging device: this identity's device key under its delegation, its MLS groups, and the state the
 /// Messaging Profile asks a device to keep (M§5.4, M§8.5). The host moves frames between it and the mailbox.
-pub struct Messenger {
+pub struct Messenger<S: Store = MemoryStore> {
     keys: IdentityKeys,
     controller_seed: Option<[u8; 32]>,
-    mls: Device<MemoryStore>,
+    mls: Device<S>,
     mailbox: (String, String),
     resolver: StaticResolver,
     seen: SeenIds,
@@ -226,7 +225,7 @@ pub struct Messenger {
     /// Deposits awaiting their answer, by deposit id: what each was, the hub it went to, when an application deposit
     /// went out (M§9.4), and those the group's new hub refused before it hosted the group, due again (spec-gap 129).
     pending: Deposits<Pending>,
-    /// Where this client still behaves differently from dsip-msg (dsip-rs stage 3i): the browser's own behaviour.
+    /// Where the two clients still behave differently (dsip-rs stage 3i): this host's behaviour.
     config: Config,
     /// Application items not yet accepted, per group, oldest first: `{id, mls, obj}` (M§9.2).
     outbox: Outbox,
@@ -296,11 +295,28 @@ pub struct Messenger {
     roster_log: BTreeMap<String, Vec<Value>>,
 }
 
-impl Messenger {
-    /// `identity_json` as returned by `create_identity`; `mailbox_did`/`mailbox_uri` this identity's mailbox
-    /// (M§4.2: the operator's, from `config.json`, or the person's); `saved_json` what [`Messenger::save`] returned,
-    /// or null for a fresh device.
+impl Messenger<MemoryStore> {
+    /// The browser's device: `identity_json` as returned by `create_identity`; `mailbox_did`/`mailbox_uri` this
+    /// identity's mailbox (M§4.2: the operator's, from `config.json`, or the person's); `saved_json` what
+    /// [`Messenger::save`] returned, or null for a fresh device. It behaves as [`Config::BROWSER`].
     pub fn new(identity_json: &str, mailbox_did: &str, mailbox_uri: &str, saved_json: Option<String>, now: f64) -> Result<Messenger, Error> {
+        let saved: Value = saved_json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+        // the MLS storage as saved: `{b64url key: b64url value}`
+        let store = MemoryStore::from_mls_json(&saved["mls"]);
+        Messenger::open(identity_json, mailbox_did, mailbox_uri, store, &saved["state"], Config::BROWSER, now)
+    }
+
+    /// Everything to keep: the MLS storage and this device's delivery state, as one JSON record. The host writes it
+    /// after every step that returned something (spec-gap 44: MLS state and delivery state committed together).
+    pub fn save(&self) -> String {
+        json!({"mls": self.mls.provider().mls_json(), "state": self.state()}).to_string()
+    }
+}
+
+impl<S: Store> Messenger<S> {
+    /// A device over `store`, which holds its MLS state, with the delivery state `state` that [`Messenger::state`]
+    /// returned (null for a fresh device), behaving as `config` says where the clients differ.
+    pub fn open(identity_json: &str, mailbox_did: &str, mailbox_uri: &str, store: S, state: &Value, config: Config, now: f64) -> Result<Messenger<S>, Error> {
         let id: Value = serde_json::from_str(identity_json).map_err(err)?;
         let device = KeyPair::from_seed(unhex(id["device_seed_hex"].as_str().unwrap_or(""))?);
         let delegation = Envelope::from_frame(id["delegation"].as_str().unwrap_or("")).map_err(|v| Error::from(format!("{:?}", v.code)))?;
@@ -311,10 +327,8 @@ impl Messenger {
             display_name: id["display_name"].as_str().unwrap_or("").to_string(),
         };
         let controller_seed = id["controller_seed_hex"].as_str().and_then(|h| unhex(h).ok());
-        let saved: Value = saved_json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-        // the MLS storage as saved: `{b64url key: b64url value}`
-        let mls = Device::with_provider(device, compact(&delegation), MemoryStore::from_mls_json(&saved["mls"]));
-        let st = &saved["state"];
+        let mls = Device::with_provider(device, compact(&delegation), store);
+        let st = state;
         let now_i = now as i64;
         let mut m = Messenger {
             keys,
@@ -331,10 +345,10 @@ impl Messenger {
             personal: st["personal"].as_str().map(String::from),
             resume: Resume::new(if st["resume"].is_object() { &st["resume"] } else { &Value::Null }),
             own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
-            config: Config::BROWSER,
+            config,
             // M§9.3: deposits awaiting an answer are sent again at the next binding (redeposit_pending)
             pending: {
-                let mut d = Deposits::new(Config::BROWSER.no_answer_s);
+                let mut d = Deposits::new(config.no_answer_s);
                 for (id, p) in st["pending"].as_object().into_iter().flatten() {
                     if let Some(p) = Pending::from_json(p) {
                         d.insert(id.clone(), p);
@@ -405,15 +419,14 @@ impl Messenger {
         Ok(m)
     }
 
-    /// Everything to keep: the MLS storage and this device's delivery state, as one JSON record. The host writes it
-    /// after every step that returned something (spec-gap 44: MLS state and delivery state committed together).
-    pub fn save(&self) -> String {
-        let mls = self.mls.provider().mls_json();
+    /// This device's delivery state, to keep with its MLS state after every step that returned something (spec-gap
+    /// 44: the two committed together); [`Messenger::open`] takes it back.
+    pub fn state(&self) -> Value {
         let convs: serde_json::Map<String, Value> = self.convs.iter().map(|(g, c)| (g.clone(), json!({
             "conversation": c.conversation, "kind": c.kind, "hub": {"did": c.hub.0, "uri": c.hub.1}, "peer": c.peer, "joined_epoch": c.joined_epoch,
         }))).collect();
         let archive: serde_json::Map<String, Value> = self.archive_keys.iter().map(|(a, (k, at))| (a.clone(), json!({"key": b64(k), "created_at": at}))).collect();
-        json!({"mls": mls, "state": {
+        json!({
             "convs": convs, "personal": self.personal, "resume": self.resume.snapshot(), "own": self.own, "outbox": self.outbox.items,
             "messages": self.messages, "grants_held": self.grants_held, "archive_keys": archive, "group_info": self.group_info,
             "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored.items(),
@@ -423,7 +436,12 @@ impl Messenger {
             "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
             "records_held": self.records_held, "records": self.records, "recording_accepted": self.recording_accepted, "leaving": self.leaving,
             "roster_log": self.roster_log,
-        }}).to_string()
+        })
+    }
+
+    /// Seconds a seq gap may stay open before the group counts as lost (M§6.5, spec-gap 69).
+    pub fn set_gap_timeout(&mut self, seconds: i64) {
+        self.gap_timeout = seconds;
     }
 
     /// Whether this device's delegation carries `dsip.messaging` (M§4.3): without it the mailbox refuses the binding.
@@ -601,17 +619,24 @@ impl Messenger {
         let candidates = payload["key_packages"].as_array().cloned().unwrap_or_default().into_iter().chain(payload.get("last_resort").cloned());
         let mut kps = vec![];
         let mut seen = vec![];
+        let mut recorder = false;
         for c in candidates {
             let bytes = unb64(&c);
             if let Ok((_, who)) = authenticate_key_package(&bytes, self.mls.provider(), &ctx) {
                 seen.push(format!("{}#{}", who.identity, who.device));
                 if who.identity == self.keys.identity && who.device == device {
+                    recorder |= who.is_recorder();
                     kps.push(bytes);
                 }
             }
         }
         if kps.is_empty() {
             return Err(Error::from(format!("no KeyPackage of device {device} in the answer (it holds: {})", seen.join(", "))));
+        }
+        if recorder && self.personal.as_deref() == Some(gid) {
+            // Recording Profile C§5: a recorder device joins conversations only — never the personal group, so it holds
+            // no archive key and records only what is sent while it is a visible member
+            return Err(Error::from(format!("{device} is a recorder device: conversations only, never the personal group (C§5)")));
         }
         kps.truncate(1);
         let op = Op::Add { peer: self.keys.identity.clone(), kps, grants: vec![], device: Some(device.to_string()) };
@@ -1319,7 +1344,7 @@ impl Messenger {
     }
 }
 
-impl Messenger {
+impl<S: Store> Messenger<S> {
     fn fresh_id(&mut self, now: i64) -> String {
         self.counter += 1;
         dsip_core::ulid::Ulid::generate_at((now.max(0) as u64) * 1000 + self.counter % 1000).as_str().to_string()
