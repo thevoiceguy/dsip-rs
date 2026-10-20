@@ -113,6 +113,14 @@ fn blob_sealed_opened_and_fetch_decided() {
                blob::Fetch::GiveUp("mismatch".into()));
     let served = json!([{"uri": "u", "status": 200, "sha256": sealed.sha256, "size": sealed.bytes.len()}]);
     assert_eq!(blob::fetch_decision(&obj, &served, 1), blob::Fetch::Play("u".into()));
+
+    // what each source answered, as both clients enter it: other bytes with their size and hash, so they are a mismatch
+    assert_eq!(blob::tried("u", 404, None), json!({"uri": "u", "status": 404}));
+    let tried = json!([blob::tried("u", 200, Some(&other))]);
+    assert_eq!(tried[0]["sha256"], dsip_mls::digest(&other));
+    assert_eq!(blob::fetch_decision(&obj, &tried, 1), blob::Fetch::GiveUp("mismatch".into()));
+    // spec-gap 67's schedule
+    assert_eq!([1, 2, 3, 4, 5, 9].map(blob::retry_delay_s), [4, 8, 16, 32, 60, 60]);
 }
 
 #[test]

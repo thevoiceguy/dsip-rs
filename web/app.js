@@ -1711,7 +1711,7 @@ async function fetchBlob(gid, m, attempt = 1) {
   for (const uri of sources) {
     try {
       const r = await fetch(uri);
-      if (!r.ok) { tried.push({ uri, status: r.status }); log(`blob source ${uri}: ${r.status}`, 'M§8.4'); continue; }
+      if (!r.ok) { tried.push(JSON.parse(messenger.blob_tried(uri, r.status, ''))); log(`blob source ${uri}: ${r.status}`, 'M§8.4'); continue; }
       const stored = await r.arrayBuffer();
       try {
         const plain = messenger.open_blob(JSON.stringify(m.object), b64u.encode(stored));
@@ -1720,12 +1720,12 @@ async function fetchBlob(gid, m, attempt = 1) {
         log(`blob for ${short(id)} fetched from ${uri}: size and SHA-256 verified, decrypted under the content's key`, 'M§8.4 rule 7');
         renderMessages();
         return;
-      } catch (why) { tried.push({ uri, status: 200, size: stored.byteLength }); log(`blob source ${uri}: ${why}`, 'M§8.4 rule 7'); }
-    } catch (e) { tried.push({ uri, status: 0 }); log(`blob source ${uri}: ${e.message}`, 'M§8.4'); }
+      } catch (why) { tried.push(JSON.parse(messenger.blob_tried(uri, 200, b64u.encode(stored)))); log(`blob source ${uri}: ${why}`, 'M§8.4 rule 7'); }
+    } catch (e) { tried.push(JSON.parse(messenger.blob_tried(uri, 0, ''))); log(`blob source ${uri}: ${e.message}`, 'M§8.4'); }
   }
   const d = JSON.parse(messenger.blob_fetch_decision(JSON.stringify(m.object), JSON.stringify(tried), attempt));
   if (d.action === 'retry') {
-    const delay = Math.min(4000 << Math.min(attempt - 1, 4), 60000);
+    const delay = messenger.blob_retry_delay_s(attempt) * 1000;
     media[id] = { state: 'retry', attempt: attempt + 1 };
     log(`blob for ${short(id)}: nothing served yet, trying again in ${delay / 1000} s (attempt ${attempt})`, 'spec-gap 106');
     setTimeout(() => fetchBlob(gid, m, attempt + 1), delay);

@@ -246,6 +246,12 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    constant goes. What remains differs in code each client still has to itself (commits and their retries after a
    conflict, re-deposits on reconnect, successor creation and the handover of pending items, call events, the blob
    `tried` input, sealed introductions); it goes behind `Config` with the thin hosts (3j).
+   3j is in parts too. 3j-1: what a received call event is (#224: history state wherever it came from, archived once
+   by session; the call log is `CallLog`), introductions and grants received (`first_contact::received`: verified as
+   credentials, the introduction checked under M§14.1, its sealed purpose opened when the device holds the identity
+   key, kept unread when it does not), and what each blob source answered (`blob::tried`, `blob::retry_delay_s`). One
+   fix came with it: the browser read a plain purpose without checking the introduction, so one carrying both
+   `purpose` and `sealed` became a request.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
@@ -260,7 +266,8 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    the leaves that do (browser); proposals stored (browser); recorder content and acceptance keys; a welcome produced
    by a Remove deposited (dsip-msg) or dropped (browser); an Add of a named device still needed while no leaf has its
    credential (dsip-msg) or no authenticated leaf is that device (browser); archive keys overwritten or kept; when a
-   call event is recorded; the blob `tried` input; a sealed introduction opened without the identity key.
+   call event is recorded (decided, 3j-1); the blob `tried` input (shared, 3j-1); a sealed introduction opened without
+   the identity key (shared, 3j-1: a device without the key keeps it unread).
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.

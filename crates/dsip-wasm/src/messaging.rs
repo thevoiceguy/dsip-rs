@@ -45,7 +45,7 @@ use dsip_messaging_device::commits::{self, Answer, Change, Synced};
 use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
-use dsip_messaging_device::{archive, blob, calls, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
+use dsip_messaging_device::{archive, blob, calls, first_contact, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
     Receipts, Retry, Route};
 use dsip_messaging_device::Config;
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
@@ -908,6 +908,18 @@ impl Messenger {
         let stored = dsip_core::b64::decode(stored_b64).unwrap_or_default();
         let plain = blob::open(&object, &stored).map_err(|c| JsValue::from_str(if c == "blob-key" { "blob key" } else { c }))?;
         Ok(b64(&plain))
+    }
+
+    /// One source's answer as the fetch decision takes it (`status` 0: not reached; `stored_b64`, bytes a 200 served
+    /// that did not open, or empty): `{uri, status, sha256?, size?}` (M§8.4 rule 7, spec-gap 106).
+    pub fn blob_tried(&self, uri: &str, status: u16, stored_b64: &str) -> String {
+        let stored = dsip_core::b64::decode(stored_b64).filter(|_| !stored_b64.is_empty());
+        blob::tried(uri, status, stored.as_deref()).to_string()
+    }
+
+    /// Seconds before fetch `attempt` is tried again (spec-gap 67's schedule: 4 s doubling, at most 60 s).
+    pub fn blob_retry_delay_s(&self, attempt: f64) -> f64 {
+        blob::retry_delay_s(attempt as i64) as f64
     }
 
     /// What a device does after its blob sources answered (`tried`: `[{uri, status, sha256?, size?}]`; the pinned
@@ -2479,47 +2491,24 @@ impl Messenger {
 
     /// A signed introduction or grant delivered through the mailbox (M§14.1, spec-gap 54), verified as a credential.
     fn first_contact_in(&mut self, item: &Value, now: i64) -> Vec<Value> {
-        let class = s_of(&item["class"]);
         let ctx = self.ctx(now);
-        let mut parts = item["envelope"].as_str().unwrap_or("").split('.');
-        let mut next = || parts.next().unwrap_or("").to_string();
-        let env = Envelope { protected: next(), payload: next(), signature: next() };
-        let checked = envelope::verify_raw(&env, &ctx, false).ok().filter(|ver| {
-            let from = ver.payload["from"].as_str().unwrap_or("");
-            ver.payload["type"] == class
-                && ver.payload["to"] == json!(self.keys.identity)
-                && ver.payload[if class == "grant" { "valid_until" } else { "expires_at" }].as_i64().unwrap_or(0) >= now
-                && dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, &ctx).ok()
-        });
-        let Some(ver) = checked else {
-            return vec![json!({"ui": "dropped", "why": format!("{class} {}: does not verify", item["cursor"])})];
-        };
-        let p = ver.payload;
-        let from = s_of(&p["from"]);
-        if class == "introduction" {
-            // sealed purposes (M§6.9) open with the identity's key agreement key, derived from the identity key (spec-gap 55)
-            let purpose = match (p.get("sealed"), self.controller_seed) {
-                (Some(_), Some(seed)) => {
-                    let opened = dsip_messaging::first_contact::open_sealed_introduction(&p, &seed);
-                    if opened["verdict"] != "accept" {
-                        return vec![json!({"ui": "dropped", "why": format!("introduction {}: {}", p["id"], opened["code"])})];
-                    }
-                    s_of(&opened["purpose"])
-                }
-                (Some(_), None) => "(sealed: this device holds no key agreement key)".to_string(),
-                (None, _) => s_of(&p["purpose"]),
-            };
-            let id = s_of(&p["id"]);
-            self.requests.insert(id.clone(), json!({"from": from, "purpose": purpose, "sealed": p.get("sealed").is_some(), "expires_at": p["expires_at"]}));
-            vec![json!({"ui": "request", "id": id, "from": from, "purpose": purpose})]
-        } else {
-            let scope = p["scope"].clone();
-            if !scope.as_array().is_some_and(|s| s.iter().any(|x| x == "dsip.message")) {
-                return vec![json!({"ui": "dropped", "why": format!("grant {} from {from}: no dsip.message scope", p["id"])})];
+        // sealed purposes (M§6.9) open with the identity's key agreement key, derived from the identity key (spec-gap 55)
+        let why = match first_contact::received(item, &self.keys.identity, &ctx, now, self.controller_seed.as_ref()) {
+            first_contact::Received::Request(req) => {
+                let purpose = req.purpose.unwrap_or_else(|| "(sealed: this device holds no key agreement key)".to_string());
+                self.requests.insert(req.id.clone(), json!({"from": req.from, "purpose": purpose, "sealed": req.sealed,
+                    "expires_at": req.payload["expires_at"]}));
+                return vec![json!({"ui": "request", "id": req.id, "from": req.from, "purpose": purpose})];
             }
-            self.grants_held.insert(from.clone(), compact(&env));
-            vec![json!({"ui": "granted", "by": from, "scope": scope, "request": p["session"]})]
-        }
+            first_contact::Received::Grant(g) => {
+                self.grants_held.insert(g.from.clone(), g.envelope);
+                return vec![json!({"ui": "granted", "by": g.from, "scope": g.scope, "request": g.request})];
+            }
+            first_contact::Received::DoesNotVerify => format!("{} {}: does not verify", s_of(&item["class"]), item["cursor"]),
+            first_contact::Received::BadIntroduction { id, code, .. } => format!("introduction {id}: {code}"),
+            first_contact::Received::NoMessageScope { id, from } => format!("grant {id} from {from}: no dsip.message scope"),
+        };
+        vec![json!({"ui": "dropped", "why": why})]
     }
 }
 

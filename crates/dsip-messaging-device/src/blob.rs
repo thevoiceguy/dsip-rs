@@ -86,3 +86,19 @@ pub fn fetch_decision(object: &Value, tried: &Value, attempt: i64) -> Fetch {
         _ => Fetch::GiveUp(d["reason"].as_str().unwrap_or("").to_string()),
     }
 }
+
+/// What one source answered, as [`fetch_decision`] takes it: `status` 0 when it could not be reached; `stored`, the
+/// bytes a 200 served that did not open, entered with their size and SHA-256 (rule 7: other bytes, or bytes that are
+/// the content's but do not decrypt under its key).
+pub fn tried(uri: &str, status: u16, stored: Option<&[u8]>) -> Value {
+    match stored {
+        Some(b) => json!({"uri": uri, "status": status, "sha256": dsip_mls::digest(b), "size": b.len()}),
+        None => json!({"uri": uri, "status": status}),
+    }
+}
+
+/// Seconds before fetch `attempt` is tried again after a [`Fetch::Retry`]: the mailbox replication schedule
+/// (spec-gap 67), 4 s doubling, at most 60 s.
+pub fn retry_delay_s(attempt: i64) -> i64 {
+    (4i64 << (attempt - 1).clamp(0, 4)).min(60)
+}
