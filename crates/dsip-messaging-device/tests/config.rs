@@ -40,6 +40,7 @@ fn keys_welcomes_and_timeouts() {
     assert!(m.replace_archive_keys && !b.replace_archive_keys);
     assert!(m.rejoin_gaps && !b.rejoin_gaps);
     assert!(m.roll_back_unprocessable && !b.roll_back_unprocessable);
+    assert!(m.batch_receipts && !b.batch_receipts);
 }
 
 #[test]

@@ -9,6 +9,12 @@
 //! Impl: the decisions are `dsip_messaging::client::Client`'s. Each event first advances the machine to `now`, and
 //! what that advance emits (a read watermark held back by the 5 s interval) comes back with the event's own
 //! decisions; a host that advanced and discarded it lost the watermark.
+//!
+//! Impl: a sync's content and receipts are collected in a [`Batch`], per conversation, and each conversation's
+//! machine is stepped once with its share when the sync's items are done (M§10.2); a receipt received in the personal
+//! group goes to the conversation it names ([`receipt_target`], spec-gap 52).
+
+use std::collections::BTreeMap;
 
 use dsip_messaging::client::Client;
 use serde_json::{json, Value};
@@ -158,4 +164,43 @@ impl Receipts {
 /// (its `src`).
 pub fn archived(items: &[Value], seq: i64) -> impl Iterator<Item = &Value> {
     items.iter().filter(move |it| it["seq"] == json!(seq) && it["object"]["object"] == "receipt")
+}
+
+/// What one sync brought for the receipts machines, per group: its content and the receipts addressed to it, in the
+/// order received. A live push is a batch of one (M§10.2).
+#[derive(Debug, Default)]
+pub struct Batch(BTreeMap<String, Vec<Value>>);
+
+impl Batch {
+    /// Content received at `seq` in `group`.
+    pub fn content(&mut self, group: &str, seq: i64, object: &Value) {
+        self.0.entry(group.to_string()).or_default().push(json!({"seq": seq, "object": object}));
+    }
+
+    /// A receipt received at `seq` in `group` from `sender_device`, for the machine of `target` ([`receipt_target`]);
+    /// an [`Emission::Archive`] of it archives it under `group`, where it arrived (spec-gap 64).
+    pub fn receipt(&mut self, group: &str, target: &str, seq: i64, object: &Value, sender_device: &str) {
+        self.0.entry(target.to_string()).or_default().push(json!({"seq": seq, "object": object, "src": group, "sender_device": sender_device}));
+    }
+
+    /// Whether nothing was collected.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Everything collected, per group in group order, leaving the batch empty.
+    pub fn take(&mut self) -> BTreeMap<String, Vec<Value>> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// The group whose receipts machine a receipt received in `group` belongs to. One received in the personal group is a
+/// sibling device's undisclosed read watermark and describes the conversation it names: that conversation's group,
+/// from `conversations` (`(group, conversation)`), or none if this device is not in it (M§10.5, spec-gap 52).
+pub fn receipt_target<'a>(group: &str, personal: bool, object: &Value, mut conversations: impl Iterator<Item = (&'a str, &'a str)>)
+    -> Option<String> {
+    if !personal {
+        return Some(group.to_string());
+    }
+    conversations.find(|(_, c)| object["conversation"] == json!(c)).map(|(g, _)| g.to_string())
 }

@@ -234,6 +234,13 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    could not be processed, the held items it released were dropped, since routing had already taken them out of the
    held items. With the rollback they are now processed as after any other item; the browser still drops them while
    its option is off.
+   3i-4: received receipts. A sync's content and receipts are collected in `receipts::Batch`, per group, and each
+   conversation's machine is stepped once with its share when the sync's items are done (M§10.2);
+   `receipts::receipt_target` sends a receipt received in the personal group, a sibling's undisclosed read watermark,
+   to the conversation it names (spec-gap 52). With `Config::batch_receipts` a receipt joins the batch (dsip-msg); the
+   browser keeps its `false`, stepping each receipt at once in the group it arrived in, so a sibling's watermark
+   reaches the personal group's machine instead of its conversation's: another shortfall to turn on with a web test.
+   The browser's content batch, which lived in each conversation, is now the same `Batch`.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

@@ -87,8 +87,6 @@ struct Conv {
     receipts: Receipts,
     /// The epoch this device joined at: items from before are history (M§12.3), not for this device's MLS state.
     joined_epoch: u64,
-    /// Content and receipts of the sync batch being processed (M§10.2 decides per batch).
-    batch: Vec<Value>,
 }
 
 /// A membership change this device proposes (M§6.5): re-proposed after a lost conflict while still needed.
@@ -228,6 +226,8 @@ pub struct Messenger {
     hello_ids: BTreeSet<String>,
     counter: u64,
     convs: BTreeMap<String, Conv>,
+    /// Content and receipts of the sync being processed, per group (M§10.2 decides per batch).
+    batch: receipts::Batch,
     personal: Option<String>,
     resume: Resume,
     /// Digests of this device's own deposits: the hub fans them back and MLS cannot decrypt them (spec-gap 47).
@@ -338,6 +338,7 @@ impl Messenger {
             hello_ids: BTreeSet::new(),
             counter: 0,
             convs: BTreeMap::new(),
+            batch: receipts::Batch::default(),
             personal: st["personal"].as_str().map(String::from),
             resume: Resume::new(if st["resume"].is_object() { &st["resume"] } else { &Value::Null }),
             own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
@@ -409,7 +410,6 @@ impl Messenger {
                 peer: c["peer"].as_str().map(String::from),
                 receipts: m.new_receipts(now_i),
                 joined_epoch: c["joined_epoch"].as_u64().unwrap_or(0),
-                batch: vec![],
             };
             m.convs.insert(gid.clone(), conv);
         }
@@ -1361,7 +1361,7 @@ impl Messenger {
         let epoch = group.epoch().as_u64();
         self.convs.insert(gid.clone(), Conv {
             group, conversation, kind: kind.to_string(), hub: (self.mailbox.0.clone(), self.mailbox.1.clone()), peer: None,
-            receipts: self.new_receipts(now), joined_epoch: epoch, batch: vec![],
+            receipts: self.new_receipts(now), joined_epoch: epoch,
         });
         let config = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined", "hub": self.mailbox.0}]}), now);
         let gi = self.group_info_frame(&gid, now)?;
@@ -1944,7 +1944,7 @@ impl Messenger {
                 self.convs.insert(group.clone(), Conv {
                     group: joined, conversation: s_of(&conv["conversation"]), kind: kind.clone(),
                     hub: (s_of(&conv["hub"]["did"]), s_of(&conv["hub"]["uri"])), peer: if kind == "direct" { peer } else { None },
-                    receipts: self.new_receipts(now), joined_epoch: epoch, batch: vec![],
+                    receipts: self.new_receipts(now), joined_epoch: epoch,
                 });
                 if kind == "personal" {
                     self.personal = Some(group.clone());
@@ -2087,6 +2087,15 @@ impl Messenger {
                 }
                 out.push(json!({"ui": "call_record", "from": sender, "session": object["session"], "outcome": object["outcome"], "fresh": fresh}));
             }
+            Some("receipt") if self.config.batch_receipts => {
+                // a sibling's undisclosed watermark describes another conversation (spec-gap 52)
+                let personal = self.personal.as_deref() == Some(gid);
+                let target = receipts::receipt_target(gid, personal, &object, self.convs.iter().map(|(g, c)| (g.as_str(), c.conversation.as_str())));
+                if let Some(t) = target {
+                    self.batch.receipt(gid, &t, seq, &object, sender_device);
+                }
+                out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
+            }
             Some("receipt") => {
                 if let Some(c) = self.convs.get_mut(gid) {
                     let batch = json!({"seq": seq, "object": object, "src": gid, "sender_device": sender_device});
@@ -2104,9 +2113,7 @@ impl Messenger {
                 // a sibling device's content is this identity's own (M§12.3: sent messages reach every device)
                 self.messages.push(json!({"group": gid, "key": key, "sender": sender, "sender_device": sender_device, "object": object,
                     "seq": seq, "mine": sender == self.keys.identity, "item": null, "blobs": item["blobs"]}));
-                if let Some(c) = self.convs.get_mut(gid) {
-                    c.pending_batch_push(json!({"seq": seq, "object": object.clone()}));
-                }
+                self.batch.content(gid, seq, &object);
                 // M§12.2: what is shown from MLS is archived under the current key
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
                 let decisions = self.history.mls(gid, seq, epoch, &key);
@@ -2131,7 +2138,7 @@ impl Messenger {
         let kind = s_of(&conv["kind"]);
         self.convs.insert(gid.to_string(), Conv {
             group, conversation: s_of(&conv["conversation"]), kind: kind.clone(), hub: (s_of(&conv["hub"]["did"]), s_of(&conv["hub"]["uri"])),
-            peer: None, receipts: self.new_receipts(now), joined_epoch: epoch, batch: vec![],
+            peer: None, receipts: self.new_receipts(now), joined_epoch: epoch,
         });
         if kind == "direct" {
             let me = self.keys.identity.clone();
@@ -2341,12 +2348,9 @@ impl Messenger {
     /// M§10.2: delivered receipts are decided once per sync batch, per conversation; each is sent as an object.
     fn receipts_batch(&mut self, now: i64) -> Vec<Value> {
         let mut out = vec![];
-        for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
-            let items = self.convs.get_mut(&gid).map(|c| c.take_batch()).unwrap_or_default();
-            if items.is_empty() {
-                continue;
-            }
-            let emissions = self.convs.get_mut(&gid).expect("group").receipts.sync(now, items.clone());
+        for (gid, items) in self.batch.take() {
+            let Some(c) = self.convs.get_mut(&gid) else { continue };
+            let emissions = c.receipts.sync(now, items.clone());
             // M§12.2 (spec-gap 64): a receipt that changed rendering is archived under the group it arrived in
             for seq in emissions.iter().filter_map(|e| if let Emission::Archive(seq) = e { Some(*seq) } else { None }) {
                 let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
@@ -2532,21 +2536,6 @@ impl Messenger {
             self.grants_held.insert(from.clone(), compact(&env));
             vec![json!({"ui": "granted", "by": from, "scope": scope, "request": p["session"]})]
         }
-    }
-}
-
-impl Conv {
-    fn pending_batch_push(&mut self, v: Value) {
-        self.batch_store().push(v);
-    }
-
-    fn take_batch(&mut self) -> Vec<Value> {
-        std::mem::take(self.batch_store())
-    }
-
-    fn batch_store(&mut self) -> &mut Vec<Value> {
-        // the batch lives beside the receipts machine: content of the sync batch being processed (M§10.2)
-        &mut self.batch
     }
 }
 

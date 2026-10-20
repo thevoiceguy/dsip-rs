@@ -435,7 +435,7 @@ struct Client {
     http: reqwest::Client,
     policy: Value,
     /// Content and receipt objects of the sync batch being processed, by group (M§10.2 decides per batch).
-    batch: Vec<(String, Value)>,
+    batch: receipts::Batch,
     /// What the receipt and history machines asked to send, by group, sent outside frame processing.
     outbox: Vec<(String, Out)>,
 }
@@ -2178,13 +2178,9 @@ impl Client {
                 }
                 // M§10.2: receipts are decided once per batch (a live push is a batch of one), per conversation.
                 if !self.batch.is_empty() {
-                    let batch = std::mem::take(&mut self.batch);
+                    let batch = self.batch.take();
                     self.tick();
-                    let mut by_group: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-                    for (g, it) in batch {
-                        by_group.entry(g).or_default().push(it);
-                    }
-                    for (g, items) in by_group {
+                    for (g, items) in batch {
                         let Some(c) = self.convs.get_mut(&g) else { continue };
                         let emissions = c.receipts.sync(now_s(), items.clone());
                         self.receipt_emissions(&g, &items, emissions);
@@ -2602,13 +2598,9 @@ impl Client {
                 let personal = self.personal.as_deref() == Some(gid);
                 println!("RECEIPT {sender} {} {what}{}", object["kind"].as_str().unwrap_or(""), if personal { " (personal group)" } else { "" });
                 // A sibling's undisclosed watermark describes another conversation (spec-gap 52).
-                let target = if personal {
-                    self.convs.iter().find(|(_, c)| json!(c.conversation) == object["conversation"]).map(|(g, _)| g.clone())
-                } else {
-                    Some(gid.to_string())
-                };
+                let target = receipts::receipt_target(gid, personal, &object, self.convs.iter().map(|(g, c)| (g.as_str(), c.conversation.as_str())));
                 if let Some(t) = target {
-                    self.batch.push((t, json!({"seq": seq, "object": object, "src": gid, "sender_device": sender_device})));
+                    self.batch.receipt(gid, &t, seq, &object, sender_device);
                 }
             }
             Some("content") => {
@@ -2621,7 +2613,7 @@ impl Client {
                 self.lines.insert(key.clone(), format!("{sender}: {}", display(&object)));
                 self.sent_at.insert(key, object["sent_at"].as_i64().unwrap_or(0));
                 self.archive_requests(gid, &decisions, &object, sender, sender_device, seq);
-                self.batch.push((gid.to_string(), json!({"seq": seq, "object": object.clone()})));
+                self.batch.content(gid, seq, &object);
                 if self.event_in(gid, sender, &object) {
                     // device events and alarm acknowledgements went to the alarm list (E§5)
                 } else if object.get("blob").is_some() {
@@ -2757,7 +2749,7 @@ async fn main() -> Result<()> {
         state: args.state.clone(),
         http: http_client(args.ca.as_deref())?,
         policy,
-        batch: vec![],
+        batch: receipts::Batch::default(),
         outbox: vec![],
         mls,
     };
