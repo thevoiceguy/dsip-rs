@@ -201,6 +201,15 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    credential), and `Retry`, which reads `CommitRetry`'s actions as types. How a client drives the retries stays its
    own: dsip-msg's command waits through the sync and re-proposal, the browser re-proposes from `after_sync`; they
    become one with the thin hosts (3j).
+   3g: history and receipts. The two vector-pinned machines are wrapped once, their decisions read as types:
+   `Receipts` (delivered, read, played, activity, and the receipts to archive) and `History` (show, duplicate,
+   apply, hold, pre-join, archive), with `archive_records` for what an archive decision asks for and `Restored` for
+   archived history waiting for its conversation. Two fixes came with it. Every receipts event now advances the
+   machine's clock first and returns what the advance decided: the browser advanced and discarded, so a read
+   watermark held back by the 5 s interval was lost when a sync came before the next tick. And what of a device's own
+   accepted objects is history is now one rule (content; a read watermark; a call event): dsip-msg treated every
+   object re-sent from the outbox after an outage as content, so a receipt sent after an outage became a timeline
+   entry, was archived as one and was booked in its own receipt state.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
