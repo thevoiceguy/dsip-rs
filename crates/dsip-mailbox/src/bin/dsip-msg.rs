@@ -59,6 +59,7 @@ use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
 use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, Outbox, Outcome,
     ProcessOptions, Receipts, Retry, Route};
+use dsip_messaging_device::Config;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::verify::SeenIds;
@@ -319,15 +320,6 @@ fn unb64(v: &Value) -> Vec<u8> {
     v.as_str().and_then(dsip_core::b64::decode).unwrap_or_default()
 }
 
-/// M§8.5: the deduplication key of an object.
-fn object_key(o: &Value) -> String {
-    if o["object"] == "call-event" {
-        // M§13.3 (spec-gap 63): one call-event per session, whichever device reported it
-        return format!("call|{}", o["session"].as_str().unwrap_or(""));
-    }
-    format!("{}|{}|{}", o["conversation"].as_str().unwrap_or(""), o["sender"].as_str().unwrap_or(""), o["id"].as_str().unwrap_or(""))
-}
-
 fn display(o: &Value) -> String {
     match o["kind"].as_str() {
         Some("text") => o["text"].as_str().unwrap_or("").to_string(),
@@ -354,10 +346,6 @@ enum Out {
     /// An archive record, sealed under `akid` when it is sent (M§12.2).
     Archive { akid: String, record: Value },
 }
-
-/// Seconds after which a deposit with no answer at all counts as the hub unreachable (M§9.4). Impl (spec-gap 72): the
-/// device's own answer timeout.
-const NO_ANSWER_S: i64 = 20;
 
 /// A deposit awaiting the hub's answer (M§5.3).
 enum Sent {
@@ -426,6 +414,8 @@ struct Client {
     pending: Outbox,
     /// Deposits awaiting the hub's answer, by deposit id (M§5.3), the hub each went to and the outbox's no-answer watch.
     deposits: Deposits<Sent>,
+    /// Where this client still behaves differently from the browser (dsip-rs stage 3i): dsip-msg's own behaviour.
+    config: Config,
     /// Answers to the deposits a command waits for, until it takes them.
     answers: BTreeMap<String, Value>,
     /// Digests of this device's own deposits: their fan-out copies come back and cannot be decrypted (spec-gap 47).
@@ -925,10 +915,10 @@ impl Client {
         Ok(())
     }
 
-    /// Wait for the answer to deposit `id`, processing every other frame as it comes; none within [`NO_ANSWER_S`] is
+    /// Wait for the answer to deposit `id`, processing every other frame as it comes; none within [`Config::no_answer_s`] is
     /// "no answer" (M§9.4), and an answer arriving later is not ours any more.
     async fn await_answer(&mut self, id: &str) -> Result<Value> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(NO_ANSWER_S as u64);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(self.config.no_answer_s as u64);
         let answer = async {
             loop {
                 if let Some(a) = self.answers.remove(id) {
@@ -1060,7 +1050,7 @@ impl Client {
     }
 
     /// The outbox re-deposits pending item `id` of `group` (M§9.3: its own MLS bytes) without waiting: its answer is
-    /// acted on when it arrives ([`Self::forward_answered`]), and none within [`NO_ANSWER_S`] counts as the hub
+    /// acted on when it arrives ([`Self::forward_answered`]), and none within [`Config::no_answer_s`] counts as the hub
     /// unreachable (M§9.4).
     async fn forward(&mut self, group: &str, id: &str) -> Result<()> {
         let Some(item) = self.pending.item(group, id).cloned() else { return Ok(()) };
@@ -1244,17 +1234,22 @@ impl Client {
             CommitOp::Update => Change::Update,
             CommitOp::MoveHub(hub) => Change::MoveHub(hub),
         };
+        let add = matches!(change, Change::Add(_));
         let c = self.convs.get_mut(group).context("group")?;
-        commits::build(&self.mls, &mut c.group, change).map_err(|e| anyhow::anyhow!(e))
+        let mut built = commits::build(&self.mls, &mut c.group, change).map_err(|e| anyhow::anyhow!(e))?;
+        if !self.config.deposits_welcome(add) {
+            built.welcome = None;
+        }
+        Ok(built)
     }
 
     /// Whether `op` still needs doing after the device caught up with a winning commit (M§6.5 "if still needed").
     fn still_needed(&self, group: &str, op: &CommitOp) -> Result<bool> {
         Ok(match op {
-            CommitOp::Add { identity, device, .. } => match device {
-                Some(d) => self.device_leaves(group, d)?.is_empty(),
-                None => self.identity_leaves(group, identity)?.is_empty(),
-            },
+            CommitOp::Add { identity, device, .. } => {
+                let r = resolver(&self.resolver_files);
+                self.config.add_needed(&self.conv(group)?.group, &self.ctx(&r), identity, device.as_deref())
+            }
             CommitOp::RemoveIdentity(identity) => !self.identity_leaves(group, identity)?.is_empty(),
             CommitOp::RemoveDevice(device) => !self.device_leaves(group, device)?.is_empty(),
             CommitOp::Update => true,
@@ -1494,10 +1489,7 @@ impl Client {
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
         for (gid, c) in &self.convs {
-            if let Ok(members) = authenticate_members(&c.group, &ctx) {
-                let mut ids: Vec<String> = members.into_iter().map(|m| m.identity).collect();
-                ids.sort();
-                ids.dedup();
+            if let Some(ids) = self.config.roster(&c.group, &ctx) {
                 self.successors.member_of(gid, &ids);
             }
         }
@@ -1942,7 +1934,7 @@ impl Client {
             let emissions = c.receipts.own(now_s(), seq, obj);
             self.queue(group, emissions);
         }
-        let key = object_key(obj);
+        let key = self.config.object_key(obj);
         self.lines.insert(key.clone(), format!("{}: {}", self.identity, display(obj)));
         let decisions = self.history.sent(group, seq, &key, obj);
         self.archive_requests(group, &decisions, obj, &self.identity.clone(), &self.keys.device.did(), seq);
@@ -2075,7 +2067,7 @@ impl Client {
                     if kind == "read" {
                         // spec-gap 68: our own watermark is history too — a device added later reads it from archive
                         let seq = reply["seq"].as_i64().unwrap_or(0);
-                        let decisions = self.history.sent(&target, seq, &object_key(&obj), &obj);
+                        let decisions = self.history.sent(&target, seq, &self.config.object_key(&obj), &obj);
                         let (me, device) = (self.identity.clone(), self.keys.device.did());
                         self.archive_requests(&target, &decisions, &obj, &me, &device, seq);
                     }
@@ -2342,7 +2334,7 @@ impl Client {
         };
         let (seq, record) = (opened.seq, &opened.record);
         let obj = &record["payload"];
-        let key_id = object_key(obj);
+        let key_id = self.config.object_key(obj);
         let e = self.history.opened(item, &opened, &key_id);
         if e.iter().any(Decision::is_show) {
             let line = format!("{}: {}", record["sender"].as_str().unwrap_or(""), display(obj));
@@ -2570,7 +2562,12 @@ impl Client {
                 let akid = object["akid"].as_str().unwrap_or("").to_string();
                 let key: [u8; 32] = unb64(&object["key"]).try_into().unwrap_or([0; 32]);
                 let fresh = !self.archive_keys.contains_key(&akid);
-                self.store_archive_key(&akid, key, object["created_at"].as_i64().unwrap_or(0))?;
+                let created = object["created_at"].as_i64().unwrap_or(0);
+                if fresh || self.config.replace_archive_keys {
+                    self.store_archive_key(&akid, key, created)?;
+                } else {
+                    self.history.archive_key(&akid, created);
+                }
                 if fresh {
                     println!("ARCHIVE-KEY {akid} from {sender}");
                 }
@@ -2621,7 +2618,7 @@ impl Client {
                 }
             }
             Some("content") => {
-                let key = object_key(&object);
+                let key = self.config.object_key(&object);
                 let decisions = self.history.mls(gid, seq, self.conv(gid)?.group.epoch().as_u64(), &key);
                 if decisions.iter().any(|d| matches!(d, Decision::Duplicate(_))) {
                     println!("DUP-HISTORY seq={seq}");
@@ -2752,7 +2749,8 @@ async fn main() -> Result<()> {
         gap_timeout: args.gap_timeout,
         arrivals: BTreeMap::new(),
         pending: Outbox::new(args.hub_timeout),
-        deposits: Deposits::new(NO_ANSWER_S),
+        deposits: Deposits::new(Config::DSIP_MSG.no_answer_s),
+        config: Config::DSIP_MSG,
         answers: BTreeMap::new(),
         own: HashSet::new(),
         resume,

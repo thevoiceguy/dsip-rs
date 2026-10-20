@@ -18,6 +18,7 @@ pub mod archive;
 pub mod blob;
 pub mod calls;
 pub mod commits;
+pub mod config;
 pub mod deposits;
 pub mod history;
 pub mod inbound;
@@ -30,6 +31,7 @@ pub mod store;
 pub mod successors;
 
 pub use commits::Retry;
+pub use config::Config;
 pub use deposits::Deposits;
 pub use history::History;
 pub use inbound::{Inbound, Route};
