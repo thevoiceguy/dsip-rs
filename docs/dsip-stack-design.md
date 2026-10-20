@@ -241,6 +241,11 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    browser keeps its `false`, stepping each receipt at once in the group it arrived in, so a sibling's watermark
    reaches the personal group's machine instead of its conversation's: another shortfall to turn on with a web test.
    The browser's content batch, which lived in each conversation, is now the same `Batch`.
+   3i-5: `ProcessOptions`, the item-processing options (what the object check sees, recorder content, call records
+   kept, proposals stored), is `Config::process`: each client's preset carries what it passed, and the browser's own
+   constant goes. What remains differs in code each client still has to itself (commits and their retries after a
+   conflict, re-deposits on reconnect, successor creation and the handover of pending items, call events, the blob
+   `tried` input, sealed introductions); it goes behind `Config` with the thin hosts (3j).
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
