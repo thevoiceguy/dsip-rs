@@ -762,11 +762,6 @@ impl Client {
         Some(recording::state(&leaves, &self.identity, self.rec_accepted.get(gid).unwrap_or(&std::collections::BTreeSet::new())))
     }
 
-    /// Whether `device` is a recorder leaf of the group (C§5: its content is never rendered).
-    fn is_recorder_leaf(&self, gid: &str, device: &str) -> bool {
-        self.recording_state(gid).is_some_and(|st| st["recorders"].as_array().into_iter().flatten().any(|r| r["device"] == device))
-    }
-
     /// From the ticker: render a conversation becoming recorded, or no longer recorded (C§5).
     fn check_recordings(&mut self) {
         if self.recorder_mode {
@@ -2450,23 +2445,20 @@ impl Client {
                 }
             }
             Outcome::Object { sender, sender_device, object } => {
-                if self.is_recorder_leaf(&gid, &sender_device) {
-                    // C§5: a recorder is receive-only — whatever it sends is treated as unauthenticated
-                    println!("DROP recorder content from {sender_device} (C§5: a recorder is receive-only)");
-                } else {
-                    if self.recorder_mode && object["object"] == "content" {
-                        // C§5: the compliance archive
-                        let line = json!({"group": gid, "seq": item["seq"], "sender": sender, "sender_device": sender_device, "object": object});
-                        use std::io::Write as _;
-                        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.state.join("recorder-archive.jsonl"))?;
-                        writeln!(f, "{line}")?;
-                        println!("ARCHIVED {sender}: {}", display(&object));
-                    }
-                    self.object_in(&gid, item, &sender, &sender_device, object).await?
+                if self.recorder_mode && object["object"] == "content" {
+                    // C§5: the compliance archive
+                    let line = json!({"group": gid, "seq": item["seq"], "sender": sender, "sender_device": sender_device, "object": object});
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.state.join("recorder-archive.jsonl"))?;
+                    writeln!(f, "{line}")?;
+                    println!("ARCHIVED {sender}: {}", display(&object));
                 }
+                self.object_in(&gid, item, &sender, &sender_device, object).await?
             }
             Outcome::Dropped(why) => println!("DROP {why}"),
             Outcome::Unauthenticated(what) => println!("UNAUTHENTICATED {what}"),
+            // C§5: a recorder is receive-only — its content is treated as from an unauthenticated leaf
+            Outcome::RecorderContent { device, .. } => println!("DROP recorder content from {device} (C§5: a recorder is receive-only)"),
             Outcome::NotForDevice => println!("SIBLING welcome {cursor}"),
             Outcome::Epoch { epoch, by, added, removed, hub, .. } => {
                 let kind = self.conv(&gid).map(|c| c.kind.clone()).unwrap_or_default();
