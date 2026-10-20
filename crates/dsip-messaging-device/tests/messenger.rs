@@ -1,8 +1,9 @@
-//! The messaging device as a library: opened over any store with either client's `Config`, its state taken back, and
-//! the Recording Profile's rule for a recorder sibling.
+//! The messaging device as a library: opened over any store with either client's `Config`, its state taken back, the
+//! Recording Profile's rule for a recorder sibling, and the events a host renders from.
 //!
 //! Spec: M§5.4 (state kept with the MLS state, spec-gap 44), M§7.1 (the personal group), M§12.3 (a new device joins
-//! the personal group first), C§5 (a recorder device joins conversations only).
+//! the personal group first), C§5 (a recorder device joins conversations only; a recorded conversation is rendered),
+//! M§6.5 (a commit that lost a conflict is re-proposed), M§9.4 (an outage), M§13.3 (call events).
 
 use serde_json::{json, Value};
 
@@ -31,11 +32,16 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// A `key-packages` answer holding one KeyPackage of `device`, a device of `identity` with `caps`.
-fn key_packages(identity: &KeyPair, device: &KeyPair, caps: &[&str]) -> String {
+/// One KeyPackage of `device`, a device of `identity` with `caps`, base64url.
+fn kp(identity: &KeyPair, device: &KeyPair, caps: &[&str]) -> String {
     let e = delegation(identity, device, caps);
     let d = Device::new(device.clone(), format!("{}.{}.{}", e.protected, e.payload, e.signature));
-    json!({"type": "key-packages", "key_packages": [dsip_core::b64::encode(&d.key_package().unwrap())]}).to_string()
+    dsip_core::b64::encode(&d.key_package().unwrap())
+}
+
+/// A `key-packages` answer holding one KeyPackage of `device`, a device of `identity` with `caps`.
+fn key_packages(identity: &KeyPair, device: &KeyPair, caps: &[&str]) -> String {
+    json!({"type": "key-packages", "key_packages": [kp(identity, device, caps)]}).to_string()
 }
 
 #[test]
@@ -239,4 +245,81 @@ fn first_contact_and_any_object_sent() {
     let item = sent["item"].as_str().unwrap().to_string();
     let ev = hub.drive(&mut m, &json!([{"send": sent["send"]}]).to_string());
     assert_eq!(ui(&ev, "sent")[0]["item"], json!(item));
+}
+
+/// The deposit id of the frame `send`.
+fn deposit_id(send: &str) -> String {
+    wire::payload_of(&Envelope::from_frame(send).unwrap()).unwrap()["id"].as_str().unwrap().to_string()
+}
+
+fn events(out: &str) -> Vec<Value> {
+    serde_json::from_str(out).unwrap()
+}
+
+#[test]
+fn events_carry_what_a_host_prints() {
+    let (alice, phone, bob, bob_phone, bob_rec) = (KeyPair::from_fixture_name("alice"), KeyPair::from_fixture_name("alice-phone"),
+        KeyPair::from_fixture_name("bob"), KeyPair::from_fixture_name("bob-phone"), KeyPair::from_fixture_name("bob-recorder"));
+    let mut hub = Hub::new();
+    let mut m = Messenger::open(&identity_json(&alice, &phone), &hub.did(), "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
+                                Config::DSIP_MSG, NOW as f64).unwrap();
+    let out = m.create_personal(NOW as f64).unwrap();
+    hub.drive(&mut m, &out);
+
+    // the commit says what it did; the conversation is recorded by Bob's recorder, which Alice has to accept (C§5)
+    let kps = json!({"type": "key-packages", "key_packages": [kp(&bob, &bob_phone, PLAIN), kp(&bob, &bob_rec, RECORDER)]});
+    let out = m.create_direct(&bob.did(), &kps.to_string(), None, NOW as f64).unwrap();
+    let ev = hub.drive(&mut m, &out);
+    let committed = ui(&ev, "committed")[0].clone();
+    assert_eq!((committed["op"]["op"].as_str(), committed["op"]["peer"].as_str()), (Some("add"), Some(bob.did().as_str())));
+    let gid = committed["group"].as_str().unwrap().to_string();
+    let rec = ui(&ev, "recording");
+    assert_eq!(rec.len(), 1, "{ev:?}");
+    assert_eq!(rec[0]["new"], json!([{"device": bob_rec.did(), "subject": bob.did(), "own": false}]));
+    assert_eq!((rec[0]["ended"].as_bool(), rec[0]["may_send"].as_bool()), (Some(false), Some(false)));
+    assert!(m.send_text(&gid, "hi", NOW as f64).is_err());
+    let accepted: Value = serde_json::from_str(&m.accept_recording(&gid, NOW as f64).unwrap()).unwrap();
+    let ev = hub.drive(&mut m, &accepted["frames"].to_string());
+    assert!(ui(&ev, "recording").is_empty(), "the same recorders: nothing new to render {ev:?}");
+
+    // a rekey that lost a conflict: which commit, at which epoch; re-proposed after the sync while still needed (M§6.5)
+    let frame = m.rekey(&gid, NOW as f64).unwrap();
+    let refusal = wire::error(&hub.key, &phone.did(), NOW, Some(&deposit_id(&frame)), "mailbox.commit-conflict", None);
+    let ev = events(&m.inbound(&refusal.frame(), NOW as f64));
+    let conflict = ui(&ev, "conflict")[0].clone();
+    assert_eq!((conflict["op"]["op"].as_str(), conflict["epoch"].as_u64()), (Some("update"), committed["epoch"].as_u64()), "{ev:?}");
+    let caught_up = wire::items(&hub.key, &phone.did(), NOW, Some("01J0000000000000000000SYNC"), vec![], Value::Null);
+    let ev = events(&m.inbound(&caught_up.frame(), NOW as f64));
+    let again = ui(&ev, "repropose")[0].clone();
+    assert_eq!((again["op"]["op"].as_str(), again["epoch"].as_u64()), (Some("update"), committed["epoch"].as_u64()), "{ev:?}");
+    assert!(again["attempt"].as_u64().is_some());
+    let ev = hub.drive(&mut m, &json!(ev).to_string());
+    assert_eq!(ui(&ev, "committed")[0]["op"]["op"], "update");
+
+    // a missed call: the event sent, its item, and whether this identity had it already (M§13.3, spec-gap 63)
+    let leg = json!({"session": "01K742SG00XZRF7H1Z8WN9CGAD", "peer": bob.did(), "alerted": true, "answered_here": false, "ended_by": "remote", "reason": ""});
+    let r: Value = serde_json::from_str(&m.call_ended_item(&leg.to_string(), NOW as f64).unwrap()).unwrap();
+    assert_eq!((r["event"]["outcome"].as_str(), r["event"]["direction"].as_str(), r["fresh"].as_bool()), (Some("missed"), Some("inbound"), Some(true)));
+    let ev = hub.drive(&mut m, &json!([{"send": r["send"]}]).to_string());
+    assert_eq!(ui(&ev, "sent")[0]["item"], r["item"]);
+    let r: Value = serde_json::from_str(&m.call_ended_item(&leg.to_string(), NOW as f64).unwrap()).unwrap();
+    assert_eq!(r["fresh"], false, "already recorded");
+    let unalerted = json!({"session": "01K742SG00XZRF7H1Z8WN9CGAE", "peer": bob.did(), "alerted": false, "ended_by": "remote"});
+    let r: Value = serde_json::from_str(&m.call_ended_item(&unalerted.to_string(), NOW as f64).unwrap()).unwrap();
+    assert!(r["event"].is_null() && r["send"] == "");
+    assert_eq!(m.call_ended(&unalerted.to_string(), NOW as f64).unwrap(), "[]");
+
+    // the hub is down: the retry names the item waiting, and its accepted says it went out after the outage (M§9.4)
+    let sent: Value = serde_json::from_str(&m.send(&gid, &json!({"object": "content", "id": "01J0000000000000000000DOWN",
+        "conversation": m.state()["convs"][&gid]["conversation"], "sender": alice.did(), "sent_at": NOW, "kind": "text", "text": "down?"}).to_string(),
+        NOW as f64).unwrap()).unwrap();
+    let down = wire::error(&hub.key, &phone.did(), NOW, Some(&deposit_id(sent["send"].as_str().unwrap())), "mailbox.hub-unreachable", None);
+    let ev = events(&m.inbound(&down.frame(), NOW as f64));
+    let retry = ui(&ev, "hub_retry")[0].clone();
+    assert_eq!(retry["item"], sent["item"], "{ev:?}");
+    let later = NOW as f64 + retry["in"].as_f64().unwrap();
+    let out = m.tick(later);
+    let ev = hub.drive(&mut m, &out);
+    let back = ui(&ev, "sent")[0].clone();
+    assert_eq!((back["item"].clone(), back["after_outage"].as_bool()), (sent["item"].clone(), Some(true)), "{ev:?}");
 }

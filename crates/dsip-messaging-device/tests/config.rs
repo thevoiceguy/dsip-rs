@@ -43,7 +43,7 @@ fn keys_welcomes_and_timeouts() {
     assert!(m.batch_receipts && !b.batch_receipts);
     // the process options: none for dsip-msg, all for the browser
     assert_eq!(m.process, dsip_messaging_device::ProcessOptions::default());
-    assert!(b.process.leaf_device_in_check && b.process.recorder_content_unauthenticated && b.process.keep_call_records && b.process.store_proposals);
+    assert!(b.process.leaf_device_in_check && b.process.keep_call_records && b.process.store_proposals);
 }
 
 #[test]

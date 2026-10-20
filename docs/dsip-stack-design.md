@@ -272,6 +272,19 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    policy's read and played); grants, introductions (sealed to a `did:key`'s converted key too, which dsip-msg could
    not do), answering requests, and release, with the peer mailbox's connection left to the host as for KeyPackage
    fetches. The browser now opens activity a peer sends; it sends none, its policy's activity being off.
+   3j-3c: the events say what dsip-msg prints. A commit, a conflict (with the epoch it lost at), a re-proposal (a new
+   event) and a commit no longer needed name the operation; `sent` says whether the item went out after an outage,
+   and the outage's retry names the item waiting; a successor's due hand-over lists the pending items, and the
+   hand-over the new item each went out as; `removed` has the group's kind; a call event its direction;
+   `call_ended_item` returns the event sent with its item and whether the identity had it already; a request whether
+   it was sealed and whether its purpose was on the wire; a message its whole object and sending device; and a
+   conversation newly recorded, or no longer recorded, is an event (`recording`), as dsip-msg rendered it. One
+   difference is settled: content from a recorder leaf is dropped by both (C§5's **content**); dsip-msg also dropped a
+   recorder's other objects, which now are processed as any member's. Left for 3j-3d, where dsip-msg takes the
+   `Messenger`'s behaviour unless a demo shows a reason not to: the outbox following deposits from the first or from
+   the first failure; recording acceptance kept by conversation (dsip-msg kept it by group, migrated); declining a
+   recording; a re-join replacing the group; a second direct conversation with one peer; history and status across
+   conversations; the own-deposit digests never pruned; the default gap timeout (60 s or 300 s).
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
