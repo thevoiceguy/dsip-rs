@@ -1,11 +1,56 @@
-//! What a device records of its calls: the `call-event` in its personal group, and the `call-record` for its
-//! identity's record-keeper.
+//! What a device records of its calls: the `call-event` in its personal group, the call log of every device of the
+//! identity, and the `call-record` for its identity's record-keeper.
 //!
 //! Spec: M§13.3 (call events, spec-gap 63; the pinned `call_event_decision`), C§9 (call records, v0.13, spec-gaps
 //! 121 and 123; the pinned `call-record-outcome` order).
 
+use std::collections::BTreeMap;
+
 use dsip_messaging::checks::check_object;
 use serde_json::{json, Value};
+
+/// This identity's call log: one call event per session, whichever device reported it, the first kept (spec-gap 63),
+/// in the order they were recorded — the order the pinned `peer_timeline` keeps for calls at the same time.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct CallLog(Vec<Value>);
+
+impl CallLog {
+    /// A log saved by session (dsip-msg's format); its order is the sessions'.
+    pub fn from_map(map: BTreeMap<String, Value>) -> CallLog {
+        CallLog(map.into_values().collect())
+    }
+
+    /// The log by session (dsip-msg's format).
+    pub fn to_map(&self) -> BTreeMap<String, Value> {
+        self.0.iter().map(|e| (e["session"].as_str().unwrap_or("").to_string(), e.clone())).collect()
+    }
+
+    /// Record a call event, sent or received, live or from the archive; `false` when its session is already logged.
+    pub fn record(&mut self, event: &Value) -> bool {
+        if self.get(event["session"].as_str().unwrap_or("")).is_some() {
+            return false;
+        }
+        self.0.push(event.clone());
+        true
+    }
+
+    /// The call event logged for `session`.
+    pub fn get(&self, session: &str) -> Option<&Value> {
+        self.0.iter().find(|e| e["session"] == session)
+    }
+
+    /// Every call event logged, in order.
+    pub fn events(&self) -> &[Value] {
+        &self.0
+    }
+
+    /// The call events with `peer`, in order, as the pinned `peer_timeline` takes them (M§13.3: interleaved by peer
+    /// identity).
+    pub fn with_peer(&self, peer: &str) -> Vec<Value> {
+        self.0.iter().filter(|e| e["peer"] == peer).cloned().collect()
+    }
+}
 
 /// How one inbound leg ended, as the host saw it.
 pub struct Ended<'a> {

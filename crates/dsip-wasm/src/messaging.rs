@@ -45,7 +45,7 @@ use dsip_messaging_device::commits::{self, Answer, Change, Synced};
 use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
+use dsip_messaging_device::{archive, blob, calls, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
     Receipts, Retry, Route};
 use dsip_messaging_device::Config;
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
@@ -243,7 +243,7 @@ pub struct Messenger {
     /// The latest GroupInfo per group (M§6.8), base64url.
     group_info: BTreeMap<String, String>,
     /// Call events of this identity's devices, in personal-group order, one per `session` (M§13.3, spec-gap 63).
-    calls: Vec<Value>,
+    calls: CallLog,
     /// Seq gaps per group (M§6.5, spec-gap 69), and the items held behind them.
     gaps: BTreeMap<String, GapTracker>,
     held_items: BTreeMap<String, Vec<Value>>,
@@ -353,7 +353,7 @@ impl Messenger {
             archive_keys: st["archive_keys"].as_object().into_iter().flatten()
                 .map(|(a, v)| (a.clone(), (unb64(&v["key"]), v["created_at"].as_i64().unwrap_or(0)))).collect(),
             group_info: serde_json::from_value(st["group_info"].clone()).unwrap_or_default(),
-            calls: st["calls"].as_array().cloned().unwrap_or_default(),
+            calls: serde_json::from_value(st["calls"].clone()).unwrap_or_default(),
             gaps: BTreeMap::new(),
             held_items: serde_json::from_value(st["held_items"].clone()).unwrap_or_default(),
             retries: BTreeMap::new(),
@@ -697,7 +697,7 @@ impl Messenger {
             ended_by: leg["ended_by"].as_str().unwrap_or(""), reason: leg["reason"].as_str().unwrap_or("") };
         let Some(obj) = calls::call_event(&ended, now as i64) else { return Ok("[]".into()) };
         let personal = self.personal.clone().ok_or_else(|| JsValue::from_str("no personal group yet"))?;
-        self.record_call(&obj);
+        self.calls.record(&obj);
         Ok(json!([self.send_object(&personal, &obj, now as i64)?]).to_string())
     }
 
@@ -835,7 +835,7 @@ impl Messenger {
     pub fn timeline(&self, gid: &str) -> String {
         let thread: Vec<Value> = serde_json::from_str(&self.thread(gid)).unwrap_or_default();
         let peer = self.convs.get(gid).and_then(|c| c.peer.clone());
-        let calls: Vec<Value> = self.calls.iter().filter(|c| peer.as_deref().is_some_and(|p| c["peer"] == p)).cloned().collect();
+        let calls = peer.as_deref().map(|p| self.calls.with_peer(p)).unwrap_or_default();
         if calls.is_empty() {
             return json!(thread).to_string();
         }
@@ -2059,9 +2059,9 @@ impl Messenger {
                 // M§13.3: every device of the identity shows one entry per call, whichever device sent it
                 let key = self.config.object_key(&object);
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
-                let decisions = self.history.mls(gid, seq, epoch, &key);
+                let decisions = self.history.mls(gid, seq, epoch, &key, &object);
                 out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
-                let fresh = self.record_call(&object);
+                let fresh = self.calls.record(&object);
                 out.push(json!({"ui": "call_event", "session": object["session"], "peer": object["peer"], "outcome": object["outcome"],
                     "from_device": sender_device, "collapsed": !fresh}));
             }
@@ -2109,7 +2109,7 @@ impl Messenger {
                 self.batch.content(gid, seq, &object);
                 // M§12.2: what is shown from MLS is archived under the current key
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
-                let decisions = self.history.mls(gid, seq, epoch, &key);
+                let decisions = self.history.mls(gid, seq, epoch, &key, &object);
                 out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
                 out.push(json!({"ui": "message", "group": gid, "from": sender, "seq": seq, "kind": object["kind"], "text": object["text"], "sent_at": object["sent_at"],
                     "id": object["id"], "blobs": item["blobs"]}));
@@ -2329,15 +2329,6 @@ impl Messenger {
         self.successors.lineage(gid, self.convs.keys().map(String::as_str))
     }
 
-    /// Keep a call event unless one for its session is held (spec-gap 63: collapsed by `session`, the first kept).
-    fn record_call(&mut self, obj: &Value) -> bool {
-        if self.calls.iter().any(|c| c["session"] == obj["session"]) {
-            return false;
-        }
-        self.calls.push(obj.clone());
-        true
-    }
-
     /// M§10.2: delivered receipts are decided once per sync batch, per conversation; each is sent as an object.
     fn receipts_batch(&mut self, now: i64) -> Vec<Value> {
         let mut out = vec![];
@@ -2459,7 +2450,7 @@ impl Messenger {
         } else if decisions.iter().any(Decision::is_apply) {
             if obj["object"] == "call-event" {
                 // spec-gap 63: an archived call event goes to the call log, not the timeline's content
-                if self.record_call(&obj) {
+                if self.calls.record(&obj) {
                     out.push(json!({"ui": "call_event", "session": obj["session"], "peer": obj["peer"], "outcome": obj["outcome"], "from_archive": true}));
                 }
             } else {

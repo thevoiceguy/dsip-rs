@@ -57,7 +57,7 @@ use dsip_messaging_device::commits::{self, Answer, Built, Change, Synced};
 use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, Outbox, Outcome,
+use dsip_messaging_device::{archive, blob, calls, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, Outbox, Outcome,
     Receipts, Retry, Route};
 use dsip_messaging_device::Config;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
@@ -390,8 +390,8 @@ struct Client {
     sent_at: HashMap<String, i64>,
     /// Content and receipts opened from archive, waiting to be applied to their conversation (spec-gap 64).
     restored: Restored,
-    /// Call history by session, from the personal group (M§13.3; spec-gap 63).
-    calls: BTreeMap<String, Value>,
+    /// Call history, one event per session, from the personal group (M§13.3; spec-gap 63).
+    calls: CallLog,
     /// Seq gaps per group (M§6.5): what is held, and when the hold began (spec-gap 69).
     gaps: BTreeMap<String, GapTracker>,
     /// Items held behind a gap, by group, kept durably until the gap fills or this device re-joins.
@@ -2230,13 +2230,6 @@ impl Client {
         self.save_resume()
     }
 
-    /// Archive one object at `(group, seq)` under the current key (M§12.2); used for call events (spec-gap 63).
-    fn archive_object(&mut self, group: &str, obj: &Value, sender: &str, sender_device: &str, seq: i64) {
-        let (Some(akid), Some(conversation)) = (self.history.current_akid(), self.convs.get(group).map(|c| c.conversation.clone())) else { return };
-        let record = archive::record(&archive::Received { conversation: &conversation, group, seq, sender, sender_device, received_at: now_s() }, obj);
-        self.outbox.push((group.to_string(), Out::Archive { akid, record }));
-    }
-
     /// Archive the receipts at `seq` in a receipt batch, filed under the group each arrived in (M§12.2, spec-gap 64).
     fn archive_receipts(&mut self, items: &[Value], seq: i64) {
         let Some(akid) = self.history.current_akid() else { return };
@@ -2270,16 +2263,18 @@ impl Client {
         let personal = self.personal.clone().context("no personal group")?;
         let reply = self.send_object(&personal, &obj, json!({})).await?;
         anyhow::ensure!(reply["type"] == "accepted", "call-event refused: {}", reply["reason"]);
-        if self.calls.contains_key(session) {
+        if !self.calls.record(&obj) {
             println!("SENT-CALL-EVENT {} session={session} (already recorded)", obj["outcome"].as_str().unwrap_or(""));
         } else {
             println!("SENT-CALL-EVENT {} session={session}", obj["outcome"].as_str().unwrap_or(""));
-            self.calls.insert(session.to_string(), obj.clone());
-            self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls)?).map_err(Self::state_err)?;
-            let (me, device) = (self.identity.clone(), self.keys.device.did());
-            self.archive_object(&personal, &obj, &me, &device, reply["seq"].as_i64().unwrap_or(0));
-            self.flush_outbox().await?;
+            self.mls.provider().put_state("calls", &serde_json::to_value(self.calls.to_map())?).map_err(Self::state_err)?;
         }
+        // spec-gap 63: our call event is state, archived once by session whichever device reported it first
+        let seq = reply["seq"].as_i64().unwrap_or(0);
+        let decisions = self.history.sent(&personal, seq, &self.config.object_key(&obj), &obj);
+        let (me, device) = (self.identity.clone(), self.keys.device.did());
+        self.archive_requests(&personal, &decisions, &obj, &me, &device, seq);
+        self.flush_outbox().await?;
         Ok(())
     }
 
@@ -2294,7 +2289,7 @@ impl Client {
         let content: Vec<Value> = self.history.snapshot()["timeline"].as_array().into_iter().flatten().filter_map(Value::as_str)
             .filter(|k| conversations.iter().any(|c| k.starts_with(&format!("{c}|"))))
             .map(|k| json!({"id": k, "at": self.sent_at.get(k).copied().unwrap_or(0)})).collect();
-        let calls: Vec<Value> = self.calls.values().filter(|c| c["peer"] == json!(peer))
+        let calls: Vec<Value> = self.calls.with_peer(peer).iter()
             .map(|c| json!({"session": c["session"], "at": c["at"], "outcome": c["outcome"]})).collect();
         let t = dsip_messaging::client::peer_timeline(&json!({"content": content, "calls": calls}));
         let entries = t["timeline"].as_array().cloned().unwrap_or_default();
@@ -2334,10 +2329,9 @@ impl Client {
         }
         if e.iter().any(Decision::is_apply) && obj["object"] == "call-event" {
             let session = obj["session"].as_str().unwrap_or("").to_string();
-            if let std::collections::btree_map::Entry::Vacant(slot) = self.calls.entry(session) {
-                println!("HISTORY-CALL {} {} session={}", obj["outcome"].as_str().unwrap_or(""), obj["peer"].as_str().unwrap_or(""), slot.key());
-                slot.insert(obj.clone());
-                let _ = self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls).unwrap_or_default());
+            if self.calls.record(obj) {
+                println!("HISTORY-CALL {} {} session={session}", obj["outcome"].as_str().unwrap_or(""), obj["peer"].as_str().unwrap_or(""));
+                let _ = self.mls.provider().put_state("calls", &serde_json::to_value(self.calls.to_map()).unwrap_or_default());
             }
             return;
         }
@@ -2583,12 +2577,14 @@ impl Client {
             Some("call-event") => {
                 // M§13.3 (spec-gap 63): every alerted device may report the call; one entry per session
                 let session = object["session"].as_str().unwrap_or("").to_string();
-                if let std::collections::btree_map::Entry::Vacant(slot) = self.calls.entry(session.clone()) {
+                // it is state, archived once by session (spec-gap 63); one from before this device joined is not its own
+                let key = self.config.object_key(&object);
+                let decisions = self.history.mls(gid, seq, self.conv(gid)?.group.epoch().as_u64(), &key, &object);
+                self.archive_requests(gid, &decisions, &object, sender, sender_device, seq);
+                if self.calls.record(&object) {
                     println!("CALL {} {} {} session={session}", object["outcome"].as_str().unwrap_or(""),
                         object["direction"].as_str().unwrap_or(""), object["peer"].as_str().unwrap_or(""));
-                    slot.insert(object.clone());
-                    self.mls.provider().put_state("calls", &serde_json::to_value(&self.calls)?).map_err(Self::state_err)?;
-                    self.archive_object(gid, &object, sender, sender_device, seq);
+                    self.mls.provider().put_state("calls", &serde_json::to_value(self.calls.to_map())?).map_err(Self::state_err)?;
                 } else {
                     println!("DUP-CALL session={session} from {sender_device}");
                 }
@@ -2605,7 +2601,7 @@ impl Client {
             }
             Some("content") => {
                 let key = self.config.object_key(&object);
-                let decisions = self.history.mls(gid, seq, self.conv(gid)?.group.epoch().as_u64(), &key);
+                let decisions = self.history.mls(gid, seq, self.conv(gid)?.group.epoch().as_u64(), &key, &object);
                 if decisions.iter().any(|d| matches!(d, Decision::Duplicate(_))) {
                     println!("DUP-HISTORY seq={seq}");
                     return Ok(());
@@ -2723,7 +2719,7 @@ async fn main() -> Result<()> {
         lines: HashMap::new(),
         sent_at: HashMap::new(),
         restored: Restored::default(),
-        calls: get("calls")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
+        calls: get("calls")?.and_then(|v| serde_json::from_value(v).ok()).map(CallLog::from_map).unwrap_or_default(),
         gaps: BTreeMap::new(),
         held_items: get("held_items")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
         pending_blobs: get("pending_blobs")?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
