@@ -57,7 +57,7 @@ use dsip_messaging_device::commits::{self, Answer, Built, Change, Synced};
 use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
 use dsip_messaging_device::successors::{self, Converge, Create, Successors};
-use dsip_messaging_device::{archive, blob, calls, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, Outbox, Outcome,
+use dsip_messaging_device::{archive, blob, calls, first_contact, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, Outbox, Outcome,
     Receipts, Retry, Route};
 use dsip_messaging_device::Config;
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
@@ -634,43 +634,24 @@ impl Client {
         let class = item["class"].as_str().unwrap_or("");
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
-        let env = from_compact(item["envelope"].as_str().unwrap_or(""));
-        let checked = dsip_core::envelope::verify_raw(&env, &ctx, false).ok().filter(|ver| {
-            let from = ver.payload["from"].as_str().unwrap_or("");
-            ver.payload["type"] == class
-                && ver.payload["to"] == json!(self.identity)
-                // an introduction lives until its expires_at; a grant's delivery expiry has passed, its valid_until has not (§19.4)
-                && ver.payload[if class == "grant" { "valid_until" } else { "expires_at" }].as_i64().unwrap_or(0) >= now_s()
-                && dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, &ctx).ok()
-        });
-        let Some(ver) = checked else {
-            println!("DROP-{} {}: does not verify", class.to_uppercase(), item["cursor"]);
-            return Ok(());
-        };
-        let p = ver.payload;
-        let from = p["from"].as_str().unwrap_or("").to_string();
-        if class == "introduction" {
-            let opened = dsip_messaging::first_contact::open_sealed_introduction(&p, &self.keys.controller.seed());
-            if opened["verdict"] != "accept" {
-                println!("DROP-INTRODUCTION {} from {from}: {}", p["id"], opened["code"]);
-                return Ok(());
+        match first_contact::received(item, &self.identity, &ctx, now_s(), Some(&self.keys.controller.seed())) {
+            first_contact::Received::DoesNotVerify => println!("DROP-{} {}: does not verify", class.to_uppercase(), item["cursor"]),
+            first_contact::Received::BadIntroduction { id, from, code } => println!("DROP-INTRODUCTION \"{id}\" from {from}: \"{code}\""),
+            first_contact::Received::NoMessageScope { id, from } => println!("DROP-GRANT \"{id}\" from {from}: no dsip.message scope"),
+            first_contact::Received::Request(req) => {
+                let purpose = req.purpose.unwrap_or_default();
+                let env = from_compact(item["envelope"].as_str().unwrap_or(""));
+                let on_wire = String::from_utf8(dsip_core::b64::decode(&env.payload).unwrap_or_default()).unwrap_or_default();
+                println!("REQUEST {} from {}: \"{purpose}\" sealed={} purpose_on_wire={}", req.id, req.from, req.sealed,
+                    !purpose.is_empty() && on_wire.contains(&purpose));
+                self.requests.insert(req.id, req.payload);
+                self.mls.provider().put_state("requests", &json!(self.requests)).map_err(Self::state_err)?;
             }
-            let purpose = opened["purpose"].as_str().unwrap_or("").to_string();
-            let on_wire = String::from_utf8(dsip_core::b64::decode(&env.payload).unwrap_or_default()).unwrap_or_default();
-            let id = p["id"].as_str().unwrap_or("").to_string();
-            println!("REQUEST {id} from {from}: \"{purpose}\" sealed={} purpose_on_wire={}", p.get("sealed").is_some(),
-                !purpose.is_empty() && on_wire.contains(&purpose));
-            self.requests.insert(id, p);
-            self.mls.provider().put_state("requests", &json!(self.requests)).map_err(Self::state_err)?;
-        } else {
-            let scope = p["scope"].clone();
-            if !scope.as_array().is_some_and(|s| s.iter().any(|x| x == "dsip.message")) {
-                println!("DROP-GRANT {} from {from}: no dsip.message scope", p["id"]);
-                return Ok(());
+            first_contact::Received::Grant(g) => {
+                self.grants_held.insert(g.from.clone(), g.envelope);
+                self.mls.provider().put_state("grants_held", &json!(self.grants_held)).map_err(Self::state_err)?;
+                println!("GRANTED by {} scope={} request={}", g.from, g.scope, g.request);
             }
-            self.grants_held.insert(from.clone(), compact(&env));
-            self.mls.provider().put_state("grants_held", &json!(self.grants_held)).map_err(Self::state_err)?;
-            println!("GRANTED by {from} scope={scope} request={}", p["session"].as_str().unwrap_or(""));
         }
         Ok(())
     }
@@ -1840,18 +1821,18 @@ impl Client {
                     Ok(body) => body,
                     Err(e) => {
                         println!("BLOB-SOURCE-REJECTED {uri}: {e}");
-                        tried.push(json!({"uri": uri, "status": 0}));
+                        tried.push(blob::tried(uri, 0, None));
                         continue;
                     }
                 },
                 Ok(resp) => {
                     println!("BLOB-SOURCE-REJECTED {uri}: {}", resp.status());
-                    tried.push(json!({"uri": uri, "status": resp.status().as_u16()}));
+                    tried.push(blob::tried(uri, resp.status().as_u16(), None));
                     continue;
                 }
                 Err(e) => {
                     println!("BLOB-SOURCE-REJECTED {uri}: {e}");
-                    tried.push(json!({"uri": uri, "status": 0}));
+                    tried.push(blob::tried(uri, 0, None));
                     continue;
                 }
             };
@@ -1867,7 +1848,7 @@ impl Client {
                 Err(c) => {
                     println!("BLOB-SOURCE-REJECTED {uri}: {c}");
                     // a 200 that is not the content's blob: other bytes (M§8.4 rule 7)
-                    tried.push(json!({"uri": uri, "status": 200, "sha256": digest(&stored), "size": stored.len()}));
+                    tried.push(blob::tried(uri, 200, Some(&stored)));
                 }
             }
         }
@@ -1889,8 +1870,7 @@ impl Client {
                 object["session"].as_str().unwrap_or("-"), path.display()
             ),
             Fetched::Retry => {
-                // the mailbox replication schedule (spec-gap 67): 4 s, doubling, at most 60 s
-                let delay = (4i64 << (attempt - 1).clamp(0, 4)).min(60);
+                let delay = blob::retry_delay_s(attempt);
                 println!("AUDIO-PENDING {} attempt={attempt} retry_in={delay}", object["id"].as_str().unwrap_or(""));
                 self.pending_blobs.push(json!({"object": object, "blobs": blobs, "sender": sender, "attempt": attempt + 1,
                     "next_at": now_s() + delay}));
