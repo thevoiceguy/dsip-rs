@@ -42,8 +42,11 @@ use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::IdentityKeys;
 use dsip_messaging_device::commits::{self, Answer, Change, Synced};
-use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, Inbound, MemoryStore, Outbox, Outcome, ProcessOptions, Retry, Route};
-use dsip_messaging::client::{registration_on_removal, Client, GapTracker, History, MoveArrival, Resume, SuccessorTracker};
+use dsip_messaging_device::history::{self, Decision, Restored};
+use dsip_messaging_device::receipts::{self, Emission};
+use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
+    ProcessOptions, Receipts, Retry, Route};
+use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume, SuccessorTracker};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
@@ -79,7 +82,7 @@ struct Conv {
     /// The other identity of a direct conversation, once known.
     peer: Option<String>,
     /// M§10 receipts for this conversation (vector-pinned).
-    receipts: Client,
+    receipts: Receipts,
     /// The epoch this device joined at: items from before are history (M§12.3), not for this device's MLS state.
     joined_epoch: u64,
     /// Content and receipts of the sync batch being processed (M§10.2 decides per batch).
@@ -267,7 +270,7 @@ pub struct Messenger {
     /// Archive records under a key this device does not hold yet, by cursor, still sealed (M§12.3 step 5).
     held_archive: BTreeMap<String, Value>,
     /// Content and receipts opened from archive and waiting for their conversation to be joined (spec-gap 64).
-    restored: Vec<Value>,
+    restored: Restored,
     /// M§10.5: whether read watermarks are disclosed to the conversation (opt-in) or kept in the personal group.
     read_disclosed: bool,
     /// M§7.5: the successor groups this device knows of and converged on (vector-pinned, spec-gap 61).
@@ -361,9 +364,9 @@ impl Messenger {
             requests: serde_json::from_value(st["requests"].clone()).unwrap_or_default(),
             want_live: false,
             gap_timeout: 60,
-            history: History::new(&Value::Null),
+            history: History::default(),
             held_archive: serde_json::from_value(st["held_archive"].clone()).unwrap_or_default(),
-            restored: st["restored"].as_array().cloned().unwrap_or_default(),
+            restored: Restored::from_items(st["restored"].as_array().cloned().unwrap_or_default()),
             read_disclosed: st["read_disclosed"].as_bool().unwrap_or(false),
             successors: serde_json::from_value(st["successors"].clone()).unwrap_or_default(),
             handover: serde_json::from_value(st["handover"].clone()).unwrap_or_default(),
@@ -387,10 +390,9 @@ impl Messenger {
             m.outbox.restore_outage(gid, down_since.as_i64(), now_i);
         }
         // the history machine from what this device holds: its keys and the epochs it joined at
-        let keys: Vec<Value> = m.archive_keys.iter().map(|(a, (_, at))| json!({"akid": a, "created_at": at})).collect();
-        let joined: serde_json::Map<String, Value> = st["convs"].as_object().into_iter().flatten()
-            .map(|(g, c)| (g.clone(), c["joined_epoch"].clone())).collect();
-        m.history = History::new(&json!({"keys": keys, "joined": joined}));
+        let keys = m.archive_keys.iter().map(|(a, (_, at))| (a.as_str(), *at));
+        let joined = st["convs"].as_object().into_iter().flatten().map(|(g, c)| (g.as_str(), c["joined_epoch"].as_u64().unwrap_or(0)));
+        m.history = History::new(keys, joined);
         // the groups: reloaded from the MLS storage by id, with what this device knew about each
         for (gid, c) in st["convs"].as_object().into_iter().flatten() {
             let Some(group) = m.mls.load_group(&dsip_core::b64::decode(gid).unwrap_or_default()).ok().flatten() else { continue };
@@ -420,7 +422,7 @@ impl Messenger {
         json!({"mls": mls, "state": {
             "convs": convs, "personal": self.personal, "resume": self.resume.snapshot(), "own": self.own, "outbox": self.outbox.items,
             "messages": self.messages, "grants_held": self.grants_held, "archive_keys": archive, "group_info": self.group_info,
-            "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored,
+            "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored.items(),
             "read_disclosed": self.read_disclosed, "calls": self.calls,
             "outages": self.outbox.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
             "hub_timeout": self.outbox.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
@@ -461,11 +463,12 @@ impl Messenger {
         // content it had shown is restored into it as history (spec-gap 64: nothing is sent or archived again).
         // Receipts booked so far are not carried over; they arrive again only if re-sent, so the marks reset.
         let me = self.keys.identity.clone();
+        let policy = json!({"delivered": true, "read": disclosed, "played": disclosed});
         for (gid, c) in self.convs.iter_mut() {
-            let mut fresh = Client::new(&json!({"now": now as i64, "me": me, "member_identities": 2, "policy": {"delivered": true, "read": disclosed, "played": disclosed}}));
+            let mut fresh = Receipts::new(&me, &policy, now as i64);
             let items: Vec<Value> = self.messages.iter().filter(|m| m["group"] == *gid && m["seq"].is_i64())
                 .map(|m| json!({"seq": m["seq"], "object": m["object"]})).collect();
-            let _ = fresh.step(&json!({"restore": {"items": items}}));
+            let _ = fresh.restore(now as i64, items);
             c.receipts = fresh;
         }
     }
@@ -476,8 +479,7 @@ impl Messenger {
     pub fn read_through(&mut self, gid: &str, content_id: &str, now: f64) -> String {
         let now_i = now as i64;
         let Some(c) = self.convs.get_mut(gid) else { return "[]".into() };
-        c.receipts.step(&json!({"advance": (now_i - c.receipts.now()).max(0)}));
-        let emissions = c.receipts.step(&json!({"read": {"through": content_id}}));
+        let emissions = c.receipts.read(now_i, &json!(content_id));
         json!(self.receipt_sends(gid, emissions, now_i)).to_string()
     }
 
@@ -486,10 +488,7 @@ impl Messenger {
         let now_i = now as i64;
         let mut out = vec![];
         for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
-            let emissions = {
-                let c = self.convs.get_mut(&gid).expect("group");
-                c.receipts.step(&json!({"advance": (now_i - c.receipts.now()).max(0)}))
-            };
+            let emissions = self.convs.get_mut(&gid).expect("group").receipts.at(now_i);
             out.extend(self.receipt_sends(&gid, emissions, now_i));
         }
         // M§9.4: a deposit with no answer at all counts as the hub unreachable
@@ -918,8 +917,7 @@ impl Messenger {
     pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> String {
         let now_i = now as i64;
         let Some(c) = self.convs.get_mut(gid) else { return "[]".into() };
-        c.receipts.step(&json!({"advance": (now_i - c.receipts.now()).max(0)}));
-        let emissions = c.receipts.step(&json!({"play": {"id": content_id}}));
+        let emissions = c.receipts.play(now_i, content_id);
         json!(self.receipt_sends(gid, emissions, now_i)).to_string()
     }
 
@@ -1312,9 +1310,8 @@ impl Messenger {
         Context::new(now, &self.resolver)
     }
 
-    fn new_receipts(&self, now: i64) -> Client {
-        Client::new(&json!({"now": now, "me": self.keys.identity, "member_identities": 2,
-            "policy": {"delivered": true, "read": self.read_disclosed, "played": self.read_disclosed}}))
+    fn new_receipts(&self, now: i64) -> Receipts {
+        Receipts::new(&self.keys.identity, &json!({"delivered": true, "read": self.read_disclosed, "played": self.read_disclosed}), now)
     }
 
 
@@ -1558,7 +1555,7 @@ impl Messenger {
                 if kind == "personal" {
                     self.personal = Some(gid.clone());
                 }
-                self.history.step(&json!({"joined": {"group": gid, "epoch": epoch}}));
+                self.history.joined(&gid, epoch);
                 if let Some(seq) = p["seq"].as_i64() {
                     self.resume.sent(&gid, seq);
                     self.gap_of_from(&gid, seq).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
@@ -1634,7 +1631,7 @@ impl Messenger {
                     let akid = self.fresh_id(now);
                     let key = KeyPair::generate().seed(); // 32 random bytes (M§12.1)
                     self.archive_keys.insert(akid.clone(), (key.to_vec(), now));
-                    self.history.step(&json!({"archive_key": {"akid": akid, "created_at": now}})); // the current key, from now on
+                    self.history.archive_key(&akid, now); // the current key, from now on
                     let obj = json!({"object": "archive-key", "akid": akid, "key": b64(&key), "created_at": now});
                     match self.send_object(&g, &obj, now) {
                         Ok(f) => out.push(json!({"send": f})),
@@ -1646,28 +1643,15 @@ impl Messenger {
             Pending::Application { gid, item } => {
                 let obj = self.outbox.item(&gid, &item).map(|i| i["obj"].clone());
                 self.outbox.remove(&gid, &item);
-                if let (Some(obj), Some(seq)) = (obj.clone().filter(|o| o["object"] == "content"), p["seq"].as_i64()) {
-                    if let Some(c) = self.convs.get_mut(&gid) {
-                        // M§10.2: our own content enters the receipts machine at its hub seq, so receipts for it are booked
-                        c.receipts.step(&json!({"advance": (now - c.receipts.now()).max(0)}));
-                        c.receipts.step(&json!({"sync": {"items": [{"seq": seq, "object": obj}]}}));
-                    }
-                    // M§12.2 (spec-gap 51): our own content is archived under the seq of its accepted
-                    let key = format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""));
-                    let emissions = self.history.step(&json!({"sent": {"group": gid, "seq": seq, "id": key, "object": "content"}}));
+                if let (Some(obj), Some(seq)) = (obj, p["seq"].as_i64()) {
+                    // M§10.2: our own content enters the receipts machine at its hub seq, so receipts for it are booked
+                    let emissions = self.convs.get_mut(&gid).map(|c| c.receipts.own(now, seq, &obj)).unwrap_or_default();
+                    out.extend(self.receipt_sends(&gid, emissions, now));
+                    // M§12.2: our own content is archived under the seq of its accepted (spec-gap 51); our read watermark
+                    // (spec-gap 68) and call events (spec-gap 63) too, as state for a device added later
+                    let decisions = self.history.sent(&gid, seq, &object_key(&obj), &obj);
                     let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
-                    out.extend(self.archive_requests(&gid, &emissions, &obj, &me, &dev, seq, now));
-                } else if let (Some(obj), Some(seq)) = (obj.clone().filter(|o| o["object"] == "call-event"), p["seq"].as_i64()) {
-                    // spec-gap 63: a call event is archived like a read watermark, state for a device added later
-                    let emissions = self.history.step(&json!({"sent": {"group": gid, "seq": seq, "id": object_key(&obj), "object": "call-event"}}));
-                    let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
-                    out.extend(self.archive_requests(&gid, &emissions, &obj, &me, &dev, seq, now));
-                } else if let (Some(obj), Some(seq)) = (obj.filter(|o| o["object"] == "receipt" && o["kind"] == "read"), p["seq"].as_i64()) {
-                    // spec-gap 68: our own read watermark is history too, under the group it went to
-                    let key = format!("{}:{}", obj["conversation"].as_str().unwrap_or(""), obj["id"].as_str().unwrap_or(""));
-                    let emissions = self.history.step(&json!({"sent": {"group": gid, "seq": seq, "id": key, "object": "receipt"}}));
-                    let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
-                    out.extend(self.archive_requests(&gid, &emissions, &obj, &me, &dev, seq, now));
+                    out.extend(self.archive_requests(&gid, &decisions, &obj, &me, &dev, seq, now));
                 }
                 if let Some(seq) = p["seq"].as_i64() {
                     // spec-gap 47: our own copy is processed by its accepted seq
@@ -1931,7 +1915,7 @@ impl Messenger {
                 if kind == "personal" {
                     self.personal = Some(group.clone());
                 }
-                self.history.step(&json!({"joined": {"group": group, "epoch": epoch}}));
+                self.history.joined(&group, epoch);
                 // M§6.6: confirm the pending registration
                 let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": group, "state": "joined"}]}), now);
                 out.push(json!({"send": env.frame()}));
@@ -2025,8 +2009,8 @@ impl Messenger {
                 let fresh = !self.archive_keys.contains_key(&akid);
                 self.archive_keys.entry(akid.clone()).or_insert((unb64(&object["key"]), created));
                 // M§12.3 step 5 (spec-gap 51): records kept for this key open now
-                let decisions = self.history.step(&json!({"archive_key": {"akid": akid, "created_at": created}}));
-                let _ = decisions;
+                // what the machine held for this key is released from held_archive below
+                let _ = self.history.archive_key(&akid, created);
                 let release: Vec<String> = self.held_archive.iter().filter(|(_, h)| h["akid"] == json!(akid)).map(|(c, _)| c.clone()).collect();
                 for c in release {
                     if let Some(h) = self.held_archive.remove(&c) {
@@ -2039,8 +2023,8 @@ impl Messenger {
                 // M§13.3: every device of the identity shows one entry per call, whichever device sent it
                 let key = object_key(&object);
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
-                let emissions = self.history.step(&json!({"mls": {"group": gid, "seq": seq, "epoch": epoch, "id": key}}));
-                out.extend(self.archive_requests(gid, &emissions, &object, sender, sender_device, seq, now));
+                let decisions = self.history.mls(gid, seq, epoch, &key);
+                out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
                 let fresh = self.record_call(&object);
                 out.push(json!({"ui": "call_event", "session": object["session"], "peer": object["peer"], "outcome": object["outcome"],
                     "from_device": sender_device, "collapsed": !fresh}));
@@ -2063,9 +2047,8 @@ impl Messenger {
             Some("receipt") => {
                 if let Some(c) = self.convs.get_mut(gid) {
                     let batch = json!({"seq": seq, "object": object, "src": gid, "sender_device": sender_device});
-                    c.receipts.step(&json!({"advance": (now - c.receipts.now()).max(0)}));
-                    let emissions = c.receipts.step(&json!({"sync": {"items": [batch]}}));
-                    out.extend(emissions.into_iter().filter_map(|e| e.get("send").cloned()).map(|s| json!({"receipt_send": {"group": gid, "send": s}})));
+                    let emissions = c.receipts.sync(now, vec![batch]);
+                    out.extend(self.receipt_sends(gid, emissions, now));
                 }
                 out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
             }
@@ -2083,8 +2066,8 @@ impl Messenger {
                 }
                 // M§12.2: what is shown from MLS is archived under the current key
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
-                let emissions = self.history.step(&json!({"mls": {"group": gid, "seq": seq, "epoch": epoch, "id": key}}));
-                out.extend(self.archive_requests(gid, &emissions, &object, sender, sender_device, seq, now));
+                let decisions = self.history.mls(gid, seq, epoch, &key);
+                out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
                 out.push(json!({"ui": "message", "group": gid, "from": sender, "seq": seq, "kind": object["kind"], "text": object["text"], "sent_at": object["sent_at"],
                     "id": object["id"], "blobs": item["blobs"]}));
             }
@@ -2335,24 +2318,18 @@ impl Messenger {
             if items.is_empty() {
                 continue;
             }
-            let emissions = {
-                let c = self.convs.get_mut(&gid).expect("group");
-                c.receipts.step(&json!({"advance": (now - c.receipts.now()).max(0)}));
-                c.receipts.step(&json!({"sync": {"items": items}}))
-            };
+            let emissions = self.convs.get_mut(&gid).expect("group").receipts.sync(now, items.clone());
             // M§12.2 (spec-gap 64): a receipt that changed rendering is archived under the group it arrived in
-            for e in emissions.iter().filter_map(|e| e.get("archive")) {
-                if let Some(seq) = e["seq"].as_i64() {
-                    let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
-                    for it in items.iter().filter(|it| it["seq"] == json!(seq) && it["object"]["object"] == "receipt") {
-                        let src = it["src"].as_str().unwrap_or(&gid).to_string();
-                        let sender = s_of(&it["object"]["sender"]);
-                        let sender_device = it["sender_device"].as_str().unwrap_or("").to_string();
-                        let (sender, sender_device) = if sender.is_empty() { (me.clone(), dev.clone()) } else { (sender, sender_device) };
-                        let decisions = vec![json!({"archive": {"group": src, "seq": seq, "akid": self.history.current_akid()}})];
-                        if self.history.current_akid().is_some() {
-                            out.extend(self.archive_requests(&src, &decisions, &it["object"], &sender, &sender_device, seq, now));
-                        }
+            for seq in emissions.iter().filter_map(|e| if let Emission::Archive(seq) = e { Some(*seq) } else { None }) {
+                let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
+                for it in receipts::archived(&items, seq) {
+                    let src = it["src"].as_str().unwrap_or(&gid).to_string();
+                    let sender = s_of(&it["object"]["sender"]);
+                    let sender_device = it["sender_device"].as_str().unwrap_or("").to_string();
+                    let (sender, sender_device) = if sender.is_empty() { (me.clone(), dev.clone()) } else { (sender, sender_device) };
+                    if let Some(akid) = self.history.current_akid() {
+                        let decisions = [Decision::Archive { group: src.clone(), seq, akid }];
+                        out.extend(self.archive_requests(&src, &decisions, &it["object"], &sender, &sender_device, seq, now));
                     }
                 }
             }
@@ -2363,12 +2340,13 @@ impl Messenger {
 
     /// Send what a conversation's receipts machine asked for: a receipt object to the conversation, or — an
     /// undisclosed read watermark — to the personal group (M§10.5, spec-gap 52).
-    fn receipt_sends(&mut self, gid: &str, emissions: Vec<Value>, now: i64) -> Vec<Value> {
+    fn receipt_sends(&mut self, gid: &str, emissions: Vec<Emission>, now: i64) -> Vec<Value> {
         let mut out = vec![];
         for e in emissions {
-            let Some(send) = e.get("send") else { continue };
-            let Some(kind) = send["receipt"].as_str() else { continue };
-            let target = if send["to"] == "personal" {
+            // activity is not sent from the browser; an archive decision is the batch's (receipts_batch)
+            let Emission::Receipt(receipt) = e else { continue };
+            let kind = receipt.kind.as_str();
+            let target = if receipt.personal {
                 match self.personal.clone() {
                     Some(p) => p,
                     None => { out.push(json!({"ui": "read_private_kept", "group": gid})); continue; }
@@ -2382,17 +2360,12 @@ impl Messenger {
                 continue;
             }
             let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).unwrap_or_default();
-            let mut obj = json!({"object": "receipt", "id": self.fresh_id(now), "conversation": conversation, "sender": self.keys.identity,
-                "sent_at": now, "kind": kind});
-            for k in ["targets", "through"] {
-                if let Some(v) = send.get(k) {
-                    obj[k] = v.clone();
-                }
-            }
+            let id = self.fresh_id(now);
+            let obj = receipt.object(&conversation, &self.keys.identity, &id, now);
             match self.send_object(&target, &obj, now) {
                 Ok(f) => {
                     out.push(json!({"send": f}));
-                    out.push(json!({"ui": "receipt_sent", "group": gid, "kind": kind, "targets": send["targets"], "through": send["through"],
+                    out.push(json!({"ui": "receipt_sent", "group": gid, "kind": kind, "targets": receipt.targets, "through": receipt.through,
                         "via": if target == gid { "conversation" } else { "personal group" }}));
                 }
                 Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default()})),
@@ -2404,13 +2377,12 @@ impl Messenger {
     /// Archive records the history machine asked for (M§12.2): each sealed under its key, AAD `group_id ‖ seq`, and
     /// deposited to this identity's mailbox as `class: archive`.
     #[allow(clippy::too_many_arguments)] // the record's fields, named as M§12.2 names them
-    fn archive_requests(&mut self, gid: &str, emissions: &[Value], obj: &Value, sender: &str, sender_device: &str, seq: i64, now: i64) -> Vec<Value> {
+    fn archive_requests(&mut self, gid: &str, decisions: &[Decision], obj: &Value, sender: &str, sender_device: &str, seq: i64, now: i64) -> Vec<Value> {
         let mut out = vec![];
         let Some(conversation) = self.convs.get(gid).map(|c| c.conversation.clone()) else { return out };
-        for a in emissions.iter().filter_map(|e| e.get("archive")) {
-            let akid = s_of(&a["akid"]);
+        let at = archive::Received { conversation: &conversation, group: gid, seq, sender, sender_device, received_at: now };
+        for (akid, record) in history::archive_records(decisions, &at, obj) {
             let Some((key, _)) = self.archive_keys.get(&akid).cloned() else { continue };
-            let record = archive::record(&archive::Received { conversation: &conversation, group: gid, seq, sender, sender_device, received_at: now }, obj);
             let key: [u8; 32] = match key.as_slice().try_into() { Ok(k) => k, Err(_) => continue };
             let nonce: [u8; 12] = KeyPair::generate().seed()[..12].try_into().expect("12 bytes");
             let Some(fields) = archive::seal_record(&key, &nonce, &akid, &record) else { continue };
@@ -2428,7 +2400,7 @@ impl Messenger {
         if !self.archive_keys.contains_key(&akid) {
             let cursor = s_of(&item["cursor"]);
             self.held_archive.insert(cursor.clone(), item.clone());
-            self.history.step(&json!({"archive": {"cursor": cursor, "akid": akid, "group": item["group"], "seq": item["seq"]}}));
+            self.history.held(item);
             return vec![json!({"ui": "archive_held", "cursor": cursor, "akid": akid})];
         }
         self.open_archive(item, now)
@@ -2451,22 +2423,22 @@ impl Messenger {
         };
         let obj = opened.record["payload"].clone();
         let key_id = object_key(&obj);
-        let decisions = self.history.step(&archive::history_event(item, &opened, &key_id));
+        let decisions = self.history.opened(item, &opened, &key_id);
         let (gid, seq, record) = (opened.group, opened.seq, opened.record);
         let sender = s_of(&record["sender"]);
-        if decisions.iter().any(|d| d.get("show").is_some()) && self.shown.insert(key_id.clone()) {
+        if decisions.iter().any(Decision::is_show) && self.shown.insert(key_id.clone()) {
             self.messages.push(json!({"group": gid, "key": key_id, "sender": sender, "sender_device": record["sender_device"], "object": obj,
                 "seq": seq, "mine": sender == self.keys.identity, "item": null, "from_archive": true}));
-            self.restored.push(json!({"seq": seq, "object": obj, "conversation": obj["conversation"]}));
+            self.restored.push(seq, &obj);
             out.push(json!({"ui": "history", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"], "text": obj["text"]}));
-        } else if decisions.iter().any(|d| d.get("apply").is_some()) {
+        } else if decisions.iter().any(Decision::is_apply) {
             if obj["object"] == "call-event" {
                 // spec-gap 63: an archived call event goes to the call log, not the timeline's content
                 if self.record_call(&obj) {
                     out.push(json!({"ui": "call_event", "session": obj["session"], "peer": obj["peer"], "outcome": obj["outcome"], "from_archive": true}));
                 }
             } else {
-                self.restored.push(json!({"seq": seq, "object": obj, "conversation": obj["conversation"]}));
+                self.restored.push(seq, &obj);
                 out.push(json!({"ui": "history_receipt", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"]}));
             }
         }
@@ -2477,24 +2449,13 @@ impl Messenger {
     /// Restored content and receipts are applied to their conversation's receipt state as history once this device
     /// is in that conversation (spec-gap 64); the rest wait.
     fn apply_restored(&mut self, now: i64) -> Vec<Value> {
-        let mut by_group: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-        let mut waiting = vec![];
-        for r in std::mem::take(&mut self.restored) {
-            let conversation = r["conversation"].clone();
-            let target = self.convs.iter().filter(|(_, c)| json!(c.conversation) == conversation)
-                .min_by_key(|(_, c)| c.kind == "personal").map(|(g, _)| g.clone());
-            match target {
-                Some(g) => by_group.entry(g).or_default().push(r),
-                None => waiting.push(r),
-            }
-        }
-        self.restored = waiting;
+        let groups = self.convs.iter().map(|(g, c)| (g.as_str(), c.conversation.as_str(), c.kind == "personal"));
         let mut out = vec![];
-        for (g, items) in by_group {
+        for (g, items) in self.restored.ready(groups) {
             let Some(c) = self.convs.get_mut(&g) else { continue };
-            c.receipts.step(&json!({"advance": (now - c.receipts.now()).max(0)}));
             let n = items.len();
-            let _ = c.receipts.step(&json!({"restore": {"items": items}}));
+            let emissions = c.receipts.restore(now, items);
+            out.extend(self.receipt_sends(&g, emissions, now));
             out.push(json!({"ui": "history_applied", "group": g, "items": n}));
         }
         out
