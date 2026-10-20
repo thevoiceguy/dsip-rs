@@ -2416,11 +2416,12 @@ impl Client {
         };
         let r = resolver(&self.resolver_files);
         let ctx = self.ctx(&r);
-        let before = self.resume.clone();
         let crash = std::mem::take(&mut self.crash_next);
         let mut slot = if class == "welcome" { None } else { self.convs.remove(&gid) };
-        let (mls, resume, me) = (&self.mls, &mut self.resume, self.identity.as_str());
-        let result = mls.provider().atomically(|| {
+        let (mls, me) = (&self.mls, self.identity.as_str());
+        let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
+                                     gap_timeout: self.gap_timeout };
+        let result = delivery.commit_processed(mls.provider(), item, self.config.roll_back_unprocessable, || {
             let target = slot.as_mut().map(|c| {
                 let Conv { group, conversation, kind, .. } = c;
                 (group, conversation.as_str(), kind.as_str())
@@ -2432,9 +2433,6 @@ impl Client {
                 let _ = std::io::stdout().flush();
                 std::process::exit(137);
             }
-            // A sibling's welcome is acknowledged without counting as a join (spec-gap 51).
-            resume.commit(item, matches!(outcome, Outcome::NotForDevice));
-            mls.provider().put_state("resume", &resume.snapshot())?;
             Ok(outcome)
         });
         if let Some(c) = slot {
@@ -2444,16 +2442,15 @@ impl Client {
             Ok(o) => o,
             Err(e) => {
                 // Rolled back: OpenMLS's in-memory group may be ahead of the database, so reload it.
-                self.resume = before;
                 if let Some(c) = self.convs.get_mut(&gid) {
                     if let Some(g) = self.mls.load_group(&dsip_core::b64::decode(&gid).unwrap_or_default()).map_err(Self::state_err)? {
                         c.group = g;
                     }
                 }
-                // Not processable at all (not a duplicate by seq): record it as handled so it is acknowledged.
+                // Committed as handled (spec-gap 138), so it is acknowledged; what it released is still processed.
                 println!("?? unprocessable {class} {cursor}: {e}");
-                self.resume.commit(item, false);
-                return self.save_resume();
+                self.save_resume()?;
+                return self.released(released).await;
             }
         };
         match outcome {
@@ -2538,8 +2535,12 @@ impl Client {
             // dsip-msg does not store proposals (ProcessOptions::store_proposals is off)
             Outcome::Nothing | Outcome::Proposal { .. } => {}
         }
+        self.released(released).await
+    }
+
+    /// The gap filled: what was waiting behind it is processed now, in seq order (M§6.5, spec-gap 69).
+    async fn released(&mut self, released: Vec<Value>) -> Result<()> {
         for held in released {
-            // the gap filled: what was waiting behind it is processed now, in seq order
             println!("RELEASED {} seq={}", held["class"].as_str().unwrap_or(""), held["seq"]);
             Box::pin(self.item(&held)).await?;
         }

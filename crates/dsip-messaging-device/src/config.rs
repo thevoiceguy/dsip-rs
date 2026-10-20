@@ -4,7 +4,8 @@
 //!
 //! Spec: M§8.5 (duplicates collapse), M§9.4 (no answer at all: the hub unreachable), M§6.5 ("if still needed"), M§7.2
 //! (a welcome for the devices an Add adds), M§7.5 (the last roster this device processed), M§12.1 (archive keys),
-//! M§6.5 (a gap that does not fill in time: the device re-joins, M§6.8; spec-gap 69).
+//! M§6.5 (a gap that does not fill in time: the device re-joins, M§6.8; spec-gap 69), M§5.4 (an item that cannot be
+//! processed: spec-gaps 44 and 138).
 //!
 //! Impl: none of these is a reading of the spec the other contradicts; each is a choice the spec leaves to the device
 //! (the no-answer timeout is spec-gap 72's). They are listed with the rest in `impl/docs/dsip-stack-design.md` §6.
@@ -61,6 +62,9 @@ pub struct Config {
     /// Whether a seq gap that has not filled in time makes this device re-join by external commit (dsip-msg), or it
     /// stays held and reported (browser).
     pub rejoin_gaps: bool,
+    /// Whether an item that fails processing is rolled back with its delivery state and then committed as handled, so
+    /// it is acknowledged (dsip-msg), or left as processing left it, uncommitted (browser).
+    pub roll_back_unprocessable: bool,
 }
 
 impl Config {
@@ -73,6 +77,7 @@ impl Config {
         roster: Roster::AllLeaves,
         replace_archive_keys: true,
         rejoin_gaps: true,
+        roll_back_unprocessable: true,
     };
 
     /// What the browser did.
@@ -84,6 +89,7 @@ impl Config {
         roster: Roster::Authenticated,
         replace_archive_keys: false,
         rejoin_gaps: false,
+        roll_back_unprocessable: false,
     };
 
     /// The key `obj` is shown and deduplicated by.

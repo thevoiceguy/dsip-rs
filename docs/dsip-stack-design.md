@@ -226,6 +226,14 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    says whether the device then re-joins by external commit. M§6.5 says it does, so the browser's `false` is a
    shortfall to close rather than a choice: its gap trackers now keep wall time like dsip-msg's, so turning the option
    on, with a web test of it, is what is left.
+   3i-3: an item that cannot be processed. Processing an item and committing it with the delivery state is now
+   `Inbound::commit_processed`. With `Config::roll_back_unprocessable`, a failure rolls back both (spec-gap 44) and the
+   item is then committed as handled, so it is acknowledged rather than redelivered after every sync (spec-gap 138,
+   drafted). dsip-msg had this; the browser keeps its `false` (no rollback; the item uncommitted) until the option is
+   turned on there with a web test, as with the gap timeout. One fix came with it: when the item that filled a seq gap
+   could not be processed, the held items it released were dropped, since routing had already taken them out of the
+   held items. With the rollback they are now processed as after any other item; the browser still drops them while
+   its option is off.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

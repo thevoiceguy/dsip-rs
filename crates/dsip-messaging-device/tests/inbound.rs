@@ -1,8 +1,9 @@
 //! Inbound routing, shared by both messaging clients: where each item goes before MLS, and what the delivery state
 //! records for it — the classes that need no processing committed, a device's own deposit and pre-join history
-//! skipped, a handshake beyond a seq gap held and released when the gap fills, and a removal clearing the group.
+//! skipped, a handshake beyond a seq gap held and released when the gap fills, a removal clearing the group, and an
+//! item committed with its MLS effect or, when it cannot be processed, rolled back and committed as handled.
 //!
-//! Spec: M§5.4, M§6.5 (spec-gaps 47, 69), M§8.5, M§11.2, M§12.3.
+//! Spec: M§5.4 (spec-gaps 44, 138), M§6.5 (spec-gaps 47, 69), M§8.5, M§11.2, M§12.3.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -13,8 +14,8 @@ use dsip_core::delegation::delegation_payload;
 use dsip_core::envelope::sign;
 use dsip_core::keys::KeyPair;
 use dsip_messaging::client::Resume;
-use dsip_messaging_device::{Inbound, Route};
-use dsip_mls::Device;
+use dsip_messaging_device::{Inbound, MemoryStore, Outcome, Route, Store};
+use dsip_mls::{Device, MlsError};
 
 const NOW: i64 = 1_790_000_000;
 const G: &str = "Z3JvdXAtMQ";
@@ -141,4 +142,50 @@ fn a_gap_that_does_not_fill_is_re_joined() {
     assert_eq!(p.route(&item("c8", "application", 8, b"msg"), true, false), Route::Duplicate);
     // and only once
     assert!(p.inbound().gap_timeouts(NOW + 600).is_empty());
+}
+
+#[test]
+fn a_processed_item_is_committed_with_the_delivery_state_in_one_transaction() {
+    let mut p = Parts::new(json!({}));
+    let store = MemoryStore::default();
+    let it = item("c:1", "application", 1, b"x");
+    let out = p.inbound().commit_processed(&store, &it, true, || {
+        store.put("mls-write", &json!(1))?;
+        Ok(Outcome::Nothing)
+    });
+    assert!(matches!(out, Ok(Outcome::Nothing)));
+    assert_eq!(p.cursor(), json!("c:1"));
+    assert_eq!(store.get("resume").unwrap(), Some(p.resume.snapshot()));
+    assert_eq!(store.get("mls-write").unwrap(), Some(json!(1)));
+}
+
+#[test]
+fn an_unprocessable_item_is_rolled_back_then_committed_as_handled() {
+    let mut p = Parts::new(json!({}));
+    let store = MemoryStore::default();
+    let it = item("c:1", "application", 1, b"x");
+    let out = p.inbound().commit_processed(&store, &it, true, || {
+        store.put("mls-write", &json!(1))?;
+        Err(MlsError("cannot decrypt".into()))
+    });
+    assert_eq!(out.unwrap_err().0, "cannot decrypt");
+    // spec-gap 44: nothing it wrote survives; spec-gap 138: acknowledged, and its redelivery is a duplicate
+    assert_eq!(store.get("mls-write").unwrap(), None);
+    assert_eq!(p.cursor(), json!("c:1"));
+    assert_eq!(p.route(&it, true, false), Route::Duplicate);
+}
+
+#[test]
+fn without_roll_back_an_unprocessable_item_stays_uncommitted() {
+    let mut p = Parts::new(json!({}));
+    let store = MemoryStore::default();
+    let it = item("c:1", "application", 1, b"x");
+    let out = p.inbound().commit_processed(&store, &it, false, || {
+        store.put("mls-write", &json!(1))?;
+        Err(MlsError("cannot decrypt".into()))
+    });
+    assert!(out.is_err());
+    assert_eq!(store.get("mls-write").unwrap(), Some(json!(1)));
+    assert_eq!(p.cursor(), Value::Null);
+    assert!(!p.resume.is_duplicate(&it));
 }
