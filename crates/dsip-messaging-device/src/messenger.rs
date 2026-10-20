@@ -50,6 +50,7 @@ use crate::{archive, blob, calls, first_contact, key_packages, CallLog, process,
 use crate::{Config, Store};
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
 use dsip_messaging::verify::verify_frame;
+use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
 use openmls::prelude::tls_codec::Serialize as _;
@@ -280,6 +281,8 @@ pub struct Messenger<S: Store = MemoryStore> {
     restored: Restored,
     /// M§10.5: whether read watermarks are disclosed to the conversation (opt-in) or kept in the personal group.
     read_disclosed: bool,
+    /// What this device discloses (M§10.5, M§11): the receipts machine's policy, `{delivered, read, played, activity}`.
+    policy: Value,
     /// M§7.5: the successor groups this device knows of and converged on (vector-pinned, spec-gap 61).
     successors: Successors,
     /// Objects of an abandoned group's outbox, by the group they go to: the dead group until its successor exists,
@@ -390,6 +393,10 @@ impl<S: Store> Messenger<S> {
             held_archive: serde_json::from_value(st["held_archive"].clone()).unwrap_or_default(),
             restored: Restored::from_items(st["restored"].as_array().cloned().unwrap_or_default()),
             read_disclosed: st["read_disclosed"].as_bool().unwrap_or(false),
+            policy: st.get("policy").filter(|p| p.is_object()).cloned().unwrap_or_else(|| {
+                let d = st["read_disclosed"].as_bool().unwrap_or(false);
+                json!({"delivered": true, "read": d, "played": d})
+            }),
             successors: serde_json::from_value(st["successors"].clone()).unwrap_or_default(),
             handover: serde_json::from_value(st["handover"].clone()).unwrap_or_default(),
             moved_from: st["mailbox"].as_str().filter(|d| *d != mailbox_did).map(String::from),
@@ -443,7 +450,7 @@ impl<S: Store> Messenger<S> {
             "convs": convs, "personal": self.personal, "resume": self.resume.snapshot(), "own": self.own, "outbox": self.outbox.items,
             "messages": self.messages, "grants_held": self.grants_held, "archive_keys": archive, "group_info": self.group_info,
             "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored.items(),
-            "read_disclosed": self.read_disclosed, "calls": self.calls,
+            "read_disclosed": self.read_disclosed, "policy": self.policy, "calls": self.calls,
             "outages": self.outbox.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
             "hub_timeout": self.outbox.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
             "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
@@ -484,16 +491,33 @@ impl<S: Store> Messenger<S> {
             return;
         }
         self.read_disclosed = disclosed;
-        // The policy is the machine's construction (vector context): each conversation gets a fresh machine, and the
-        // content it had shown is restored into it as history (spec-gap 64: nothing is sent or archived again).
-        // Receipts booked so far are not carried over; they arrive again only if re-sent, so the marks reset.
+        self.policy["read"] = json!(disclosed);
+        self.policy["played"] = json!(disclosed);
+        self.rebuild_receipts(now as i64);
+    }
+
+    /// What this device discloses to other identities (M§10.5, M§11): `{delivered, read, played, activity}`, each a
+    /// boolean; `delivered` defaults on, the rest off. A recorder discloses nothing (C§5).
+    pub fn set_receipt_policy(&mut self, policy_json: &str, now: f64) -> Result<(), Error> {
+        let p: Value = serde_json::from_str(policy_json).map_err(err)?;
+        let on = |k: &str, default: bool| p[k].as_bool().unwrap_or(default);
+        self.policy = json!({"delivered": on("delivered", true), "read": on("read", false), "played": on("played", false), "activity": on("activity", false)});
+        self.read_disclosed = on("read", false);
+        self.rebuild_receipts(now as i64);
+        Ok(())
+    }
+
+    /// The policy is the machine's construction (vector context): each conversation gets a fresh machine, and the
+    /// content it had shown is restored into it as history (spec-gap 64: nothing is sent or archived again).
+    /// Receipts booked so far are not carried over; they arrive again only if re-sent, so the marks reset.
+    fn rebuild_receipts(&mut self, now: i64) {
         let me = self.keys.identity.clone();
-        let policy = json!({"delivered": true, "read": disclosed, "played": disclosed});
+        let policy = self.policy.clone();
         for (gid, c) in self.convs.iter_mut() {
-            let mut fresh = Receipts::new(&me, &policy, now as i64);
+            let mut fresh = Receipts::new(&me, &policy, now);
             let items: Vec<Value> = self.messages.iter().filter(|m| m["group"] == *gid && m["seq"].is_i64())
                 .map(|m| json!({"seq": m["seq"], "object": m["object"]})).collect();
-            let _ = fresh.restore(now as i64, items);
+            let _ = fresh.restore(now, items);
             c.receipts = fresh;
         }
     }
@@ -511,11 +535,7 @@ impl<S: Store> Messenger<S> {
     /// Advance every conversation's clock (M§10.3: a read held back by the 5 s interval goes out when it passes).
     pub fn tick(&mut self, now: f64) -> String {
         let now_i = now as i64;
-        let mut out = vec![];
-        for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
-            let emissions = self.convs.get_mut(&gid).expect("group").receipts.at(now_i);
-            out.extend(self.receipt_sends(&gid, emissions, now_i));
-        }
+        let mut out = self.advance_receipts(now_i);
         // M§9.4: a deposit with no answer at all counts as the hub unreachable
         for (_, p) in self.pending.silent(now_i) {
             if let Pending::Application { gid, item } = p {
@@ -1312,6 +1332,23 @@ impl<S: Store> Messenger<S> {
         self.send_object(gid, &obj, now_i)
     }
 
+    /// Send any object to `gid` as an application message (M§8): content is sent only where it may be (C§5, M§7.3).
+    /// `{item, send}`: the outbox item it went out under (null: kept for a successor, M§9.4), whose `sent` event
+    /// names it, and the frame (empty: queued behind an unreachable hub).
+    pub fn send(&mut self, gid: &str, object_json: &str, now: f64) -> Result<String, Error> {
+        let now = now as i64;
+        let gid = self.live(gid);
+        let obj: Value = serde_json::from_str(object_json).map_err(err)?;
+        if !self.convs.contains_key(&gid) {
+            return Err(Error::from("not a member of that group"));
+        }
+        if obj["object"] == "content" {
+            self.may_send_content(&gid, now)?;
+        }
+        let (item, frame) = self.send_item(&gid, &obj, now)?;
+        Ok(json!({"item": item, "send": frame}).to_string())
+    }
+
     /// Conversations: `[{group, conversation, kind, peer, members, epoch, hub, pending, recorded, recorders, may_send,
     /// recorders_pending}]`; members are the leaves that authenticate at `now` (M§6.2); `pending` counts items not yet
     /// accepted by the hub; `recorders_pending` lists the recorders the user has still to accept (C§5).
@@ -1442,7 +1479,7 @@ impl<S: Store> Messenger<S> {
     }
 
     fn new_receipts(&self, now: i64) -> Receipts {
-        Receipts::new(&self.keys.identity, &json!({"delivered": true, "read": self.read_disclosed, "played": self.read_disclosed}), now)
+        Receipts::new(&self.keys.identity, &self.policy, now)
     }
 
 
@@ -1619,6 +1656,12 @@ impl<S: Store> Messenger<S> {
 
     /// Encrypt an application object and deposit it; pending until accepted (M§9.2).
     fn send_object(&mut self, gid: &str, obj: &Value, now: i64) -> Result<String, Error> {
+        self.send_item(gid, obj, now).map(|(_, frame)| frame)
+    }
+
+    /// As [`Messenger::send_object`], with the outbox item id the object went out under (`None`: kept for a
+    /// successor, M§9.4).
+    fn send_item(&mut self, gid: &str, obj: &Value, now: i64) -> Result<(Option<String>, String), Error> {
         let (provider, signer) = (self.mls.provider(), self.mls.signer());
         let c = self.convs.get_mut(gid).ok_or_else(|| Error::from("not a member of that group"))?;
         let bytes = c.group.create_message(provider, &signer, &serde_json::to_vec(obj).map_err(err)?)
@@ -1632,7 +1675,7 @@ impl<S: Store> Messenger<S> {
             Deposit::Abandoned => {
                 // M§9.4: the dead group takes no more content; it goes to the successor once there is one
                 self.handover.entry(gid.to_string()).or_default().push(obj.clone());
-                return Ok(String::new());
+                return Ok((None, String::new()));
             }
             Deposit::Queued => true,
             Deposit::Send => false,
@@ -1644,10 +1687,11 @@ impl<S: Store> Messenger<S> {
             self.messages.push(json!({"group": gid, "key": key, "sender": self.keys.identity, "sender_device": self.keys.device.did(),
                 "object": obj, "seq": null, "mine": true, "item": item["id"]}));
         }
+        let id = Some(s_of(&item["id"]));
         if queued {
-            return Ok(String::new()); // M§9.4: queued behind the pending head while the hub is down
+            return Ok((id, String::new())); // M§9.4: queued behind the pending head while the hub is down
         }
-        Ok(self.deposit_item(gid, &item, now))
+        Ok((id, self.deposit_item(gid, &item, now)))
     }
 
     /// The deposit of a pending item, under a fresh envelope but the same item id and bytes (M§9.3).
@@ -1992,7 +2036,11 @@ impl<S: Store> Messenger<S> {
         // M§12.3: items from before this device joined are history; a group it is not in is skipped
         let route = self.delivery().route(item, joined.is_some(), |epoch| joined.is_some_and(|j| epoch < j), now);
         let (bytes, released) = match route {
-            Route::Ephemeral | Route::Other => return Ok(out),
+            Route::Ephemeral => {
+                out.extend(self.activity_in(item, now));
+                return Ok(out);
+            }
+            Route::Other => return Ok(out),
             Route::Duplicate => {
                 out.push(json!({"ui": "duplicate", "class": class, "cursor": item["cursor"]}));
                 return Ok(out);
@@ -2480,11 +2528,172 @@ impl<S: Store> Messenger<S> {
 
     /// Send what a conversation's receipts machine asked for: a receipt object to the conversation, or — an
     /// undisclosed read watermark — to the personal group (M§10.5, spec-gap 52).
+    /// Seal and deposit one activity (M§11.1): signed by the device key, AES-256-GCM under the epoch's exporter key,
+    /// AAD `group_id ‖ epoch`, an ephemeral deposit no `accepted` answers.
+    fn activity_out(&mut self, gid: &str, activity: &str, state: &str, now: i64) -> Vec<Value> {
+        let Some(c) = self.convs.get(gid) else { return vec![] };
+        let obj = json!({"object": "activity", "conversation": c.conversation, "sender": self.keys.identity, "activity": activity, "state": state});
+        let signed = dsip_core::envelope::sign(&obj, &self.keys.device, &self.keys.device.kid());
+        let key = match dsip_mls::activity_key(&c.group, self.mls.provider()) {
+            Ok(k) => k,
+            Err(e) => return vec![json!({"error": format!("activity key: {e}")})],
+        };
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&KeyPair::generate().seed()[..12]);
+        let use_ = SealUse::Activity { group: c.group.group_id().as_slice(), epoch: c.group.epoch().as_u64() };
+        let sealed = seal(&key, &nonce, compact(&signed).as_bytes(), use_);
+        let frame = self.hub_deposit(gid, "ephemeral", json!({"sealed": b64(&sealed)}), now);
+        vec![json!({"send": frame}), json!({"ui": "activity_sent", "group": gid, "activity": activity, "state": state})]
+    }
+
+    /// A pushed activity (M§11.1): opened with the epoch's exporter key, its device signature verified, and kept only
+    /// from a device that is a member's leaf; shown until the deposit's `expires_at` (M§11.2).
+    fn activity_in(&mut self, item: &Value, now: i64) -> Vec<Value> {
+        let gid = s_of(&item["group"]);
+        let ctx = Context::new(now, &self.resolver);
+        let Some(c) = self.convs.get(&gid) else { return vec![] };
+        let Ok(key) = dsip_mls::activity_key(&c.group, self.mls.provider()) else { return vec![] };
+        let use_ = SealUse::Activity { group: c.group.group_id().as_slice(), epoch: c.group.epoch().as_u64() };
+        let Ok(plain) = open(&key, &unb64(&item["sealed"]), use_) else {
+            return vec![json!({"ui": "dropped", "why": "activity: not sealed for this epoch"})];
+        };
+        let mut parts = std::str::from_utf8(&plain).unwrap_or("").split('.');
+        let mut next = || parts.next().unwrap_or("").to_string();
+        let env = Envelope { protected: next(), payload: next(), signature: next() };
+        let Ok(ver) = dsip_core::envelope::verify_raw(&env, &ctx, false) else {
+            return vec![json!({"ui": "dropped", "why": "activity: bad signature"})];
+        };
+        // M§11.1: the signature attributes it; the signing device must be a leaf of the group
+        let leaf = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).find(|w| w.device == ver.signer_did).map(|w| w.identity);
+        let octx = json!({"conversation": c.conversation, "conversation_kind": c.kind, "leaf_identity": leaf});
+        let obj = ver.payload;
+        if dsip_messaging::checks::check_object(&obj, &octx)["verdict"] != "accept" {
+            return vec![json!({"ui": "dropped", "why": format!("activity from {}: not a member's device", ver.signer_did)})];
+        }
+        let mut out = self.advance_receipts(now);
+        let emissions = self.convs.get_mut(&gid).map(|c| c.receipts.activity_in(now, &obj["sender"], &obj["activity"], &obj["state"], &item["expires_at"]))
+            .unwrap_or_default();
+        out.extend(self.receipt_sends(&gid, emissions, now));
+        out.push(json!({"ui": "activity", "group": gid, "from": obj["sender"], "activity": obj["activity"], "state": obj["state"]}));
+        out
+    }
+
+    /// Advance every conversation's receipts machine to `now` (M§10.3, M§11.2): what it emits, and the activity that
+    /// expired (`activity_cleared`).
+    fn advance_receipts(&mut self, now: i64) -> Vec<Value> {
+        let mut out = vec![];
+        for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
+            let c = self.convs.get_mut(&gid).expect("group");
+            let before = c.receipts.snapshot()["activity"].clone();
+            let emissions = c.receipts.at(now);
+            let after = c.receipts.snapshot()["activity"].clone();
+            for (who, acts) in before.as_object().into_iter().flatten() {
+                for a in acts.as_object().into_iter().flatten().map(|(a, _)| a) {
+                    if after[who.as_str()].get(a).is_none() {
+                        out.push(json!({"ui": "activity_cleared", "group": gid, "from": who, "activity": a}));
+                    }
+                }
+            }
+            out.extend(self.receipt_sends(&gid, emissions, now));
+        }
+        out
+    }
+
+    /// A contact grant for `peer` (§19.4, scope `dsip.message`), answering introduction `session` if any, valid 30 days;
+    /// the compact envelope. The device's delegation rides in its header, so a verifier binds the signer to this
+    /// identity (§7.4).
+    pub fn grant(&self, peer: &str, session: Option<String>, now: f64) -> String {
+        let now = now as i64;
+        let p = json!({"dsip": wire::version_block(), "type": "grant", "id": wire::new_id(now), "from": self.keys.identity,
+            "to": peer, "session": session.unwrap_or_else(|| wire::new_id(now)), "scope": ["dsip.message"],
+            "valid_until": now + 30 * 86400, "issued_at": now, "expires_at": now + 30});
+        compact(&self.sign_delegated(&p))
+    }
+
+    /// An introduction to `target` asking permission to message (M§14.1), its purpose sealed to the key agreement key
+    /// in `target`'s document (M§6.9) unless `plain`. `{id, envelope, send}`: the compact envelope the host deposits at
+    /// `target`'s mailbox ([`Messenger::first_contact_frame`]), and the `mailbox-config` that tells this identity's own
+    /// mailbox first, so the grant that answers it is not rate-limited there (spec-gap 81).
+    pub fn introduce(&mut self, target: &str, purpose: &str, plain: bool, now: f64) -> Result<String, Error> {
+        let now = now as i64;
+        let mut p = json!({"dsip": wire::version_block(), "type": "introduction", "id": wire::new_id(now), "from": self.keys.identity,
+            "to": target, "identity": {"display_name": self.keys.display_name}, "purpose": purpose, "issued_at": now,
+            "expires_at": now + 7 * 86_400});
+        if !plain {
+            // §7.2: a did:key's key agreement key is converted from the key itself; any other DID's is its document's
+            let pk = match dsip_core::did::public_from_did_key(target) {
+                Some(public) => dsip_core::hpke::x25519_from_ed25519_public(&public),
+                None => dsip_core::did::Resolver::resolve(&self.resolver, target).and_then(|d| d.x25519_key_agreement()),
+            };
+            let pk = pk.ok_or_else(|| Error::from(format!("{target} publishes no key agreement key: introduce it plain")))?;
+            let mut sk_e = [0u8; 32];
+            sk_e.copy_from_slice(&KeyPair::generate().seed());
+            dsip_messaging::first_contact::seal_introduction(&mut p, purpose, &pk, &sk_e);
+        }
+        let id = s_of(&p["id"]);
+        let envelope = compact(&self.sign_delegated(&p));
+        let notice = self.config_env(json!({"subject": self.keys.identity, "introductions_sent": [id]}), now);
+        Ok(json!({"id": id, "envelope": envelope, "send": notice.frame()}).to_string())
+    }
+
+    /// A first-contact deposit (spec-gap 54) of `class` `introduction` or `grant` for `recipient`, to send on a
+    /// connection to `recipient`'s mailbox `to_mailbox`; the mailbox answers on that connection.
+    pub fn first_contact_frame(&self, to_mailbox: &str, class: &str, recipient: &str, envelope: &str, now: f64) -> String {
+        wire::message(&self.keys.device, "deposit", to_mailbox, now as i64, wire::TTL_S,
+            json!({"class": class, "recipient": recipient, "envelope": envelope})).frame()
+    }
+
+    /// Answer request `id` (M§14.1) with a `dsip.message` grant: `{requester, envelope}`, the grant to deposit at the
+    /// requester's mailbox. The request is kept until [`Messenger::forget_request`], once that deposit is accepted.
+    pub fn accept_request(&self, id: &str, now: f64) -> Result<String, Error> {
+        let r = self.requests.get(id).ok_or_else(|| Error::from("no such request"))?;
+        let requester = s_of(&r["from"]);
+        Ok(json!({"requester": requester, "envelope": self.grant(&requester, Some(id.to_string()), now)}).to_string())
+    }
+
+    /// Forget request `id`, answered or declined.
+    pub fn forget_request(&mut self, id: &str) -> bool {
+        self.requests.remove(id).is_some()
+    }
+
+    /// A `mailbox-config` releasing this device's binding (M§4.1): the mailbox stops pushing to it. The frame; not
+    /// kept pending, so the next binding does not release it again.
+    pub fn release(&self, now: f64) -> String {
+        wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now as i64, wire::TTL_S,
+            json!({"subject": self.keys.identity, "release": true})).frame()
+    }
+
+    fn sign_delegated(&self, p: &Value) -> Envelope {
+        dsip_core::envelope::sign_bytes(&dsip_core::envelope::encode_payload(p), &self.keys.device, &self.keys.device.kid(),
+                                        vec![self.keys.delegation.clone()])
+    }
+
+    /// The user's own activity in `gid` (M§11.1: typing, uploading, recording), `state` `active` or `stopped`: sent
+    /// when the policy discloses activity, at the pace the receipts machine keeps. Frames and events.
+    pub fn activity(&mut self, gid: &str, activity: &str, state: &str, now: f64) -> String {
+        let now = now as i64;
+        let gid = self.live(gid);
+        let Some(c) = self.convs.get_mut(&gid) else { return "[]".into() };
+        let emissions = c.receipts.activity(now, activity, state);
+        let mut out = self.receipt_sends(&gid, emissions, now);
+        if out.is_empty() {
+            out.push(json!({"ui": "activity_not_sent", "group": gid, "activity": activity, "state": state}));
+        }
+        json!(out).to_string()
+    }
+
     fn receipt_sends(&mut self, gid: &str, emissions: Vec<Emission>, now: i64) -> Vec<Value> {
         let mut out = vec![];
         for e in emissions {
-            // activity is not sent from the browser; an archive decision is the batch's (receipts_batch)
-            let Emission::Receipt(receipt) = e else { continue };
+            // an archive decision is the batch's (receipts_batch)
+            let receipt = match e {
+                Emission::Receipt(r) => r,
+                Emission::Activity { activity, state } => {
+                    out.extend(self.activity_out(gid, &activity, &state, now));
+                    continue;
+                }
+                _ => continue,
+            };
             let kind = receipt.kind.as_str();
             let target = if receipt.personal {
                 match self.personal.clone() {

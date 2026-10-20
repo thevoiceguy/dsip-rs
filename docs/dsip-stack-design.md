@@ -265,6 +265,13 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    requests, introductions, release, activity). 3j-3c: events carrying what dsip-msg prints (item ids, a call's
    direction, a removed group's kind, re-proposals, recording changes). 3j-3d: dsip-msg hosts the `Messenger`; its
    saved state is migrated on first load (decided 2026-10-20) and its output lines stay as the demos read them.
+   3j-3b is in two halves. The first: rekey, removal by credential (a lapsed leaf; a device of this identity from
+   every group, its new archive key sent once the personal group's commit is merged), and a move to any hub. The
+   second: `send` for any object, naming the outbox item the hub's `sent` answers; activity sealed and opened
+   (M§11) under a receipt policy the host sets (`set_receipt_policy`; the browser's `set_read_disclosed` is that
+   policy's read and played); grants, introductions (sealed to a `did:key`'s converted key too, which dsip-msg could
+   not do), answering requests, and release, with the peer mailbox's connection left to the host as for KeyPackage
+   fetches. The browser now opens activity a peer sends; it sends none, its policy's activity being off.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
