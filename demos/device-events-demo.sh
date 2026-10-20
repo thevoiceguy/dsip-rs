@@ -126,7 +126,7 @@ echo "  the on-call phone rang:"; grep -m2 -E "← invite|ringing" "$DIR/oncall.
 [ "$(count "$DIR/e.log" "^ESCALATE 127.0.0.1/3/")" = 0 ] || { echo "FAIL: the acknowledged alarm escalated"; exit 1; }
 
 echo "=== an SNMPv2c inform: answered once its event is stored (E§3)"
-send_trap inform 127.0.0.1:$TRAP_PORT public 124000 1.3.6.1.4.1.9999.1.0.30 rid=41 > "$DIR/inform-41.log"
+INFORM_TIMEOUT=5 send_trap inform 127.0.0.1:$TRAP_PORT public 124000 1.3.6.1.4.1.9999.1.0.30 rid=41 > "$DIR/inform-41.log"
 grep -q "RESPONSE after 1 attempt" "$DIR/inform-41.log" || { echo "FAIL: the inform was not answered"; cat "$DIR/inform-41.log"; exit 1; }
 wait_for "$DIR/g.log" "^SNMP inform .* rid=41: stored, answered" 10
 echo "  $(cat "$DIR/inform-41.log")"
