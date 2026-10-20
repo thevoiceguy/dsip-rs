@@ -252,6 +252,9 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    key, kept unread when it does not), and what each blob source answered (`blob::tried`, `blob::retry_delay_s`). One
    fix came with it: the browser read a plain purpose without checking the introduction, so one carrying both
    `purpose` and `sealed` became a request.
+   3j-2: the browser's `Messenger`, already sans-I/O, is `dsip_messaging_device::messenger::Messenger`, its refusals a
+   plain `Error`; `dsip-wasm` keeps the same JavaScript API as a wrapper that forwards every method. Nothing changes
+   for the browser. dsip-msg moves onto it next, its differences behind `Config`.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);

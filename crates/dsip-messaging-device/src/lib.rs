@@ -24,6 +24,7 @@ pub mod first_contact;
 pub mod history;
 pub mod inbound;
 pub mod key_packages;
+pub mod messenger;
 pub mod outbox;
 pub mod process;
 pub mod receipts;

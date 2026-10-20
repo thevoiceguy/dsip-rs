@@ -1,302 +1,30 @@
-//! The messaging device in the browser (client stage 6): the Messaging Profile's device side on OpenMLS, driven
-//! with JSON strings and emitting frames and events, as the §12 engine is driven.
+//! The messaging device in the browser (client stage 6): `dsip_messaging_device::messenger::Messenger`, the device
+//! side of the Messaging Profile on OpenMLS, bound for JavaScript. It is driven with JSON strings and emits frames and
+//! events, as the §12 engine is driven; every method forwards to the library (dsip-rs stage 3j-2).
 //!
-//! Spec: M§4.2 (the mailbox a `did:key` identity names in its reachability hint; the peer's found the same way),
-//! M§4.3 (bind with a verified `hello`; the delegation carries `dsip.messaging`), M§5.2–M§5.5 (`deposit`,
-//! `accepted`, `sync`/`items`, `key-packages`/`key-package-fetch`), M§6.2 (every leaf authenticated), M§6.4 (wire
-//! forms), M§6.5 (a commit is applied only on the hub's `accepted`; refusals as the vector-pinned `CommitRetry`
-//! decides, spec-gap 58; seq gaps held by `GapTracker`, spec-gap 69), M§6.6 (`mailbox-config` `joined`/`left`),
-//! M§6.7 (KeyPackages uploaded), M§7.1 (the personal group and the first archive key), M§7.2 (a direct
-//! conversation: the peer's devices and our own in one commit, hubbed at our mailbox, the held grant presented),
-//! M§8.1 (content objects checked before rendering), M§8.5 (seq dedup and the ack cursor — `Resume`, spec-gap 44),
-//! M§9.2–M§9.3 (pending until `accepted`; the same bytes re-deposited), M§10.2 (delivered receipts decided per sync
-//! batch by the vector-pinned `Client`), M§12.1 (the archive key, kept for the device that will read history),
-//! M§14.2 (a grant presented to the peer's mailbox), M§8.4 and M§5.6 (a blob sealed under a single-use key, uploaded
-//! with a signed `blob-put`, named with its key in the content and without it in the manifest; fetched from the
-//! sources the pinned rule orders and verified before it is opened), M§8.2 (`audio` content), M§10.4 (`played`, under
-//! the same opt-in as `read`), M§13.2–M§13.3 (voicemail as caller-recorded audio carrying the session; a callee
-//! leg's call event to the personal group, collapsed by session, interleaved into the peer's timeline), M§9.4 (a hub
-//! that stops answering: content kept pending and retried by the pinned outbox, and past the device's threshold handed
-//! to a successor), M§7.5 (the successor created at this identity's mailbox, re-adding the dead group's roster;
-//! a successor welcome checked and converged on by the pinned tracker), M§12.1–M§12.3 (archive keys, archive records written for what
-//! is shown and read back as history by a device added later, every live key re-sent to a new sibling), M§10.3 and
-//! M§10.5 (a read watermark per conversation, disclosed only with the opt-in, else to the personal group).
+//! Spec: M§4–M§14 as the library implements them (`dsip_messaging_device::messenger`); §7.4 (a delegation re-issued
+//! with `dsip.messaging`, [`redelegate`]).
 //!
 //! Impl: MLS state lives in OpenMLS's memory storage and is exported with the delivery state in one `save()`, which
-//! the host writes as one record after each step — the atomic commit of spec-gap 44 in a browser. A reload restores
-//! both. Pending deposits (not yet `accepted`) are kept with their bytes and re-deposited on the next bind (M§9.3:
-//! idempotent at the hub by digest). What this device does not do yet: a seq gap that does not fill is reported, not
-//! re-joined (M§6.8; `Config::rejoin_gaps`, off in `Config::BROWSER`). The item processing is `dsip_messaging_device::process`, shared with `dsip-msg` (dsip-rs
-//! stage 3).
-
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+//! the host writes as one record after each step — the atomic commit of spec-gap 44 in a browser.
 
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
-use dsip_core::did::StaticResolver;
-use dsip_core::envelope::{self, Context, Envelope};
+use dsip_core::envelope::{self, Envelope};
 use dsip_core::keys::KeyPair;
-use dsip_core::version::Supported;
-use dsip_endpoint::hello::{client_hello, verify_relay_hello};
-use dsip_endpoint::verify::SeenIds;
-use dsip_endpoint::IdentityKeys;
-use dsip_messaging_device::commits::{self, Answer, Change, Synced};
-use dsip_messaging_device::history::{self, Decision, Restored};
-use dsip_messaging_device::receipts::{self, Emission};
-use dsip_messaging_device::successors::{self, Converge, Create, Successors};
-use dsip_messaging_device::{archive, blob, calls, first_contact, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
-    Receipts, Retry, Route};
-use dsip_messaging_device::Config;
-use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
-use dsip_messaging::verify::verify_frame;
-use dsip_messaging::wire;
-use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
-use openmls::prelude::tls_codec::Serialize as _;
-use openmls::prelude::*;
-use openmls_traits::OpenMlsProvider;
+use dsip_messaging_device::messenger::{Error, Messenger as Inner};
 
 use crate::{js, unhex};
 
-fn b64(bytes: &[u8]) -> String {
-    dsip_core::b64::encode(bytes)
-}
-
-fn unb64(v: &Value) -> Vec<u8> {
-    v.as_str().and_then(dsip_core::b64::decode).unwrap_or_default()
-}
-
-fn s_of(v: &Value) -> String {
-    v.as_str().unwrap_or("").to_string()
-}
-
-fn compact(e: &Envelope) -> String {
-    format!("{}.{}.{}", e.protected, e.payload, e.signature)
-}
-
-/// One group this device is in.
-struct Conv {
-    group: MlsGroup,
-    conversation: String,
-    kind: String,
-    /// `(did, uri)` of the hub.
-    hub: (String, String),
-    /// The other identity of a direct conversation, once known.
-    peer: Option<String>,
-    /// M§10 receipts for this conversation (vector-pinned).
-    receipts: Receipts,
-    /// The epoch this device joined at: items from before are history (M§12.3), not for this device's MLS state.
-    joined_epoch: u64,
-}
-
-/// A membership change this device proposes (M§6.5): re-proposed after a lost conflict while still needed.
-#[derive(Clone)]
-enum Op {
-    /// Add `peer`'s devices (and our own others) from these TLS-serialized KeyPackages, with the grants that
-    /// authorize the add (M§14.2). `device` names one device of our own identity when that is what is added (M§12.3).
-    Add { peer: String, kps: Vec<Vec<u8>>, grants: Vec<String>, device: Option<String> },
-    /// Join the group by external commit from the latest GroupInfo this identity's mailbox delivered (M§6.8).
-    Rejoin,
-    /// Commit the pending Remove proposals by which `identity` leaves (M§7.3 "Leaving", spec-gap 125).
-    Leave { identity: String },
-    /// Remove every leaf of another member identity (M§7.3: any member identity MAY remove another).
-    Remove { identity: String },
-    /// Move the group to another hub, `{did, uri}`: a commit changing `dsip_conversation.hub` and nothing else (M§7.4).
-    MoveHub { hub: Value },
-}
-
-/// A deposit awaiting the hub's answer, by deposit id (M§9.2).
-#[derive(Clone)]
-enum Pending {
-    /// A commit staged in the group: merged on `accepted`, discarded on refusal (M§6.5). `fields` are the deposit's,
-    /// re-deposited as the same MLS bytes when the answer is lost (M§9.3).
-    Commit { gid: String, op: Option<Op>, fields: Value },
-    /// A GroupInfo for the hub (M§6.5 rule 6); `then` is proposed once it is accepted.
-    GroupInfo { gid: String, then: Option<Op> },
-    /// An application message of this device's own, in the outbox until accepted (M§9.2).
-    Application { gid: String, item: String },
-    /// The archive key is sent to the personal group once its GroupInfo is accepted (M§7.1).
-    PersonalReady { gid: String },
-    /// A KeyPackage upload (M§5.5).
-    KeyPackages { count: usize },
-    /// A `mailbox-config` (M§6.6) with these fields.
-    Config { fields: Value },
-    /// An archive record deposited to our mailbox (M§12.2) with these fields; acknowledged, nothing else to do.
-    Archive { fields: Value },
-    /// A Remove proposal of this device's leave (M§7.3): sequenced by the hub, nothing to merge.
-    Proposal { gid: String },
-}
-
-impl Op {
-    fn to_json(&self) -> Value {
-        match self {
-            Op::Add { peer, kps, grants, device } => {
-                json!({"add": {"peer": peer, "kps": kps.iter().map(|k| b64(k)).collect::<Vec<_>>(), "grants": grants, "device": device}})
-            }
-            Op::Rejoin => json!("rejoin"),
-            Op::Leave { identity } => json!({"leave": identity}),
-            Op::Remove { identity } => json!({"remove": identity}),
-            Op::MoveHub { hub } => json!({"move_hub": hub}),
-        }
-    }
-
-    fn from_json(v: &Value) -> Option<Op> {
-        if v == "rejoin" {
-            return Some(Op::Rejoin);
-        }
-        if let Some(i) = v.get("leave").and_then(Value::as_str) {
-            return Some(Op::Leave { identity: i.to_string() });
-        }
-        if let Some(i) = v.get("remove").and_then(Value::as_str) {
-            return Some(Op::Remove { identity: i.to_string() });
-        }
-        if let Some(h) = v.get("move_hub") {
-            return Some(Op::MoveHub { hub: h.clone() });
-        }
-        let a = v.get("add")?;
-        Some(Op::Add {
-            peer: s_of(&a["peer"]),
-            kps: a["kps"].as_array()?.iter().map(unb64).collect(),
-            grants: serde_json::from_value(a["grants"].clone()).unwrap_or_default(),
-            device: a["device"].as_str().map(String::from),
-        })
-    }
-}
-
-impl Pending {
-    /// The group a deposit was for, if any.
-    fn gid(&self) -> Option<&str> {
-        match self {
-            Pending::Commit { gid, .. } | Pending::GroupInfo { gid, .. } | Pending::Application { gid, .. } | Pending::PersonalReady { gid }
-            | Pending::Proposal { gid } => Some(gid),
-            Pending::KeyPackages { .. } | Pending::Config { .. } | Pending::Archive { .. } => None,
-        }
-    }
-
-    /// What survives a restart: everything but application items, which the outbox holds (M§9.2), and key package
-    /// uploads, made afresh.
-    fn to_json(&self) -> Option<Value> {
-        Some(match self {
-            Pending::Commit { gid, op, fields } => json!({"commit": {"gid": gid, "op": op.as_ref().map(Op::to_json), "fields": fields}}),
-            Pending::GroupInfo { gid, then } => json!({"group_info": {"gid": gid, "then": then.as_ref().map(Op::to_json)}}),
-            Pending::PersonalReady { gid } => json!({"personal_ready": gid}),
-            Pending::Config { fields } => json!({"config": fields}),
-            Pending::Archive { fields } => json!({"archive": fields}),
-            Pending::Application { .. } | Pending::KeyPackages { .. } | Pending::Proposal { .. } => return None,
-        })
-    }
-
-    fn from_json(v: &Value) -> Option<Pending> {
-        let op = |o: &Value| if o.is_null() { None } else { Op::from_json(o) };
-        if let Some(c) = v.get("commit") {
-            return Some(Pending::Commit { gid: s_of(&c["gid"]), op: op(&c["op"]), fields: c["fields"].clone() });
-        }
-        if let Some(g) = v.get("group_info") {
-            return Some(Pending::GroupInfo { gid: s_of(&g["gid"]), then: op(&g["then"]) });
-        }
-        if let Some(g) = v.get("personal_ready") {
-            return Some(Pending::PersonalReady { gid: s_of(g) });
-        }
-        if let Some(f) = v.get("config") {
-            return Some(Pending::Config { fields: f.clone() });
-        }
-        v.get("archive").map(|f| Pending::Archive { fields: f.clone() })
-    }
+fn js_err(e: Error) -> JsValue {
+    JsValue::from_str(&e.0)
 }
 
 /// A messaging device: this identity's device key under its delegation, its MLS groups, and the state the
 /// Messaging Profile asks a device to keep (M§5.4, M§8.5). The host moves frames between it and the mailbox.
 #[wasm_bindgen]
-pub struct Messenger {
-    keys: IdentityKeys,
-    controller_seed: Option<[u8; 32]>,
-    mls: Device<MemoryStore>,
-    mailbox: (String, String),
-    resolver: StaticResolver,
-    seen: SeenIds,
-    supported: Supported,
-    /// Hello ids sent and not yet answered: one per connection being opened (§20.5 anti-splicing).
-    hello_ids: BTreeSet<String>,
-    counter: u64,
-    convs: BTreeMap<String, Conv>,
-    /// Content and receipts of the sync being processed, per group (M§10.2 decides per batch).
-    batch: receipts::Batch,
-    personal: Option<String>,
-    resume: Resume,
-    /// Digests of this device's own deposits: the hub fans them back and MLS cannot decrypt them (spec-gap 47).
-    own: HashSet<String>,
-    /// Deposits awaiting their answer, by deposit id: what each was, the hub it went to, when an application deposit
-    /// went out (M§9.4), and those the group's new hub refused before it hosted the group, due again (spec-gap 129).
-    pending: Deposits<Pending>,
-    /// Where this client still behaves differently from dsip-msg (dsip-rs stage 3i): the browser's own behaviour.
-    config: Config,
-    /// Application items not yet accepted, per group, oldest first: `{id, mls, obj}` (M§9.2).
-    outbox: Outbox,
-    /// The thread, every content object shown, in arrival order: `{group, key, sender, sender_device, object, seq, mine}`.
-    messages: Vec<Value>,
-    /// Object keys shown (M§8.5: the archive and MLS copies are one message).
-    shown: BTreeSet<String>,
-    /// Grants other identities issued to this one, by granter: compact envelopes (§19.4; presented at M§14.2).
-    grants_held: BTreeMap<String, String>,
-    /// Archive keys by `akid`: `(key, created_at)` (M§12.1).
-    archive_keys: BTreeMap<String, (Vec<u8>, i64)>,
-    /// The latest GroupInfo per group (M§6.8), base64url.
-    group_info: BTreeMap<String, String>,
-    /// Call events of this identity's devices, in personal-group order, one per `session` (M§13.3, spec-gap 63).
-    calls: CallLog,
-    /// Seq gaps per group (M§6.5, spec-gap 69), and the items held behind them.
-    gaps: BTreeMap<String, GapTracker>,
-    held_items: BTreeMap<String, Vec<Value>>,
-    /// Membership changes refused by the hub and waiting for a sync before re-proposal (spec-gap 58).
-    retries: BTreeMap<String, (Retry, Op)>,
-    /// The hub that answered a deposit `mailbox.unknown-group`, by group: after the sync, a different hub means the
-    /// group moved (M§7.4 "A member that missed the move").
-    unknown_at: BTreeMap<String, String>,
-    /// Application items refused `mailbox.unknown-group`, by group, held until the sync shows whether the group moved:
-    /// re-encrypted and re-sent to the new hub if it did, refused for good if not (M§7.4).
-    moved_items: BTreeMap<String, Vec<String>>,
-    /// M§7.4 (spec-gap 129): per group that moved, the vector-pinned wait for its new hub to host it, and the deposits
-    /// it answered `mailbox.unknown-group` before then, due again at a time (the same bytes, M§9.3).
-    arrivals: BTreeMap<String, MoveArrival>,
-    /// Introductions delivered through the mailbox, by id (M§14.1: requests, never messages).
-    requests: BTreeMap<String, Value>,
-    want_live: bool,
-    gap_timeout: i64,
-    /// History (M§12): archive keys and join epochs, what to archive, records held until their key arrives.
-    history: History,
-    /// Archive records under a key this device does not hold yet, by cursor, still sealed (M§12.3 step 5).
-    held_archive: BTreeMap<String, Value>,
-    /// Content and receipts opened from archive and waiting for their conversation to be joined (spec-gap 64).
-    restored: Restored,
-    /// M§10.5: whether read watermarks are disclosed to the conversation (opt-in) or kept in the personal group.
-    read_disclosed: bool,
-    /// M§7.5: the successor groups this device knows of and converged on (vector-pinned, spec-gap 61).
-    successors: Successors,
-    /// Objects of an abandoned group's outbox, by the group they go to: the dead group until its successor exists,
-    /// then the successor until it holds its members (M§9.4: re-encrypted for the successor, spec-gap 72).
-    handover: BTreeMap<String, Vec<Value>>,
-    /// The mailbox this state was saved at; a different one at start is a move. Spec: M§4.1 "Moving to another
-    /// mailbox" (v0.13, spec-gap 122): the device registers every group it is in at the new mailbox and syncs it from
-    /// the start.
-    moved_from: Option<String>,
-    /// Whether this device's delegation carries `dsip.record` (C§5): a recorder device, receive-only, never in its
-    /// identity's personal group; as a record-keeper it keeps the `call-record`s parties send it (C§9).
-    recorder: bool,
-    /// This device's call records not yet handed to the conversation with its record-keeper, oldest first (C§9: held
-    /// until that conversation exists, spec-gap 123).
-    records_held: Vec<Value>,
-    /// As a record-keeper: the records received, `{group, from, device, received_at, record}`, one per session leg.
-    records: Vec<Value>,
-    /// Recorder devices this identity accepted, by conversation id: this device's acceptances and its siblings', from
-    /// the `recording-acceptance` objects in the personal group (C§5: the union).
-    recording_accepted: BTreeMap<String, BTreeSet<String>>,
-    /// Groups this identity is leaving (M§7.3): nothing is sent there and they are not listed; the device proposes its
-    /// identity's removal again at each new epoch until a commit removes it.
-    leaving: BTreeSet<String>,
-    /// Each group's roster changes by identity, oldest first: `{seq, epoch, by, added, removed, left}` (M§7.3: every
-    /// roster change rendered, attributed to the committing identity).
-    roster_log: BTreeMap<String, Vec<Value>>,
-}
+pub struct Messenger(Inner);
 
 #[wasm_bindgen]
 impl Messenger {
@@ -305,229 +33,57 @@ impl Messenger {
     /// or null for a fresh device.
     #[wasm_bindgen(constructor)]
     pub fn new(identity_json: &str, mailbox_did: &str, mailbox_uri: &str, saved_json: Option<String>, now: f64) -> Result<Messenger, JsValue> {
-        let id: Value = serde_json::from_str(identity_json).map_err(js)?;
-        let device = KeyPair::from_seed(unhex(id["device_seed_hex"].as_str().unwrap_or(""))?);
-        let delegation = Envelope::from_frame(id["delegation"].as_str().unwrap_or("")).map_err(|v| JsValue::from_str(&format!("{:?}", v.code)))?;
-        let keys = IdentityKeys {
-            identity: id["identity"].as_str().unwrap_or("").to_string(),
-            device: device.clone(),
-            delegation: delegation.clone(),
-            display_name: id["display_name"].as_str().unwrap_or("").to_string(),
-        };
-        let controller_seed = id["controller_seed_hex"].as_str().and_then(|h| unhex(h).ok());
-        let saved: Value = saved_json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-        // the MLS storage as saved: `{b64url key: b64url value}`
-        let mls = Device::with_provider(device, compact(&delegation), MemoryStore::from_mls_json(&saved["mls"]));
-        let st = &saved["state"];
-        let now_i = now as i64;
-        let mut m = Messenger {
-            keys,
-            controller_seed,
-            mls,
-            mailbox: (mailbox_did.to_string(), mailbox_uri.to_string()),
-            resolver: StaticResolver::default(),
-            seen: SeenIds::default(),
-            supported: Supported::all_known(),
-            hello_ids: BTreeSet::new(),
-            counter: 0,
-            convs: BTreeMap::new(),
-            batch: receipts::Batch::default(),
-            personal: st["personal"].as_str().map(String::from),
-            resume: Resume::new(if st["resume"].is_object() { &st["resume"] } else { &Value::Null }),
-            own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
-            config: Config::BROWSER,
-            // M§9.3: deposits awaiting an answer are sent again at the next binding (redeposit_pending)
-            pending: {
-                let mut d = Deposits::new(Config::BROWSER.no_answer_s);
-                for (id, p) in st["pending"].as_object().into_iter().flatten() {
-                    if let Some(p) = Pending::from_json(p) {
-                        d.insert(id.clone(), p);
-                    }
-                }
-                d
-            },
-            outbox: Outbox { items: serde_json::from_value(st["outbox"].clone()).unwrap_or_default(), ..Outbox::new(dsip_messaging::client::HUB_TIMEOUT_S) },
-            messages: st["messages"].as_array().cloned().unwrap_or_default(),
-            shown: st["messages"].as_array().into_iter().flatten().map(|m| s_of(&m["key"])).collect(),
-            grants_held: serde_json::from_value(st["grants_held"].clone()).unwrap_or_default(),
-            archive_keys: st["archive_keys"].as_object().into_iter().flatten()
-                .map(|(a, v)| (a.clone(), (unb64(&v["key"]), v["created_at"].as_i64().unwrap_or(0)))).collect(),
-            group_info: serde_json::from_value(st["group_info"].clone()).unwrap_or_default(),
-            calls: serde_json::from_value(st["calls"].clone()).unwrap_or_default(),
-            gaps: BTreeMap::new(),
-            held_items: serde_json::from_value(st["held_items"].clone()).unwrap_or_default(),
-            retries: BTreeMap::new(),
-            unknown_at: BTreeMap::new(),
-            moved_items: BTreeMap::new(),
-            arrivals: BTreeMap::new(),
-            requests: serde_json::from_value(st["requests"].clone()).unwrap_or_default(),
-            want_live: false,
-            gap_timeout: 60,
-            history: History::default(),
-            held_archive: serde_json::from_value(st["held_archive"].clone()).unwrap_or_default(),
-            restored: Restored::from_items(st["restored"].as_array().cloned().unwrap_or_default()),
-            read_disclosed: st["read_disclosed"].as_bool().unwrap_or(false),
-            successors: serde_json::from_value(st["successors"].clone()).unwrap_or_default(),
-            handover: serde_json::from_value(st["handover"].clone()).unwrap_or_default(),
-            moved_from: st["mailbox"].as_str().filter(|d| *d != mailbox_did).map(String::from),
-            recorder: dsip_core::delegation::capabilities(&delegation).iter().any(|c| c == "dsip.record"),
-            records_held: st["records_held"].as_array().cloned().unwrap_or_default(),
-            records: st["records"].as_array().cloned().unwrap_or_default(),
-            recording_accepted: serde_json::from_value(st["recording_accepted"].clone()).unwrap_or_default(),
-            leaving: serde_json::from_value(st["leaving"].clone()).unwrap_or_default(),
-            roster_log: serde_json::from_value(st["roster_log"].clone()).unwrap_or_default(),
-        };
-        if let Some(t) = st["hub_timeout"].as_i64() {
-            m.outbox.hub_timeout = t;
-        }
-        if m.moved_from.is_some() {
-            // spec-gap 122: the cursors were the old mailbox's; the new one delivers from its own beginning
-            m.resume.cursor_invalid();
-        }
-        // M§9.4: an outage survives a restart; its first retry is due at once
-        for (gid, down_since) in st["outages"].as_object().into_iter().flatten() {
-            m.outbox.restore_outage(gid, down_since.as_i64(), now_i);
-        }
-        // the history machine from what this device holds: its keys and the epochs it joined at
-        let keys = m.archive_keys.iter().map(|(a, (_, at))| (a.as_str(), *at));
-        let joined = st["convs"].as_object().into_iter().flatten().map(|(g, c)| (g.as_str(), c["joined_epoch"].as_u64().unwrap_or(0)));
-        m.history = History::new(keys, joined);
-        // the groups: reloaded from the MLS storage by id, with what this device knew about each
-        for (gid, c) in st["convs"].as_object().into_iter().flatten() {
-            let Some(group) = m.mls.load_group(&dsip_core::b64::decode(gid).unwrap_or_default()).ok().flatten() else { continue };
-            let conv = Conv {
-                group,
-                conversation: s_of(&c["conversation"]),
-                kind: s_of(&c["kind"]),
-                hub: (s_of(&c["hub"]["did"]), s_of(&c["hub"]["uri"])),
-                peer: c["peer"].as_str().map(String::from),
-                receipts: m.new_receipts(now_i),
-                joined_epoch: c["joined_epoch"].as_u64().unwrap_or(0),
-            };
-            m.convs.insert(gid.clone(), conv);
-        }
-        Ok(m)
+        Inner::new(identity_json, mailbox_did, mailbox_uri, saved_json, now).map(Messenger).map_err(js_err)
     }
 
     /// Everything to keep: the MLS storage and this device's delivery state, as one JSON record. The host writes it
     /// after every step that returned something (spec-gap 44: MLS state and delivery state committed together).
     pub fn save(&self) -> String {
-        let mls = self.mls.provider().mls_json();
-        let convs: serde_json::Map<String, Value> = self.convs.iter().map(|(g, c)| (g.clone(), json!({
-            "conversation": c.conversation, "kind": c.kind, "hub": {"did": c.hub.0, "uri": c.hub.1}, "peer": c.peer, "joined_epoch": c.joined_epoch,
-        }))).collect();
-        let archive: serde_json::Map<String, Value> = self.archive_keys.iter().map(|(a, (k, at))| (a.clone(), json!({"key": b64(k), "created_at": at}))).collect();
-        json!({"mls": mls, "state": {
-            "convs": convs, "personal": self.personal, "resume": self.resume.snapshot(), "own": self.own, "outbox": self.outbox.items,
-            "messages": self.messages, "grants_held": self.grants_held, "archive_keys": archive, "group_info": self.group_info,
-            "held_items": self.held_items, "requests": self.requests, "held_archive": self.held_archive, "restored": self.restored.items(),
-            "read_disclosed": self.read_disclosed, "calls": self.calls,
-            "outages": self.outbox.outages.iter().filter(|(_, o)| o.is_down()).map(|(g, o)| (g.clone(), json!(o.down_since()))).collect::<serde_json::Map<_, _>>(),
-            "hub_timeout": self.outbox.hub_timeout, "successors": self.successors, "handover": self.handover, "mailbox": self.mailbox.0,
-            "pending": self.pending.iter().filter_map(|(id, p)| Some((id.clone(), p.to_json()?))).collect::<serde_json::Map<_, _>>(),
-            "records_held": self.records_held, "records": self.records, "recording_accepted": self.recording_accepted, "leaving": self.leaving,
-            "roster_log": self.roster_log,
-        }}).to_string()
+        self.0.save()
     }
 
     /// Whether this device's delegation carries `dsip.messaging` (M§4.3): without it the mailbox refuses the binding.
     pub fn delegation_ok(&self) -> bool {
-        dsip_core::delegation::capabilities(&self.keys.delegation).iter().any(|c| c == "dsip.messaging")
+        self.0.delegation_ok()
     }
 
     /// The identity's mailbox `{did, uri}`.
     pub fn mailbox(&self) -> String {
-        json!({"did": self.mailbox.0, "uri": self.mailbox.1}).to_string()
+        self.0.mailbox()
     }
 
     /// Grants held from others, `{identity: compact}` (from the calling engine's contact file, §19.4): what is
     /// presented to the peer's mailbox (M§14.2), beside grants that arrive through this mailbox.
     pub fn set_grants(&mut self, grants_json: &str) {
-        if let Ok(g) = serde_json::from_str::<BTreeMap<String, String>>(grants_json) {
-            for (k, v) in g {
-                self.grants_held.insert(k, v);
-            }
-        }
+        self.0.set_grants(grants_json)
     }
 
     /// M§10.5: disclose read watermarks to the conversation (`true`) or keep them in the personal group (`false`,
     /// the default). Applies to every conversation's receipts machine.
     pub fn set_read_disclosed(&mut self, disclosed: bool, now: f64) {
-        if self.read_disclosed == disclosed {
-            return;
-        }
-        self.read_disclosed = disclosed;
-        // The policy is the machine's construction (vector context): each conversation gets a fresh machine, and the
-        // content it had shown is restored into it as history (spec-gap 64: nothing is sent or archived again).
-        // Receipts booked so far are not carried over; they arrive again only if re-sent, so the marks reset.
-        let me = self.keys.identity.clone();
-        let policy = json!({"delivered": true, "read": disclosed, "played": disclosed});
-        for (gid, c) in self.convs.iter_mut() {
-            let mut fresh = Receipts::new(&me, &policy, now as i64);
-            let items: Vec<Value> = self.messages.iter().filter(|m| m["group"] == *gid && m["seq"].is_i64())
-                .map(|m| json!({"seq": m["seq"], "object": m["object"]})).collect();
-            let _ = fresh.restore(now as i64, items);
-            c.receipts = fresh;
-        }
+        self.0.set_read_disclosed(disclosed, now)
     }
 
     /// The user has read a conversation through `content_id` (M§10.3): the receipts machine decides whether a
     /// watermark goes out, to the conversation or to the personal group (M§10.5), at most one per 5 s. Frames and
     /// events, as `inbound` returns them.
     pub fn read_through(&mut self, gid: &str, content_id: &str, now: f64) -> String {
-        let now_i = now as i64;
-        let Some(c) = self.convs.get_mut(gid) else { return "[]".into() };
-        let emissions = c.receipts.read(now_i, &json!(content_id));
-        json!(self.receipt_sends(gid, emissions, now_i)).to_string()
+        self.0.read_through(gid, content_id, now)
     }
 
     /// Advance every conversation's clock (M§10.3: a read held back by the 5 s interval goes out when it passes).
     pub fn tick(&mut self, now: f64) -> String {
-        let now_i = now as i64;
-        let mut out = vec![];
-        for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
-            let emissions = self.convs.get_mut(&gid).expect("group").receipts.at(now_i);
-            out.extend(self.receipt_sends(&gid, emissions, now_i));
-        }
-        // M§9.4: a deposit with no answer at all counts as the hub unreachable
-        for (_, p) in self.pending.silent(now_i) {
-            if let Pending::Application { gid, item } = p {
-                out.extend(self.hub_unreachable(&gid, &item, true, now_i));
-            }
-        }
-        // M§7.4 (spec-gap 129): deposits the new hub refused before it hosted the group, due again
-        for pending in self.pending.due(now_i) {
-            out.extend(self.redeposit(pending, now_i));
-        }
-        for (gid, ems) in self.outbox.due(now_i) {
-            out.extend(self.outage_emissions(&gid, ems, now_i));
-        }
-        // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8), when configured
-        if self.config.rejoin_gaps {
-            for (gid, held) in self.delivery().gap_timeouts(now_i) {
-                out.push(json!({"ui": "gap_timeout", "group": gid, "held": held}));
-                match self.external_commit(&gid, now_i) {
-                    Ok(frame) => {
-                        self.retries.insert(gid, (Retry::default(), Op::Rejoin));
-                        out.push(json!({"send": frame}));
-                    }
-                    Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default(), "group": gid})),
-                }
-            }
-        }
-        json!(out).to_string()
+        self.0.tick(now)
     }
 
     /// This device's hub-outage threshold, seconds (M§9.4: the client's own; 24 h RECOMMENDED).
     pub fn set_hub_timeout(&mut self, seconds: f64) {
-        self.outbox.hub_timeout = seconds as i64;
+        self.0.set_hub_timeout(seconds)
     }
 
     /// Groups whose hub is unreachable: `{group: {down_since, pending, abandoned}}` (M§9.4).
     pub fn outages(&self) -> String {
-        let m: serde_json::Map<String, Value> = self.outbox.outages.iter().map(|(g, o)| (g.clone(), json!({"down_since": o.down_since(),
-            "pending": o.pending().len(), "abandoned": o.is_abandoned(), "successor": self.successors.successor(g)}))).collect();
-        Value::Object(m).to_string()
+        self.0.outages()
     }
 
     /// Create the successor of `dead` (M§7.5) once its hub has been unreachable past the threshold: a group for the
@@ -536,62 +92,13 @@ impl Messenger {
     /// M§7.5 spec-gap 61). When this device already converged on a successor, that one is used. The pending items
     /// follow once the successor holds its members (M§9.4). Frames.
     pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
-        let now_i = now as i64;
-        self.track_rosters(now_i);
-        let me = self.keys.identity.clone();
-        let peers = match self.successors.create(dead, &me) {
-            Create::Use(w) => {
-                let moved = self.handover.remove(dead).unwrap_or_default();
-                self.handover.entry(w.clone()).or_default().extend(moved);
-                let out = self.flush_handover(&w, now_i);
-                return Ok(json!(out.into_iter().filter_map(|e| e.get("send").cloned()).collect::<Vec<_>>()).to_string());
-            }
-            Create::Refuse(why) => return Err(JsValue::from_str(&format!("successor refused: {}", json!(why)))),
-            Create::Create { peers } => peers,
-        };
-        let (conversation, kind) = self.convs.get(dead).map(|c| (c.conversation.clone(), c.kind.clone())).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        let all: Value = serde_json::from_str(key_packages_json).unwrap_or(Value::Null);
-        let mut kps = vec![];
-        let mut grants = vec![];
-        for peer in &peers {
-            if let Some(answer) = all.get(peer) {
-                kps.extend(self.pick_key_packages(peer, &answer.to_string(), now_i).unwrap_or_default());
-                grants.extend(self.grants_held.get(peer).cloned());
-            }
-        }
-        let (gid, frames) = self.new_group_for(Some(conversation), &kind, Some(dead), now_i)?;
-        let peer = self.convs.get(dead).and_then(|c| c.peer.clone());
-        if let Some(c) = self.convs.get_mut(&gid) {
-            c.peer = peer;
-        }
-        let decisions = self.successors.created(&gid, dead);
-        let moved = self.handover.remove(dead).unwrap_or_default();
-        self.handover.entry(gid.clone()).or_default().extend(moved);
-        if kind == "personal" {
-            self.personal = Some(gid.clone());
-        }
-        let op = (!kps.is_empty()).then(|| Op::Add { peer: peers.first().cloned().unwrap_or_default(), kps, grants, device: None });
-        let gi_id = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-        self.pending.insert(gi_id, Pending::GroupInfo { gid: gid.clone(), then: op });
-        if kind == "personal" {
-            // M§12.1: the personal group's successor gets an archive key of its own, as a new personal group does
-            self.pending.insert(format!("personal:{gid}"), Pending::PersonalReady { gid: gid.clone() });
-        }
-        let mut out: Vec<String> = frames;
-        for d in decisions {
-            if let Converge::Leave(g) = d {
-                out.extend(self.leave_group(&g, now_i));
-            }
-        }
-        Ok(json!(out).to_string())
+        self.0.create_successor(dead, key_packages_json, now).map_err(js_err)
     }
 
     /// The hand-over to a successor could not be done (the peers' KeyPackages could not be fetched): retried with the
     /// §13.2 backoff (M§9.4, spec-gap 72).
     pub fn successor_failed(&mut self, dead: &str) {
-        if let Some(o) = self.outbox.outages.get_mut(dead) {
-            o.handover_failed();
-        }
+        self.0.successor_failed(dead)
     }
 
     /// Add one device of this identity (M§12.3, M§6.7) to `gid` from its mailbox's `key-packages` answer (only the
@@ -599,78 +106,30 @@ impl Messenger {
     /// archive key is re-sent there ([`Messenger::resend_archive_keys`]). The groups to add it to, in order, are
     /// [`Messenger::groups_for_new_device`].
     pub fn add_device(&mut self, gid: &str, device: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
-        let now_i = now as i64;
-        let payload: Value = serde_json::from_str(key_packages_json).map_err(js)?;
-        let ctx = self.ctx(now_i);
-        let candidates = payload["key_packages"].as_array().cloned().unwrap_or_default().into_iter().chain(payload.get("last_resort").cloned());
-        let mut kps = vec![];
-        let mut seen = vec![];
-        for c in candidates {
-            let bytes = unb64(&c);
-            if let Ok((_, who)) = authenticate_key_package(&bytes, self.mls.provider(), &ctx) {
-                seen.push(format!("{}#{}", who.identity, who.device));
-                if who.identity == self.keys.identity && who.device == device {
-                    kps.push(bytes);
-                }
-            }
-        }
-        if kps.is_empty() {
-            return Err(JsValue::from_str(&format!("no KeyPackage of device {device} in the answer (it holds: {})", seen.join(", "))));
-        }
-        kps.truncate(1);
-        let op = Op::Add { peer: self.keys.identity.clone(), kps, grants: vec![], device: Some(device.to_string()) };
-        self.propose(gid, &op, now_i)
+        self.0.add_device(gid, device, key_packages_json, now).map_err(js_err)
     }
 
     /// The groups a new device of this identity joins, in order: the personal group first (M§12.3 step 3), then
     /// every conversation it is not in yet (M§6.7); `[]` when it is everywhere already.
     pub fn groups_for_new_device(&self, device: &str, now: f64) -> String {
-        let ctx = Context::new(now as i64, &self.resolver);
-        let in_group = |c: &Conv| c.group.members().any(|m| member_identity(&c.group, m.index, &ctx).ok().is_some_and(|w| w.device == device));
-        let mut order: Vec<String> = vec![];
-        if let Some(p) = &self.personal {
-            if self.convs.get(p).is_some_and(|c| !in_group(c)) {
-                order.push(p.clone());
-            }
-        }
-        for (g, c) in &self.convs {
-            if c.kind != "personal" && !in_group(c) {
-                order.push(g.clone());
-            }
-        }
-        json!(order).to_string()
+        self.0.groups_for_new_device(device, now)
     }
 
     /// M§12.3 step 3: every live archive key, as `archive-key` objects to the personal group, so a device just added
     /// can read the archive. Frames to send.
     pub fn resend_archive_keys(&mut self, now: f64) -> String {
-        let now_i = now as i64;
-        let Some(personal) = self.personal.clone() else { return "[]".into() };
-        let keys: Vec<(String, Vec<u8>, i64)> = self.archive_keys.iter().map(|(a, (k, t))| (a.clone(), k.clone(), *t)).collect();
-        let mut frames = vec![];
-        for (akid, key, at) in keys {
-            let obj = json!({"object": "archive-key", "akid": akid, "key": b64(&key), "created_at": at});
-            if let Ok(f) = self.send_object(&personal, &obj, now_i) {
-                frames.push(f);
-            }
-        }
-        json!(frames).to_string()
+        self.0.resend_archive_keys(now)
     }
 
     /// Archive keys this device holds, `[{akid, created_at}]`, newest current (M§12.1).
     pub fn archive_keys(&self) -> String {
-        json!(self.archive_keys.iter().map(|(a, (_, at))| json!({"akid": a, "created_at": at})).collect::<Vec<_>>()).to_string()
+        self.0.archive_keys()
     }
 
     /// Groups this identity's mailbox delivered a GroupInfo for that this device is not in (M§6.8): what it can join by
     /// external commit. `[{group, conversation, kind}]`, the personal group first.
     pub fn available(&self) -> String {
-        let mut out: Vec<Value> = self.group_info.iter().filter(|(g, _)| !self.convs.contains_key(*g)).filter_map(|(g, gi)| {
-            let conv = dsip_mls::group_info_conversation(&unb64(&json!(gi)))?;
-            Some(json!({"group": g, "conversation": conv["conversation"], "kind": conv["kind"], "hub": conv["hub"]}))
-        }).collect();
-        out.sort_by_key(|c| c["kind"] != "personal");
-        json!(out).to_string()
+        self.0.available()
     }
 
     /// Join `gid` by external commit (M§6.8): a device of an identity that has a leaf there, or the identity's own
@@ -678,12 +137,7 @@ impl Messenger {
     /// `stale-epoch` refusal discards the joined state, syncs and joins again from the newer GroupInfo (the pinned
     /// `CommitRetry`, spec-gap 58). No archive key comes with it: history waits for a sibling (M§12.3). Frames.
     pub fn external_join(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        if self.convs.contains_key(gid) {
-            return Err(JsValue::from_str("this device is in that group already"));
-        }
-        let frame = self.external_commit(gid, now as i64)?;
-        self.retries.insert(gid.to_string(), (Retry::default(), Op::Rejoin));
-        Ok(json!([frame]).to_string())
+        self.0.external_join(gid, now).map_err(js_err)
     }
 
     /// A callee leg of this device ended (M§13.3): whether it sends a `call-event` to the personal group, by the
@@ -691,14 +145,7 @@ impl Messenger {
     /// `declined` when this device ended it with `user.declined`, else `missed`. `leg_json` is `{session, peer, alerted,
     /// answered_here, ended_by: "local"|"remote", reason}`. Frames to send (`[]` when none).
     pub fn call_ended(&mut self, leg_json: &str, now: f64) -> Result<String, JsValue> {
-        let leg: Value = serde_json::from_str(leg_json).map_err(js)?;
-        let ended = calls::Ended { session: leg["session"].as_str().unwrap_or(""), peer: leg["peer"].as_str().unwrap_or(""),
-            alerted: leg["alerted"] == json!(true), answered_here: leg["answered_here"] == json!(true),
-            ended_by: leg["ended_by"].as_str().unwrap_or(""), reason: leg["reason"].as_str().unwrap_or("") };
-        let Some(obj) = calls::call_event(&ended, now as i64) else { return Ok("[]".into()) };
-        let personal = self.personal.clone().ok_or_else(|| JsValue::from_str("no personal group yet"))?;
-        self.calls.record(&obj);
-        Ok(json!([self.send_object(&personal, &obj, now as i64)?]).to_string())
+        self.0.call_ended(leg_json, now).map_err(js_err)
     }
 
     /// One leg's `call-record` for this identity's record-keeper `keeper` (C§9), built from what the host saw of the
@@ -710,78 +157,20 @@ impl Messenger {
     ///
     /// Spec: C§9 (v0.13, spec-gaps 121 and 123).
     pub fn call_record(&mut self, keeper: &str, leg_json: &str, now: f64) -> Result<String, JsValue> {
-        let leg: Value = serde_json::from_str(leg_json).map_err(js)?;
-        let rec = calls::call_record(&leg, &self.keys.device.did(), now as i64)
-            .map_err(|code| JsValue::from_str(&format!("call record not sent: {code}")))?;
-        self.records_held.push(rec.clone());
-        let frames: Value = serde_json::from_str(&self.flush_records(keeper, now)?).map_err(js)?;
-        Ok(json!({"record": rec, "frames": frames}).to_string())
+        self.0.call_record(keeper, leg_json, now).map_err(js_err)
     }
 
     /// The held call records, sent to the direct conversation with `keeper` when there is one (C§9: the record-keeper
     /// opens it, spec-gap 123); frames to send, `[]` while there is none.
     pub fn flush_records(&mut self, keeper: &str, now: f64) -> Result<String, JsValue> {
-        let Some(gid) = self.convs.iter().find(|(_, c)| c.kind == "direct" && c.peer.as_deref() == Some(keeper)).map(|(g, _)| g.clone()) else {
-            return Ok("[]".into());
-        };
-        let gid = self.live(&gid);
-        let mut frames = vec![];
-        while let Some(rec) = self.records_held.first().cloned() {
-            let f = self.send_object(&gid, &rec, now as i64)?;
-            self.records_held.remove(0);
-            if !f.is_empty() {
-                frames.push(f);
-            }
-        }
-        Ok(json!(frames).to_string())
+        self.0.flush_records(keeper, now).map_err(js_err)
     }
 
     /// Leave the conversation `gid` for this identity (M§7.3 "Leaving", spec-gap 125): a Remove proposal for each of
     /// its leaves goes to the hub, another member commits them, and until then nothing is sent there and it is not
     /// listed. The personal group is never left. Returns the frames to send.
     pub fn leave(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        let gid = self.live(gid);
-        if !self.convs.contains_key(&gid) {
-            return Err(JsValue::from_str("not a member of that group"));
-        }
-        if self.personal.as_deref() == Some(gid.as_str()) {
-            return Err(JsValue::from_str("the personal group is not left (M§7.1)"));
-        }
-        self.leaving.insert(gid.clone());
-        Ok(json!(self.propose_leave(&gid, now as i64)).to_string())
-    }
-
-    /// The Remove proposals for every leaf of this identity in `gid`, deposited: this device's own by `leave_group`
-    /// (MLS lets a member propose, never commit, its own removal), a sibling's by `propose_remove_member`.
-    fn propose_leave(&mut self, gid: &str, now: i64) -> Vec<Value> {
-        let ctx = Context::new(now, &self.resolver);
-        let (provider, signer) = (self.mls.provider(), self.mls.signer());
-        let me = self.keys.identity.clone();
-        let mut bytes = vec![];
-        let mut errors = vec![];
-        if let Some(c) = self.convs.get_mut(gid) {
-            let own = c.group.own_leaf_index();
-            let mine = commits::identity_leaves(&c.group, &ctx, &me);
-            for idx in mine {
-                let msg = if idx == own {
-                    c.group.leave_group(provider, &signer).map_err(|e| format!("{e:?}"))
-                } else {
-                    c.group.propose_remove_member(provider, &signer, idx).map(|(m, _)| m).map_err(|e| format!("{e:?}"))
-                };
-                match msg.and_then(|m| m.tls_serialize_detached().map_err(|e| format!("{e:?}"))) {
-                    Ok(b) => bytes.push(b),
-                    Err(e) => errors.push(e),
-                }
-            }
-        }
-        let mut out: Vec<Value> = errors.into_iter().map(|e| json!({"error": format!("leave proposal in {gid}: {e}")})).collect();
-        for b in bytes {
-            let frame = self.hub_deposit(gid, "handshake", json!({"mls": b64(&b)}), now);
-            let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-            self.pending.insert(id, Pending::Proposal { gid: gid.to_string() });
-            out.push(json!({"send": frame}));
-        }
-        out
+        self.0.leave(gid, now).map_err(js_err)
     }
 
     /// The user accepted the recording of `gid` (C§5): every recorder now in it is accepted for this conversation, and
@@ -790,292 +179,131 @@ impl Messenger {
     ///
     /// Spec: C§5 "Acceptance is the person's, not one device's".
     pub fn accept_recording(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        let now_i = now as i64;
-        let gid = &self.live(gid);
-        let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        let rec = self.recording_of(&self.leaves_of(gid, now_i), &conversation);
-        let devices: Vec<String> = rec["pending"].as_array().into_iter().flatten().filter_map(|r| r["device"].as_str().map(String::from)).collect();
-        if devices.is_empty() {
-            return Err(JsValue::from_str("no recorder to accept in this conversation"));
-        }
-        self.recording_accepted.entry(conversation.clone()).or_default().extend(devices.iter().cloned());
-        let mut frames = vec![];
-        if let Some(personal) = self.personal.clone() {
-            let obj = json!({"object": "recording-acceptance", "conversation": conversation, "recorders": devices, "accepted_at": now_i});
-            let f = self.send_object(&personal, &obj, now_i)?;
-            if !f.is_empty() {
-                frames.push(f);
-            }
-        }
-        Ok(json!({"accepted": devices, "frames": frames}).to_string())
+        self.0.accept_recording(gid, now).map_err(js_err)
     }
 
     /// How many of this device's call records wait for the conversation with the record-keeper (C§9).
     pub fn held_records(&self) -> usize {
-        self.records_held.len()
+        self.0.held_records()
     }
 
     /// As a record-keeper: the records received (C§9), `[{group, from, device, received_at, record}]`.
     pub fn records(&self) -> String {
-        json!(self.records).to_string()
+        self.0.records()
     }
 
     /// Whether this device is a recorder (its delegation carries `dsip.record`, C§5).
     pub fn is_recorder(&self) -> bool {
-        self.recorder
+        self.0.is_recorder()
     }
 
     /// The call log, one entry per session (M§13.3).
     pub fn calls(&self) -> String {
-        json!(self.calls).to_string()
+        self.0.calls()
     }
 
     /// One conversation's timeline (M§13.3, the pinned `peer_timeline`): its messages with this identity's call events
     /// for the peer interleaved — `{"call": {…}}` or the message as [`Messenger::thread`] gives it.
     pub fn timeline(&self, gid: &str) -> String {
-        let thread: Vec<Value> = serde_json::from_str(&self.thread(gid)).unwrap_or_default();
-        let peer = self.convs.get(gid).and_then(|c| c.peer.clone());
-        let calls = peer.as_deref().map(|p| self.calls.with_peer(p)).unwrap_or_default();
-        if calls.is_empty() {
-            return json!(thread).to_string();
-        }
-        let content: Vec<Value> = thread.iter().enumerate().map(|(i, m)| json!({"id": i.to_string(), "at": m["object"]["sent_at"]})).collect();
-        let order = dsip_messaging::client::peer_timeline(&json!({"content": content, "calls": calls}));
-        let out: Vec<Value> = order["timeline"].as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(|e| {
-            if let Some(i) = e.strip_prefix("content:") {
-                i.parse::<usize>().ok().and_then(|i| thread.get(i).cloned())
-            } else {
-                let sess = e.strip_prefix("call:").unwrap_or("");
-                calls.iter().find(|c| c["session"] == sess).map(|c| json!({"call": c}))
-            }
-        }).collect();
-        json!(out).to_string()
+        self.0.timeline(gid)
     }
 
     /// Whether this device can send to `peer` (M§13.2 condition 2): a direct conversation exists, or a grant from them
     /// is held that would let one be created (M§14.2).
     pub fn can_send(&self, peer: &str) -> bool {
-        self.convs.values().any(|c| c.kind == "direct" && c.peer.as_deref() == Some(peer)) || self.grants_held.contains_key(peer)
+        self.0.can_send(peer)
     }
 
     /// Seal a payload for upload (M§8.4 rule 1): a fresh single-use 32-byte key, AES-256-GCM, no AAD, stored as
     /// `nonce ‖ ciphertext ‖ tag`. Returns `{"sealed": b64url, "key": b64url, "sha256": hex, "size": n}`.
     pub fn seal_blob(&self, plain_b64: &str) -> String {
-        let plain = dsip_core::b64::decode(plain_b64).unwrap_or_default();
-        let key = KeyPair::generate().seed();
-        let nonce: [u8; 12] = KeyPair::generate().seed()[..12].try_into().expect("12 bytes");
-        let sealed = blob::seal_blob(&key, &nonce, &plain);
-        json!({"sealed": b64(&sealed.bytes), "key": b64(&key), "sha256": sealed.sha256, "size": sealed.bytes.len()}).to_string()
+        self.0.seal_blob(plain_b64)
     }
 
     /// The `blob-put` that authorizes one upload of `sha256`/`size` to this identity's mailbox (M§5.6), as the compact
     /// envelope for `Authorization: DSIP …`, carrying the device's delegation (M§5.1).
     pub fn blob_put(&self, sha256: &str, size: f64, now: f64) -> String {
-        let env = wire::message_delegated(&self.keys.device, vec![self.keys.delegation.clone()], "blob-put", &self.mailbox.0, now as i64,
-            wire::TTL_S, json!({"sha256": sha256, "size": size as u64}));
-        compact(&env)
+        self.0.blob_put(sha256, size, now)
     }
 
     /// An `audio` content object (M§8.2) for a blob already uploaded: `blob_json` is `{uri, sha256, size, key, content_type}`
     /// from [`Messenger::seal_blob`] and the upload; `purpose` `voice-message` or `voicemail` (with `session`). The deposit
     /// carries the manifest without the key (M§8.4 rule 4). The frame to send.
     pub fn send_audio(&mut self, gid: &str, blob_json: &str, duration_ms: f64, purpose: &str, session: Option<String>, now: f64) -> Result<String, JsValue> {
-        let now_i = now as i64;
-        let gid = &self.live(gid);
-        let b: Value = serde_json::from_str(blob_json).map_err(js)?;
-        let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        self.may_send_content(gid, now_i)?;
-        let id = self.fresh_id(now_i);
-        let uploaded = blob::Uploaded { uri: b["uri"].as_str().unwrap_or(""), sha256: b["sha256"].as_str().unwrap_or(""),
-            size: b["size"].as_u64().unwrap_or(0), key: b["key"].as_str().unwrap_or(""), content_type: b["content_type"].as_str().unwrap_or("") };
-        let obj = blob::audio_content(&id, &conversation, &self.keys.identity, now_i, purpose, duration_ms as i64, &uploaded, session.as_deref());
-        self.send_object(gid, &obj, now_i)
+        self.0.send_audio(gid, blob_json, duration_ms, purpose, session, now).map_err(js_err)
     }
 
     /// Where to fetch a content's blob from, in order (M§8.4 rules 6–7, the pinned `blob_sources`): the manifest's copy
     /// at another `uri` for the same `sha256` and `size`, then the content's own. `object_json` is the content object,
     /// `manifest_json` the item's `blobs` (or null).
     pub fn blob_sources(&self, object_json: &str, manifest_json: &str) -> String {
-        let object: Value = serde_json::from_str(object_json).unwrap_or(Value::Null);
-        let manifest: Value = serde_json::from_str(manifest_json).unwrap_or(Value::Null);
-        json!(blob::sources(&object, &manifest)).to_string()
+        self.0.blob_sources(object_json, manifest_json)
     }
 
     /// Open a fetched blob for a content object (M§8.4 rule 7): the size and SHA-256 must match the content's `blob`
     /// before it is decrypted under the key the content carries. The plaintext, base64url, or the refusal code.
     pub fn open_blob(&self, object_json: &str, stored_b64: &str) -> Result<String, JsValue> {
-        let object: Value = serde_json::from_str(object_json).map_err(js)?;
-        let stored = dsip_core::b64::decode(stored_b64).unwrap_or_default();
-        let plain = blob::open(&object, &stored).map_err(|c| JsValue::from_str(if c == "blob-key" { "blob key" } else { c }))?;
-        Ok(b64(&plain))
+        self.0.open_blob(object_json, stored_b64).map_err(js_err)
     }
 
     /// One source's answer as the fetch decision takes it (`status` 0: not reached; `stored_b64`, bytes a 200 served
     /// that did not open, or empty): `{uri, status, sha256?, size?}` (M§8.4 rule 7, spec-gap 106).
     pub fn blob_tried(&self, uri: &str, status: u16, stored_b64: &str) -> String {
-        let stored = dsip_core::b64::decode(stored_b64).filter(|_| !stored_b64.is_empty());
-        blob::tried(uri, status, stored.as_deref()).to_string()
+        self.0.blob_tried(uri, status, stored_b64)
     }
 
     /// Seconds before fetch `attempt` is tried again (spec-gap 67's schedule: 4 s doubling, at most 60 s).
     pub fn blob_retry_delay_s(&self, attempt: f64) -> f64 {
-        blob::retry_delay_s(attempt as i64) as f64
+        self.0.blob_retry_delay_s(attempt)
     }
 
     /// What a device does after its blob sources answered (`tried`: `[{uri, status, sha256?, size?}]`; the pinned
     /// `blob_fetch`, spec-gap 106): `{"action": "retry"|"give-up", "reason"}`.
     pub fn blob_fetch_decision(&self, object_json: &str, tried_json: &str, attempt: f64) -> String {
-        let object: Value = serde_json::from_str(object_json).unwrap_or(Value::Null);
-        let tried: Value = serde_json::from_str(tried_json).unwrap_or(Value::Null);
-        match blob::fetch_decision(&object, &tried, attempt as i64) {
-            blob::Fetch::Play(source) => json!({"action": "play", "source": source}),
-            blob::Fetch::Retry => json!({"action": "retry", "reason": "unavailable"}),
-            blob::Fetch::GiveUp(reason) => json!({"action": "give-up", "reason": reason}),
-        }
-        .to_string()
+        self.0.blob_fetch_decision(object_json, tried_json, attempt)
     }
 
     /// The user played an `audio` or `video` content (M§10.4): a `played` receipt under the same opt-in as `read`
     /// (M§10.5). Frames and events, as `inbound` returns them.
     pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> String {
-        let now_i = now as i64;
-        let Some(c) = self.convs.get_mut(gid) else { return "[]".into() };
-        let emissions = c.receipts.play(now_i, content_id);
-        json!(self.receipt_sends(gid, emissions, now_i)).to_string()
+        self.0.played(gid, content_id, now)
     }
 
     /// A DID document to hold (§8.1), for `did:web` peers.
     pub fn add_document(&mut self, doc_json: &str) -> bool {
-        match serde_json::from_str::<dsip_core::did::DidDocument>(doc_json) {
-            Ok(d) => {
-                self.resolver.insert(d);
-                true
-            }
-            Err(_) => false,
-        }
+        self.0.add_document(doc_json)
     }
 
     /// The client `hello` to send first on a connection to a mailbox (§13.2, M§4.3); one per connection.
     pub fn hello_frame(&mut self, now: f64) -> String {
-        let id = self.fresh_id(now as i64);
-        self.hello_ids.insert(id.clone());
-        client_hello(&self.keys, &self.supported, &id, now as i64).frame()
+        self.0.hello_frame(now)
     }
 
     /// Verify a service's `hello` (must echo one of ours, §20.5). Returns `{"ok":true,"did":…,"capabilities":…}` or
     /// `{"ok":false,"code":…}`. Named as the relay host expects, so one connection class serves both.
     pub fn relay_hello(&mut self, frame: &str, now: f64) -> String {
-        let answered = Envelope::from_frame(frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["in_reply_to"])).unwrap_or_default();
-        if !self.hello_ids.remove(&answered) {
-            return json!({"ok": false, "code": "hello-not-ours"}).to_string();
-        }
-        match verify_relay_hello(frame, &answered, now as i64, &self.resolver, &mut self.seen, &self.supported) {
-            Ok(h) => json!({"ok": true, "did": h.did, "capabilities": h.capabilities}).to_string(),
-            Err(v) => json!({"ok": false, "code": v.code.and_then(|c| serde_json::to_value(c).ok()).and_then(|c| c.as_str().map(String::from)).unwrap_or_default()}).to_string(),
-        }
+        self.0.relay_hello(frame, now)
     }
 
     /// A `sync` for this identity's mailbox (M§5.4): `since`/`ack_through` from the durable state, `live` once asked.
     pub fn sync_frame(&mut self, live: bool, now: f64) -> String {
-        self.want_live |= live;
-        let mut fields = self.resume.sync_fields();
-        fields["live"] = json!(self.want_live);
-        wire::message(&self.keys.device, "sync", &self.mailbox.0, now as i64, wire::TTL_S, fields).frame()
+        self.0.sync_frame(live, now)
     }
 
     /// A `key-packages` upload of `n` fresh KeyPackages and a last-resort one (M§5.5, M§6.7).
     pub fn key_packages_frame(&mut self, n: usize, now: f64) -> Result<String, JsValue> {
-        let mut packages = vec![];
-        for _ in 0..n {
-            packages.push(json!(b64(&self.mls.key_package().map_err(|e| js(e.0))?)));
-        }
-        let last = b64(&self.mls.key_package().map_err(|e| js(e.0))?);
-        let env = wire::message(&self.keys.device, "key-packages", &self.mailbox.0, now as i64, wire::TTL_S,
-            json!({"subject": self.keys.identity, "key_packages": packages, "last_resort": last}));
-        self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::KeyPackages { count: n + 1 });
-        Ok(env.frame())
+        self.0.key_packages_frame(n, now).map_err(js_err)
     }
 
     /// What to send on a fresh binding: pending application items again (M§9.3, the same bytes), then a sync.
     pub fn on_bound(&mut self, now: f64) -> String {
-        let mut frames = vec![];
-        let moved = self.moved_from.is_some();
-        if let Some(old) = self.moved_from.take() {
-            // spec-gap 122: a mailbox this identity moved to learns its groups, so hubs' fan-out is admitted (M§6.6)
-            let groups: Vec<Value> = self.convs.iter().map(|(g, c)| json!({"group": g, "state": "joined", "hub": c.hub.0, "hub_uri": c.hub.1})).collect();
-            if !groups.is_empty() {
-                let env = self.config_env(json!({"subject": self.keys.identity, "groups": groups}), now as i64);
-                frames.push(env.frame());
-            }
-            let _ = old;
-        }
-        frames.extend(self.redeposit_pending(moved, now as i64));
-        for (gid, items) in self.outbox.items.clone() {
-            if self.outbox.is_down(&gid) || self.outbox.is_abandoned(&gid) {
-                continue; // M§9.4: the outage's own backoff re-deposits the head (tick)
-            }
-            for it in items {
-                frames.push(self.deposit_item(&gid, &it, now as i64));
-            }
-        }
-        frames.push(self.sync_frame(true, now));
-        json!(frames).to_string()
-    }
-
-    /// Deposits whose answer a binding that ended took with it, sent again under fresh envelopes: a GroupInfo as a new
-    /// export, a commit as the same MLS bytes (the hub answers a duplicate digest with its seq, M§6.5), a
-    /// `mailbox-config` or archive record with the same fields. Application items go again from the outbox.
-    ///
-    /// Spec: M§9.3; M§4.1 step 3 (v0.13, spec-gap 122): after a move the new mailbox's registration of every group
-    /// supersedes a pending `mailbox-config` at the old one. Impl: an archive record goes to the new mailbox, the
-    /// identity's mailbox now; key packages are uploaded afresh by the host at every binding.
-    fn redeposit_pending(&mut self, moved: bool, now: i64) -> Vec<String> {
-        let mut frames = vec![];
-        for (id, p) in self.pending.iter().map(|(id, p)| (id.clone(), p.clone())).collect::<Vec<_>>() {
-            let frame = match &p {
-                Pending::GroupInfo { gid, .. } if self.convs.contains_key(gid) && !(self.outbox.is_down(gid) || self.outbox.is_abandoned(gid)) => {
-                    self.group_info_frame(gid, now).ok()
-                }
-                Pending::Commit { gid, fields, .. } if self.convs.contains_key(gid) => Some(self.hub_deposit(gid, "handshake", fields.clone(), now)),
-                Pending::Config { fields } if !moved => Some(wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S, fields.clone()).frame()),
-                Pending::Archive { fields } => {
-                    let gid = s_of(&fields["ref_group"]);
-                    Some(wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &self.mailbox.0, now, &gid, "archive", fields.clone()).frame())
-                }
-                Pending::GroupInfo { .. } | Pending::Commit { .. } | Pending::Config { .. } | Pending::KeyPackages { .. } | Pending::Proposal { .. } => None,
-                Pending::Application { .. } | Pending::PersonalReady { .. } => continue,
-            };
-            self.pending.remove(&id);
-            if let Some(f) = frame {
-                let nid = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-                self.pending.insert(nid, p);
-                frames.push(f);
-            }
-        }
-        frames
-    }
-
-    /// A `mailbox-config` to this device's mailbox (M§6.6), pending until answered.
-    fn config_env(&mut self, fields: Value, now: i64) -> Envelope {
-        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S, fields.clone());
-        self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Config { fields });
-        env
+        self.0.on_bound(now)
     }
 
     /// Create this identity's personal group at its mailbox (M§7.1): the `mailbox-config` that registers it and the
     /// GroupInfo deposit; the first archive key follows once the hub holds the group (M§12.1). Frames to send.
     pub fn create_personal(&mut self, now: f64) -> Result<String, JsValue> {
-        if self.personal.is_some() {
-            return Err(JsValue::from_str("this identity already has a personal group here"));
-        }
-        let (gid, frames) = self.new_group("personal", now as i64)?;
-        self.personal = Some(gid.clone());
-        // the GroupInfo deposit is the last frame: its accepted leads to the archive key
-        if let Some(id) = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])) {
-            self.pending.insert(id, Pending::GroupInfo { gid: gid.clone(), then: None });
-            self.pending.insert(format!("personal:{gid}"), Pending::PersonalReady { gid });
-        }
-        Ok(json!(frames).to_string())
+        self.0.create_personal(now).map_err(js_err)
     }
 
     /// A `key-package-fetch` for `target` to send on a connection to `to_mailbox` (M§5.5), presenting the grant
@@ -1083,39 +311,14 @@ impl Messenger {
     /// `successor_of` names the dead group a successor is created for: the target's mailbox serves it without a
     /// grant when that group is registered for the target (M§7.5, spec-gap 61).
     pub fn fetch_frame(&mut self, to_mailbox: &str, target: &str, now: f64, successor_of: Option<String>) -> String {
-        let mut fields = json!({"target": target});
-        if let Some(g) = successor_of {
-            fields["successor_of"] = json!(g);
-        }
-        if let Some(g) = self.grants_held.get(target) {
-            fields["grant"] = json!(g);
-        }
-        wire::message(&self.keys.device, "key-package-fetch", to_mailbox, now as i64, wire::TTL_S, fields).frame()
+        self.0.fetch_frame(to_mailbox, target, now, successor_of)
     }
 
     /// Create a direct conversation with `target` from its mailbox's `key-packages` answer (M§7.2): every device of
     /// the target the vector-pinned rule picks (C§5), plus this identity's own other devices from `own_json` (the
     /// same answer shape, or null), in one commit once the group is hubbed. Returns the frames to send, or the refusal.
     pub fn create_direct(&mut self, target: &str, key_packages_json: &str, own_json: Option<String>, now: f64) -> Result<String, JsValue> {
-        if let Some(gid) = self.convs.iter().find(|(_, c)| c.kind == "direct" && c.peer.as_deref() == Some(target)).map(|(g, _)| g.clone()) {
-            return Err(JsValue::from_str(&format!("a conversation with {target} exists: {gid}")));
-        }
-        let now_i = now as i64;
-        let mut kps = self.pick_key_packages(target, key_packages_json, now_i)?;
-        if let Some(own) = own_json {
-            let me = self.keys.identity.clone();
-            kps.extend(self.pick_key_packages(&me, &own, now_i).unwrap_or_default());
-        }
-        let (gid, frames) = self.new_group("direct", now_i)?;
-        if let Some(c) = self.convs.get_mut(&gid) {
-            c.peer = Some(target.to_string());
-        }
-        let grants: Vec<String> = self.grants_held.get(target).cloned().into_iter().collect();
-        let op = Op::Add { peer: target.to_string(), kps, grants, device: None };
-        if let Some(id) = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])) {
-            self.pending.insert(id, Pending::GroupInfo { gid, then: Some(op) });
-        }
-        Ok(json!(frames).to_string())
+        self.0.create_direct(target, key_packages_json, own_json, now).map_err(js_err)
     }
 
     /// Create a group conversation (M§7.3, `kind: group`) with the identities of `targets_json`, `{identity: its
@@ -1123,1402 +326,81 @@ impl Messenger {
     /// the vector-pinned rule picks, added in one commit once the group is hubbed at this identity's mailbox, with the
     /// grants held from them (M§14.2). Returns the frames to send.
     pub fn create_group(&mut self, targets_json: &str, own_json: Option<String>, now: f64) -> Result<String, JsValue> {
-        let now_i = now as i64;
-        let targets: serde_json::Map<String, Value> = serde_json::from_str(targets_json).map_err(js)?;
-        if targets.is_empty() {
-            return Err(JsValue::from_str("a group needs at least one other identity"));
-        }
-        let (mut kps, mut grants) = (vec![], vec![]);
-        for (target, answer) in &targets {
-            kps.extend(self.pick_key_packages(target, &answer.to_string(), now_i)?);
-            grants.extend(self.grants_held.get(target).cloned());
-        }
-        if let Some(own) = own_json {
-            let me = self.keys.identity.clone();
-            kps.extend(self.pick_key_packages(&me, &own, now_i).unwrap_or_default());
-        }
-        let (gid, frames) = self.new_group("group", now_i)?;
-        let peer = targets.keys().next().cloned().unwrap_or_default();
-        let op = Op::Add { peer, kps, grants, device: None };
-        if let Some(id) = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])) {
-            self.pending.insert(id, Pending::GroupInfo { gid, then: Some(op) });
-        }
-        Ok(json!(frames).to_string())
+        self.0.create_group(targets_json, own_json, now).map_err(js_err)
     }
 
     /// Add `target`'s devices to the group conversation `gid` from its mailbox's `key-packages` answer (M§7.3: any
     /// member identity MAY add another, holding its grant, M§14.2): the commit to deposit.
     pub fn add_member(&mut self, gid: &str, target: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
-        let now_i = now as i64;
-        if self.member_identities(gid, now_i).iter().any(|i| i == target) {
-            return Err(JsValue::from_str(&format!("{target} is a member already")));
-        }
-        let kps = self.pick_key_packages(target, key_packages_json, now_i)?;
-        let grants: Vec<String> = self.grants_held.get(target).cloned().into_iter().collect();
-        self.propose(gid, &Op::Add { peer: target.to_string(), kps, grants, device: None }, now_i)
+        self.0.add_member(gid, target, key_packages_json, now).map_err(js_err)
     }
 
     /// Remove the member identity `target` from the conversation `gid`, every leaf of it (M§7.3: any member identity
     /// MAY remove another; this identity leaves with [`Messenger::leave`] instead): the commit to deposit.
     pub fn remove_member(&mut self, gid: &str, target: &str, now: f64) -> Result<String, JsValue> {
-        if target == self.keys.identity {
-            return Err(JsValue::from_str("this identity leaves instead (M§7.3: no commit removes its committer)"));
-        }
-        if self.personal.as_deref() == Some(gid) {
-            return Err(JsValue::from_str("the personal group holds this identity's devices only (M§7.1)"));
-        }
-        self.propose(gid, &Op::Remove { identity: target.to_string() }, now as i64)
+        self.0.remove_member(gid, target, now).map_err(js_err)
     }
 
     /// Move the conversation `gid` to this identity's own mailbox as its hub (M§7.4: while the hub is alive, any member
     /// MAY move the group): the commit to deposit at the current hub. On `accepted` this device's mailbox follows and
     /// the new hub is bootstrapped with the GroupInfo and `handover_seq`.
     pub fn move_hub(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        let gid = self.live(gid);
-        let c = self.convs.get(&gid).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        if c.hub.0 == self.mailbox.0 {
-            return Err(JsValue::from_str("the conversation is already hubbed at this identity's mailbox"));
-        }
-        let hub = json!({"did": self.mailbox.0, "uri": self.mailbox.1});
-        self.propose(&gid, &Op::MoveHub { hub }, now as i64)
+        self.0.move_hub(gid, now).map_err(js_err)
     }
 
     /// The roster changes of a conversation and its predecessors, oldest first: `[{group, seq, epoch, by, added,
     /// removed, left}]` (M§7.3: rendered, attributed to the committing identity).
     pub fn roster_log(&self, gid: &str) -> String {
-        let groups = self.lineage(gid);
-        let list: Vec<Value> = self.roster_log.iter().filter(|(g, _)| groups.contains(*g))
-            .flat_map(|(g, es)| es.iter().map(move |e| { let mut e = e.clone(); e["group"] = json!(g); e })).collect();
-        json!(list).to_string()
+        self.0.roster_log(gid)
     }
 
     /// A text message to a conversation (M§8.1 `content`, kind `text`): the deposit to send, pending until the hub's
     /// `accepted` (M§9.2).
     pub fn send_text(&mut self, gid: &str, text: &str, now: f64) -> Result<String, JsValue> {
-        let now_i = now as i64;
-        let gid = &self.live(gid);
-        let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        self.may_send_content(gid, now_i)?;
-        let obj = json!({"object": "content", "id": self.fresh_id(now_i), "conversation": conversation, "sender": self.keys.identity,
-            "sent_at": now_i, "kind": "text", "purpose": "message", "content_type": "text/plain", "text": text});
-        self.send_object(gid, &obj, now_i)
+        self.0.send_text(gid, text, now).map_err(js_err)
     }
 
     /// Conversations: `[{group, conversation, kind, peer, members, epoch, hub, pending, recorded, recorders, may_send,
     /// recorders_pending}]`; members are the leaves that authenticate at `now` (M§6.2); `pending` counts items not yet
     /// accepted by the hub; `recorders_pending` lists the recorders the user has still to accept (C§5).
     pub fn conversations(&self, now: f64) -> String {
-        let ctx = Context::new(now as i64, &self.resolver);
-        let list: Vec<Value> = self.convs.iter().filter(|(g, _)| !self.leaving.contains(*g))
-            .filter(|(g, _)| !self.successors.successor(g).is_some_and(|w| self.convs.contains_key(w) && w != g.as_str())).map(|(g, c)| {
-            let leaves: Vec<_> = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect();
-            let recording = self.recording_of(&leaves, &c.conversation);
-            let mut members: Vec<String> = leaves.into_iter().map(|w| w.identity).collect();
-            members.sort();
-            members.dedup();
-            json!({"group": g, "conversation": c.conversation, "kind": c.kind, "peer": c.peer, "members": members, "epoch": c.group.epoch().as_u64(),
-                   "recorded": recording["recorded"], "recorders": recording["recorders"], "may_send": recording["may_send"],
-                   "recorders_pending": recording["pending"],
-                   "hub": {"did": c.hub.0, "uri": c.hub.1}, "pending": self.outbox.pending(g) + self.handover.get(g).map_or(0, Vec::len),
-                   "hub_down": self.outbox.is_down(g),
-                   "predecessors": self.lineage(g).into_iter().filter(|x| x != g).collect::<Vec<_>>()})
-        }).collect();
-        json!(list).to_string()
+        self.0.conversations(now)
     }
 
     /// The thread of one group in `seq` order (M§8.5): `[{key, sender, sender_device, object, seq, mine, delivered,
     /// from_archive}]`; `read_through` of the whole thread is `{identity: content id}` (M§10.3), in
     /// [`Messenger::read_marks`].
     pub fn thread(&self, gid: &str) -> String {
-        let snap = self.convs.get(gid).map(|c| c.receipts.snapshot()).unwrap_or(Value::Null);
-        let groups = self.lineage(gid);
-        let mut list: Vec<Value> = self.messages.iter().filter(|m| m["group"].as_str().is_some_and(|g| groups.contains(g))).map(|m| {
-            let mut m = m.clone();
-            m["delivered"] = snap["delivered"][s_of(&m["object"]["id"])].clone();
-            m["played"] = snap["played"][s_of(&m["object"]["id"])].clone();
-            m
-        }).collect();
-        // predecessors first, each in seq order (a successor's numbering starts afresh)
-        let order: Vec<String> = { let mut v: Vec<String> = groups.iter().cloned().collect(); v.sort_by_key(|g| (g == gid, self.lineage(g).len())); v };
-        list.sort_by_key(|m| (order.iter().position(|g| m["group"] == g.as_str()).unwrap_or(0), m["seq"].as_i64().unwrap_or(i64::MAX), s_of(&m["key"])));
-        json!(list).to_string()
+        self.0.thread(gid)
     }
 
     /// Each identity's read watermark in a conversation, `{identity: content id}` (M§10.3; a sibling's undisclosed
     /// one reaches us through the personal group, M§10.5).
     pub fn read_marks(&self, gid: &str) -> String {
-        self.convs.get(gid).map(|c| c.receipts.snapshot()["read_through"].to_string()).unwrap_or_else(|| "{}".into())
+        self.0.read_marks(gid)
     }
 
     /// Introductions delivered through the mailbox and not yet answered (M§14.1), `{id: payload}`.
     pub fn requests(&self) -> String {
-        json!(self.requests).to_string()
+        self.0.requests()
     }
 
     /// The personal group's id, once created.
     pub fn personal(&self) -> Option<String> {
-        self.personal.clone()
+        self.0.personal()
     }
 
     /// Process one frame from the mailbox. Returns the emissions: `{send: frame}` (to the mailbox), `{ui: …}`
     /// events, `{sync: true}` when a refused commit asks for one (spec-gap 58), `{refused: …}`, `{error: …}`.
     pub fn inbound(&mut self, frame: &str, now: f64) -> String {
-        let now_i = now as i64;
-        let mut out = vec![];
-        self.seen.sweep(now_i);
-        let inb = {
-            let mut ctx = Context::new(now_i, &self.resolver);
-            ctx.seen_ids = self.seen.set();
-            ctx.supported = self.supported.clone();
-            match verify_frame(frame, &ctx) {
-                Ok(i) => i,
-                Err(r) => return json!([{"rejected": {"code": r.code, "reason": r.reason}}]).to_string(),
-            }
-        };
-        let p = inb.payload().clone();
-        self.seen.insert(&s_of(&p["id"]), now_i, now_i);
-        let answers_ours = p["in_reply_to"].as_str().is_some_and(|id| self.pending.contains(id));
-        if inb.device() != self.mailbox.0 && !(matches!(inb.msg_type(), "key-packages" | "error") || (inb.msg_type() == "accepted" && answers_ours)) {
-            // Everything on this binding is the mailbox's (M§4.1), except what it relays unchanged: a hub's `accepted`
-            // or `error` to a deposit it forwarded (M§5.2), and a peer mailbox's answer to a key-package-fetch (M§5.5).
-            out.push(json!({"drop": format!("frame from {}, not the mailbox", inb.device())}));
-            return json!(out).to_string();
-        }
-        match inb.msg_type() {
-            "items" => {
-                for item in p["items"].as_array().into_iter().flatten() {
-                    match self.item(item, now_i) {
-                        Ok(more) => out.extend(more),
-                        Err(e) => out.push(json!({"error": format!("item {}: {}", item["cursor"], e.0)})),
-                    }
-                }
-                out.extend(self.receipts_batch(now_i));
-                out.extend(self.apply_restored(now_i));
-                if p["next"].is_string() {
-                    out.push(json!({"send": self.sync_frame(false, now)}));
-                } else if p["in_reply_to"].is_string() {
-                    // caught up: membership changes refused for a conflict are re-proposed while still needed, and what a
-                    // moved group's old hub refused goes to the new one (M§7.4). Only the answer to a sync says so: a live
-                    // push (no in_reply_to, M§5.4) can arrive first, from before the winning commit or the move
-                    out.extend(self.after_sync(now_i));
-                }
-            }
-            "accepted" => out.extend(self.accepted(&p, now_i)),
-            "error" if p["reason"] == "mailbox.cursor-invalid" => {
-                // M§5.4: re-sync from null; seq positions make the redelivery collapse (M§8.5)
-                self.resume.cursor_invalid();
-                out.push(json!({"ui": "resync"}));
-                out.push(json!({"send": self.sync_frame(false, now)}));
-            }
-            "error" => out.extend(self.refused(&p, now_i)),
-            "key-packages" => out.push(json!({"key_packages": p})),
-            other => out.push(json!({"drop": format!("no handler for {other}")})),
-        }
-        json!(out).to_string()
+        self.0.inbound(frame, now)
     }
 
     /// A fresh ULID (§12.9: timestamp-consistent with `now`).
     pub fn new_id(&mut self, now: f64) -> String {
-        self.fresh_id(now as i64)
+        self.0.new_id(now)
     }
 }
-
-impl Messenger {
-    fn fresh_id(&mut self, now: i64) -> String {
-        self.counter += 1;
-        dsip_core::ulid::Ulid::generate_at((now.max(0) as u64) * 1000 + self.counter % 1000).as_str().to_string()
-    }
-
-    fn ctx(&self, now: i64) -> Context<'_> {
-        Context::new(now, &self.resolver)
-    }
-
-    fn new_receipts(&self, now: i64) -> Receipts {
-        Receipts::new(&self.keys.identity, &json!({"delivered": true, "read": self.read_disclosed, "played": self.read_disclosed}), now)
-    }
-
-
-    /// Authenticate a `key-packages` answer and pick the devices to add for `target` (M§5.5, M§6.2, C§5).
-    fn pick_key_packages(&self, target: &str, payload_json: &str, now: i64) -> Result<Vec<Vec<u8>>, JsValue> {
-        let payload: Value = serde_json::from_str(payload_json).map_err(js)?;
-        if payload["type"] != "key-packages" {
-            return Err(JsValue::from_str(&format!("key-package-fetch refused: {} {}", payload["reason"], payload["detail"])));
-        }
-        let me = key_packages::Me { identity: &self.keys.identity, device: &self.keys.device.did() };
-        let picked = key_packages::select(&payload, target, &me, "conversation", self.mls.provider(), &self.ctx(now))
-            .map_err(|why| JsValue::from_str(&format!("no device of {target} to add: {why} (C§5)")))?;
-        Ok(picked.into_iter().map(|(bytes, _)| bytes).collect())
-    }
-
-    /// A group of `kind` hubbed at this identity's mailbox (M§6.5 rule 6, M§6.6): registered with `mailbox-config`,
-    /// its GroupInfo deposited. Returns the group id and the frames, GroupInfo last.
-    fn new_group(&mut self, kind: &str, now: i64) -> Result<(String, Vec<String>), JsValue> {
-        self.new_group_for(None, kind, None, now)
-    }
-
-    /// As [`Self::new_group`], for an existing `conversation` and with `successor_of` (M§7.5).
-    fn new_group_for(&mut self, conversation: Option<String>, kind: &str, successor_of: Option<&str>, now: i64) -> Result<(String, Vec<String>), JsValue> {
-        let conversation = conversation.unwrap_or_else(|| self.fresh_id(now));
-        let group_id = self.fresh_id(now).into_bytes();
-        let conv = json!({"conversation": conversation, "kind": kind, "hub": {"did": self.mailbox.0, "uri": self.mailbox.1}, "successor_of": successor_of});
-        let group = self.mls.create_group(&group_id, &serde_json::to_vec(&conv).map_err(js)?).map_err(|e| js(e.0))?;
-        let gid = b64(group.group_id().as_slice());
-        let epoch = group.epoch().as_u64();
-        self.convs.insert(gid.clone(), Conv {
-            group, conversation, kind: kind.to_string(), hub: (self.mailbox.0.clone(), self.mailbox.1.clone()), peer: None,
-            receipts: self.new_receipts(now), joined_epoch: epoch,
-        });
-        let config = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined", "hub": self.mailbox.0}]}), now);
-        let gi = self.group_info_frame(&gid, now)?;
-        Ok((gid, vec![config.frame(), gi]))
-    }
-
-    /// The GroupInfo deposit for the hub (M§6.5 rule 6).
-    fn group_info_frame(&mut self, gid: &str, now: i64) -> Result<String, JsValue> {
-        self.group_info_frame_at(gid, None, now)
-    }
-
-    /// As [`Self::group_info_frame`]; `handover_seq` bootstraps a group's new hub, which continues the numbering after
-    /// the seq the old hub gave the moving commit (M§7.4).
-    fn group_info_frame_at(&mut self, gid: &str, handover_seq: Option<i64>, now: i64) -> Result<String, JsValue> {
-        let c = self.convs.get(gid).ok_or_else(|| JsValue::from_str("group"))?;
-        let gi = c.group.export_group_info(self.mls.provider().crypto(), &self.mls.signer(), true).map_err(|e| js(format!("{e:?}")))?;
-        let bytes = gi.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?;
-        let mut fields = json!({"mls": b64(&bytes)});
-        if let Some(h) = handover_seq {
-            fields["handover_seq"] = json!(h);
-        }
-        Ok(self.hub_deposit(gid, "group-info", fields, now))
-    }
-
-    /// The group moved to `hub` (`{did, uri}`) by the commit at `seq`: deposits go there from now on, and this
-    /// identity's mailbox is told, so it admits the new hub's fan-out and forwards to it (M§7.4 "Member mailboxes follow
-    /// their owner's devices"). The same `did` at a new `uri` is not a move: no `handover_seq`, nothing logged.
-    fn hub_moved(&mut self, gid: &str, hub: &Value, (seq, epoch): (i64, u64), by: &str, now: i64) -> Vec<Value> {
-        let (did, uri) = (s_of(&hub["did"]), s_of(&hub["uri"]));
-        let Some(c) = self.convs.get_mut(gid) else { return vec![] };
-        let moved = c.hub.0 != did;
-        c.hub = (did.clone(), uri.clone());
-        let mut g = json!({"group": gid, "state": "joined", "hub": did});
-        if uri.starts_with("wss://") {
-            g["hub_uri"] = json!(uri);
-        }
-        let mut out = vec![];
-        if moved {
-            // spec-gap 129: until the new hub accepts a deposit, its mailbox.unknown-group means "not set up yet"
-            let a = self.arrivals.entry(gid.to_string()).or_insert_with(|| MoveArrival::new(&json!({"now": now})));
-            a.set_now(now);
-            a.moved(&did);
-            g["handover_seq"] = json!(seq);
-            // rendered in the thread like a roster change, attributed to the committing identity
-            let entry = json!({"seq": seq, "epoch": epoch, "by": by, "added": [], "removed": [], "left": [], "hub": did});
-            self.roster_log.entry(gid.to_string()).or_default().push(entry.clone());
-            let mut ui = entry;
-            ui["ui"] = json!("hub_moved");
-            ui["group"] = json!(gid);
-            out.push(ui);
-        }
-        let env = self.config_env(json!({"subject": self.keys.identity, "groups": [g]}), now);
-        out.insert(0, json!({"send": env.frame()}));
-        out
-    }
-
-    /// A deposit to a group's hub through this device's mailbox, the delegation in the header (M§5.1, M§5.2).
-    fn hub_deposit(&mut self, gid: &str, class: &str, fields: Value, now: i64) -> String {
-        let hub = self.convs.get(gid).map(|c| c.hub.0.clone()).unwrap_or_default();
-        if let Some(bytes) = fields["mls"].as_str().and_then(dsip_core::b64::decode) {
-            self.own.insert(digest(&bytes));
-        }
-        let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &hub, now, gid, class, fields);
-        if let Some(p) = wire::payload_of(&env) {
-            self.pending.addressed(s_of(&p["id"]), hub);
-        }
-        env.frame()
-    }
-
-    /// Stage a commit for `op` and deposit it (M§6.5); merged on `accepted`.
-    fn propose(&mut self, gid: &str, op: &Op, now: i64) -> Result<String, JsValue> {
-        let ctx = Context::new(now, &self.resolver);
-        if matches!(op, Op::Rejoin) {
-            return self.external_commit(gid, now);
-        }
-        let c = self.convs.get_mut(gid).ok_or_else(|| JsValue::from_str("group"))?;
-        // M§7.3: another identity is removed whole, every leaf of it (the rule every member checks, spec-gap 126)
-        let leaves = match op {
-            Op::Remove { identity } => commits::identity_leaves(&c.group, &ctx, identity),
-            _ => vec![],
-        };
-        let mut packages = vec![];
-        let (change, grants) = match op {
-            Op::Rejoin => unreachable!("handled above"),
-            // M§7.3 "Leaving": the leaver's Remove proposals, committed by reference
-            Op::Leave { .. } => (Change::Proposals, &[][..]),
-            Op::Remove { identity } if leaves.is_empty() => return Err(JsValue::from_str(&format!("{identity} is not a member"))),
-            Op::Remove { .. } => (Change::Remove(&leaves), &[][..]),
-            // M§7.4: a GroupContextExtensions commit changing the hub and nothing else, ordered by the old hub
-            Op::MoveHub { hub } => (Change::MoveHub(hub), &[][..]),
-            Op::Add { kps, grants, .. } => {
-                for bytes in kps {
-                    let (kp, _) = authenticate_key_package(bytes, self.mls.provider(), &ctx).map_err(|e| js(e.0))?;
-                    packages.push(kp);
-                }
-                (Change::Add(&packages), grants.as_slice())
-            }
-        };
-        let mut built = commits::build(&self.mls, &mut c.group, change).map_err(js)?;
-        if !self.config.deposits_welcome(matches!(op, Op::Add { .. })) {
-            built.welcome = None;
-        }
-        let fields = built.fields(grants);
-        let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
-        let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-        self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(op.clone()), fields });
-        Ok(frame)
-    }
-
-    /// Whether a conversation is recorded and by whom, from its members' leaves (C§5, the pinned `conversation`
-    /// check), with the recorders accepted: this identity's own (C§5: they need none) and those its devices accepted
-    /// for this conversation. `pending` lists the recorders still to accept: a new one asks again.
-    fn recording_of(&self, leaves: &[dsip_messaging::mls_wire::LeafIdentity], conversation: &str) -> Value {
-        recording::state(leaves, &self.keys.identity, self.recording_accepted.get(conversation).unwrap_or(&BTreeSet::new()))
-    }
-
-    /// The members' leaves of a group this device is in, authenticated at `now` (M§6.2).
-    fn leaves_of(&self, gid: &str, now: i64) -> Vec<dsip_messaging::mls_wire::LeafIdentity> {
-        let ctx = Context::new(now, &self.resolver);
-        self.convs.get(gid).map(|c| c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).collect()).unwrap_or_default()
-    }
-
-    /// Content may go to `gid` (C§5): this device is not a recorder, which never speaks, and every recorder in the
-    /// conversation is accepted.
-    fn may_send_content(&self, gid: &str, now: i64) -> Result<(), JsValue> {
-        if self.recorder {
-            return Err(JsValue::from_str("this device is a recorder: it never sends content (C§5)"));
-        }
-        if self.leaving.contains(gid) {
-            return Err(JsValue::from_str("this identity has left the conversation (M§7.3)"));
-        }
-        let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        if self.recording_of(&self.leaves_of(gid, now), &conversation)["may_send"] != json!(true) {
-            return Err(JsValue::from_str("this conversation is recorded and a recorder is not accepted: no content is sent (C§5)"));
-        }
-        Ok(())
-    }
-
-    /// Encrypt an application object and deposit it; pending until accepted (M§9.2).
-    fn send_object(&mut self, gid: &str, obj: &Value, now: i64) -> Result<String, JsValue> {
-        let (provider, signer) = (self.mls.provider(), self.mls.signer());
-        let c = self.convs.get_mut(gid).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
-        let bytes = c.group.create_message(provider, &signer, &serde_json::to_vec(obj).map_err(js)?)
-            .map_err(|e| js(format!("{e:?}")))?.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?;
-        let mut item = json!({"id": self.fresh_id(now), "mls": b64(&bytes), "obj": obj});
-        if let Some(b) = obj.get("blob") {
-            // M§8.4 rule 4: the deposit's manifest names the blob without its key
-            item["blobs"] = json!([{"uri": b["uri"], "sha256": b["sha256"], "size": b["size"]}]);
-        }
-        let queued = match self.outbox.deposit(gid, item.clone(), now, false) {
-            Deposit::Abandoned => {
-                // M§9.4: the dead group takes no more content; it goes to the successor once there is one
-                self.handover.entry(gid.to_string()).or_default().push(obj.clone());
-                return Ok(String::new());
-            }
-            Deposit::Queued => true,
-            Deposit::Send => false,
-        };
-        if obj["object"] == "content" {
-            // shown at once as ours; its seq is filled in by the hub's accepted (M§8.5)
-            let key = self.config.object_key(obj);
-            self.shown.insert(key.clone());
-            self.messages.push(json!({"group": gid, "key": key, "sender": self.keys.identity, "sender_device": self.keys.device.did(),
-                "object": obj, "seq": null, "mine": true, "item": item["id"]}));
-        }
-        if queued {
-            return Ok(String::new()); // M§9.4: queued behind the pending head while the hub is down
-        }
-        Ok(self.deposit_item(gid, &item, now))
-    }
-
-    /// The deposit of a pending item, under a fresh envelope but the same item id and bytes (M§9.3).
-    fn deposit_item(&mut self, gid: &str, item: &Value, now: i64) -> String {
-        let mut fields = json!({"mls": item["mls"]});
-        if let Some(b) = item.get("blobs") {
-            fields["blobs"] = b.clone();
-        }
-        let frame = self.hub_deposit(gid, "application", fields, now);
-        let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-        self.pending.watch(id.clone(), now);
-        self.pending.insert(id, Pending::Application { gid: gid.to_string(), item: s_of(&item["id"]) });
-        frame
-    }
-
-    /// The hub or mailbox accepted a deposit of ours (M§5.3).
-    fn accepted(&mut self, p: &Value, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        let id = s_of(&p["in_reply_to"]);
-        let Some((pending, hub)) = self.pending.answer(&id) else { return out };
-        if let (Some(gid), Some(hub)) = (pending.gid(), hub) {
-            if let Some(a) = self.arrivals.get_mut(gid) {
-                a.set_now(now);
-                a.answer(&hub, None); // M§7.4 (spec-gap 129): an accepted shows the new hub hosts the group
-            }
-        }
-        match pending {
-            Pending::Proposal { gid } => {
-                if let Some(seq) = p["seq"].as_i64() {
-                    self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
-                }
-                out.push(json!({"ui": "leave_proposed", "group": gid, "seq": p["seq"]}));
-            }
-            Pending::Commit { gid, op: Some(Op::Rejoin), .. } => {
-                // M§6.8: the external commit is already applied locally (OpenMLS stores it merged)
-                let Some(c) = self.convs.get(&gid) else { return out };
-                let (epoch, kind, conversation) = (c.group.epoch().as_u64(), c.kind.clone(), c.conversation.clone());
-                let members = self.member_identities(&gid, now);
-                if kind == "personal" {
-                    self.personal = Some(gid.clone());
-                }
-                self.history.joined(&gid, epoch);
-                if let Some(seq) = p["seq"].as_i64() {
-                    self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
-                }
-                self.retries.remove(&gid);
-                let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined"}]}), now);
-                out.push(json!({"send": env.frame()}));
-                out.push(json!({"ui": "joined", "group": gid, "conversation": conversation, "kind": kind, "members": members, "epoch": epoch,
-                    "external": true, "seq": p["seq"]}));
-                // M§6.5 rule 6: the hub gets the GroupInfo of the new epoch
-                if let Ok(f) = self.group_info_frame(&gid, now) {
-                    let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-                    self.pending.insert(id, Pending::GroupInfo { gid, then: None });
-                    out.push(json!({"send": f}));
-                }
-            }
-            Pending::Commit { gid, op, .. } => {
-                let before_ids = self.member_identities(&gid, now);
-                let left: Vec<String> = match &op {
-                    Some(Op::Leave { identity }) => vec![identity.clone()],
-                    _ => vec![],
-                };
-                if let Some(c) = self.convs.get_mut(&gid) {
-                    if let Err(e) = c.group.merge_pending_commit(self.mls.provider()) {
-                        out.push(json!({"error": format!("merge commit: {e:?}")}));
-                        return out;
-                    }
-                    let epoch = c.group.epoch().as_u64();
-                    let (added, device) = match &op { Some(Op::Add { peer, device, .. }) => (Some(peer.clone()), device.clone()), _ => (None, None) };
-                    out.push(json!({"ui": "committed", "group": gid, "epoch": epoch, "seq": p["seq"], "added": added, "device": device,
-                        "personal": self.personal.as_deref() == Some(gid.as_str())}));
-                }
-                if let Some(epoch) = self.convs.get(&gid).map(|c| c.group.epoch().as_u64()) {
-                    let me = self.keys.identity.clone();
-                    out.extend(self.log_roster(&gid, (p["seq"].clone(), epoch), &me, &before_ids, &left, now));
-                }
-                if let Some(seq) = p["seq"].as_i64() {
-                    self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
-                }
-                self.retries.remove(&gid);
-                self.unknown_at.remove(&gid);
-                // M§7.4: the committer's mailbox follows on `accepted`, and the new hub is bootstrapped by the GroupInfo
-                // carrying the seq the old hub gave the moving commit
-                let mut handover_seq = None;
-                if let (Some(Op::MoveHub { hub }), Some(seq), Some(epoch)) = (&op, p["seq"].as_i64(), self.convs.get(&gid).map(|c| c.group.epoch().as_u64())) {
-                    let me = self.keys.identity.clone();
-                    out.extend(self.hub_moved(&gid, hub, (seq, epoch), &me, now));
-                    handover_seq = Some(seq);
-                }
-                out.extend(self.flush_handover(&gid, now)); // M§9.4: the successor holds its members: the pending items go in
-                match self.group_info_frame_at(&gid, handover_seq, now) {
-                    Ok(f) => {
-                        let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-                        self.pending.insert(id, Pending::GroupInfo { gid, then: None });
-                        out.push(json!({"send": f}));
-                    }
-                    Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default()})),
-                }
-            }
-            Pending::GroupInfo { gid, then } => {
-                if then.is_none() {
-                    out.extend(self.flush_handover(&gid, now)); // a successor with nobody to add (M§9.4)
-                }
-                if let Some(op) = then {
-                    match self.propose(&gid, &op, now) {
-                        Ok(f) => out.push(json!({"send": f})),
-                        Err(e) => out.push(json!({"refused": format!("add: {}", e.as_string().unwrap_or_default())})),
-                    }
-                }
-                if let Some(Pending::PersonalReady { gid: g }) = self.pending.remove(&format!("personal:{gid}")) {
-                    // M§7.1, M§12.1: the first archive key, sent to the personal group as an object
-                    let akid = self.fresh_id(now);
-                    let key = KeyPair::generate().seed(); // 32 random bytes (M§12.1)
-                    self.archive_keys.insert(akid.clone(), (key.to_vec(), now));
-                    self.history.archive_key(&akid, now); // the current key, from now on
-                    let obj = json!({"object": "archive-key", "akid": akid, "key": b64(&key), "created_at": now});
-                    match self.send_object(&g, &obj, now) {
-                        Ok(f) => out.push(json!({"send": f})),
-                        Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default()})),
-                    }
-                    out.push(json!({"ui": "personal", "group": g}));
-                }
-            }
-            Pending::Application { gid, item } => {
-                let obj = self.outbox.item(&gid, &item).map(|i| i["obj"].clone());
-                self.outbox.remove(&gid, &item);
-                if let (Some(obj), Some(seq)) = (obj, p["seq"].as_i64()) {
-                    // M§10.2: our own content enters the receipts machine at its hub seq, so receipts for it are booked
-                    let emissions = self.convs.get_mut(&gid).map(|c| c.receipts.own(now, seq, &obj)).unwrap_or_default();
-                    out.extend(self.receipt_sends(&gid, emissions, now));
-                    // M§12.2: our own content is archived under the seq of its accepted (spec-gap 51); our read watermark
-                    // (spec-gap 68) and call events (spec-gap 63) too, as state for a device added later
-                    let decisions = self.history.sent(&gid, seq, &self.config.object_key(&obj), &obj);
-                    let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
-                    out.extend(self.archive_requests(&gid, &decisions, &obj, &me, &dev, seq, now));
-                }
-                if let Some(seq) = p["seq"].as_i64() {
-                    // spec-gap 47: our own copy is processed by its accepted seq
-                    self.resume.sent(&gid, seq);
-                    self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "application"}}));
-                    for m in self.messages.iter_mut().filter(|m| m["item"] == item) {
-                        m["seq"] = json!(seq);
-                    }
-                }
-                out.push(json!({"ui": "sent", "group": gid, "item": item, "seq": p["seq"], "duplicate": p["duplicate"]}));
-                // M§9.4: an accepted ends an outage and flushes the queue in order
-                let ems = self.outbox.answered(&gid, &item, None);
-                if ems.iter().any(|e| e.get("forward").is_some()) {
-                    out.push(json!({"ui": "hub_back", "group": gid}));
-                }
-                out.extend(self.outage_emissions(&gid, ems, now));
-            }
-            Pending::PersonalReady { .. } => {}
-            Pending::KeyPackages { count } => out.push(json!({"ui": "key_packages_uploaded", "count": count})),
-            Pending::Config { .. } => {}
-            Pending::Archive { .. } => out.push(json!({"ui": "archived", "duplicate": p["duplicate"]})),
-        }
-        out
-    }
-
-    /// The hub or mailbox refused a deposit of ours (M§16): a commit as `CommitRetry` decides (spec-gap 58).
-    fn refused(&mut self, p: &Value, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        let reason = s_of(&p["reason"]);
-        let id = s_of(&p["in_reply_to"]);
-        let Some((pending, hub)) = self.pending.answer(&id) else {
-            out.push(json!({"error": format!("{reason} {}", p["detail"])}));
-            return out;
-        };
-        if matches!(pending, Pending::Commit { .. } | Pending::Application { .. }) {
-            let gid = pending.gid().unwrap_or_default().to_string();
-            let ems = match (self.arrivals.get_mut(&gid), &hub) {
-                (Some(a), Some(hub)) => {
-                    a.set_now(now);
-                    a.answer(hub, Some(&reason))
-                }
-                _ => vec![],
-            };
-            if let Some(d) = ems.iter().find_map(|e| e["retry_in"].as_i64()) {
-                // M§7.4 (spec-gap 129): the hub the group moved to is not set up yet: the same deposit again later
-                self.pending.defer(pending, now + d);
-                out.push(json!({"ui": "hub_arriving", "group": gid, "in": d}));
-                return out;
-            }
-            if ems.iter().any(|e| e.get("expired").is_some()) {
-                out.push(json!({"ui": "hub_arrival_expired", "group": gid}));
-            }
-        }
-        match pending {
-            Pending::Commit { gid, op, .. } => {
-                let mut retry = self.retries.remove(&gid).map(|(r, _)| r).unwrap_or_default();
-                if let Answer::Discard { surface } = retry.answer(Some(&reason)) {
-                    if matches!(op, Some(Op::Rejoin)) {
-                        // M§6.8: the joined state from a GroupInfo that was not the latest is discarded
-                        if let Some(mut c) = self.convs.remove(&gid) {
-                            let _ = c.group.delete(self.mls.provider().storage());
-                        }
-                    } else if let Some(c) = self.convs.get_mut(&gid) {
-                        let _ = c.group.clear_pending_commit(self.mls.provider().storage());
-                    }
-                    if let Some(r) = surface {
-                        out.push(json!({"refused": format!("commit in {gid}: {r}")}));
-                    } else {
-                        if reason == "mailbox.unknown-group" {
-                            // M§7.4: the group may have moved; the sync shows whether it did
-                            if let Some(c) = self.convs.get(&gid) {
-                                self.unknown_at.insert(gid.clone(), c.hub.0.clone());
-                            }
-                        }
-                        out.push(json!({"ui": "conflict", "group": gid, "reason": reason}));
-                        if let Some(op) = op.clone() {
-                            self.retries.insert(gid.clone(), (retry.clone(), op));
-                        }
-                        out.push(json!({"sync": true}));
-                    }
-                }
-            }
-            Pending::GroupInfo { gid, .. } => out.push(json!({"refused": format!("group-info for {gid}: {reason}")})),
-            // M§7.3: a refused proposal (a stale epoch) is proposed again at the next epoch
-            Pending::Proposal { gid } => out.push(json!({"ui": "leave_proposal_refused", "group": gid, "reason": reason})),
-            Pending::Application { gid, item } if reason == "mailbox.unknown-group" && self.convs.contains_key(&gid) => {
-                // M§7.4 "A member that missed the move": sync; re-encrypted and re-sent to the new hub if the group moved
-                let hub = self.convs.get(&gid).map(|c| c.hub.0.clone()).unwrap_or_default();
-                self.unknown_at.insert(gid.clone(), hub);
-                self.moved_items.entry(gid.clone()).or_default().push(item.clone());
-                out.push(json!({"ui": "moved_check", "group": gid, "item": item}));
-                out.push(json!({"sync": true}));
-            }
-            Pending::Application { gid, item } => {
-                let down = is_outage(&reason);
-                if !down {
-                    // M§9.4: unreachable keeps it pending; any other refusal is final
-                    self.outbox.remove(&gid, &item);
-                    self.messages.retain(|m| m["item"] != item);
-                    self.outbox.answered(&gid, &item, Some(&reason));
-                } else {
-                    out.extend(self.hub_unreachable(&gid, &item, false, now));
-                }
-                out.push(json!({"refused": format!("message {item}: {reason}"), "group": gid, "item": item, "pending": down}));
-            }
-            Pending::PersonalReady { .. } => {}
-            Pending::KeyPackages { .. } => out.push(json!({"refused": format!("key packages: {reason}")})),
-            Pending::Config { .. } => out.push(json!({"refused": format!("mailbox-config: {reason}")})),
-            Pending::Archive { .. } => out.push(json!({"refused": format!("archive record: {reason}")})),
-        }
-        out
-    }
-
-    /// After a sync caught up: re-propose membership changes that lost a conflict and are still needed (M§6.5).
-    fn after_sync(&mut self, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        for gid in self.retries.keys().cloned().collect::<Vec<_>>() {
-            let (mut retry, op) = self.retries.remove(&gid).expect("present");
-            let needed = match &op {
-                // M§6.8: still needed while this device is not in the group
-                Op::Rejoin => !self.convs.contains_key(&gid),
-                // M§7.3: the proposals lapsed with the epoch the conflict moved past; the leaver proposes again
-                Op::Leave { .. } => false,
-                // M§7.3: still needed while any leaf of the identity remains
-                Op::Remove { identity } => self.member_identities(&gid, now).contains(identity),
-                // M§7.4: still needed while the group is hubbed elsewhere
-                Op::MoveHub { hub } => self.convs.get(&gid).is_some_and(|c| c.hub.0 != s_of(&hub["did"])),
-                Op::Add { peer, device, .. } => {
-                    let ctx = self.ctx(now);
-                    self.convs.get(&gid).is_some_and(|c| self.config.add_needed(&c.group, &ctx, peer, device.as_deref()))
-                }
-            };
-            let moved = self.hub_moved_since(&gid);
-            match retry.synced(needed, moved) {
-                Synced::Done => out.push(json!({"ui": "no_longer_needed", "group": gid})),
-                Synced::Surface(r) => out.push(json!({"refused": format!("commit in {gid}: {r}")})),
-                Synced::Repropose(_) => match self.propose(&gid, &op, now) {
-                    Ok(f) => {
-                        self.retries.insert(gid.clone(), (retry.clone(), op.clone()));
-                        out.push(json!({"send": f}));
-                    }
-                    Err(e) => out.push(json!({"refused": e.as_string().unwrap_or_default()})),
-                },
-            }
-        }
-        for (gid, items) in std::mem::take(&mut self.moved_items) {
-            let moved = self.hub_moved_since(&gid);
-            for item in items {
-                if moved {
-                    // M§7.4: re-encrypted at the current epoch and re-sent to the new hub
-                    match self.reencrypt_item(&gid, &item, now) {
-                        Some(f) => out.push(json!({"send": f})),
-                        None => out.push(json!({"refused": format!("message {item}: no longer in the outbox"), "group": gid, "item": item})),
-                    }
-                } else {
-                    // spec-gap 60: no move, so mailbox.unknown-group is final
-                    self.outbox.remove(&gid, &item);
-                    self.messages.retain(|m| m["item"] != item);
-                    out.push(json!({"refused": format!("message {item}: mailbox.unknown-group"), "group": gid, "item": item, "pending": false}));
-                }
-            }
-        }
-        let waiting: BTreeSet<String> = self.retries.keys().cloned().collect();
-        self.unknown_at.retain(|g, _| waiting.contains(g));
-        out
-    }
-
-    /// Whether the group's hub is no longer the one that answered `mailbox.unknown-group` (M§7.4, spec-gap 60).
-    fn hub_moved_since(&self, gid: &str) -> bool {
-        match (self.unknown_at.get(gid), self.convs.get(gid)) {
-            (Some(at), Some(c)) => c.hub.0 != *at,
-            _ => false,
-        }
-    }
-
-    /// An outbox item encrypted afresh at the group's current epoch and deposited to its current hub (M§7.4).
-    fn reencrypt_item(&mut self, gid: &str, item_id: &str, now: i64) -> Option<String> {
-        let obj = self.outbox.item(gid, item_id)?["obj"].clone();
-        let (provider, signer) = (self.mls.provider(), self.mls.signer());
-        let c = self.convs.get_mut(gid)?;
-        let bytes = c.group.create_message(provider, &signer, &serde_json::to_vec(&obj).ok()?).ok()?.tls_serialize_detached().ok()?;
-        let item = self.outbox.item_mut(gid, item_id)?;
-        item["mls"] = json!(b64(&bytes));
-        let item = item.clone();
-        Some(self.deposit_item(gid, &item, now))
-    }
-
-    fn gap_of_from(&mut self, gid: &str, first_seq: i64, now: i64) -> &mut GapTracker {
-        self.delivery().gap_of_from(gid, first_seq, now)
-    }
-
-    /// The delivery state inbound routing reads and writes (M§5.4).
-    fn delivery(&mut self) -> Inbound<'_> {
-        Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items, gap_timeout: self.gap_timeout }
-    }
-
-    /// One `items[]` element (M§5.4): committed with the MLS change it caused (spec-gap 44).
-    fn item(&mut self, item: &Value, now: i64) -> Result<Vec<Value>, MlsError> {
-        let mut out = vec![];
-        let class = s_of(&item["class"]);
-        let gid = s_of(&item["group"]);
-        let joined = self.convs.get(&gid).map(|c| c.joined_epoch);
-        // M§12.3: items from before this device joined are history; a group it is not in is skipped
-        let route = self.delivery().route(item, joined.is_some(), |epoch| joined.is_some_and(|j| epoch < j), now);
-        let (bytes, released) = match route {
-            Route::Ephemeral | Route::Other => return Ok(out),
-            Route::Duplicate => {
-                out.push(json!({"ui": "duplicate", "class": class, "cursor": item["cursor"]}));
-                return Ok(out);
-            }
-            Route::FirstContact => {
-                out.extend(self.first_contact_in(item, now));
-                self.resume.commit(item, false);
-                return Ok(out);
-            }
-            Route::Archive => {
-                out.extend(self.archive_in(item, now));
-                self.resume.commit(item, false);
-                return Ok(out);
-            }
-            Route::GroupInfo { group, mls } => {
-                self.group_info.insert(group, s_of(&mls));
-                return Ok(out);
-            }
-            Route::Own => {
-                // our own deposit fanned back (M§6.5 rule 5), arriving before its accepted (spec-gap 47)
-                out.push(json!({"ui": "self", "class": class, "seq": item["seq"]}));
-                return Ok(out);
-            }
-            Route::PreJoin => {
-                out.push(json!({"ui": "prejoin", "class": class, "seq": item["seq"]}));
-                return Ok(out);
-            }
-            Route::Held => {
-                // M§6.5 (spec-gap 69): a handshake beyond a seq gap, and anything after a held item, waits for the gap
-                out.push(json!({"ui": "hold", "class": class, "seq": item["seq"]}));
-                return Ok(out);
-            }
-            Route::Process { bytes, released, .. } => (bytes, released),
-        };
-        let before_ids = self.member_identities(&gid, now);
-        let result = {
-            let ctx = Context::new(now, &self.resolver);
-            let me = self.keys.identity.clone();
-            let target = self.convs.get_mut(&gid).filter(|_| class != "welcome").map(|c| (&mut c.group, c.conversation.as_str(), c.kind.as_str()));
-            let mls = &self.mls;
-            let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
-                                         gap_timeout: self.gap_timeout };
-            // committed: the delivery state records the item with its MLS effect (the host saves both together)
-            delivery.commit_processed(mls.provider(), item, self.config.roll_back_unprocessable, || process(mls, target, &class, &bytes, &ctx, &me, self.config.process))
-        };
-        let outcome = match result {
-            Ok(o) => o,
-            Err(e) if self.config.roll_back_unprocessable => {
-                // rolled back, and committed as handled (spec-gap 138): the in-memory group may be ahead of the store
-                if let Some(c) = self.convs.get_mut(&gid) {
-                    if let Some(g) = self.mls.load_group(&dsip_core::b64::decode(&gid).unwrap_or_default())? {
-                        c.group = g;
-                    }
-                }
-                out.push(json!({"ui": "unprocessable", "class": class, "cursor": item["cursor"], "why": e.0}));
-                out.extend(self.released(released, now)?);
-                return Ok(out);
-            }
-            Err(e) => return Err(e),
-        };
-        match outcome {
-            Outcome::Joined { members, group, conv, epoch, by } => {
-                let joined = self.mls.load_group(&dsip_core::b64::decode(&group).unwrap_or_default())?.ok_or_else(|| MlsError("joined group not stored".into()))?;
-                let kind = s_of(&conv["kind"]);
-                let peer = members.iter().find(|m| **m != self.keys.identity).cloned();
-                self.convs.insert(group.clone(), Conv {
-                    group: joined, conversation: s_of(&conv["conversation"]), kind: kind.clone(),
-                    hub: (s_of(&conv["hub"]["did"]), s_of(&conv["hub"]["uri"])), peer: if kind == "direct" { peer } else { None },
-                    receipts: self.new_receipts(now), joined_epoch: epoch,
-                });
-                if kind == "personal" {
-                    self.personal = Some(group.clone());
-                }
-                self.history.joined(&group, epoch);
-                // M§6.6: confirm the pending registration
-                let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": group, "state": "joined"}]}), now);
-                out.push(json!({"send": env.frame()}));
-                out.push(json!({"ui": "joined", "group": group, "conversation": conv["conversation"], "kind": kind, "members": members, "epoch": epoch,
-                    "successor_of": conv["successor_of"]}));
-                if kind != "personal" && by != self.keys.identity {
-                    // M§7.3: the joiner renders its own add, attributed to the identity whose commit added it
-                    let entry = json!({"seq": item["seq"], "epoch": epoch, "by": by, "added": [self.keys.identity], "removed": [], "left": []});
-                    self.roster_log.entry(group.clone()).or_default().push(entry.clone());
-                    let mut ui = entry;
-                    ui["ui"] = json!("roster");
-                    ui["group"] = json!(group);
-                    out.push(ui);
-                }
-                if let Some(pred) = conv["successor_of"].as_str().map(String::from) {
-                    out.extend(self.successor_welcome(&group, &pred, now));
-                }
-            }
-            Outcome::Object { sender, sender_device, object } => out.extend(self.object_in(&gid, item, &sender, &sender_device, object, now)),
-            Outcome::Dropped(why) => out.push(json!({"ui": "dropped", "why": why})),
-            Outcome::Unauthenticated(what) => out.push(json!({"ui": "unauthenticated", "what": what})),
-            Outcome::NotForDevice => out.push(json!({"ui": "sibling_welcome", "cursor": item["cursor"]})),
-            Outcome::Epoch { epoch, by, added, removed, left, hub } => {
-                if let Some(h) = hub {
-                    // M§7.4: a device that processes the moving commit tells its mailbox
-                    out.extend(self.hub_moved(&gid, &h, (item["seq"].as_i64().unwrap_or(0), epoch), &by, now));
-                }
-                out.extend(self.log_roster(&gid, (item["seq"].clone(), epoch), &by, &before_ids, &left, now));
-                out.push(json!({"ui": "epoch", "group": gid, "epoch": epoch, "by": by, "added": added, "removed": removed}));
-                if self.leaving.contains(&gid) {
-                    // M§7.3: a proposal lapses with its epoch; still a member, the leave is proposed again
-                    out.extend(self.propose_leave(&gid, now));
-                }
-            }
-            Outcome::Removed { by, remaining } => {
-                let was_leaving = self.leaving.remove(&gid);
-                // spec-gap 127: a member may add this identity back with a new welcome; its seq gaps here start afresh
-                self.delivery().removed(&gid);
-                let mut c = self.convs.remove(&gid);
-                if let Some(c) = c.as_mut() {
-                    // spec-gap 127: the group's MLS state goes too, so a welcome back into the same group id can be joined
-                    let _ = c.group.delete(self.mls.provider().storage());
-                }
-                if self.personal.as_deref() == Some(gid.as_str()) {
-                    self.personal = None;
-                }
-                out.push(json!({"ui": "removed", "group": gid, "by": by, "conversation": c.map(|c| c.conversation), "left": was_leaving}));
-                let decision = registration_on_removal(&json!({"me": self.keys.identity, "remaining_identities": remaining}));
-                if decision["left"] == json!(true) {
-                    let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}), now);
-                    out.push(json!({"send": env.frame()}));
-                }
-            }
-            Outcome::Proposal { proposer, removes, others, roster } => {
-                let d = dsip_messaging::checks::leave_proposals(&json!({"me": self.keys.identity, "proposer": proposer, "removes": removes,
-                    "others": others, "roster": roster}));
-                let who = s_of(&proposer["identity"]);
-                match d["action"].as_str() {
-                    Some("commit") => match self.propose(&gid, &Op::Leave { identity: who.clone() }, now) {
-                        Ok(f) => {
-                            out.push(json!({"send": f}));
-                            out.push(json!({"ui": "leave_committing", "group": gid, "identity": who}));
-                        }
-                        Err(e) => out.push(json!({"error": format!("committing the leave of {who}: {}", e.as_string().unwrap_or_default())})),
-                    },
-                    Some("left") => {
-                        // a sibling device left for this identity: nothing more is sent; the commit removing us follows
-                        self.leaving.insert(gid.clone());
-                        out.push(json!({"ui": "left", "group": gid, "by_device": proposer["device"]}));
-                    }
-                    _ => out.push(json!({"ui": "leave_proposals", "group": gid, "identity": who, "decision": d})),
-                }
-            }
-            Outcome::Nothing => {}
-        }
-        out.extend(self.released(released, now)?);
-        Ok(out)
-    }
-
-    /// The gap filled: what was held behind it is processed now, in seq order (M§6.5, spec-gap 69).
-    fn released(&mut self, released: Vec<Value>, now: i64) -> Result<Vec<Value>, MlsError> {
-        let mut out = vec![];
-        for held in released {
-            out.push(json!({"ui": "released", "class": held["class"], "seq": held["seq"]}));
-            out.extend(self.item(&held, now)?);
-        }
-        Ok(out)
-    }
-
-    /// A decrypted application object, already committed (M§8.1).
-    fn object_in(&mut self, gid: &str, item: &Value, sender: &str, sender_device: &str, object: Value, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        let seq = item["seq"].as_i64().unwrap_or(0);
-        match object["object"].as_str() {
-            Some("archive-key") => {
-                let akid = s_of(&object["akid"]);
-                let created = object["created_at"].as_i64().unwrap_or(0);
-                let fresh = !self.archive_keys.contains_key(&akid);
-                if fresh || self.config.replace_archive_keys {
-                    self.archive_keys.insert(akid.clone(), (unb64(&object["key"]), created));
-                }
-                // M§12.3 step 5 (spec-gap 51): records kept for this key open now
-                // what the machine held for this key is released from held_archive below
-                let _ = self.history.archive_key(&akid, created);
-                let release: Vec<String> = self.held_archive.iter().filter(|(_, h)| h["akid"] == json!(akid)).map(|(c, _)| c.clone()).collect();
-                for c in release {
-                    if let Some(h) = self.held_archive.remove(&c) {
-                        out.extend(self.open_archive(&h, now));
-                    }
-                }
-                out.push(json!({"ui": "archive_key", "akid": akid, "from": sender, "fresh": fresh}));
-            }
-            Some("call-event") => {
-                // M§13.3: every device of the identity shows one entry per call, whichever device sent it
-                let key = self.config.object_key(&object);
-                let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
-                let decisions = self.history.mls(gid, seq, epoch, &key, &object);
-                out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
-                let fresh = self.calls.record(&object);
-                out.push(json!({"ui": "call_event", "session": object["session"], "peer": object["peer"], "outcome": object["outcome"],
-                    "from_device": sender_device, "collapsed": !fresh}));
-            }
-            Some("recording-acceptance") => {
-                // C§5: each device accepts the union of its own acceptances and those in its personal group
-                let conv = s_of(&object["conversation"]);
-                let devices: Vec<String> = object["recorders"].as_array().into_iter().flatten().filter_map(|d| d.as_str().map(String::from)).collect();
-                self.recording_accepted.entry(conv.clone()).or_default().extend(devices.iter().cloned());
-                out.push(json!({"ui": "recording_accepted", "conversation": conv, "recorders": devices, "from_device": sender_device}));
-            }
-            Some("call-record") if self.recorder => {
-                // C§9: a record-keeper keeps one record per session leg (the sending device's)
-                let fresh = !self.records.iter().any(|r| r["record"]["session"] == object["session"] && r["device"] == sender_device);
-                if fresh {
-                    self.records.push(json!({"group": gid, "from": sender, "device": sender_device, "received_at": now, "record": object}));
-                }
-                out.push(json!({"ui": "call_record", "from": sender, "session": object["session"], "outcome": object["outcome"], "fresh": fresh}));
-            }
-            Some("receipt") if self.config.batch_receipts => {
-                // a sibling's undisclosed watermark describes another conversation (spec-gap 52)
-                let personal = self.personal.as_deref() == Some(gid);
-                let target = receipts::receipt_target(gid, personal, &object, self.convs.iter().map(|(g, c)| (g.as_str(), c.conversation.as_str())));
-                if let Some(t) = target {
-                    self.batch.receipt(gid, &t, seq, &object, sender_device);
-                }
-                out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
-            }
-            Some("receipt") => {
-                if let Some(c) = self.convs.get_mut(gid) {
-                    let batch = json!({"seq": seq, "object": object, "src": gid, "sender_device": sender_device});
-                    let emissions = c.receipts.sync(now, vec![batch]);
-                    out.extend(self.receipt_sends(gid, emissions, now));
-                }
-                out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
-            }
-            Some("content") => {
-                let key = self.config.object_key(&object);
-                if !self.shown.insert(key.clone()) {
-                    out.push(json!({"ui": "duplicate_content", "seq": seq}));
-                    return out;
-                }
-                // a sibling device's content is this identity's own (M§12.3: sent messages reach every device)
-                self.messages.push(json!({"group": gid, "key": key, "sender": sender, "sender_device": sender_device, "object": object,
-                    "seq": seq, "mine": sender == self.keys.identity, "item": null, "blobs": item["blobs"]}));
-                self.batch.content(gid, seq, &object);
-                // M§12.2: what is shown from MLS is archived under the current key
-                let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
-                let decisions = self.history.mls(gid, seq, epoch, &key, &object);
-                out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
-                out.push(json!({"ui": "message", "group": gid, "from": sender, "seq": seq, "kind": object["kind"], "text": object["text"], "sent_at": object["sent_at"],
-                    "id": object["id"], "blobs": item["blobs"]}));
-            }
-            _ => {}
-        }
-        out
-    }
-
-    /// Build the external commit from the latest GroupInfo held for `gid` and deposit it at the group's hub (M§6.8).
-    fn external_commit(&mut self, gid: &str, now: i64) -> Result<String, JsValue> {
-        let gi = self.group_info.get(gid).cloned().ok_or_else(|| JsValue::from_str("no GroupInfo for that group from this mailbox; sync first"))?;
-        if let Some(mut old) = self.convs.remove(gid) {
-            let _ = old.group.delete(self.mls.provider().storage()); // superseded: the resync removes the old leaf
-        }
-        let (group, commit) = self.mls.external_join(&unb64(&json!(gi))).map_err(|e| js(e.0))?;
-        let conv: Value = conversation_extension(&group).and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| JsValue::from_str("no dsip_conversation"))?;
-        let epoch = group.epoch().as_u64();
-        let kind = s_of(&conv["kind"]);
-        self.convs.insert(gid.to_string(), Conv {
-            group, conversation: s_of(&conv["conversation"]), kind: kind.clone(), hub: (s_of(&conv["hub"]["did"]), s_of(&conv["hub"]["uri"])),
-            peer: None, receipts: self.new_receipts(now), joined_epoch: epoch,
-        });
-        if kind == "direct" {
-            let me = self.keys.identity.clone();
-            let peer = self.member_identities(gid, now).into_iter().find(|m| *m != me);
-            if let Some(c) = self.convs.get_mut(gid) {
-                c.peer = peer;
-            }
-        }
-        let bytes = commit.tls_serialize_detached().map_err(|e| js(format!("{e:?}")))?;
-        let fields = json!({"mls": b64(&bytes)});
-        let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
-        let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-        self.pending.insert(id, Pending::Commit { gid: gid.to_string(), op: Some(Op::Rejoin), fields });
-        Ok(frame)
-    }
-
-    /// The identities with a verified leaf in `gid`, sorted.
-    /// Record a merged commit's roster change by identity, from the member identities before it, and say so to the UI
-    /// (M§7.3: every roster change rendered, attributed to the committing identity). Nothing when no identity came or
-    /// went (a device of a member added or removed, a path update).
-    fn log_roster(&mut self, gid: &str, (seq, epoch): (Value, u64), by: &str, before: &[String], left: &[String], now: i64) -> Vec<Value> {
-        let after = self.member_identities(gid, now);
-        let added: Vec<&String> = after.iter().filter(|i| !before.contains(i)).collect();
-        let gone: Vec<&String> = before.iter().filter(|i| !after.contains(i)).collect();
-        if added.is_empty() && gone.is_empty() {
-            return vec![];
-        }
-        let (left, removed): (Vec<&String>, Vec<&String>) = gone.into_iter().partition(|i| left.contains(i));
-        let entry = json!({"seq": seq, "epoch": epoch, "by": by, "added": added, "removed": removed, "left": left});
-        self.roster_log.entry(gid.to_string()).or_default().push(entry.clone());
-        let mut ui = entry;
-        ui["ui"] = json!("roster");
-        ui["group"] = json!(gid);
-        vec![ui]
-    }
-
-    fn member_identities(&self, gid: &str, now: i64) -> Vec<String> {
-        let ctx = Context::new(now, &self.resolver);
-        let mut ids: Vec<String> = self.convs.get(gid).map(|c| c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok())
-            .map(|w| w.identity).collect()).unwrap_or_default();
-        ids.sort();
-        ids.dedup();
-        ids
-    }
-
-    /// A deposit the group's new hub refused before it hosted the group, made again to the group's hub: an application
-    /// item's same bytes under a fresh envelope (M§9.3), a commit's same MLS bytes (M§7.4, spec-gap 129).
-    fn redeposit(&mut self, pending: Pending, now: i64) -> Vec<Value> {
-        match pending {
-            Pending::Application { gid, item } => {
-                match self.outbox.item(&gid, &item).cloned() {
-                    Some(item) => vec![json!({"send": self.deposit_item(&gid, &item, now)})],
-                    None => vec![],
-                }
-            }
-            Pending::Commit { gid, op, fields } if self.convs.contains_key(&gid) => {
-                let frame = self.hub_deposit(&gid, "handshake", fields.clone(), now);
-                let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
-                self.pending.insert(id, Pending::Commit { gid, op, fields });
-                vec![json!({"send": frame})]
-            }
-            _ => vec![],
-        }
-    }
-
-    /// A deposit for `gid` met an unreachable hub (or no answer): the outage starts or continues (M§9.4).
-    fn hub_unreachable(&mut self, gid: &str, item: &str, silent: bool, now: i64) -> Vec<Value> {
-        let (started, ems) = self.outbox.unreachable(gid, item, silent, now);
-        let mut out = vec![];
-        if started {
-            out.push(json!({"ui": "hub_down", "group": gid, "hub_timeout": self.outbox.hub_timeout}));
-        }
-        out.extend(self.outage_emissions(gid, ems, now));
-        out
-    }
-
-    /// Act on the outbox's emissions (M§9.4): re-deposit the head, or hand the group to its successor at the threshold.
-    fn outage_emissions(&mut self, gid: &str, ems: Vec<Value>, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        for e in ems {
-            if let Some(id) = e["forward"].as_str() {
-                if let Some(item) = self.outbox.item(gid, id).cloned() {
-                    out.push(json!({"send": self.deposit_item(gid, &item, now)}));
-                }
-            } else if let Some(d) = e["retry_in"].as_i64() {
-                out.push(json!({"ui": "hub_retry", "group": gid, "in": d}));
-            } else if e.get("successor").is_some() || e.get("handover").is_some() {
-                // M§9.4: the threshold passed: the dead group takes no more content; its pending items are re-encrypted
-                // for the successor, which the host creates once it has the members' KeyPackages (M§7.5)
-                let items = self.outbox.take(gid);
-                let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
-                self.messages.retain(|m| !ids.contains(&m["item"]));
-                for i in &items {
-                    self.shown.remove(&self.config.object_key(&i["obj"]));
-                }
-                self.handover.entry(gid.to_string()).or_default().extend(items.into_iter().map(|i| i["obj"].clone()));
-                self.track_rosters(now);
-                let me = self.keys.identity.clone();
-                let roster: Vec<String> = self.member_identities(gid, now).into_iter().filter(|i| *i != me).collect();
-                out.push(json!({"successor_due": {"group": gid, "peers": roster, "kind": self.convs.get(gid).map(|c| c.kind.clone()),
-                    "existing": self.successors.successor(gid)}}));
-            }
-        }
-        out
-    }
-
-    /// A welcome to a successor group (M§7.5): the pinned check (its creator, leaf 0, was in the predecessor's last
-    /// roster this device processed, and it adds nobody who was not) and convergence on the lowest `group_id`.
-    fn successor_welcome(&mut self, group: &str, pred: &str, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        let roster = self.member_identities(group, now);
-        let creator = {
-            let ctx = Context::new(now, &self.resolver);
-            self.convs.get(group).map(|c| successors::creator(&c.group, &ctx)).unwrap_or_default()
-        };
-        // the predecessor's roster as this device last processed it; the new group itself is not tracked yet
-        self.track_rosters_but(Some(group), now);
-        for d in self.successors.welcome(group, pred, &creator, &roster) {
-            if let Converge::Join(_) = d {
-                out.push(json!({"ui": "successor", "group": group, "of": pred, "creator": creator}));
-                // M§9.4: what this device still had pending for the dead group goes to the successor, re-encrypted
-                let items = self.outbox.take(pred);
-                let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
-                self.messages.retain(|m| !ids.contains(&m["item"]));
-                for i in &items {
-                    self.shown.remove(&self.config.object_key(&i["obj"]));
-                }
-                let mut waiting = self.handover.remove(pred).unwrap_or_default();
-                waiting.extend(items.into_iter().map(|i| i["obj"].clone()));
-                self.handover.entry(group.to_string()).or_default().extend(waiting);
-                self.outbox.forget(pred);
-                out.extend(self.flush_handover(group, now));
-            } else if let Converge::Decline(g) | Converge::FirstContact(g) = &d {
-                let why = if matches!(d, Converge::FirstContact(_)) { "not a valid successor: first contact (M§7.5)" } else { "a lower successor exists (M§7.5)" };
-                out.push(json!({"ui": "successor_declined", "group": g, "of": pred, "why": why}));
-                out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
-            } else if let Converge::Leave(g) = &d {
-                out.push(json!({"ui": "successor_left", "group": g, "of": pred}));
-                out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
-            }
-        }
-        out
-    }
-
-    /// The group a conversation lives in now: `gid`, or the successor this device converged on (M§7.5).
-    fn live(&self, gid: &str) -> String {
-        self.successors.live(gid, |g| self.convs.contains_key(g))
-    }
-
-    /// Send what waits for `gid` (a successor) as new objects (M§9.4: re-encrypted, never the dead group's bytes).
-    fn flush_handover(&mut self, gid: &str, now: i64) -> Vec<Value> {
-        let objs = self.handover.remove(gid).unwrap_or_default();
-        let mut out = vec![];
-        for obj in objs {
-            match self.send_object(gid, &obj, now) {
-                Ok(f) if !f.is_empty() => out.push(json!({"send": f})),
-                Ok(_) => {}
-                Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default()})),
-            }
-        }
-        if !out.is_empty() {
-            out.push(json!({"ui": "handed_over", "group": gid, "items": out.len()}));
-        }
-        out
-    }
-
-    /// Record every group's roster by identity for the successor checks (M§7.5: the last roster this device processed).
-    fn track_rosters(&mut self, now: i64) {
-        self.track_rosters_but(None, now);
-    }
-
-    /// [`Self::track_rosters`], except for `skip`.
-    fn track_rosters_but(&mut self, skip: Option<&str>, now: i64) {
-        let ctx = Context::new(now, &self.resolver);
-        let rosters: Vec<(String, Vec<String>)> = self.convs.iter().filter(|(g, _)| Some(g.as_str()) != skip)
-            .filter_map(|(g, c)| self.config.roster(&c.group, &ctx).map(|r| (g.clone(), r))).collect();
-        for (g, r) in rosters {
-            self.successors.member_of(&g, &r);
-        }
-    }
-
-    /// Stop using a group (M§7.5: a higher successor, or one that fails the check): `mailbox-config` `left`. Frames.
-    fn leave_group(&mut self, gid: &str, now: i64) -> Vec<String> {
-        if self.convs.remove(gid).is_none() {
-            return vec![];
-        }
-        self.outbox.forget(gid);
-        let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}), now);
-        vec![env.frame()]
-    }
-
-    /// The groups whose messages make up `gid`'s thread: it and the predecessors it succeeds (M§7.5: the dead group
-    /// stays readable and the conversation continues in the successor).
-    fn lineage(&self, gid: &str) -> BTreeSet<String> {
-        self.successors.lineage(gid, self.convs.keys().map(String::as_str))
-    }
-
-    /// M§10.2: delivered receipts are decided once per sync batch, per conversation; each is sent as an object.
-    fn receipts_batch(&mut self, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        for (gid, items) in self.batch.take() {
-            let Some(c) = self.convs.get_mut(&gid) else { continue };
-            let emissions = c.receipts.sync(now, items.clone());
-            // M§12.2 (spec-gap 64): a receipt that changed rendering is archived under the group it arrived in
-            for seq in emissions.iter().filter_map(|e| if let Emission::Archive(seq) = e { Some(*seq) } else { None }) {
-                let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
-                for it in receipts::archived(&items, seq) {
-                    let src = it["src"].as_str().unwrap_or(&gid).to_string();
-                    let sender = s_of(&it["object"]["sender"]);
-                    let sender_device = it["sender_device"].as_str().unwrap_or("").to_string();
-                    let (sender, sender_device) = if sender.is_empty() { (me.clone(), dev.clone()) } else { (sender, sender_device) };
-                    if let Some(akid) = self.history.current_akid() {
-                        let decisions = [Decision::Archive { group: src.clone(), seq, akid }];
-                        out.extend(self.archive_requests(&src, &decisions, &it["object"], &sender, &sender_device, seq, now));
-                    }
-                }
-            }
-            out.extend(self.receipt_sends(&gid, emissions, now));
-        }
-        out
-    }
-
-    /// Send what a conversation's receipts machine asked for: a receipt object to the conversation, or — an
-    /// undisclosed read watermark — to the personal group (M§10.5, spec-gap 52).
-    fn receipt_sends(&mut self, gid: &str, emissions: Vec<Emission>, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        for e in emissions {
-            // activity is not sent from the browser; an archive decision is the batch's (receipts_batch)
-            let Emission::Receipt(receipt) = e else { continue };
-            let kind = receipt.kind.as_str();
-            let target = if receipt.personal {
-                match self.personal.clone() {
-                    Some(p) => p,
-                    None => { out.push(json!({"ui": "read_private_kept", "group": gid})); continue; }
-                }
-            } else {
-                gid.to_string()
-            };
-            if target == gid && self.may_send_content(gid, now).is_err() {
-                // C§5: no receipts into a recorded conversation until its recorders are accepted (nor ever from a recorder)
-                out.push(json!({"ui": "receipt_withheld", "group": gid, "kind": kind}));
-                continue;
-            }
-            let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).unwrap_or_default();
-            let id = self.fresh_id(now);
-            let obj = receipt.object(&conversation, &self.keys.identity, &id, now);
-            match self.send_object(&target, &obj, now) {
-                Ok(f) => {
-                    out.push(json!({"send": f}));
-                    out.push(json!({"ui": "receipt_sent", "group": gid, "kind": kind, "targets": receipt.targets, "through": receipt.through,
-                        "via": if target == gid { "conversation" } else { "personal group" }}));
-                }
-                Err(e) => out.push(json!({"error": e.as_string().unwrap_or_default()})),
-            }
-        }
-        out
-    }
-
-    /// Archive records the history machine asked for (M§12.2): each sealed under its key, AAD `group_id ‖ seq`, and
-    /// deposited to this identity's mailbox as `class: archive`.
-    #[allow(clippy::too_many_arguments)] // the record's fields, named as M§12.2 names them
-    fn archive_requests(&mut self, gid: &str, decisions: &[Decision], obj: &Value, sender: &str, sender_device: &str, seq: i64, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        let Some(conversation) = self.convs.get(gid).map(|c| c.conversation.clone()) else { return out };
-        let at = archive::Received { conversation: &conversation, group: gid, seq, sender, sender_device, received_at: now };
-        for (akid, record) in history::archive_records(decisions, &at, obj) {
-            let Some((key, _)) = self.archive_keys.get(&akid).cloned() else { continue };
-            let key: [u8; 32] = match key.as_slice().try_into() { Ok(k) => k, Err(_) => continue };
-            let nonce: [u8; 12] = KeyPair::generate().seed()[..12].try_into().expect("12 bytes");
-            let Some(fields) = archive::seal_record(&key, &nonce, &akid, &record) else { continue };
-            let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &self.mailbox.0, now, gid, "archive", fields.clone());
-            self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Archive { fields });
-            out.push(json!({"send": env.frame()}));
-            out.push(json!({"ui": "archive", "group": gid, "seq": seq, "akid": akid, "object": obj["object"]}));
-        }
-        out
-    }
-
-    /// An archive item (M§12.2, M§12.3 step 5): opened and shown as history, or kept sealed until its key arrives.
-    fn archive_in(&mut self, item: &Value, now: i64) -> Vec<Value> {
-        let akid = s_of(&item["akid"]);
-        if !self.archive_keys.contains_key(&akid) {
-            let cursor = s_of(&item["cursor"]);
-            self.held_archive.insert(cursor.clone(), item.clone());
-            self.history.held(item);
-            return vec![json!({"ui": "archive_held", "cursor": cursor, "akid": akid})];
-        }
-        self.open_archive(item, now)
-    }
-
-    /// Open one archive record under a held key; content becomes a timeline entry once, a receipt is applied as
-    /// history (nothing sent, nothing archived again — spec-gap 64).
-    fn open_archive(&mut self, item: &Value, now: i64) -> Vec<Value> {
-        let mut out = vec![];
-        let akid = s_of(&item["akid"]);
-        let Some((key, _)) = self.archive_keys.get(&akid).cloned() else { return out };
-        let key: [u8; 32] = match key.as_slice().try_into() { Ok(k) => k, Err(_) => return out };
-        let opened = match archive::open_item(&key, item) {
-            Ok(o) => o,
-            Err(archive::OpenError::DoesNotOpen) => {
-                out.push(json!({"ui": "dropped", "why": format!("archive {}: does not open for its group and seq", item["cursor"])}));
-                return out;
-            }
-            Err(archive::OpenError::NotJson) => return out,
-        };
-        let obj = opened.record["payload"].clone();
-        let key_id = self.config.object_key(&obj);
-        let decisions = self.history.opened(item, &opened, &key_id);
-        let (gid, seq, record) = (opened.group, opened.seq, opened.record);
-        let sender = s_of(&record["sender"]);
-        if decisions.iter().any(Decision::is_show) && self.shown.insert(key_id.clone()) {
-            self.messages.push(json!({"group": gid, "key": key_id, "sender": sender, "sender_device": record["sender_device"], "object": obj,
-                "seq": seq, "mine": sender == self.keys.identity, "item": null, "from_archive": true}));
-            self.restored.push(seq, &obj);
-            out.push(json!({"ui": "history", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"], "text": obj["text"]}));
-        } else if decisions.iter().any(Decision::is_apply) {
-            if obj["object"] == "call-event" {
-                // spec-gap 63: an archived call event goes to the call log, not the timeline's content
-                if self.calls.record(&obj) {
-                    out.push(json!({"ui": "call_event", "session": obj["session"], "peer": obj["peer"], "outcome": obj["outcome"], "from_archive": true}));
-                }
-            } else {
-                self.restored.push(seq, &obj);
-                out.push(json!({"ui": "history_receipt", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"]}));
-            }
-        }
-        out.extend(self.apply_restored(now));
-        out
-    }
-
-    /// Restored content and receipts are applied to their conversation's receipt state as history once this device
-    /// is in that conversation (spec-gap 64); the rest wait.
-    fn apply_restored(&mut self, now: i64) -> Vec<Value> {
-        let groups = self.convs.iter().map(|(g, c)| (g.as_str(), c.conversation.as_str(), c.kind == "personal"));
-        let mut out = vec![];
-        for (g, items) in self.restored.ready(groups) {
-            let Some(c) = self.convs.get_mut(&g) else { continue };
-            let n = items.len();
-            let emissions = c.receipts.restore(now, items);
-            out.extend(self.receipt_sends(&g, emissions, now));
-            out.push(json!({"ui": "history_applied", "group": g, "items": n}));
-        }
-        out
-    }
-
-    /// A signed introduction or grant delivered through the mailbox (M§14.1, spec-gap 54), verified as a credential.
-    fn first_contact_in(&mut self, item: &Value, now: i64) -> Vec<Value> {
-        let ctx = self.ctx(now);
-        // sealed purposes (M§6.9) open with the identity's key agreement key, derived from the identity key (spec-gap 55)
-        let why = match first_contact::received(item, &self.keys.identity, &ctx, now, self.controller_seed.as_ref()) {
-            first_contact::Received::Request(req) => {
-                let purpose = req.purpose.unwrap_or_else(|| "(sealed: this device holds no key agreement key)".to_string());
-                self.requests.insert(req.id.clone(), json!({"from": req.from, "purpose": purpose, "sealed": req.sealed,
-                    "expires_at": req.payload["expires_at"]}));
-                return vec![json!({"ui": "request", "id": req.id, "from": req.from, "purpose": purpose})];
-            }
-            first_contact::Received::Grant(g) => {
-                self.grants_held.insert(g.from.clone(), g.envelope);
-                return vec![json!({"ui": "granted", "by": g.from, "scope": g.scope, "request": g.request})];
-            }
-            first_contact::Received::DoesNotVerify => format!("{} {}: does not verify", s_of(&item["class"]), item["cursor"]),
-            first_contact::Received::BadIntroduction { id, code, .. } => format!("introduction {id}: {code}"),
-            first_contact::Received::NoMessageScope { id, from } => format!("grant {id} from {from}: no dsip.message scope"),
-        };
-        vec![json!({"ui": "dropped", "why": why})]
-    }
-}
-
-
-
-/// Whether a refusal of a deposit to the hub is an outage (M§9.4): unreachable, or unable to store (spec-gap 99).
-fn is_outage(reason: &str) -> bool {
-    matches!(reason, "mailbox.hub-unreachable" | "mailbox.quota-exceeded")
-}
-
 
 /// Re-issue this identity's delegation to its device with `dsip.messaging`, and `extra` when given (`dsip.record` for
 /// a record-keeper, C§9), beside the capabilities it has (M§4.3, §7.4), signed by the identity key this browser
