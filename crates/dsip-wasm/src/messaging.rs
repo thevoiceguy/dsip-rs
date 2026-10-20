@@ -44,9 +44,10 @@ use dsip_endpoint::IdentityKeys;
 use dsip_messaging_device::commits::{self, Answer, Change, Synced};
 use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
+use dsip_messaging_device::successors::{self, Converge, Create, Successors};
 use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
     ProcessOptions, Receipts, Retry, Route};
-use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume, SuccessorTracker};
+use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::wire;
 use dsip_mls::{authenticate_key_package, conversation_extension, digest, member_identity, Device, MlsError};
@@ -274,7 +275,7 @@ pub struct Messenger {
     /// M§10.5: whether read watermarks are disclosed to the conversation (opt-in) or kept in the personal group.
     read_disclosed: bool,
     /// M§7.5: the successor groups this device knows of and converged on (vector-pinned, spec-gap 61).
-    successors: SuccessorTracker,
+    successors: Successors,
     /// Objects of an abandoned group's outbox, by the group they go to: the dead group until its successor exists,
     /// then the successor until it holds its members (M§9.4: re-encrypted for the successor, spec-gap 72).
     handover: BTreeMap<String, Vec<Value>>,
@@ -527,21 +528,21 @@ impl Messenger {
     pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
         let now_i = now as i64;
         self.track_rosters(now_i);
-        let decision = self.successors.step(&json!({"create": {"predecessor": dead}}));
-        let d = decision.first().cloned().unwrap_or(Value::Null);
-        if let Some(w) = d["use"].as_str() {
-            let moved = self.handover.remove(dead).unwrap_or_default();
-            self.handover.entry(w.to_string()).or_default().extend(moved);
-            let out = self.flush_handover(w, now_i);
-            return Ok(json!(out.into_iter().filter_map(|e| e.get("send").cloned()).collect::<Vec<_>>()).to_string());
-        }
-        let Some(create) = d.get("create") else { return Err(JsValue::from_str(&format!("successor refused: {}", d["refuse"]))) };
+        let me = self.keys.identity.clone();
+        let peers = match self.successors.create(dead, &me) {
+            Create::Use(w) => {
+                let moved = self.handover.remove(dead).unwrap_or_default();
+                self.handover.entry(w.clone()).or_default().extend(moved);
+                let out = self.flush_handover(&w, now_i);
+                return Ok(json!(out.into_iter().filter_map(|e| e.get("send").cloned()).collect::<Vec<_>>()).to_string());
+            }
+            Create::Refuse(why) => return Err(JsValue::from_str(&format!("successor refused: {}", json!(why)))),
+            Create::Create { peers } => peers,
+        };
         let (conversation, kind) = self.convs.get(dead).map(|c| (c.conversation.clone(), c.kind.clone())).ok_or_else(|| JsValue::from_str("not a member of that group"))?;
         let all: Value = serde_json::from_str(key_packages_json).unwrap_or(Value::Null);
-        let me = self.keys.identity.clone();
         let mut kps = vec![];
         let mut grants = vec![];
-        let peers: Vec<String> = create["roster"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|i| *i != me).map(String::from).collect();
         for peer in &peers {
             if let Some(answer) = all.get(peer) {
                 kps.extend(self.pick_key_packages(peer, &answer.to_string(), now_i).unwrap_or_default());
@@ -553,7 +554,7 @@ impl Messenger {
         if let Some(c) = self.convs.get_mut(&gid) {
             c.peer = peer;
         }
-        let ems = self.successors.step(&json!({"created": {"group": gid, "successor_of": dead}}));
+        let decisions = self.successors.created(&gid, dead);
         let moved = self.handover.remove(dead).unwrap_or_default();
         self.handover.entry(gid.clone()).or_default().extend(moved);
         if kind == "personal" {
@@ -567,9 +568,9 @@ impl Messenger {
             self.pending.insert(format!("personal:{gid}"), Pending::PersonalReady { gid: gid.clone() });
         }
         let mut out: Vec<String> = frames;
-        for e in ems {
-            if let Some(g) = e["leave"].as_str() {
-                out.extend(self.leave_group(g, now_i));
+        for d in decisions {
+            if let Converge::Leave(g) = d {
+                out.extend(self.leave_group(&g, now_i));
             }
         }
         Ok(json!(out).to_string())
@@ -2202,7 +2203,7 @@ impl Messenger {
         let roster = self.member_identities(group, now);
         let creator = {
             let ctx = Context::new(now, &self.resolver);
-            self.convs.get(group).and_then(|c| member_identity(&c.group, LeafNodeIndex::new(0), &ctx).ok()).map(|w| w.identity).unwrap_or_default()
+            self.convs.get(group).map(|c| successors::creator(&c.group, &ctx)).unwrap_or_default()
         };
         // the predecessor's roster as this device last processed it; the new group itself is not tracked yet
         for gid in self.convs.keys().filter(|g| g.as_str() != group).cloned().collect::<Vec<_>>() {
@@ -2211,9 +2212,8 @@ impl Messenger {
                 self.successors.member_of(&gid, &ids);
             }
         }
-        let ems = self.successors.step(&json!({"welcome": {"group": group, "successor_of": pred, "creator": creator, "roster": roster}}));
-        for e in ems {
-            if e.get("join").is_some() {
+        for d in self.successors.welcome(group, pred, &creator, &roster) {
+            if let Converge::Join(_) = d {
                 out.push(json!({"ui": "successor", "group": group, "of": pred, "creator": creator}));
                 // M§9.4: what this device still had pending for the dead group goes to the successor, re-encrypted
                 let items = self.outbox.take(pred);
@@ -2227,11 +2227,11 @@ impl Messenger {
                 self.handover.entry(group.to_string()).or_default().extend(waiting);
                 self.outbox.forget(pred);
                 out.extend(self.flush_handover(group, now));
-            } else if let Some(g) = e["decline"].as_str().or(e["first_contact"].as_str()) {
-                let why = if e.get("first_contact").is_some() { "not a valid successor: first contact (M§7.5)" } else { "a lower successor exists (M§7.5)" };
+            } else if let Converge::Decline(g) | Converge::FirstContact(g) = &d {
+                let why = if matches!(d, Converge::FirstContact(_)) { "not a valid successor: first contact (M§7.5)" } else { "a lower successor exists (M§7.5)" };
                 out.push(json!({"ui": "successor_declined", "group": g, "of": pred, "why": why}));
                 out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
-            } else if let Some(g) = e["leave"].as_str() {
+            } else if let Converge::Leave(g) = &d {
                 out.push(json!({"ui": "successor_left", "group": g, "of": pred}));
                 out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
             }
@@ -2241,14 +2241,7 @@ impl Messenger {
 
     /// The group a conversation lives in now: `gid`, or the successor this device converged on (M§7.5).
     fn live(&self, gid: &str) -> String {
-        let mut g = gid.to_string();
-        for _ in 0..8 {
-            match self.successors.successor(&g) {
-                Some(w) if self.convs.contains_key(w) && w != g => g = w.to_string(),
-                _ => break,
-            }
-        }
-        g
+        self.successors.live(gid, |g| self.convs.contains_key(g))
     }
 
     /// Send what waits for `gid` (a successor) as new objects (M§9.4: re-encrypted, never the dead group's bytes).
@@ -2291,14 +2284,7 @@ impl Messenger {
     /// The groups whose messages make up `gid`'s thread: it and the predecessors it succeeds (M§7.5: the dead group
     /// stays readable and the conversation continues in the successor).
     fn lineage(&self, gid: &str) -> BTreeSet<String> {
-        let mut set: BTreeSet<String> = [gid.to_string()].into();
-        loop {
-            let more: Vec<String> = self.convs.keys().filter(|g| !set.contains(*g) && self.successors.successor(g).is_some_and(|w| set.contains(w))).cloned().collect();
-            if more.is_empty() {
-                return set;
-            }
-            set.extend(more);
-        }
+        self.successors.lineage(gid, self.convs.keys().map(String::as_str))
     }
 
     /// Keep a call event unless one for its session is held (spec-gap 63: collapsed by `session`, the first kept).

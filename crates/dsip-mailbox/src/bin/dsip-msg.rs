@@ -50,12 +50,13 @@ use dsip_core::keys::KeyPair;
 use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::checks::check_object;
-use dsip_messaging::client::{select_mailbox, GapTracker, HubOutage, MoveArrival, Resume, SuccessorTracker};
+use dsip_messaging::client::{select_mailbox, GapTracker, HubOutage, MoveArrival, Resume};
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_messaging_device::commits::{self, Answer, Built, Change, Synced};
 use dsip_messaging_device::history::{self, Decision, Restored};
 use dsip_messaging_device::receipts::{self, Emission};
+use dsip_messaging_device::successors::{self, Converge, Create, Successors};
 use dsip_messaging_device::{archive, blob, calls, key_packages, process, recording, Deposit, Deposits, History, Inbound, Outbox, Outcome,
     ProcessOptions, Receipts, Retry, Route};
 use dsip_mls::{authenticate_key_package, authenticate_members, conversation_extension, digest, member_identity, Device, MlsError};
@@ -431,7 +432,7 @@ struct Client {
     own: HashSet<String>,
     resume: Resume,
     /// Successor groups per dead group (M§7.5, spec-gap 61).
-    successors: SuccessorTracker,
+    successors: Successors,
     grants: HashMap<String, String>,
     /// KeyPackages fetched ahead of an add, by identity (M§5.5: single use, held until committed).
     prefetched: HashMap<String, KeyPackage>,
@@ -1156,7 +1157,7 @@ impl Client {
         let items = self.pending.items.get(dead).cloned().unwrap_or_default();
         self.active = Some(dead.to_string());
         self.create_successor().await.map_err(|e| anyhow::anyhow!("successor of {dead} not created ({e}); {} item(s) kept pending", items.len()))?;
-        let Some(winner) = self.successors.snapshot()[dead]["successor"].as_str().map(String::from) else {
+        let Some(winner) = self.successors.successor(dead).map(String::from) else {
             bail!("no successor for {dead}; {} item(s) kept pending", items.len());
         };
         for it in items {
@@ -1521,18 +1522,18 @@ impl Client {
     }
 
     /// Act on what the successor tracker decided (spec-gap 61).
-    async fn apply_successor(&mut self, emissions: Vec<Value>, of: &str) -> Result<()> {
+    async fn apply_successor(&mut self, decisions: Vec<Converge>, of: &str) -> Result<()> {
         self.save_successors()?;
-        for e in emissions {
-            if let Some(g) = e["join"].as_str() {
-                println!("SUCCESSOR joined group={g} of={of}");
-                self.active = Some(g.to_string());
-                self.save_groups()?;
-            } else if let Some(g) = e["leave"].as_str().or(e["decline"].as_str()) {
-                self.leave_group(g, &format!("successor of {of} converged elsewhere")).await?;
-            } else if let Some(g) = e["first_contact"].as_str() {
+        for d in decisions {
+            match d {
+                Converge::Join(g) => {
+                    println!("SUCCESSOR joined group={g} of={of}");
+                    self.active = Some(g);
+                    self.save_groups()?;
+                }
+                Converge::Leave(g) | Converge::Decline(g) => self.leave_group(&g, &format!("successor of {of} converged elsewhere")).await?,
                 // M§7.5: not a valid successor; its mailbox admitted it only as one, so it is not kept
-                self.leave_group(g, "not a valid successor: first contact required").await?;
+                Converge::FirstContact(g) => self.leave_group(&g, "not a valid successor: first contact required").await?,
             }
         }
         // The conversation continues in the successor converged on, never in the dead group or a left one.
@@ -1550,25 +1551,24 @@ impl Client {
     async fn create_successor(&mut self) -> Result<()> {
         let pred = self.active()?;
         self.track_rosters();
-        let decision = self.successors.step(&json!({"create": {"predecessor": pred}}));
-        let Some(d) = decision.first() else { bail!("successor tracker said nothing") };
-        if let Some(g) = d["use"].as_str() {
-            println!("SUCCESSOR exists group={g} of={pred}");
-            self.active = Some(g.to_string());
-            return self.save_groups();
-        }
-        let Some(create) = d.get("create") else { bail!("successor refused: {}", d["refuse"]) };
+        let peers = match self.successors.create(&pred, &self.identity) {
+            Create::Use(g) => {
+                println!("SUCCESSOR exists group={g} of={pred}");
+                self.active = Some(g);
+                return self.save_groups();
+            }
+            Create::Refuse(why) => bail!("successor refused: {}", json!(why)),
+            Create::Create { peers } => peers,
+        };
         let (conversation, kind) = {
             let c = self.conv(&pred)?;
             (c.conversation.clone(), c.kind.clone())
         };
         let gid = self.new_group_for(&conversation, &kind, Some(&pred)).await?;
         println!("SUCCESSOR created group={gid} of={pred}");
-        let emissions = self.successors.step(&json!({"created": {"group": gid, "successor_of": pred}}));
-        self.apply_successor(emissions, &pred).await?;
-        let others: Vec<String> = create["roster"].as_array().into_iter().flatten().filter_map(Value::as_str)
-            .filter(|i| *i != self.identity).map(String::from).collect();
-        for peer in others {
+        let decisions = self.successors.created(&gid, &pred);
+        self.apply_successor(decisions, &pred).await?;
+        for peer in peers {
             if !self.convs.contains_key(&gid) {
                 return Ok(()); // a lower successor arrived meanwhile and this one was left
             }
@@ -2487,17 +2487,14 @@ impl Client {
                     // M§7.5: check the successor against the predecessor as this device last knew it, then converge
                     let r = resolver(&self.resolver_files);
                     let ctx = self.ctx(&r);
-                    let creator = self.conv(&group).ok()
-                        .and_then(|c| member_identity(&c.group, LeafNodeIndex::new(0), &ctx).ok())
-                        .map(|w| w.identity).unwrap_or_default();
+                    let creator = self.conv(&group).map(|c| successors::creator(&c.group, &ctx)).unwrap_or_default();
                     let mut roster = members.clone();
                     roster.sort();
                     roster.dedup();
                     self.track_rosters();
-                    let emissions =
-                        self.successors.step(&json!({"welcome": {"group": group, "successor_of": pred, "creator": creator, "roster": roster}}));
+                    let decisions = self.successors.welcome(&group, pred, &creator, &roster);
                     let pred = pred.to_string();
-                    self.apply_successor(emissions, &pred).await?;
+                    self.apply_successor(decisions, &pred).await?;
                 }
             }
             Outcome::Object { sender, sender_device, object } => {

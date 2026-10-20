@@ -210,6 +210,11 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    accepted objects is history is now one rule (content; a read watermark; a call event): dsip-msg treated every
    object re-sent from the outbox after an outage as content, so a receipt sent after an outage became a timeline
    entry, was archived as one and was booked in its own receipt state.
+   3h: successor groups. `Successors` reads the vector-pinned `SuccessorTracker`'s decisions as types (`Create`: use,
+   create re-adding these peers, refuse; `Converge`: join, leave, decline, first contact) and is persisted as the
+   tracker itself, so both saved formats are unchanged. It also answers where a conversation lives now and which
+   groups make up its thread, and `creator` gives the identity a successor's welcome is checked against (leaf 0).
+   How each client hands the dead group's pending items over stays its own (below).
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
@@ -218,11 +223,13 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    routed to their conversation and batched (dsip-msg) or stepped at once; receipt policy and activity; waiting for the
    epoch to move after a conflict (dsip-msg); 20 s or 60 s before a deposit with no answer is an outage; re-deposits of
    commits, GroupInfo and config on reconnect (browser); `mailbox-config joined` after an external join (browser); a
-   successor made with one commit per peer (dsip-msg) or one for all (browser); proposals stored (browser); recorder
-   content and acceptance keys; a welcome produced by a Remove deposited (dsip-msg) or dropped (browser); an Add of a
-   named device still needed while no leaf has its credential (dsip-msg) or no authenticated leaf is that device
-   (browser); archive keys overwritten or kept; when a call event is recorded; the blob `tried`
-   input; a sealed introduction opened without the identity key.
+   successor made with one commit per peer (dsip-msg) or one for all (browser); the dead group's pending items moved one
+   by one into the successor's outbox (dsip-msg) or re-encrypted as new objects once the successor holds its members
+   (browser); a group's roster recorded for the successor checks only when every leaf authenticates (dsip-msg) or from
+   the leaves that do (browser); proposals stored (browser); recorder content and acceptance keys; a welcome produced
+   by a Remove deposited (dsip-msg) or dropped (browser); an Add of a named device still needed while no leaf has its
+   credential (dsip-msg) or no authenticated leaf is that device (browser); archive keys overwritten or kept; when a
+   call event is recorded; the blob `tried` input; a sealed introduction opened without the identity key.
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.
