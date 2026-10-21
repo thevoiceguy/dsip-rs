@@ -74,18 +74,9 @@ impl Outbox {
         self.outages.get(group).is_some_and(HubOutage::is_abandoned)
     }
 
-    /// `group`'s outage machine, made now if it has none.
-    pub fn outage_mut(&mut self, group: &str, now: i64) -> &mut HubOutage {
-        let timeout = self.hub_timeout;
-        self.outages.entry(group.to_string()).or_insert_with(|| HubOutage::new(&json!({"now": now, "hub_timeout": timeout})))
-    }
-
-    /// A new item for `group`. With `track`, the group's outage machine follows every deposit from now on; without, it
-    /// is made when the hub first proves unreachable ([`Outbox::unreachable`]).
-    pub fn deposit(&mut self, group: &str, item: Value, now: i64, track: bool) -> Deposit {
-        if track {
-            self.outage_mut(group, now);
-        }
+    /// A new item for `group`. The group's outage machine is made when the hub first proves unreachable
+    /// ([`Outbox::unreachable`]), so an outage starts then.
+    pub fn deposit(&mut self, group: &str, item: Value) -> Deposit {
         if self.is_abandoned(group) {
             return Deposit::Abandoned;
         }

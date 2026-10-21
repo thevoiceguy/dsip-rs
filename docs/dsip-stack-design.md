@@ -300,6 +300,13 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    default. Found on the way: a device's own copy fanned back without its `accepted` (the binding lost before the
    answer) did not count for the gap tracker, so the next handshake was held behind a gap that was not one; it now
    counts (spec-gap 69) for both clients, and may release what a gap held.
+   3j-4: what only the old dsip-msg used goes: the outbox's `track` flag (an outage machine is made when the hub
+   first proves unreachable, as 3j-3d decided), `Outbox::outage_mut`, `CallLog::to_map` (`from_map` stays, for the
+   migration) and `History::is_prejoin`; `inbound::gap_tracker` is private to the routing. With that, 3j is done and so
+   is stage 3: one messaging client, `dsip-messaging-device`, hosted by the browser and by dsip-msg, each host moving
+   frames, keeping the clock and doing the network fetches. What still differs is the `Config` options listed next,
+   each to go once decided; the browser's shortfalls (`rejoin_gaps`, `roll_back_unprocessable`, `batch_receipts`)
+   first, each with a web test.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
    it is decided (with a vector where a rule is involved): the dedup key (with or without the sender); an unprocessable

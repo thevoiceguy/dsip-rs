@@ -132,11 +132,6 @@ impl History {
         self.0.current_akid()
     }
 
-    /// Whether an MLS item of `group` at `epoch` predates this device's membership.
-    pub fn is_prejoin(&self, group: &str, epoch: i64) -> bool {
-        self.0.is_prejoin(group, epoch)
-    }
-
     /// The machine's state: `timeline`, `held`, `current_akid`.
     pub fn snapshot(&self) -> Value {
         self.0.snapshot()

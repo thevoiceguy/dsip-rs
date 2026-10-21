@@ -77,7 +77,7 @@ pub enum Route {
 /// A group's gap tracker, starting from the seq position this device has committed, or, for a device that has just
 /// joined and processed nothing, from the item at hand: what came before its welcome is not its gap (M§6.5, M§12.3
 /// step 5; spec-gap 69). `now` starts the tracker's clock.
-pub fn gap_tracker<'g>(gaps: &'g mut BTreeMap<String, GapTracker>, resume: &Resume, gap_timeout: i64, group: &str, first_seq: i64, now: i64)
+fn gap_tracker<'g>(gaps: &'g mut BTreeMap<String, GapTracker>, resume: &Resume, gap_timeout: i64, group: &str, first_seq: i64, now: i64)
     -> &'g mut GapTracker {
     let committed = resume.snapshot()["groups"][group]["contiguous"].as_i64().unwrap_or(0);
     let contiguous = if committed == 0 { (first_seq - 1).max(0) } else { committed };
@@ -85,7 +85,9 @@ pub fn gap_tracker<'g>(gaps: &'g mut BTreeMap<String, GapTracker>, resume: &Resu
 }
 
 impl<'a> Inbound<'a> {
-    /// [`gap_tracker`] over these parts.
+    /// This group's gap tracker, starting from the seq position this device has committed, or, for a device that has
+    /// just joined and processed nothing, from `first_seq`: what came before its welcome is not its gap (M§6.5, M§12.3
+    /// step 5; spec-gap 69). `now` starts the tracker's clock.
     pub fn gap_of_from(self, group: &str, first_seq: i64, now: i64) -> &'a mut GapTracker {
         gap_tracker(self.gaps, self.resume, self.gap_timeout, group, first_seq, now)
     }

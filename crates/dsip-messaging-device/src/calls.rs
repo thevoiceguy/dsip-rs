@@ -16,14 +16,10 @@ use serde_json::{json, Value};
 pub struct CallLog(Vec<Value>);
 
 impl CallLog {
-    /// A log saved by session (dsip-msg's format); its order is the sessions'.
+    /// A log saved by session, as dsip-msg kept it before it hosted the `Messenger` (read once, when that state is
+    /// migrated); its order is the sessions'.
     pub fn from_map(map: BTreeMap<String, Value>) -> CallLog {
         CallLog(map.into_values().collect())
-    }
-
-    /// The log by session (dsip-msg's format).
-    pub fn to_map(&self) -> BTreeMap<String, Value> {
-        self.0.iter().map(|e| (e["session"].as_str().unwrap_or("").to_string(), e.clone())).collect()
     }
 
     /// Record a call event, sent or received, live or from the archive; `false` when its session is already logged.

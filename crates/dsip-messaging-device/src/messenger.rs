@@ -1791,7 +1791,7 @@ impl<S: Store> Messenger<S> {
             // M§8.4 rule 4: the deposit's manifest names the blob without its key
             item["blobs"] = json!([{"uri": b["uri"], "sha256": b["sha256"], "size": b["size"]}]);
         }
-        let queued = match self.outbox.deposit(gid, item.clone(), now, false) {
+        let queued = match self.outbox.deposit(gid, item.clone()) {
             Deposit::Abandoned => {
                 // M§9.4: the dead group takes no more content; it goes to the successor once there is one
                 self.handover.entry(gid.to_string()).or_default().push(obj.clone());
