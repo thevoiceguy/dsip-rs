@@ -1,7 +1,7 @@
 //! The messaging device, sans-I/O: this identity's device key under its delegation, its MLS groups and the state
 //! the Messaging Profile asks a device to keep, driven with JSON strings and emitting frames and events. The host
-//! moves frames between it and the mailbox and keeps the clock. The browser (`dsip-wasm`) is its host; dsip-msg
-//! becomes one through the rest of dsip-rs stage 3j, its differences behind [`Config`].
+//! moves frames between it and the mailbox and keeps the clock. The browser (`dsip-wasm`) and dsip-msg are its hosts,
+//! their differences behind [`Config`].
 //!
 //! Spec: M§4.2 (the mailbox a `did:key` identity names in its reachability hint; the peer's found the same way),
 //! M§4.3 (bind with a verified `hello`; the delegation carries `dsip.messaging`), M§5.2–M§5.5 (`deposit`,
@@ -24,9 +24,10 @@
 //! is shown and read back as history by a device added later, every live key re-sent to a new sibling), M§10.3 and
 //! M§10.5 (a read watermark per conversation, disclosed only with the opt-in, else to the personal group).
 //!
-//! Impl: MLS state lives in OpenMLS's memory storage and is exported with the delivery state in one `save()`, which
-//! the host writes as one record after each step — the atomic commit of spec-gap 44 in a browser. A reload restores
-//! both. Pending deposits (not yet `accepted`) are kept with their bytes and re-deposited on the next bind (M§9.3:
+//! Impl: MLS state lives in the host's [`Store`]: in the browser OpenMLS's memory storage, exported with the delivery
+//! state in one `save()` that the host writes as one record after each step — the atomic commit of spec-gap 44 in a
+//! browser; natively a SQLite database, where each item's MLS writes and delivery state commit in one transaction and
+//! the host writes [`Messenger::state`] after each step. A reload restores both. Pending deposits (not yet `accepted`) are kept with their bytes and re-deposited on the next bind (M§9.3:
 //! idempotent at the hub by digest). Where the clients still differ, [`Config`] holds both behaviours (a seq gap that
 //! does not fill is reported, not re-joined, with `Config::rejoin_gaps` off, as in `Config::BROWSER`).
 
@@ -135,7 +136,7 @@ impl Op {
     /// What the commit does, for the host to say: `{op, peer?, device?, identity?, hub?}` (no key material).
     fn describe(&self) -> Value {
         match self {
-            Op::Add { peer, device, .. } => json!({"op": "add", "peer": peer, "device": device}),
+            Op::Add { peer, device, kps, .. } => json!({"op": "add", "peer": peer, "device": device, "devices": kps.len()}),
             Op::Rejoin => json!({"op": "rejoin"}),
             Op::Leave { identity } => json!({"op": "leave", "identity": identity}),
             Op::Remove { identity } => json!({"op": "remove", "identity": identity}),
@@ -311,6 +312,8 @@ pub struct Messenger<S: Store = MemoryStore> {
     /// This device's call records not yet handed to the conversation with its record-keeper, oldest first (C§9: held
     /// until that conversation exists, spec-gap 123).
     records_held: Vec<Value>,
+    /// TEST ONLY: a recorder device that sends content anyway, so members can be shown dropping it (C§5). Not saved.
+    recorder_sends: bool,
     /// The recorder devices each conversation was last shown with (C§5): a change is rendered. Not saved: what a
     /// conversation is recorded by at start is in [`Messenger::conversations`].
     recording_seen: BTreeMap<String, BTreeSet<String>>,
@@ -418,6 +421,7 @@ impl<S: Store> Messenger<S> {
             moved_from: st["mailbox"].as_str().filter(|d| *d != mailbox_did).map(String::from),
             recorder: dsip_core::delegation::capabilities(&delegation).iter().any(|c| c == "dsip.record"),
             records_held: st["records_held"].as_array().cloned().unwrap_or_default(),
+            recorder_sends: false,
             recording_seen: BTreeMap::new(),
             records: st["records"].as_array().cloned().unwrap_or_default(),
             recording_accepted: serde_json::from_value(st["recording_accepted"].clone()).unwrap_or_default(),
@@ -1085,6 +1089,14 @@ impl<S: Store> Messenger<S> {
 
     /// What to send on a fresh binding: pending application items again (M§9.3, the same bytes), then a sync.
     pub fn on_bound(&mut self, now: f64) -> String {
+        let mut frames: Vec<String> = serde_json::from_str(&self.rebind(now)).unwrap_or_default();
+        frames.push(self.sync_frame(true, now));
+        json!(frames).to_string()
+    }
+
+    /// [`Messenger::on_bound`] without the sync, for a host that syncs when its user asks: deposits whose answer the
+    /// ended binding took with it, and the outbox's pending items, again (M§9.3: the same bytes).
+    pub fn rebind(&mut self, now: f64) -> String {
         let mut frames = vec![];
         let moved = self.moved_from.is_some();
         if let Some(old) = self.moved_from.take() {
@@ -1105,7 +1117,6 @@ impl<S: Store> Messenger<S> {
                 frames.push(self.deposit_item(&gid, &it, now as i64));
             }
         }
-        frames.push(self.sync_frame(true, now));
         json!(frames).to_string()
     }
 
@@ -1438,6 +1449,53 @@ impl<S: Store> Messenger<S> {
         self.personal.clone()
     }
 
+    /// The store holding this device's MLS state, for a host that writes [`Messenger::state`] beside it (spec-gap 44).
+    pub fn store(&self) -> &S {
+        self.mls.provider()
+    }
+
+    /// Whether nothing this device did is still in flight: no deposit awaiting its answer or waiting to go again, no
+    /// refused commit waiting for a sync, no item refused by a hub the group may have left (M§5.3, M§6.5, M§7.4). A
+    /// host whose commands complete one at a time waits for this.
+    pub fn settled(&self) -> bool {
+        // the personal group's archive key waits for its GroupInfo's answer under a placeholder, never answered itself
+        let waiting = self.pending.iter().any(|(_, p)| !matches!(p, Pending::PersonalReady { .. }));
+        !waiting && self.pending.deferred() == 0 && self.retries.is_empty() && self.moved_items.is_empty()
+    }
+
+    /// The successor of `gid` this device converged on and is in (M§7.5), if any.
+    pub fn successor(&self, gid: &str) -> Option<String> {
+        self.successors.successor(gid).filter(|w| self.convs.contains_key(*w)).map(String::from)
+    }
+
+    /// One conversation's receipt state (M§10): what each identity has been delivered, read and played, and the
+    /// activity shown, as the receipts machine keeps it; null for a group this device is not in.
+    pub fn receipt_state(&self, gid: &str) -> String {
+        self.convs.get(gid).map(|c| c.receipts.snapshot()).unwrap_or(Value::Null).to_string()
+    }
+
+    /// The devices a mailbox's `key-packages` answer for `target` would add, as the vector-pinned rule picks them
+    /// (M§5.5, M§6.2, C§5): `[{device, recorder}]`, or why none would be.
+    pub fn key_package_devices(&self, target: &str, key_packages_json: &str, now: f64) -> Result<String, Error> {
+        let payload: Value = serde_json::from_str(key_packages_json).map_err(err)?;
+        if payload["type"] != "key-packages" {
+            return Err(Error::from(format!("key-package-fetch refused: {} {}", payload["reason"], payload["detail"])));
+        }
+        let me = key_packages::Me { identity: &self.keys.identity, device: &self.keys.device.did() };
+        let picked = key_packages::select(&payload, target, &me, "conversation", self.mls.provider(), &self.ctx(now as i64))
+            .map_err(|why| Error::from(format!("no device of {target} to add: {why} (C§5)")))?;
+        let ctx = self.ctx(now as i64);
+        let devices: Vec<Value> = picked.iter().filter_map(|(bytes, _)| authenticate_key_package(bytes, self.mls.provider(), &ctx).ok())
+            .map(|(_, w)| json!({"device": w.device, "recorder": w.is_recorder()})).collect();
+        Ok(json!(devices).to_string())
+    }
+
+    /// TEST ONLY: let this recorder device send content anyway (C§5 forbids it), so a demo can show members dropping
+    /// it.
+    pub fn set_recorder_sends(&mut self, on: bool) {
+        self.recorder_sends = on;
+    }
+
     /// Process one frame from the mailbox. Returns the emissions: `{send: frame}` (to the mailbox), `{ui: …}`
     /// events, `{sync: true}` when a refused commit asks for one (spec-gap 58), `{refused: …}`, `{error: …}`.
     pub fn inbound(&mut self, frame: &str, now: f64) -> String {
@@ -1703,7 +1761,7 @@ impl<S: Store> Messenger<S> {
     /// Content may go to `gid` (C§5): this device is not a recorder, which never speaks, and every recorder in the
     /// conversation is accepted.
     fn may_send_content(&self, gid: &str, now: i64) -> Result<(), Error> {
-        if self.recorder {
+        if self.recorder && !self.recorder_sends {
             return Err(Error::from("this device is a recorder: it never sends content (C§5)"));
         }
         if self.leaving.contains(gid) {
@@ -1921,7 +1979,8 @@ impl<S: Store> Messenger<S> {
         let reason = s_of(&p["reason"]);
         let id = s_of(&p["in_reply_to"]);
         let Some((pending, hub)) = self.pending.answer(&id) else {
-            out.push(json!({"error": format!("{reason} {}", p["detail"])}));
+            // not an answer to a deposit of ours (a sync's, or none): the mailbox's reason and detail as they came
+            out.push(json!({"error": format!("{reason} {}", p["detail"]), "reason": p["reason"], "detail": p["detail"]}));
             return out;
         };
         if matches!(pending, Pending::Commit { .. } | Pending::Application { .. }) {
@@ -2125,9 +2184,10 @@ impl<S: Store> Messenger<S> {
                 self.group_info.insert(group, s_of(&mls));
                 return Ok(out);
             }
-            Route::Own => {
-                // our own deposit fanned back (M§6.5 rule 5), arriving before its accepted (spec-gap 47)
+            Route::Own { released } => {
+                // our own deposit fanned back (M§6.5 rule 5), arriving before its accepted (spec-gap 47) or instead of it
                 out.push(json!({"ui": "self", "class": class, "seq": item["seq"]}));
+                out.extend(self.released(released, now)?);
                 return Ok(out);
             }
             Route::PreJoin => {
@@ -2867,7 +2927,8 @@ impl<S: Store> Messenger<S> {
                 }
             } else {
                 self.restored.push(seq, &obj);
-                out.push(json!({"ui": "history_receipt", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"]}));
+                out.push(json!({"ui": "history_receipt", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"],
+                    "targets": obj["targets"], "through": obj["through"]}));
             }
         }
         out.extend(self.apply_restored(now));

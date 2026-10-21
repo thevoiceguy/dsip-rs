@@ -3,7 +3,8 @@
 //!
 //! Spec: M§5.4 (state kept with the MLS state, spec-gap 44), M§7.1 (the personal group), M§12.3 (a new device joins
 //! the personal group first), C§5 (a recorder device joins conversations only; a recorded conversation is rendered),
-//! M§6.5 (a commit that lost a conflict is re-proposed), M§9.4 (an outage), M§13.3 (call events).
+//! M§6.5 (a commit that lost a conflict is re-proposed), M§9.4 (an outage), M§13.3 (call events), M§5.3 and M§9.3 (a host
+//! that waits for every deposit's answer, and deposits them again on a new binding without syncing).
 
 use serde_json::{json, Value};
 
@@ -322,4 +323,56 @@ fn events_carry_what_a_host_prints() {
     let ev = hub.drive(&mut m, &out);
     let back = ui(&ev, "sent")[0].clone();
     assert_eq!((back["item"].clone(), back["after_outage"].as_bool()), (sent["item"].clone(), Some(true)), "{ev:?}");
+}
+
+#[test]
+fn a_host_that_waits_for_its_commands_and_syncs_when_asked() {
+    let (alice, phone, bob, bob_phone, bob_rec) = (KeyPair::from_fixture_name("alice"), KeyPair::from_fixture_name("alice-phone"),
+        KeyPair::from_fixture_name("bob"), KeyPair::from_fixture_name("bob-phone"), KeyPair::from_fixture_name("bob-recorder"));
+    let mut hub = Hub::new();
+    let mut m = Messenger::open(&identity_json(&alice, &phone), &hub.did(), "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
+                                Config::DSIP_MSG, NOW as f64).unwrap();
+    assert!(m.settled(), "nothing done yet");
+    let out = m.create_personal(NOW as f64).unwrap();
+    assert!(!m.settled(), "the GroupInfo awaits its answer (M§5.3)");
+    hub.drive(&mut m, &out);
+    assert!(m.settled(), "answered, and the archive key that followed too");
+
+    // the devices an answer would add, as the pinned rule picks them (C§5); the commit counts them
+    let kps = json!({"type": "key-packages", "key_packages": [kp(&bob, &bob_phone, PLAIN), kp(&bob, &bob_rec, RECORDER)]}).to_string();
+    let devices: Value = serde_json::from_str(&m.key_package_devices(&bob.did(), &kps, NOW as f64).unwrap()).unwrap();
+    assert_eq!(devices, json!([{"device": bob_phone.did(), "recorder": false}, {"device": bob_rec.did(), "recorder": true}]));
+    let refused = json!({"type": "error", "reason": "mailbox.first-contact-required"}).to_string();
+    assert!(m.key_package_devices(&bob.did(), &refused, NOW as f64).unwrap_err().0.contains("first-contact-required"));
+    let out = m.create_direct(&bob.did(), &kps, None, NOW as f64).unwrap();
+    let ev = hub.drive(&mut m, &out);
+    let committed = ui(&ev, "committed")[0].clone();
+    assert_eq!(committed["op"]["devices"], 2, "{committed}");
+    let gid = committed["group"].as_str().unwrap().to_string();
+    let receipts: Value = serde_json::from_str(&m.receipt_state(&gid)).unwrap();
+    assert!(receipts["read_through"].is_object(), "{receipts}");
+    assert_eq!(m.receipt_state("no-such-group"), "null");
+    assert_eq!(m.successor(&gid), None);
+
+    // a commit in flight is unsettled; a new binding deposits it again without a sync, unless the host asks for one
+    m.rekey(&gid, NOW as f64).unwrap();
+    assert!(!m.settled());
+    let types = |frames: &str| -> Vec<String> {
+        serde_json::from_str::<Vec<String>>(frames).unwrap().iter()
+            .map(|f| wire::payload_of(&Envelope::from_frame(f).unwrap()).unwrap()["type"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(types(&m.rebind(NOW as f64)), ["deposit"], "the same commit again (M§9.3), no sync");
+    assert_eq!(types(&m.on_bound(NOW as f64)), ["deposit", "sync"]);
+
+    // refused for a conflict: unsettled until the sync shows the commit is still needed and it is proposed again
+    let pending: Vec<String> = serde_json::from_str(&m.rebind(NOW as f64)).unwrap();
+    let refusal = wire::error(&hub.key, &phone.did(), NOW, Some(&deposit_id(&pending[0])), "mailbox.commit-conflict", None);
+    let ev = events(&m.inbound(&refusal.frame(), NOW as f64));
+    assert!(!ui(&ev, "conflict").is_empty() && !m.settled(), "{ev:?}");
+    let caught_up = wire::items(&hub.key, &phone.did(), NOW, Some("01J0000000000000000000SYNC"), vec![], Value::Null);
+    let ev = events(&m.inbound(&caught_up.frame(), NOW as f64));
+    assert!(!ui(&ev, "repropose").is_empty(), "{ev:?}");
+    let ev = hub.drive(&mut m, &json!(ev).to_string());
+    assert_eq!(ui(&ev, "committed")[0]["op"]["op"], "update");
+    assert!(m.settled(), "{ev:?}");
 }
