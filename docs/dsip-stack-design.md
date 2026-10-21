@@ -307,12 +307,19 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    frames, keeping the clock and doing the network fetches. What still differs is the `Config` options listed next,
    each to go once decided; the browser's shortfalls (`rejoin_gaps`, `roll_back_unprocessable`, `batch_receipts`)
    first, each with a web test.
+   The browser's shortfalls closed: all three options go, both clients doing what M§6.5, spec-gaps 44 and 138, and
+   M§10.2 with spec-gap 52 ask. A seq gap that does not fill re-joins by external commit, and the `Messenger`'s gap
+   timeout defaults to M§6.5's RECOMMENDED 300 s (the browser's was 60; a setting now, as the hub timeout is). An item
+   that cannot be processed is rolled back with its delivery state (the browser's `MemoryStore` restores both maps)
+   and committed as handled, so it is acknowledged. A received receipt joins the sync's batch, a sibling's private
+   watermark booked to the conversation it names. The web tests: `messaging-gaps` (a push lost on its way, so the
+   rekey after it is held and the device re-joins when the gap stays open; a message from an epoch the receiver has
+   moved two past, unprocessable, then not redelivered after a reload) and a step of `messaging-devices` (a sibling's
+   private read applied to the conversation, with the archived copy of it kept back so only the receipt can carry it);
+   each fails on the code before. The test library holds or drops what a page's sockets receive, from an init script.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
-   it is decided (with a vector where a rule is involved): the dedup key (with or without the sender); an unprocessable
-   item rolled back and acknowledged (dsip-msg) or neither; a seq gap that does not fill re-joined (dsip-msg) or only
-   reported; receipts received in the personal group routed to their conversation and batched (dsip-msg) or stepped
-   at once; 20 s or 60 s before a deposit with no answer is an outage; a group's roster recorded for the successor
+   it is decided (with a vector where a rule is involved): the dedup key (with or without the sender); 20 s or 60 s before a deposit with no answer is an outage; a group's roster recorded for the successor
    checks only when every leaf authenticates (dsip-msg) or from the leaves that do (browser); proposals stored
    (browser); a welcome produced by a Remove deposited (dsip-msg) or dropped (browser); an Add of a named device still
    needed while no leaf has its credential (dsip-msg) or no authenticated leaf is that device (browser); archive keys
@@ -322,7 +329,8 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    verified after the hello, receipt policy and activity, re-proposing once the sync is answered rather than waiting
    for the epoch to move, re-deposits of commits, GroupInfo and config on a new binding, `mailbox-config joined` after
    an external join, a successor made with one commit for all its members, and the dead group's pending items
-   re-encrypted as new objects once the successor holds them.
+   re-encrypted as new objects once the successor holds them; and dsip-msg's way for an unprocessable item, a seq gap
+   that does not fill, and receipts received (the browser's shortfalls, closed after 3j).
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.

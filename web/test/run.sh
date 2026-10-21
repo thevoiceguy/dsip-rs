@@ -74,7 +74,7 @@ grep -q "DSIP leg" "$D/gw-a.log" && grep -q "DSIP leg" "$D/gw-b.log" || { echo "
 rc=0
 for b in $(echo "$BROWSERS" | sed 's/all/firefox chromium/; s/,/ /g'); do
   echo "== $b"
-  for t in ${TESTS:-call first-contact devices gateway deploy messaging messaging-devices messaging-voice messaging-voicemail messaging-rejoin messaging-successor messaging-pending messaging-rebind messaging-group messaging-hub-move messaging-interop call-records call-recording}; do
+  for t in ${TESTS:-call first-contact devices gateway deploy messaging messaging-devices messaging-voice messaging-voicemail messaging-rejoin messaging-gaps messaging-successor messaging-pending messaging-rebind messaging-group messaging-hub-move messaging-interop call-records call-recording}; do
     (cd web && BROWSER=$b URL="https://$LISTEN/" RELAY_B="wss://$LISTEN_B/dsip" TURN_SECRET="$TURN_SECRET" FIXTURE="$D" \
        MAILBOX_A="wss://$MBX_A/dsip" MAILBOX_A_DID="$MAILBOX_A_DID" MAILBOX_B="wss://$MBX_B/dsip" MAILBOX_B_DID="$MAILBOX_B_DID" \
        MAILBOX_BIN="$(cd .. && pwd)/$B/dsip-mailbox" DSIP_BIN="$(cd .. && pwd)/$B/dsip" NODE_URL="$NODE" node test/$t.mjs) || rc=1

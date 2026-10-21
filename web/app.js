@@ -1321,6 +1321,7 @@ async function startMessagingNow() {
     }
     m.set_read_disclosed(!!settings.read_disclosed, now());
     if (settings.hub_timeout_s) m.set_hub_timeout(settings.hub_timeout_s);   // M§9.4: the device's own threshold
+    if (settings.gap_timeout_s) m.set_gap_timeout(settings.gap_timeout_s);   // M§6.5: RECOMMENDED 300 s
     messenger = m;
   } catch (e) { log(`messaging not started: ${e.message || e}`, 'M§4'); renderMessages(); return; }
   messenger.set_grants(JSON.stringify(heldGrantFrames()));
@@ -1402,7 +1403,8 @@ function onMessagingUi(e) {
   const sec = { joined: 'M§6.6', committed: 'M§6.5', personal: 'M§7.1', message: 'M§8.1', sent: 'M§9.2', receipt: 'M§10.2', receipt_sent: 'M§10.2', epoch: 'M§7.3', removed: 'M§7.3',
     key_packages_uploaded: 'M§5.5', archive_key: 'M§12.1', archive_key_created: 'M§12.1', granted: 'M§14.1', request: 'M§14.1', duplicate: 'M§8.5', self: 'spec-gap 47', hold: 'M§6.5', released: 'M§6.5', conflict: 'M§6.5',
     archive: 'M§12.2', archived: 'M§12.2', archive_held: 'M§12.3', history: 'M§12.3', history_receipt: 'M§12.2', history_applied: 'M§12.2', read_private_kept: 'M§10.5',
-    call_record: 'C§9', recording: 'C§5', recorder_content: 'C§5', repropose: 'M§6.5', recording_accepted: 'C§5', receipt_withheld: 'C§5', left: 'M§7.3', leave_proposed: 'M§7.3', leave_committing: 'M§7.3', leave_proposals: 'M§7.3', leave_proposal_refused: 'M§7.3', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5', hub_moved: 'M§7.4', moved_check: 'M§7.4', hub_arriving: 'M§7.4', hub_arrival_expired: 'M§7.4' }[e.ui] || 'M§';
+    call_record: 'C§9', recording: 'C§5', recorder_content: 'C§5', repropose: 'M§6.5', recording_accepted: 'C§5', receipt_withheld: 'C§5', left: 'M§7.3', leave_proposed: 'M§7.3', leave_committing: 'M§7.3', leave_proposals: 'M§7.3', leave_proposal_refused: 'M§7.3', hub_down: 'M§9.4', hub_retry: 'M§9.4', hub_back: 'M§9.4', handed_over: 'M§9.4', successor: 'M§7.5', successor_declined: 'M§7.5', successor_left: 'M§7.5', hub_moved: 'M§7.4', moved_check: 'M§7.4', hub_arriving: 'M§7.4', hub_arrival_expired: 'M§7.4',
+    gap_timeout: 'M§6.5', unprocessable: 'spec-gap 138' }[e.ui] || 'M§';
   const fields = Object.entries(e).filter(([k]) => k !== 'ui' && k !== 'text' && k !== 'object').map(([k, v]) => `${k}=${typeof v === 'string' ? short(v) : JSON.stringify(v)}`).join(' ');
   log(`◇ ${e.ui} ${fields}`, sec);
   if (e.ui === 'message') { if (!activeConv) activeConv = e.group; notify(`Message from ${nameOf(e.from) || short(e.from)}`); }
@@ -1568,6 +1570,15 @@ async function moveHub(gid) {
     log(`moving ${short(gid)} to our mailbox as its hub`, 'M§7.4');
   } catch (e) { notify(`cannot move the conversation: ${e.message || e}`); }
   renderMessages();
+}
+
+/** Refresh our own key material in the conversation `gid` (post-compromise security): an Update commit (M§6.5). */
+async function rekey(gid) {
+  if (!messenger) return;
+  try {
+    await driveMailbox([{ send: messenger.rekey(gid, now()) }]);
+    log(`refreshing our keys in ${short(gid)}`, 'M§6.5');
+  } catch (e) { notify(`cannot refresh the keys: ${e.message || e}`); }
 }
 
 /** One roster change as members see it (M§7.3: attributed to the committing identity), or a hub move (M§7.4). */
@@ -2091,6 +2102,8 @@ function renderMessages() {
     available: () => JSON.parse(messenger.available()),
     // successor groups (round 2D)
     setHubTimeout: async (s) => { settings.hub_timeout_s = s; await saveSettings(); messenger?.set_hub_timeout(s); },
+    setGapTimeout: async (s) => { settings.gap_timeout_s = s; await saveSettings(); messenger?.set_gap_timeout(s); },
+    rekey,
     outages: () => JSON.parse(messenger.outages()),
     joinAvailable,
     timeline: (gid) => JSON.parse(messenger.timeline(gid || activeConv)),

@@ -176,21 +176,15 @@ impl<'a> Inbound<'a> {
     /// Process the item [`Route::Process`] returned, with `process`, and commit it with its MLS effect (M§5.4, spec-gap
     /// 44); a sibling's welcome is committed without counting as a join (spec-gap 51).
     ///
-    /// With `roll_back` ([`crate::Config::roll_back_unprocessable`]), `process` runs inside `store`'s transaction and
-    /// the delivery state recording the item is written in the same one, under `resume`. If either fails, both roll
-    /// back, the host must reload any group it holds in memory, and the item is committed as handled.
+    /// `process` runs inside `store`'s transaction and the delivery state recording the item is written in the same
+    /// one, under `resume`. If either fails, both roll back, the host must reload any group it holds in memory, and the
+    /// item is committed as handled.
     ///
     /// Impl (spec-gap 138): an item that fails processing once fails it again on every redelivery, so committing it as
     /// handled lets the device acknowledge it instead of receiving it after every sync. The error is still returned
-    /// for the host to report. Without `roll_back`, `process` runs outside any transaction and a failed item stays
-    /// uncommitted.
-    pub fn commit_processed<S: Store>(&mut self, store: &S, item: &Value, roll_back: bool,
+    /// for the host to report.
+    pub fn commit_processed<S: Store>(&mut self, store: &S, item: &Value,
                                       process: impl FnOnce() -> Result<Outcome, MlsError>) -> Result<Outcome, MlsError> {
-        if !roll_back {
-            let outcome = process()?;
-            self.resume.commit(item, matches!(outcome, Outcome::NotForDevice));
-            return Ok(outcome);
-        }
         let before = self.resume.clone();
         let resume = &mut *self.resume;
         let result = store.atomically(|| {

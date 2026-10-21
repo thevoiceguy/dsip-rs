@@ -81,6 +81,12 @@ impl Messenger {
         self.0.set_hub_timeout(seconds)
     }
 
+    /// Seconds a seq gap may stay open before this device re-joins the group by external commit (M§6.5, spec-gap 69;
+    /// RECOMMENDED 300). Set before the device processes anything: each group's tracker takes it when made.
+    pub fn set_gap_timeout(&mut self, seconds: f64) {
+        self.0.set_gap_timeout(seconds as i64)
+    }
+
     /// Groups whose hub is unreachable: `{group: {down_since, pending, abandoned}}` (M§9.4).
     pub fn outages(&self) -> String {
         self.0.outages()
@@ -346,6 +352,12 @@ impl Messenger {
     /// the new hub is bootstrapped with the GroupInfo and `handover_seq`.
     pub fn move_hub(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
         self.0.move_hub(gid, now).map_err(js_err)
+    }
+
+    /// Refresh this device's own leaf key material in `gid` (post-compromise security): an Update commit (M§6.5). The
+    /// frame to send.
+    pub fn rekey(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
+        self.0.rekey(gid, now).map_err(js_err)
     }
 
     /// The roster changes of a conversation and its predecessors, oldest first: `[{group, seq, epoch, by, added,

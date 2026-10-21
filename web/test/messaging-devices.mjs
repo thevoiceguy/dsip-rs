@@ -3,8 +3,9 @@
 // personal group only (M§10.3, M§10.5). Alice enrols a second browser from her identity file; her first device adds
 // it to the personal group and the conversation and re-sends the archive keys (M§12.3, M§6.7); the second device
 // reads the archive records the first one wrote as history (M§12.2), with both sides and the right seqs, then takes
-// part live both ways, and a reload keeps it all (spec-gap 44).
-import { launch, person, enrolled, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit } from './lib.mjs';
+// part live both ways, and a reload keeps it all (spec-gap 44). The second device's private read reaches the first
+// through the personal group and is applied to the conversation it names (M§10.5, spec-gap 52).
+import { launch, person, enrolled, ready, until, addContact, rowButton, checker, dump, logOf, sleep, submit, holdItems } from './lib.mjs';
 
 const MAILBOX_A_DID = process.env.MAILBOX_A_DID;
 const check = checker();
@@ -115,6 +116,27 @@ try {
   await say(bob, bConv.group, 'still there, second device?');
   await until(alice2.page, (g) => window.dsip.thread(g).some((m) => m.object.text === 'still there, second device?'), a2Conv.group, 20000);
   check('Alice-2: a message after the reload decrypts', true);
+
+  // 6. A sibling's undisclosed read (Alice-2 keeps hers private) reaches Alice-1 through the personal group, and
+  //    Alice-1 applies it to the conversation it names, not to the personal group (M§10.5, spec-gap 52; M§10.2)
+  await alice.page.click('nav button[data-view=contacts]');
+  await say(bob, bConv.group, 'read this on your second device');
+  await until(alice.page, (g) => window.dsip.thread(g).some((m) => m.object.text === 'read this on your second device'), aConv.group, 20000);
+  const target = await alice.page.evaluate((g) => window.dsip.thread(g).find((m) => m.object.text === 'read this on your second device').object.id, aConv.group);
+  check('Alice-1: has not read it herself (its thread is not on screen)', (await alice.page.evaluate((g) => window.dsip.readMarks(g), aConv.group))[alice.did] !== target);
+  // the sibling also archives her watermark (spec-gap 68); kept back here, so only the receipt itself can carry it
+  await holdItems(alice, 'archive');
+  await alice2.page.click('nav button[data-view=messages]');
+  await alice2.page.evaluate((g) => window.dsip.openConversation(g), a2Conv.group);
+  await until(alice2.page, (g) => window.dsip.thread(g).some((m) => m.object.text === 'read this on your second device'), a2Conv.group, 20000);
+  await until(alice.page, ([g, did, t]) => window.dsip.readMarks(g)[did] === t, [aConv.group, alice.did, target], 20000)
+    .catch(() => {});
+  const marks = await alice.page.evaluate((g) => window.dsip.readMarks(g), aConv.group);
+  check('Alice-1: the conversation shows where her identity read, from the sibling\'s watermark (spec-gap 52)', marks[alice.did] === target, JSON.stringify(marks));
+  await alice.page.evaluate(() => window.__tap.release());
+  const personalMarks = await alice.page.evaluate(() => window.dsip.readMarks(window.dsip.personalGroup()));
+  check('Alice-1: the watermark is booked to the conversation, not to the personal group it came through (M§10.2)', !personalMarks[alice.did], JSON.stringify(personalMarks));
+  check('Bob: still sees no read mark from the private sibling', (await bob.page.evaluate((g) => window.dsip.readMarks(g), bConv.group))[alice.did] !== target);
 } catch (err) {
   check.fail(`exception: ${err.message}`);
   for (const [p, c] of [[alice, aConv], [bob, bConv], [alice2, a2Conv]]) if (p && c) console.log(`  ${p.name} thread: ${JSON.stringify(await texts(p, c.group).catch(() => null))}`);
