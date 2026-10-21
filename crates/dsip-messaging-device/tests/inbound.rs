@@ -167,7 +167,7 @@ fn a_processed_item_is_committed_with_the_delivery_state_in_one_transaction() {
     let mut p = Parts::new(json!({}));
     let store = MemoryStore::default();
     let it = item("c:1", "application", 1, b"x");
-    let out = p.inbound().commit_processed(&store, &it, true, || {
+    let out = p.inbound().commit_processed(&store, &it, || {
         store.put("mls-write", &json!(1))?;
         Ok(Outcome::Nothing)
     });
@@ -182,7 +182,7 @@ fn an_unprocessable_item_is_rolled_back_then_committed_as_handled() {
     let mut p = Parts::new(json!({}));
     let store = MemoryStore::default();
     let it = item("c:1", "application", 1, b"x");
-    let out = p.inbound().commit_processed(&store, &it, true, || {
+    let out = p.inbound().commit_processed(&store, &it, || {
         store.put("mls-write", &json!(1))?;
         Err(MlsError("cannot decrypt".into()))
     });
@@ -191,19 +191,4 @@ fn an_unprocessable_item_is_rolled_back_then_committed_as_handled() {
     assert_eq!(store.get("mls-write").unwrap(), None);
     assert_eq!(p.cursor(), json!("c:1"));
     assert_eq!(p.route(&it, true, false), Route::Duplicate);
-}
-
-#[test]
-fn without_roll_back_an_unprocessable_item_stays_uncommitted() {
-    let mut p = Parts::new(json!({}));
-    let store = MemoryStore::default();
-    let it = item("c:1", "application", 1, b"x");
-    let out = p.inbound().commit_processed(&store, &it, false, || {
-        store.put("mls-write", &json!(1))?;
-        Err(MlsError("cannot decrypt".into()))
-    });
-    assert!(out.is_err());
-    assert_eq!(store.get("mls-write").unwrap(), Some(json!(1)));
-    assert_eq!(p.cursor(), Value::Null);
-    assert!(!p.resume.is_duplicate(&it));
 }

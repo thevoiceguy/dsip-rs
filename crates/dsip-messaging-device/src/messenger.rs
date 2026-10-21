@@ -28,8 +28,7 @@
 //! state in one `save()` that the host writes as one record after each step — the atomic commit of spec-gap 44 in a
 //! browser; natively a SQLite database, where each item's MLS writes and delivery state commit in one transaction and
 //! the host writes [`Messenger::state`] after each step. A reload restores both. Pending deposits (not yet `accepted`) are kept with their bytes and re-deposited on the next bind (M§9.3:
-//! idempotent at the hub by digest). Where the clients still differ, [`Config`] holds both behaviours (a seq gap that
-//! does not fill is reported, not re-joined, with `Config::rejoin_gaps` off, as in `Config::BROWSER`).
+//! idempotent at the hub by digest). Where the clients still differ, [`Config`] holds both behaviours.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -407,7 +406,7 @@ impl<S: Store> Messenger<S> {
             arrivals: BTreeMap::new(),
             requests: serde_json::from_value(st["requests"].clone()).unwrap_or_default(),
             want_live: false,
-            gap_timeout: 60,
+            gap_timeout: dsip_messaging::client::GAP_TIMEOUT_S,
             history: History::default(),
             held_archive: serde_json::from_value(st["held_archive"].clone()).unwrap_or_default(),
             restored: Restored::from_items(st["restored"].as_array().cloned().unwrap_or_default()),
@@ -571,17 +570,15 @@ impl<S: Store> Messenger<S> {
         for (gid, ems) in self.outbox.due(now_i) {
             out.extend(self.outage_emissions(&gid, ems, now_i));
         }
-        // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8), when configured
-        if self.config.rejoin_gaps {
-            for (gid, held) in self.delivery().gap_timeouts(now_i) {
-                out.push(json!({"ui": "gap_timeout", "group": gid, "held": held}));
-                match self.external_commit(&gid, now_i) {
-                    Ok(frame) => {
-                        self.retries.insert(gid, (Retry::default(), Op::Rejoin));
-                        out.push(json!({"send": frame}));
-                    }
-                    Err(e) => out.push(json!({"error": e.0, "group": gid})),
+        // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)
+        for (gid, held) in self.delivery().gap_timeouts(now_i) {
+            out.push(json!({"ui": "gap_timeout", "group": gid, "held": held}));
+            match self.external_commit(&gid, now_i) {
+                Ok(frame) => {
+                    self.retries.insert(gid, (Retry::default(), Op::Rejoin));
+                    out.push(json!({"send": frame}));
                 }
+                Err(e) => out.push(json!({"error": e.0, "group": gid})),
             }
         }
         out.extend(self.recording_changes(now_i));
@@ -1791,7 +1788,7 @@ impl<S: Store> Messenger<S> {
             // M§8.4 rule 4: the deposit's manifest names the blob without its key
             item["blobs"] = json!([{"uri": b["uri"], "sha256": b["sha256"], "size": b["size"]}]);
         }
-        let queued = match self.outbox.deposit(gid, item.clone(), now, false) {
+        let queued = match self.outbox.deposit(gid, item.clone()) {
             Deposit::Abandoned => {
                 // M§9.4: the dead group takes no more content; it goes to the successor once there is one
                 self.handover.entry(gid.to_string()).or_default().push(obj.clone());
@@ -2210,11 +2207,11 @@ impl<S: Store> Messenger<S> {
             let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
                                          gap_timeout: self.gap_timeout };
             // committed: the delivery state records the item with its MLS effect (the host saves both together)
-            delivery.commit_processed(mls.provider(), item, self.config.roll_back_unprocessable, || process(mls, target, &class, &bytes, &ctx, &me, self.config.process))
+            delivery.commit_processed(mls.provider(), item, || process(mls, target, &class, &bytes, &ctx, &me, self.config.process))
         };
         let outcome = match result {
             Ok(o) => o,
-            Err(e) if self.config.roll_back_unprocessable => {
+            Err(e) => {
                 // rolled back, and committed as handled (spec-gap 138): the in-memory group may be ahead of the store
                 if let Some(c) = self.convs.get_mut(&gid) {
                     if let Some(g) = self.mls.load_group(&dsip_core::b64::decode(&gid).unwrap_or_default())? {
@@ -2225,7 +2222,6 @@ impl<S: Store> Messenger<S> {
                 out.extend(self.released(released, now)?);
                 return Ok(out);
             }
-            Err(e) => return Err(e),
         };
         match outcome {
             Outcome::Joined { members, group, conv, epoch, by } => {
@@ -2380,20 +2376,12 @@ impl<S: Store> Messenger<S> {
                 }
                 out.push(json!({"ui": "call_record", "from": sender, "session": object["session"], "outcome": object["outcome"], "fresh": fresh}));
             }
-            Some("receipt") if self.config.batch_receipts => {
+            Some("receipt") => {
                 // a sibling's undisclosed watermark describes another conversation (spec-gap 52)
                 let personal = self.personal.as_deref() == Some(gid);
                 let target = receipts::receipt_target(gid, personal, &object, self.convs.iter().map(|(g, c)| (g.as_str(), c.conversation.as_str())));
                 if let Some(t) = target {
                     self.batch.receipt(gid, &t, seq, &object, sender_device);
-                }
-                out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
-            }
-            Some("receipt") => {
-                if let Some(c) = self.convs.get_mut(gid) {
-                    let batch = json!({"seq": seq, "object": object, "src": gid, "sender_device": sender_device});
-                    let emissions = c.receipts.sync(now, vec![batch]);
-                    out.extend(self.receipt_sends(gid, emissions, now));
                 }
                 out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
             }

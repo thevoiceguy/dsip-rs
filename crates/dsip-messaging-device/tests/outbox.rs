@@ -20,9 +20,9 @@ fn forwards(ems: &[Value]) -> Vec<&str> {
 
 #[test]
 fn an_outage_starts_when_the_hub_stops_answering() {
-    // the machine follows every deposit from the first, at t=0 (dsip-msg's `track`)
+    // a deposit at t=0, accepted
     let mut o = Outbox::new(3600);
-    assert_eq!(o.deposit(G, item("a"), 0, true), Deposit::Send);
+    assert_eq!(o.deposit(G, item("a")), Deposit::Send);
     o.answered(G, "a", None);
     o.remove(G, "a");
     // the host's clock ticks while the hub is up
@@ -30,11 +30,12 @@ fn an_outage_starts_when_the_hub_stops_answering() {
         assert!(o.due(t).is_empty());
     }
     // two hours on, the hub stops answering: the outage starts now, so the next tick retries the head
-    assert_eq!(o.deposit(G, item("b"), 7200, true), Deposit::Send);
-    let ems = o.answered(G, "b", Some("mailbox.hub-unreachable"));
+    assert_eq!(o.deposit(G, item("b")), Deposit::Send);
+    let (started, ems) = o.unreachable(G, "b", false, 7200);
+    assert!(started);
     assert_eq!(ems, vec![json!({"retry_in": 1})]);
-    // the machine's clock is the host's last tick (each second): not the time the machine was made
-    assert_eq!(o.outages[G].down_since(), Some(7199));
+    // not the time of the first deposit, two hours before
+    assert_eq!(o.outages[G].down_since(), Some(7200));
     let due = o.due(7201);
     assert_eq!(due.len(), 1);
     assert_eq!(forwards(&due[0].1), vec!["b"], "a retry, not the successor trigger: {due:?}");
@@ -44,13 +45,13 @@ fn an_outage_starts_when_the_hub_stops_answering() {
 fn queued_flushed_then_abandoned() {
     // the machine made only when the hub first proves unreachable (the browser's way)
     let mut o = Outbox::new(30);
-    assert_eq!(o.deposit(G, item("a"), 100, false), Deposit::Send);
+    assert_eq!(o.deposit(G, item("a")), Deposit::Send);
     assert!(o.outages.is_empty());
     let (started, ems) = o.unreachable(G, "a", false, 100);
     assert!(started && o.is_down(G));
     assert_eq!(ems, vec![json!({"retry_in": 1})]);
     // while down, new items wait behind the head (M§9.4)
-    assert_eq!(o.deposit(G, item("b"), 101, false), Deposit::Queued);
+    assert_eq!(o.deposit(G, item("b")), Deposit::Queued);
     assert_eq!(o.pending(G), 2);
     // the head's retry, then an accepted: the hub is back and the rest goes out in order
     assert_eq!(forwards(&o.due(101)[0].1), vec!["a"]);
@@ -67,7 +68,7 @@ fn queued_flushed_then_abandoned() {
     assert!(o.is_abandoned(G));
     assert_eq!(o.take(G).len(), 1);
     // the dead group takes nothing more
-    assert_eq!(o.deposit(G, item("c"), 232, false), Deposit::Abandoned);
+    assert_eq!(o.deposit(G, item("c")), Deposit::Abandoned);
     assert_eq!(o.pending(G), 0);
     o.forget(G);
     assert!(!o.is_abandoned(G) && o.outages.is_empty());

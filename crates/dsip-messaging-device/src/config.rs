@@ -3,10 +3,7 @@
 //! did; an option goes once it is decided, with a vector where a rule is involved.
 //!
 //! Spec: M§8.5 (duplicates collapse), M§9.4 (no answer at all: the hub unreachable), M§6.5 ("if still needed"), M§7.2
-//! (a welcome for the devices an Add adds), M§7.5 (the last roster this device processed), M§12.1 (archive keys),
-//! M§6.5 (a gap that does not fill in time: the device re-joins, M§6.8; spec-gap 69), M§5.4 (an item that cannot be
-//! processed: spec-gaps 44 and 138), M§10.2 (receipts decided once per sync batch), M§10.5 (a sibling's undisclosed
-//! read watermark, spec-gap 52).
+//! (a welcome for the devices an Add adds), M§7.5 (the last roster this device processed), M§12.1 (archive keys).
 //!
 //! Impl: none of these is a reading of the spec the other contradicts; each is a choice the spec leaves to the device
 //! (the no-answer timeout is spec-gap 72's). They are listed with the rest in `impl/docs/dsip-stack-design.md` §6.
@@ -61,15 +58,6 @@ pub struct Config {
     pub roster: Roster,
     /// Whether a received archive key replaces one already held under its `akid` (dsip-msg) or is ignored (browser).
     pub replace_archive_keys: bool,
-    /// Whether a seq gap that has not filled in time makes this device re-join by external commit (dsip-msg), or it
-    /// stays held and reported (browser).
-    pub rejoin_gaps: bool,
-    /// Whether an item that fails processing is rolled back with its delivery state and then committed as handled, so
-    /// it is acknowledged (dsip-msg), or left as processing left it, uncommitted (browser).
-    pub roll_back_unprocessable: bool,
-    /// Whether a received receipt joins the sync's [`crate::receipts::Batch`], one in the personal group under the
-    /// conversation it names (dsip-msg), or is stepped at once in the group it arrived in (browser).
-    pub batch_receipts: bool,
     /// How items are processed: what the object check sees, call records kept (C§9), and
     /// proposals stored for a leave (M§7.3).
     pub process: ProcessOptions,
@@ -84,9 +72,6 @@ impl Config {
         named_device: NamedDevice::ByCredential,
         roster: Roster::AllLeaves,
         replace_archive_keys: true,
-        rejoin_gaps: true,
-        roll_back_unprocessable: true,
-        batch_receipts: true,
         process: ProcessOptions { leaf_device_in_check: false, keep_call_records: false,
                                   store_proposals: false },
     };
@@ -99,9 +84,6 @@ impl Config {
         named_device: NamedDevice::Authenticated,
         roster: Roster::Authenticated,
         replace_archive_keys: false,
-        rejoin_gaps: false,
-        roll_back_unprocessable: false,
-        batch_receipts: false,
         process: ProcessOptions { leaf_device_in_check: true, keep_call_records: true,
                                   store_proposals: true },
     };

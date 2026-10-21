@@ -62,6 +62,7 @@ export async function submit(page, id) {
 export async function openPage(browser, name, url = URL) {
   const ctx = await browser.newContext({ ignoreHTTPSErrors: true, permissions: which === 'chromium' ? ['camera', 'microphone'] : [] });
   await ctx.addInitScript(heartbeat);
+  await ctx.addInitScript(socketTap);
   const page = await ctx.newPage();
   pages.push(page);
   diagnoseClicks(page);
@@ -100,6 +101,46 @@ export async function enrolled(browser, name, file, pass, url = URL) {
   const did = await page.evaluate(() => window.dsip.identity());
   return { ctx, page, did, name };
 }
+
+/** A test's hold on what a page's sockets receive, from before the page's own scripts run: while
+ *  `window.__tap.hold(text, url)` is true of a frame, the frame is kept back, until `window.__tap.release()` delivers
+ *  what was kept, in order, or `window.__tap.drop()` loses it (a mailbox that never delivered it). Unset, it does
+ *  nothing. */
+function socketTap() {
+  const Native = window.WebSocket;
+  const tap = { hold: null, held: [] };
+  tap.release = () => { tap.hold = null; for (const h of tap.held.splice(0)) h.fn.call(h.ws, h.ev); };
+  tap.drop = () => { tap.hold = null; return tap.held.splice(0).length; };
+  window.__tap = tap;
+  window.WebSocket = class extends Native {
+    set onmessage(fn) {
+      super.onmessage = fn && ((ev) => {
+        if (tap.hold && tap.hold(ev.data, this.url)) { tap.held.push({ fn, ev, ws: this }); return undefined; }
+        return fn.call(this, ev);
+      });
+    }
+    get onmessage() { return super.onmessage; }
+  };
+}
+
+/** Keep back, on `p`'s sockets, every `items` frame carrying an item of `cls` in `group` (any group when null; M§5.4:
+ *  a live push is one item): `window.__tap.release()` or `.drop()` ends it. */
+export async function holdItems(p, cls, group = null) {
+  await p.page.evaluate(([c, g]) => {
+    window.__tap.held.length = 0;
+    window.__tap.hold = (text) => {
+      try {
+        const f = JSON.parse(text);
+        const b = f.payload.replace(/-/g, '+').replace(/_/g, '/');
+        const body = JSON.parse(atob(b + '='.repeat((4 - (b.length % 4)) % 4)));
+        return body.type === 'items' && (body.items || []).some((i) => i.class === c && (!g || i.group === g));
+      } catch { return false; }
+    };
+  }, [cls, group]);
+}
+
+/** How many frames `p`'s sockets are keeping back. */
+export const heldCount = (p) => p.page.evaluate(() => window.__tap.held.length);
 
 /** A page timer every 250 ms: the longest gap between ticks says how long the main thread was ever held (pageDiag). */
 function heartbeat() {

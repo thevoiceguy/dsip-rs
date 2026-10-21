@@ -213,13 +213,16 @@ test/messaging.mjs      stage 6: two browsers on two operators enrol at two mail
                         federated through the hint, text both ways, delivered receipts, a reload keeping MLS state and history
 test/messaging-devices.mjs  round 2A: archive records, a second browser of the same identity added by the first (personal group,
                         conversation, archive keys re-sent) reading the history both sides in seq order, read watermarks private
-                        and disclosed, three devices live, a reload
+                        and disclosed, three devices live, a reload, a sibling's private read applied to the conversation
 test/messaging-voice.mjs    round 2B: a voice message recorded, sealed, uploaded with a signed blob-put, received through the
                         mailbox's replica, verified, decrypted and played, a played receipt, a reload, a voice reply
 test/messaging-voicemail.mjs  round 2C: a missed and a declined call recorded as call events, a voicemail offered after the
                         decline and not after the caller's own hang-up, recorded, received with its session, one timeline
 test/messaging-rejoin.mjs   round 2C: a new device that nobody adds joins the personal group and the conversation by external
                         commit; the peer verifies the join; messages flow; no history comes with it
+test/messaging-gaps.mjs     a push lost on its way leaves a commit beyond a seq gap: held, then re-joined by external commit
+                        when the gap stays open (M§6.5, M§6.8); a message from an epoch the receiver moved two past is
+                        unprocessable, rolled back and acknowledged, never redelivered (spec-gaps 44, 138)
 test/messaging-successor.mjs  round 2D: a conversation hubbed at a third mailbox the test starts and kills; Bob moves to
                         mailbox B; Alice's message waits out the outage, her device creates the successor and re-adds
                         Bob without a grant; Bob checks it and joins; the message arrives; the thread is kept
@@ -303,6 +306,11 @@ declined call's session, its blob verified; Bob's timeline reads missed call, de
 keeps the call log. `messaging-rejoin.mjs`: Alice's only device goes away; a new one enrolled from her identity file
 waits for a sibling, then joins her personal group and the conversation by external commit; Bob verifies the join
 and sees the new device; messages flow both ways, and nothing from before the join is shown.
+`messaging-gaps.mjs`: the test library's socket tap (an init script on every page: `window.__tap.hold`, `release`,
+`drop`) loses one of Alice's messages on its way to Bob, whose gap timeout is set to 5 s; Alice rekeys, Bob holds the
+commit beyond the gap, then re-joins by external commit and the conversation carries on without the lost message.
+Then Alice's page keeps Bob's next message back while she rekeys twice: it cannot be decrypted, is committed as
+handled, and after a reload it is not delivered again.
 `messaging-successor.mjs`: Bob's mailbox is a third one the test starts; he opens the conversation there and the
 test kills it. Bob moves to mailbox B and registers his groups. Alice's next message is refused as hub-unreachable and
 kept pending; past her 12 s threshold her device fetches Bob's KeyPackages from B without a grant and creates the
