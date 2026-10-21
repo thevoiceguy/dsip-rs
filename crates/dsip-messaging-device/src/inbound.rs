@@ -52,8 +52,12 @@ pub enum Route {
     },
     /// A class this device does not process: committed.
     Other,
-    /// This device's own deposit fanned back (spec-gap 47): committed.
-    Own,
+    /// This device's own deposit fanned back (spec-gap 47): committed. Its seq counts for the gap tracker as its
+    /// `accepted` would (spec-gap 69), so it may fill a gap: the held items it released, to route after it.
+    Own {
+        /// Held items released by this one.
+        released: Vec<Value>,
+    },
     /// From before this device joined the group, or a group it is not in (M§12.3): committed.
     PreJoin,
     /// Beyond a seq gap (spec-gap 69): committed as handled and stored in `held_items`.
@@ -116,8 +120,11 @@ impl<'a> Inbound<'a> {
             return Route::Process { group, bytes, released: vec![] };
         }
         if self.own.contains(&dsip_mls::digest(&bytes)) {
+            // spec-gap 69: the copy may arrive before its accepted, or instead of it (a binding lost on the way); either
+            // way it is no gap
+            let released = if member && item["held_release"] != json!(true) { self.gap_step(&group, item, now).1 } else { vec![] };
             self.resume.commit(item, false);
-            return Route::Own;
+            return Route::Own { released };
         }
         let pre = match dsip_mls::message_header(&bytes) {
             Ok((_, epoch, _)) => !member || prejoin(epoch),
@@ -129,26 +136,39 @@ impl<'a> Inbound<'a> {
         }
         let mut released = vec![];
         if item["held_release"] != json!(true) && member {
-            let seq = item["seq"].as_i64().unwrap_or(0);
-            let decisions = gap_tracker(self.gaps, self.resume, self.gap_timeout, &group, seq, now).step(&json!({"item": {"seq": seq, "class": class}}));
-            if decisions.iter().any(|d| d["hold"] == json!(seq)) {
+            let (hold, more) = self.gap_step(&group, item, now);
+            if hold {
                 let mut held = item.clone();
                 held["held_release"] = json!(true);
                 self.held_items.entry(group).or_default().push(held);
                 self.resume.commit(item, true);
                 return Route::Held;
             }
-            for d in &decisions {
-                if let Some(s) = d["process"].as_i64().filter(|s| *s != seq) {
-                    if let Some(items) = self.held_items.get_mut(&group) {
-                        if let Some(i) = items.iter().position(|h| h["seq"] == json!(s)) {
-                            released.push(items.remove(i));
-                        }
+            released = more;
+        }
+        Route::Process { group, bytes, released }
+    }
+
+    /// Step `group`'s gap tracker with `item` (M§6.5, spec-gap 69): whether the item is held behind a gap, and the held
+    /// items its seq releases, in seq order.
+    fn gap_step(&mut self, group: &str, item: &Value, now: i64) -> (bool, Vec<Value>) {
+        let seq = item["seq"].as_i64().unwrap_or(0);
+        let class = item["class"].as_str().unwrap_or("");
+        let decisions = gap_tracker(self.gaps, self.resume, self.gap_timeout, group, seq, now).step(&json!({"item": {"seq": seq, "class": class}}));
+        if decisions.iter().any(|d| d["hold"] == json!(seq)) {
+            return (true, vec![]);
+        }
+        let mut released = vec![];
+        for d in &decisions {
+            if let Some(s) = d["process"].as_i64().filter(|s| *s != seq) {
+                if let Some(items) = self.held_items.get_mut(group) {
+                    if let Some(i) = items.iter().position(|h| h["seq"] == json!(s)) {
+                        released.push(items.remove(i));
                     }
                 }
             }
         }
-        Route::Process { group, bytes, released }
+        (false, released)
     }
 
     /// Process the item [`Route::Process`] returned, with `process`, and commit it with its MLS effect (M§5.4, spec-gap

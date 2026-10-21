@@ -16,7 +16,7 @@ use dsip_messaging_device::{process, Outcome, ProcessOptions};
 use dsip_mls::{authenticate_key_package, Device};
 
 const NOW: i64 = 1_790_000_000;
-const ALL: ProcessOptions = ProcessOptions { leaf_device_in_check: true, recorder_content_unauthenticated: true, keep_call_records: true, store_proposals: true };
+const ALL: ProcessOptions = ProcessOptions { leaf_device_in_check: true, keep_call_records: true, store_proposals: true };
 
 fn ulid(n: u8) -> String {
     Ulid::from_parts((NOW as u64) * 1000 + u64::from(n), [n; 10]).as_str().to_string()

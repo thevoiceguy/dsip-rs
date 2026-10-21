@@ -45,9 +45,16 @@ pub enum Outcome {
     /// Not merged or not shown, with why.
     Dropped(String),
     /// M§6.2: content from a member leaf whose delegation no longer verifies (revoked, expired) — not rendered, not
-    /// archived. Expected, not an error: a device can send just before its revocation is known. With
-    /// [`ProcessOptions::recorder_content_unauthenticated`], content from a recorder leaf too (C§5).
+    /// archived. Expected, not an error: a device can send just before its revocation is known.
     Unauthenticated(String),
+    /// C§5: `content` from a recorder leaf, treated as from an unauthenticated leaf: not rendered, not archived. Its
+    /// other objects are processed as any member's (dsip-rs 3j-3c: dsip-msg dropped them too).
+    RecorderContent {
+        /// The recorder device.
+        device: String,
+        /// The content's `id`.
+        id: Value,
+    },
     /// M§7.3: a commit merged, attributed to the committing identity; `hub` is set when it changed the group's hub
     /// reference (M§7.4); `left` names the identities it removed by their own Remove proposals (M§7.3 "Leaving").
     Epoch {
@@ -95,8 +102,6 @@ pub enum Outcome {
 pub struct ProcessOptions {
     /// Give the object check the sender's device (`leaf_device`) as well as its identity.
     pub leaf_device_in_check: bool,
-    /// C§5: content from a recorder leaf is [`Outcome::Unauthenticated`] (else the host decides).
-    pub recorder_content_unauthenticated: bool,
     /// C§9: keep call records (`store: call-record`), which render nothing, as objects for a record-keeper.
     pub keep_call_records: bool,
     /// M§7.3 "Leaving": store a member's proposals for the next commit and report them (else they are ignored).
@@ -163,9 +168,9 @@ pub fn process<P: OpenMlsProvider>(mls: &Device<P>, group: Option<(&mut MlsGroup
             if verdict["verdict"] != "accept" {
                 return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
             }
-            if opts.recorder_content_unauthenticated && from_recorder && obj["object"] == "content" {
+            if from_recorder && obj["object"] == "content" {
                 // C§5: content from a recorder leaf is treated as from an unauthenticated leaf: not rendered, not archived
-                return Ok(Outcome::Unauthenticated(format!("{} from recorder {sender_device}", obj["id"])));
+                return Ok(Outcome::RecorderContent { device: sender_device, id: obj["id"].clone() });
             }
             if opts.keep_call_records && verdict["effective"]["store"] == "call-record" {
                 return Ok(Outcome::Object { sender, sender_device, object: obj }); // C§9: kept, never rendered

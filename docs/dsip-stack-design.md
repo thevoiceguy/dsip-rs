@@ -272,22 +272,50 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    policy's read and played); grants, introductions (sealed to a `did:key`'s converted key too, which dsip-msg could
    not do), answering requests, and release, with the peer mailbox's connection left to the host as for KeyPackage
    fetches. The browser now opens activity a peer sends; it sends none, its policy's activity being off.
+   3j-3c: the events say what dsip-msg prints. A commit, a conflict (with the epoch it lost at), a re-proposal (a new
+   event) and a commit no longer needed name the operation; `sent` says whether the item went out after an outage,
+   and the outage's retry names the item waiting; a successor's due hand-over lists the pending items, and the
+   hand-over the new item each went out as; `removed` has the group's kind; a call event its direction;
+   `call_ended_item` returns the event sent with its item and whether the identity had it already; a request whether
+   it was sealed and whether its purpose was on the wire; a message its whole object and sending device; and a
+   conversation newly recorded, or no longer recorded, is an event (`recording`), as dsip-msg rendered it. One
+   difference is settled: content from a recorder leaf is dropped by both (C§5's **content**); dsip-msg also dropped a
+   recorder's other objects, which now are processed as any member's. Left for 3j-3d, where dsip-msg takes the
+   `Messenger`'s behaviour unless a demo shows a reason not to: the outbox following deposits from the first or from
+   the first failure; recording acceptance kept by conversation (dsip-msg kept it by group, migrated); declining a
+   recording; a re-join replacing the group; a second direct conversation with one peer; history and status across
+   conversations; the own-deposit digests never pruned; the default gap timeout (60 s or 300 s).
+   3j-3d: dsip-msg hosts the `Messenger`. It moves the `Messenger`'s frames over its `wss` connection, keeps the
+   clock, fetches KeyPackages, blobs and first-contact answers on connections of their own, and prints the events as
+   the lines the demos read; every demo that drives it passes unchanged. Whatever set deposits going — a command, a
+   frame, the clock — is settled (`Messenger::settled`: every deposit answered, no refused commit waiting for its sync)
+   before the next command is read, so commands still run one at a time; a binding sends what the last one left unanswered (`Messenger::rebind`) and syncs only when told,
+   as dsip-msg always did. The `Messenger`'s state is written beside its MLS state after every step, and each item
+   commits with its delivery state in one transaction (spec-gap 44; `crash-next` still exits inside it). State from
+   the dsip-msg before is migrated on first load (decided 2026-10-20), its old keys cleared. The open differences went
+   the `Messenger`'s way, no demo showing a reason not to: the outbox follows deposits from the first failure;
+   recording acceptance is kept by conversation; declining a recording is leaving (M§7.3), not forgetting the group; a
+   re-join is refused while the device is in the group; a second direct conversation with one peer is refused; history
+   and status are per conversation; the own-deposit digests are kept. dsip-msg keeps its 300 s gap timeout as its flag's
+   default. Found on the way: a device's own copy fanned back without its `accepted` (the binding lost before the
+   answer) did not count for the gap tracker, so the next handshake was held behind a gap that was not one; it now
+   counts (spec-gap 69) for both clients, and may release what a gap held.
 
    Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
-   it is decided (with a vector where a rule is involved): frames verified after the hello (browser) or not (dsip-msg);
-   the dedup key (with or without the sender); an unprocessable item rolled back and acknowledged (dsip-msg) or
-   neither; a seq gap that does not fill re-joined (dsip-msg) or only reported; receipts received in the personal group
-   routed to their conversation and batched (dsip-msg) or stepped at once; receipt policy and activity; waiting for the
-   epoch to move after a conflict (dsip-msg); 20 s or 60 s before a deposit with no answer is an outage; re-deposits of
-   commits, GroupInfo and config on reconnect (browser); `mailbox-config joined` after an external join (browser); a
-   successor made with one commit per peer (dsip-msg) or one for all (browser); the dead group's pending items moved one
-   by one into the successor's outbox (dsip-msg) or re-encrypted as new objects once the successor holds its members
-   (browser); a group's roster recorded for the successor checks only when every leaf authenticates (dsip-msg) or from
-   the leaves that do (browser); proposals stored (browser); recorder content and acceptance keys; a welcome produced
-   by a Remove deposited (dsip-msg) or dropped (browser); an Add of a named device still needed while no leaf has its
-   credential (dsip-msg) or no authenticated leaf is that device (browser); archive keys overwritten or kept; when a
-   call event is recorded (decided, 3j-1); the blob `tried` input (shared, 3j-1); a sealed introduction opened without
-   the identity key (shared, 3j-1: a device without the key keeps it unread).
+   it is decided (with a vector where a rule is involved): the dedup key (with or without the sender); an unprocessable
+   item rolled back and acknowledged (dsip-msg) or neither; a seq gap that does not fill re-joined (dsip-msg) or only
+   reported; receipts received in the personal group routed to their conversation and batched (dsip-msg) or stepped
+   at once; 20 s or 60 s before a deposit with no answer is an outage; a group's roster recorded for the successor
+   checks only when every leaf authenticates (dsip-msg) or from the leaves that do (browser); proposals stored
+   (browser); a welcome produced by a Remove deposited (dsip-msg) or dropped (browser); an Add of a named device still
+   needed while no leaf has its credential (dsip-msg) or no authenticated leaf is that device (browser); archive keys
+   overwritten or kept. Decided: when a call event is recorded (3j-1); the blob `tried` input (shared, 3j-1); a sealed
+   introduction opened without the identity key (shared, 3j-1: a device without the key keeps it unread); recorder
+   content and acceptance keys (3j-3c); and with dsip-msg on the `Messenger` (3j-3d), the `Messenger`'s way for frames
+   verified after the hello, receipt policy and activity, re-proposing once the sync is answered rather than waiting
+   for the epoch to move, re-deposits of commits, GroupInfo and config on a new binding, `mailbox-config joined` after
+   an external join, a successor made with one commit for all its members, and the dead group's pending items
+   re-encrypted as new objects once the successor holds them.
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.

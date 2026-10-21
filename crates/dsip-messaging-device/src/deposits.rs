@@ -80,6 +80,11 @@ impl<P> Deposits<P> {
         self.later.push((at, p));
     }
 
+    /// How many deposits are deferred, waiting for their time (spec-gap 129).
+    pub fn deferred(&self) -> usize {
+        self.later.len()
+    }
+
     /// The deferred deposits due by `now`, oldest first.
     pub fn due(&mut self, now: i64) -> Vec<P> {
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.later).into_iter().partition(|(at, _)| *at <= now);

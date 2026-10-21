@@ -15,10 +15,9 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
-use dsip_mailbox::wire;
 use dsip_transport::now_s;
 
-use super::{Args, Client};
+use super::{Args, Client, Item, Sent};
 
 /// The device-events state of one device: its alarm lists, and in gateway mode everything the gateway holds.
 pub(super) struct Events {
@@ -46,6 +45,8 @@ pub(super) struct Events {
     informs: dsip_events::InformTracker,
     inform_responses: HashMap<(String, i64), (Vec<u8>, ReplyTo)>,
     inform_items: HashMap<String, (String, i64)>,
+    /// The outbox items whose inform was said to be pending (M§9.4): said once.
+    inform_pending: std::collections::HashSet<String>,
     inform_clock: i64,
     /// The gateway's snmpEngineID, for RFC 5343 discovery over TLS (E§3).
     snmp_engine: Vec<u8>,
@@ -96,6 +97,7 @@ impl Events {
                 _ => vec![],
             },
             inform_items: HashMap::new(),
+            inform_pending: Default::default(),
             inform_clock: now_s(),
             heartbeat: args.heartbeat.map(|n| (n, 0)),
         })
@@ -210,20 +212,13 @@ impl Client {
         self.deposit_event(event).await.map(|_| ())
     }
 
-    /// Deposit one `device-event`; the hub's answer (`accepted`, `pending` with the outbox id, or a refusal).
-    async fn deposit_event(&mut self, event: Value) -> Result<Value> {
+    /// Deposit one `device-event` into the active conversation through the outbox (M§9.2): its `sent` says
+    /// `OK sent event`.
+    async fn deposit_event(&mut self, event: Value) -> Result<Sent> {
         let group = self.active()?;
-        let now = now_s();
-        let obj = json!({"object": "content", "id": wire::new_id(now), "conversation": self.conv(&group)?.conversation,
-            "sender": self.identity, "sent_at": now, "kind": "device-event", "purpose": "message", "event": event});
-        let reply = self.send_object(&group, &obj, json!({})).await?;
-        self.sent(&group, &reply, &obj);
-        match reply["type"].as_str() {
-            Some("accepted") => println!("OK sent event seq={}", reply["seq"]),
-            Some("pending") => {}
-            _ => println!("ERR send refused: {}", reply["reason"]),
-        }
-        Ok(reply)
+        self.may_send(&group)?;
+        let obj = self.content(&group, json!({"kind": "device-event", "event": event}))?;
+        self.send_content(&group, obj, Item::Event).await
     }
 
     /// Gateway mode (E§3): one SNMP datagram from the LAN → a signed `device-event`; an inform is answered only
@@ -332,17 +327,16 @@ impl Client {
                 self.inform_respond(&key).await;
             } else if e.get("deposit").is_some() {
                 println!("SNMP inform {from} rid={rid}: {}", raw["snmp"]["trap_oid"].as_str().unwrap_or("-"));
-                let reply = self.deposit_event(event.clone()).await?;
-                match reply["type"].as_str() {
-                    Some("accepted") => self.inform_outcome_key(&key, true).await,
-                    Some("pending") => {
-                        // M§9.4: the hub is unreachable; the inform is answered when the outbox's deposit is accepted
-                        if let Some(id) = reply["id"].as_str() {
-                            self.events.inform_items.insert(id.to_string(), key.clone());
-                        }
-                        println!("SNMP inform {from} rid={rid}: pending, not answered");
+                // answered when the hub accepts its event, whenever that is (M§9.4: an outage keeps it pending)
+                match self.deposit_event(event.clone()).await? {
+                    Sent::Out(id) => {
+                        self.events.inform_items.insert(id, key.clone());
                     }
-                    _ => self.inform_outcome_key(&key, false).await,
+                    Sent::Queued(id) => {
+                        self.events.inform_items.insert(id.clone(), key.clone());
+                        self.inform_pending(&id);
+                    }
+                    Sent::Successor => println!("SNMP inform {from} rid={rid}: pending, not answered"),
                 }
             }
         }
@@ -452,8 +446,18 @@ impl Client {
 
     /// An outbox item was finally accepted or refused (M§9.4): if it carried an inform's event, settle the inform.
     pub(super) async fn inform_outcome(&mut self, item_id: &str, accepted: bool) {
+        self.events.inform_pending.remove(item_id);
         if let Some(key) = self.events.inform_items.remove(item_id) {
             self.inform_outcome_key(&key, accepted).await;
+        }
+    }
+
+    /// An outbox item stays pending behind an unreachable hub (M§9.4): an inform it carries is not answered yet.
+    pub(super) fn inform_pending(&mut self, item_id: &str) {
+        if let Some((source, rid)) = self.events.inform_items.get(item_id) {
+            if self.events.inform_pending.insert(item_id.to_string()) {
+                println!("SNMP inform {source} rid={rid}: pending, not answered");
+            }
         }
     }
 
@@ -508,19 +512,14 @@ impl Client {
     /// Send an `alarm-ack` (E§5): this operator owns the alarm (`ack`) or has finished with it (`closed`).
     pub(super) async fn send_alarm_ack(&mut self, resource: &str, kind: &str, state: &str) -> Result<()> {
         let group = self.active()?;
-        let now = now_s();
-        let obj = json!({"object": "content", "id": wire::new_id(now), "conversation": self.conv(&group)?.conversation,
-            "sender": self.identity, "sent_at": now, "kind": "alarm-ack", "purpose": "message",
-            "alarm": {"resource": resource, "type": kind, "qualifier": ""}, "state": state});
-        let reply = self.send_object(&group, &obj, json!({})).await?;
-        self.sent(&group, &reply, &obj);
+        self.may_send(&group)?;
+        let obj = self.content(&group, json!({"kind": "alarm-ack", "alarm": {"resource": resource, "type": kind, "qualifier": ""},
+                                              "state": state}))?;
+        let alarm = obj["alarm"].clone();
+        self.send_content(&group, obj, Item::AlarmAck).await?;
         // our own acknowledgement counts in our own alarm list too (it is fanned back to us as SELF)
-        self.alarm_step(&group, &json!({"ack": {"alarm": obj["alarm"], "state": state, "by": self.identity}}));
-        match reply["type"].as_str() {
-            Some("accepted") => println!("OK sent alarm-ack seq={}", reply["seq"]),
-            Some("pending") => {}
-            _ => println!("ERR send refused: {}", reply["reason"]),
-        }
+        let me = self.identity.clone();
+        self.alarm_step(&group, &json!({"ack": {"alarm": alarm, "state": state, "by": me}}));
         Ok(())
     }
 

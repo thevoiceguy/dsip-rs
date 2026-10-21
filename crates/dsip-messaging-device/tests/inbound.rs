@@ -3,7 +3,7 @@
 //! skipped, a handshake beyond a seq gap held and released when the gap fills, a removal clearing the group, and an
 //! item committed with its MLS effect or, when it cannot be processed, rolled back and committed as handled.
 //!
-//! Spec: M§5.4 (spec-gaps 44, 138), M§6.5 (spec-gaps 47, 69), M§8.5, M§11.2, M§12.3.
+//! Spec: M§5.4 (spec-gaps 44, 138), M§6.5 (spec-gaps 47, 69: a device's own copy is no gap), M§8.5, M§11.2, M§12.3.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -84,7 +84,7 @@ fn own_deposits_and_prejoin_history() {
     let mut p = Parts::new(json!({}));
     // this device's own deposit fanned back (spec-gap 47)
     p.own.insert(dsip_mls::digest(&bytes));
-    assert_eq!(p.route(&item("c1", "application", 1, &bytes), true, false), Route::Own);
+    assert_eq!(p.route(&item("c1", "application", 1, &bytes), true, false), Route::Own { released: vec![] });
     assert_eq!(p.cursor(), "c1");
     p.own.clear();
     // M§12.3: a group this device is not in, or an epoch from before it joined
@@ -92,6 +92,24 @@ fn own_deposits_and_prejoin_history() {
     assert_eq!(p.route(&item("c3", "application", 3, &bytes), true, true), Route::PreJoin);
     assert_eq!(p.cursor(), "c3");
     assert!(matches!(p.route(&item("c4", "application", 4, &bytes), true, false), Route::Process { bytes: b, .. } if b == bytes));
+}
+
+#[test]
+fn an_own_deposit_is_no_gap() {
+    // processed through seq 4; seq 5 is this device's own, its accepted lost with the binding (spec-gap 69)
+    let own = application_bytes();
+    let mut p = Parts::new(json!({"groups": {G: {"contiguous": 4}}}));
+    p.own.insert(dsip_mls::digest(&own));
+    assert_eq!(p.route(&item("c5", "application", 5, &own), true, false), Route::Own { released: vec![] });
+    // so the handshake at seq 6 is next, not beyond a gap
+    assert!(matches!(p.route(&item("c6", "handshake", 6, b"commit"), true, false), Route::Process { released, .. } if released.is_empty()));
+
+    // the other way round: seq 7 held behind the gap at 6, then 6 turns out to be our own copy, which releases it
+    let mut p = Parts::new(json!({"groups": {G: {"contiguous": 5}}}));
+    p.own.insert(dsip_mls::digest(&own));
+    assert_eq!(p.route(&item("c7", "handshake", 7, b"commit"), true, false), Route::Held);
+    let Route::Own { released } = p.route(&item("c6", "application", 6, &own), true, false) else { panic!() };
+    assert_eq!(released.iter().map(|r| r["seq"].as_i64().unwrap()).collect::<Vec<_>>(), vec![7]);
 }
 
 #[test]
