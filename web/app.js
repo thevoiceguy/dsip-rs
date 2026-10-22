@@ -106,7 +106,8 @@ function renderContacts() {
       : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant';
     return { c, status, presence: presenceShown.get(c.did) };
   });
-  const key = JSON.stringify(rows.map(({ c, status, presence }) => [c.name, c.did, c.numbers, status, presence]));
+  // presence is left out: a badge changes in place (presenceRefresh), so a notify never rebuilds the rows under a click
+  const key = JSON.stringify(rows.map(({ c, status }) => [c.name, c.did, c.numbers, status]));
   if (key !== shownContacts) { shownContacts = key; renderContactRows(rows); }
   renderRequests();
 }
@@ -117,6 +118,7 @@ function renderContactRows(rows) {
   if (!rows.length) ul.innerHTML = '<li class="muted small">no contacts yet: paste a DID above</li>';
   for (const { c, status, presence } of rows) {
     const li = document.createElement('li');
+    li.dataset.did = c.did;
     li.innerHTML = `<span class="name"></span><span class="presence"></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
     li.querySelector('.name').textContent = c.name || '(unnamed)';
     renderPresence(li.querySelector('.presence'), presence);
@@ -1395,13 +1397,14 @@ function presenceNotified(p) {
 }
 
 function presenceRefresh(list) {
-  let changed = false;
   for (const v of list) {
     if (!v?.target) continue;
     const shown = { state: v.state, token: v.token, source: v.source };
-    if (JSON.stringify(presenceShown.get(v.target)) !== JSON.stringify(shown)) { presenceShown.set(v.target, shown); changed = true; }
+    if (JSON.stringify(presenceShown.get(v.target)) === JSON.stringify(shown)) continue;
+    presenceShown.set(v.target, shown);
+    const li = [...$('contact-list').children].find((x) => x.dataset.did === v.target);
+    if (li) renderPresence(li.querySelector('.presence'), shown);
   }
-  if (changed) renderContacts();
 }
 
 /** P§4: the combined state; an unknown token is shown raw beside its fallback (P§5); the relay's own assertion is
