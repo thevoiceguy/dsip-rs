@@ -27,6 +27,13 @@ wait_for() { # file pattern seconds
   echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -40 "$f"; return 1
 }
 fail() { echo "FAIL: $*"; exit 1; }
+grant_to() { # fd file out: send a grant and keep the new GRANT line (the log may hold earlier ones)
+  local before; before=$(grep -c "^GRANT " "$2" || true)
+  echo "grant $4" >&"$1"
+  for _ in $(seq 50); do [ "$(grep -c "^GRANT " "$2" || true)" -gt "$before" ] && break; sleep 0.2; done
+  [ "$(grep -c "^GRANT " "$2" || true)" -gt "$before" ] || fail "no GRANT in $2"
+  grep "^GRANT " "$2" | tail -1 | cut -d' ' -f2 > "$3"
+}
 
 echo "=== mailboxes, documents, Alice and Bob's phone"
 $MBX --state "$DIR/mbx-a" --listen 127.0.0.1:9491 --owner "$ALICE" "${RESOLVER[@]}" --ca "$DIR/ca.pem" >"$DIR/mbx-a.log" 2>&1 &
@@ -124,7 +131,7 @@ echo "kp 3" >&4; wait_for "$DIR/bp.log" "OK uploaded" 10
 echo "kp 3" >&3; wait_for "$DIR/a.log" "OK uploaded" 10
 NB=$(grep -c "^JOINED .* kind=group" "$DIR/br.log" || true)
 echo "  Alice creates a group with Bob: every Bob device is added — his phone AND his recorder"
-echo "grant $ALICE" >&4; sleep 2; grep "^GRANT " "$DIR/bp.log" | tail -1 | cut -d' ' -f2 > "$DIR/grant2.txt"
+grant_to 4 "$DIR/bp.log" "$DIR/grant2.txt" "$ALICE"
 echo "create group $BOB $DIR/grant2.txt" >&3
 wait_for "$DIR/a.log" "^OK added $BOB \([0-9]+ device\(s\)\)" 30
 wait_for "$DIR/bp.log" "^JOINED .* kind=group" 30
@@ -133,7 +140,7 @@ for _ in $(seq 100); do [ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt
 [ "$(grep -c "^RECORDED group=" "$DIR/a.log")" -ge 2 ] || { sleep 3; [ "$(grep -c "^RECORDED group=" "$DIR/a.log")" -ge 2 ] || fail "A: Alice was not told her new conversation is recorded"; }
 NB=$(grep -c "^JOINED .* kind=group" "$DIR/br.log")
 echo "  Bob creates a group with Alice: his own other device (the recorder) is added with her (M§7.2)"
-echo "grant $BOB" >&3; sleep 2; grep "^GRANT " "$DIR/a.log" | tail -1 | cut -d' ' -f2 > "$DIR/grant3.txt"
+grant_to 3 "$DIR/a.log" "$DIR/grant3.txt" "$BOB"
 echo "create group $ALICE $DIR/grant3.txt" >&4
 wait_for "$DIR/bp.log" "^OWN-DEVICES 1 added with the peer's" 30
 for _ in $(seq 100); do [ "$(grep -c "^JOINED .* kind=group" "$DIR/br.log")" -gt "$NB" ] && break; sleep 0.2; done
