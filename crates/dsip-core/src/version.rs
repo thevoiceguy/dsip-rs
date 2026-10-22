@@ -31,7 +31,7 @@ impl Supported {
     /// message since v0.7; no extension id), the Presence Profile draft (`presence/0.1`, P§3) and sealed bodies
     /// (`sealed-body/1.0`, §10.4).
     /// Live endpoints and relays use this; the vectors pin negotiation with explicit contexts.
-    /// Impl (spec-gap 142): `presence/0.1` is listed because presence records name it.
+    /// Spec: §9.4 (a presence record names `presence/0.1`; a processor of records lists it, spec-gap 142).
     pub fn all_known() -> Supported {
         Supported {
             core: "1.0".into(),

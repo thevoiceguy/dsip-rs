@@ -12,8 +12,8 @@ use dsip_core::registry::{effective_presence_state, PRESENCE_STATES};
 
 /// The profile identifier a presence record names in `dsip.profiles`.
 ///
-/// Spec: P§ (title), §11.2 (a receiver supporting none of the named profiles refuses the payload).
-/// Impl (spec-gap 142): a record names `presence/0.1`, and implementations of P§ list it as supported.
+/// Spec: §9.4, P§3 (a record names `presence/0.1`, spec-gap 142), §11.2 (a receiver supporting none of the named
+/// profiles refuses the payload).
 pub const PROFILE: &str = "presence/0.1";
 
 /// The identity's presence as P§4 combines it.

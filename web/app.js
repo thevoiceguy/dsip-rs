@@ -681,7 +681,7 @@ async function placeCall(to, video, destination) {
       $('call-route').textContent = `via their relay ${hint.uri} (a hint from the nodes, signed by ${short(hint.signer)}, expires in ${Math.max(0, Math.round(hint.expires_at - now()))} s; hint-sourced, not authoritative, §8.1)`;
       $('call-route').classList.remove('hidden');
       r = await openCallRelay(hint.uri, route);
-      if (call !== me) { releasePeerRelay(r); callRelays.delete(route); return; }
+      if (call !== me) { callRelays.delete(route); releasePeerRelay(r); return; }
       if (!r) { log(`their relay ${hint.uri} did not bind us; trying our own relay instead`, '§8.1'); $('call-route').textContent += ' — unreachable; through our own relay'; }
     } else if (hint) { $('call-route').textContent = `their hint names our relay (${hint.uri})`; $('call-route').classList.remove('hidden'); }
     // the call glue asks for the SDP offer (onMediaRequest); the invite carries it (B§: the transport binding object)
@@ -747,31 +747,61 @@ async function discover(did) {
   return out.hint;
 }
 
-/** A connection to another relay for one call: our hello binds this device there, and the session's frames go
- *  through it (routed by `to` on that relay); closed when the call ends. Resolves to null if it refuses or is not
- *  reachable within 8 s. */
-function openCallRelay(uri, sid) {
-  const shared = presenceRelays.get(uri);
-  if (shared?.bound) {   // one connection per relay: a second binding of this device there would replace the first
-    callRelays.set(sid, shared);
-    log(`their relay ${uri}: using the connection already open for presence`, '§13.2');
-    return Promise.resolve(shared);
+/** Route a call (or an introduction, keyed by the peer's DID) through another relay: the shared connection there
+ *  (peerRelay), recorded against `sid` until the call ends. Resolves to null if it refuses or does not bind in 8 s. */
+async function openCallRelay(uri, sid) {
+  const shared = peerRelays.get(uri)?.bound;
+  const r = await peerRelay(uri, 'this call');
+  if (r) {
+    callRelays.set(sid, r);
+    if (shared) log(`their relay ${uri}: using the connection already open there`, '§13.2');
   }
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
-    const r = new Relay(uri, engine.ep, {
-      bound: (info) => { r.did = info.did; log(`← hello        their relay ${short(info.did)} bound us for this call (in_reply_to matched)`, '§13.2 · §20.5'); done(r); },
-      refused: (x) => { log(`✗ their relay's hello rejected: ${x.code}`, '§20.5'); r.close(); done(null); },
-      rejected: (code) => { log(`✗ their relay refused our hello: ${code}`, '§13.2'); r.close(); done(null); },
+  return r;
+}
+
+/** Our one connection to another relay, shared by the calls and introductions routed through it and by the presence
+ *  watches of contacts bound there: a second binding of this device there would replace the first, and each would
+ *  reconnect and replace the other in turn (§13.2). Our hello binds this device there; frames go through it, routed
+ *  by `to` on that relay. Resolves to null if it refuses or does not bind within 8 s; releasePeerRelay closes it
+ *  once nothing uses it. */
+const peerRelays = new Map();   // relay URI → the connection
+function peerRelay(uri, why) {
+  let r = peerRelays.get(uri);
+  if (r?.bound) return Promise.resolve(r);
+  if (!r) {
+    const conn = new Relay(uri, engine.ep, {
+      bound: (info) => {
+        conn.did = info.did;
+        log(`← hello        their relay ${short(info.did)} bound us for ${why} (in_reply_to matched)`, '§13.2 · §20.5');
+        for (const s of presenceSubs.values()) if (s.relay === conn) s.renewAt = now();   // reconnected: watch again
+        conn.waiting.splice(0).forEach((w) => w(conn));
+      },
+      refused: (x) => { log(`✗ their relay's hello rejected: ${x.code}`, '§20.5'); dropPeerRelay(conn); },
+      rejected: (code) => { log(`✗ their relay refused our hello: ${code}`, '§13.2'); dropPeerRelay(conn); },
       frame: (text) => engine.inbound(text),
-      closed: () => { if (settled && callRelays.get(sid) === r && !r.closedByUs) log(`their relay ${uri} dropped the connection; reconnecting`, '§13.2'); },
+      closed: (was) => { if (was && !conn.closedByUs) log(`their relay ${uri} dropped the connection; reconnecting`, '§13.2'); },
       dropped: (f) => log(`✗ their relay not connected: a ${JSON.parse(f).type || 'frame'} was not sent`),
     }, now);
-    callRelays.set(sid, r);
-    r.connect();
-    setTimeout(() => { if (!settled) { r.close(); callRelays.delete(sid); done(null); } }, 8000);
-  }).then((r) => { if (!r) callRelays.delete(sid); return r; });
+    conn.waiting = [];
+    peerRelays.set(uri, conn);
+    conn.connect();
+    r = conn;
+  }
+  return new Promise((resolve) => {
+    const w = (x) => { clearTimeout(t); resolve(x); };
+    const t = setTimeout(() => {
+      r.waiting = r.waiting.filter((x) => x !== w);
+      resolve(null);
+      if (!r.bound) releasePeerRelay(r);
+    }, 8000);
+    r.waiting.push(w);
+  });
+}
+
+function dropPeerRelay(r) {
+  r.close();
+  if (peerRelays.get(r.url) === r) peerRelays.delete(r.url);
+  r.waiting.splice(0).forEach((w) => w(null));
 }
 
 /** Publish our reachability hint on the nodes (DHT Hints Profile §10 `POST /dsip/v1/hints`): signed by this
@@ -1095,7 +1125,7 @@ function endCall(stay = false) {
   if (!call) return;
   call.media?.close();
   const cr = callRelays.get(call.sid);
-  if (cr) { const sid = call.sid; setTimeout(() => { callRelays.delete(sid); if (releasePeerRelay(cr)) log(`their relay ${cr.url}: connection for the call closed`, '§13.2'); }, 1000); }
+  if (cr) { const sid = call.sid; setTimeout(() => { callRelays.delete(sid); log(releasePeerRelay(cr) ? `their relay ${cr.url}: connection for the call closed` : `their relay ${cr.url}: the call is done with the connection; kept, still in use`, '§13.2'); }, 1000); }
   $('local').srcObject = null; $('remote').srcObject = null;
   $('view-incoming').classList.add('hidden');
   const ended = call; call = null;
@@ -1141,14 +1171,15 @@ function closePeerRelay(did) {
   const r = callRelays.get(did);
   if (!r) return;
   callRelays.delete(did);
-  if (releasePeerRelay(r)) log(`their relay ${r.url}: connection for the introduction closed`, '§13.2');
+  log(releasePeerRelay(r) ? `their relay ${r.url}: connection for the introduction closed` : `their relay ${r.url}: the introduction is done with the connection; kept, still in use`, '§13.2');
 }
 
 /** Close a connection to a peer's relay that a call or an introduction no longer needs, unless presence notifies
  *  still come over it (or another call uses it). Returns whether it was closed. */
 function releasePeerRelay(r) {
-  if (!r || [...presenceRelays.values()].includes(r) || [...callRelays.values()].includes(r)) return false;
+  if (!r || r.waiting?.length || [...presenceSubs.values()].some((s) => s.relay === r) || [...callRelays.values()].includes(r)) return false;
   r.close();
+  if (peerRelays.get(r.url) === r) peerRelays.delete(r.url);
   return true;
 }
 
@@ -1276,7 +1307,6 @@ function connect() {
 const presenceShown = new Map();   // contact DID → {state, token, source} (P§4), as the contact list shows it
 const presenceSent = new Set();    // ids of our records, to recognise the authority's refusal (P§3)
 const presenceSubs = new Map();    // contact DID → {sub, relay, renewAt, retryAt}: our watch on it (§9.3)
-const presenceRelays = new Map();  // relay URI → a connection to a contact's own relay, kept for its notifies
 const PRESENCE_SUB_S = 3600;       // §9.3: the presence event class's cap; renewed before it lapses
 let presenceTimer = null;
 
@@ -1324,16 +1354,16 @@ function presenceTick() {
   presenceRefresh(JSON.parse(engine.ep.presence_all(now())));
 }
 
-/** Watch a contact's presence: subscribe at the relay that answers for it (§9.3), ours or, when its hint names
- *  another, that one over a connection kept open for the notifies (§8.1: hint-sourced, not authoritative).
- *  Impl (spec-gap 143): we bind at their relay to subscribe there, as for an introduction (§19.4); that binding makes
- *  this device reachable there too. Their records are verified here whatever relay carries them (P§3). */
+/** Watch a contact's presence: subscribe at the relay that answers for it, ours or, when its hint names another,
+ *  that one over the connection we keep there (§8.1: hint-sourced, not authoritative).
+ *  Spec: §9.3 (spec-gap 143): we bind at their relay to subscribe there, and that binding makes this device
+ *  reachable there too. Their records are verified here whatever relay carries them (§9.4, P§3). */
 async function presenceWatch(did) {
   const pending = { renewAt: 0, retryAt: now() + 60 };   // until it is answered, not asked again for a minute
   presenceSubs.set(did, pending);
   let r = relay;
   const hint = await discover(did).catch(() => null);
-  if (hint?.uri && hint.uri !== relayUrl()) r = (await presenceRelay(hint.uri)) || relay;
+  if (hint?.uri && hint.uri !== relayUrl()) r = (await peerRelay(hint.uri, 'presence')) || relay;
   if (!r?.bound) return;
   const authority = r === relay ? relayInfo?.did : r.did;
   if (!authority) return;
@@ -1352,39 +1382,6 @@ function presenceBlocked(sub) {
   const s = presenceSubs.get(did);
   if (s) Object.assign(s, { renewAt: 0, retryAt: now() + 60 });
   log(`presence of ${short(did)}: not available from that relay (§9.3: unknown and not allowed look the same); trying again later`, '§9.3');
-}
-
-/** A connection to a contact's relay for presence notifies, shared by every contact bound there and by calls through
- *  it: one connection per relay, since a second binding of this device there would replace the first (§13.2). */
-const presencePending = new Map();   // relay URI → the connect in flight
-function presenceRelay(uri) {
-  const have = presenceRelays.get(uri);
-  if (have?.bound) return Promise.resolve(have);
-  const open = [...callRelays.values()].find((r) => r.url === uri && r.bound);
-  if (open) { presenceRelays.set(uri, open); return Promise.resolve(open); }
-  if (presencePending.has(uri)) return presencePending.get(uri);
-  if (have) return Promise.resolve(null);   // reconnecting by itself: the watch is tried again later
-  const p = new Promise((resolve) => {
-    let settled = false;
-    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
-    const r = new Relay(uri, engine.ep, {
-      bound: (info) => {
-        r.did = info.did; done(r);
-        log(`← hello        their relay ${short(info.did)} bound us for presence (in_reply_to matched)`, '§13.2 · §20.5');
-        for (const s of presenceSubs.values()) if (s.relay === r) s.renewAt = now();   // reconnected: watch again
-      },
-      refused: () => { r.close(); done(null); },
-      rejected: () => { r.close(); done(null); },
-      frame: (text) => engine.inbound(text),
-      closed: () => {},
-      dropped: () => {},
-    }, now);
-    presenceRelays.set(uri, r);
-    r.connect();
-    setTimeout(() => done(r.bound ? r : null), 8000);
-  }).finally(() => presencePending.delete(uri));
-  presencePending.set(uri, p);
-  return p;
 }
 
 /** A presence notify: the wasm verifies each record and combines them (P§3, P§4). */

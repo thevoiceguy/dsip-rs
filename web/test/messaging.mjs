@@ -56,8 +56,8 @@ try {
   await bob.page.click('#request-list button:text-is("Grant")');
   await until(alice.page, (did) => window.dsip.contactStatus(did) === 'they granted you', bob.did);
   check('Alice: holds Bob\'s grant', true);
-  await until(alice.page, () => /connection for the introduction closed/.test(document.getElementById('log').textContent));
-  check('Alice: the connection to relay B closed once answered', !(await alice.page.evaluate(() => window.dsip.callRelays())).includes(RELAY_B));
+  await until(alice.page, () => /connection for the introduction closed|the introduction is done with the connection/.test(document.getElementById('log').textContent));
+  check('Alice: the introduction released its connection to relay B once answered (closed, or kept for presence)', !(await alice.page.evaluate(() => window.dsip.callRelays())).includes(RELAY_B));
 
   // 4. Alice opens the conversation: Bob's mailbox through his hint, KeyPackages fetched there, group at mailbox A
   await rowButton(alice, bob, 'Message');
