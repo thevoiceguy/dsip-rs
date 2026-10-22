@@ -14,8 +14,10 @@ pub const REASON_BEARING_TYPES: &[&str] = &["reject", "cancel", "bye", "error"];
 
 /// The reason categories.
 ///
-/// Spec: §15.1 token grammar; §15.3 fallback behavior. v0.8 adds `mailbox` (spec-gap 38).
-pub const CATEGORIES: &[&str] = &["user", "endpoint", "identity", "session", "media", "policy", "transport", "gateway", "mailbox"];
+/// Spec: §15.1 token grammar; §15.3 fallback behavior. v0.8 adds `mailbox` (spec-gap 38), v0.17 `presence` (P§9,
+/// spec-gap 134).
+pub const CATEGORIES: &[&str] =
+    &["user", "endpoint", "identity", "session", "media", "policy", "transport", "gateway", "mailbox", "presence"];
 
 /// `dsip-reason` registry: (token, valid-on message types).
 ///
@@ -83,6 +85,9 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("mailbox.hub-unreachable", &["error"]), // v0.8 (spec-gap 72): the mailbox could not reach the group's hub (M§9.4)
     ("mailbox.not-served", &["error"]), // v0.16 (spec-gap 130): an owner operation the mailbox will not serve (M§4.1)
     ("mailbox.not-enrolled", &["error"]), // v0.16 (spec-gap 130): a release for a configured identity (M§4.1)
+    ("presence.signer-mismatch", &["error"]), // v0.17 (spec-gap 134): the record's device/subject is not its signer's (P§3)
+    ("presence.lifetime", &["error"]), // v0.17 (spec-gap 134): a record's lifetime outside 60–3,600 s (P§8)
+    ("presence.stale", &["error"]), // v0.17 (spec-gap 134): a record not newer than the one held for its device (P§3)
 ];
 
 /// `dsip-answered-by` registered values. Unknown values render as `service`.
@@ -123,7 +128,25 @@ pub const MESSAGE_TYPES: &[&str] = &[
     "provenance", "key-rotation", "reachability-hint", // v0.7: §22.3, §7.5, DHT Hints Profile
     "delegation-revocation",                           // v0.8: §7.4 (spec-gap 57)
     "alias-monitor",                                   // v0.14: Alias Transparency T§8 (spec-gap 124)
+    "presence",                                        // v0.17: §9.4 / Presence Profile P§3 (spec-gap 134)
 ];
+
+/// `dsip-presence-state` registered values (P§5, v0.17, spec-gap 136). The registry is open: any other well-formed
+/// token is accepted and resolves to [`PRESENCE_STATE_FALLBACK`].
+pub const PRESENCE_STATES: &[&str] = &["available", "busy", "away", "dnd", "offline"];
+
+/// What an unknown presence state is shown and ranked as (P§5): never one that makes a reachable person look
+/// unreachable.
+pub const PRESENCE_STATE_FALLBACK: &str = "available";
+
+/// The effective presence state of `token` (P§5).
+pub fn effective_presence_state(token: &str) -> &str {
+    if PRESENCE_STATES.contains(&token) {
+        token
+    } else {
+        PRESENCE_STATE_FALLBACK
+    }
+}
 
 /// `dsip-integrity-mode` registered values (§22.2). Unknown values resolve to `metadata-only`.
 pub const INTEGRITY_MODES: &[&str] = &["metadata-only", "derivative-bound"];

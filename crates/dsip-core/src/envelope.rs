@@ -21,7 +21,10 @@ use crate::ulid::Ulid;
 use crate::verdict::{RejectCode, Verdict};
 use crate::version::Supported;
 use crate::wire::parse_payload;
-use crate::{HINT_MAX_VALIDITY_S, INTRODUCTION_MAX_VALIDITY_S, REPLAY_WINDOW_S, ULID_TOLERANCE_S, WS_MAX_ENVELOPE_BYTES};
+use crate::{
+    HINT_MAX_VALIDITY_S, INTRODUCTION_MAX_VALIDITY_S, PRESENCE_MAX_VALIDITY_S, REPLAY_WINDOW_S, ULID_TOLERANCE_S,
+    WS_MAX_ENVELOPE_BYTES,
+};
 
 /// The three-member JWS envelope.
 ///
@@ -267,20 +270,33 @@ pub fn verify(env: &Envelope, ctx: &Context, frame: Option<&str>) -> Result<Veri
         if ia > ctx.now + REPLAY_WINDOW_S {
             return Err(Verdict::reject(RejectCode::ReplayWindow));
         }
+    } else if msg_type == "presence" {
+        // Spec: §12.9 (v0.17, spec-gap 134) — the authority keeps a record and forwards it in notify bodies for its
+        // whole lifetime (P§3), so as for a hint the age bound is `expires_at` under the 3,600 s cap; the future
+        // bound stays.
+        if ea - ia > PRESENCE_MAX_VALIDITY_S {
+            return Err(Verdict::reject(RejectCode::PresenceValidity));
+        }
+        if ia > ctx.now + REPLAY_WINDOW_S {
+            return Err(Verdict::reject(RejectCode::ReplayWindow));
+        }
     } else if ia < ctx.now - REPLAY_WINDOW_S || ia > ctx.now + REPLAY_WINDOW_S {
         // Impl (spec-gap 7): symmetric window
         return Err(Verdict::reject(RejectCode::ReplayWindow));
     }
-    if ea < ctx.now {
+    // §12.9 (spec-gap 141): expires_at is the first instant the message is no longer valid
+    if ea <= ctx.now {
         return Err(if msg_type == "invite" {
             Verdict::reject_with(RejectCode::Expired, "session.expired")
         } else {
             Verdict::reject(RejectCode::Expired)
         });
     }
-    // Stage 10: dedup
+    // Stage 10: dedup. Not for a record kept and forwarded for its lifetime (§12.9, spec-gap 141): §8.3 decides a
+    // re-observed hint, `seq` a re-observed presence record (P§3)
     let id = p["id"].as_str().ok_or_else(|| shape("id"))?;
-    if ctx.seen_ids.contains(id) {
+    let kept = matches!(msg_type.as_str(), "reachability-hint" | "presence");
+    if !kept && ctx.seen_ids.contains(id) {
         return Err(Verdict::reject(RejectCode::DuplicateId));
     }
     // Stage 11: ULID timestamp vs issued_at (§20.6)

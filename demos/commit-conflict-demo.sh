@@ -32,6 +32,14 @@ wait_for() { # file pattern seconds
   return 1
 }
 
+wait_more() { # file pattern count seconds: wait until the log holds more than `count` matching lines (one already
+  # there from an earlier step must not count again)
+  local f=$1 pat=$2 k=$3 n=${4:-20}
+  for _ in $(seq $((n * 5))); do [ "$(grep -cE "$pat" "$f" 2>/dev/null || true)" -gt "$k" ] && return 0; sleep 0.2; done
+  echo "TIMEOUT waiting for a new /$pat/ in $f"; echo "--- $f"; tail -8 "$f"; return 1
+}
+seen() { grep -cE "$2" "$1" 2>/dev/null || true; } # file pattern: how many matching lines the log holds now
+
 echo "=== mailboxes, documents, devices, a direct conversation hubbed at Alice's mailbox"
 $MBX --state "$DIR/mbx-a" --listen 127.0.0.1:9511 --owner "$ALICE" "${RESOLVER[@]}" --ca "$DIR/ca.pem" >"$DIR/mbx-a.log" 2>&1 &
 $MBX --state "$DIR/mbx-b" --listen 127.0.0.1:9512 --owner "$BOB" "${RESOLVER[@]}" --ca "$DIR/ca.pem" >"$DIR/mbx-b.log" 2>&1 &
@@ -57,7 +65,7 @@ echo "live" >&3
 echo "=== one epoch behind: Bob misses Alice's rekey and rekeys from the old epoch (mailbox.commit-conflict)"
 echo "offline" >&4; wait_for "$DIR/b.log" "OK offline" 10
 echo "rekey" >&3; wait_for "$DIR/a.log" "^OK rekeyed epoch=2 " 30
-echo "online" >&4; wait_for "$DIR/b.log" "OK connected" 15
+N=$(seen "$DIR/b.log" "OK connected"); echo "online" >&4; wait_more "$DIR/b.log" "OK connected" "$N" 15
 echo "rekey" >&4
 wait_for "$DIR/b.log" "^CONFLICT rekeyed: mailbox.commit-conflict at epoch 1" 30
 wait_for "$DIR/b.log" "^EPOCH 2 kind=direct by=$ALICE" 30
@@ -66,10 +74,10 @@ wait_for "$DIR/b.log" "^OK rekeyed epoch=3 " 30
 wait_for "$DIR/a.log" "^EPOCH 3 kind=direct by=$BOB" 30
 
 echo "=== two epochs behind (mailbox.stale-epoch)"
-echo "offline" >&4; wait_for "$DIR/b.log" "OK offline" 10
+N=$(seen "$DIR/b.log" "OK offline"); echo "offline" >&4; wait_more "$DIR/b.log" "OK offline" "$N" 10
 echo "rekey" >&3; wait_for "$DIR/a.log" "^OK rekeyed epoch=4 " 30
 echo "rekey" >&3; wait_for "$DIR/a.log" "^OK rekeyed epoch=5 " 30
-echo "online" >&4; wait_for "$DIR/b.log" "OK connected" 15; sleep 0.5
+N=$(seen "$DIR/b.log" "OK connected"); echo "online" >&4; wait_more "$DIR/b.log" "OK connected" "$N" 15; sleep 0.5
 # Alice writes while Bob is back but not yet synced. His mailbox must not push it to him: live push belongs to the
 # connection that asked for it (M§5.4), and pushing it here would move his cursor past Alice's two commits.
 echo "send Pushed before Bob syncs" >&3; wait_for "$DIR/a.log" "^OK sent" 15; sleep 1

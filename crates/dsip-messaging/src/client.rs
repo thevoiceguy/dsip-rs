@@ -857,7 +857,8 @@ impl Client {
         let exp = e["expires_at"].as_i64().unwrap_or(i64::MIN);
         if e["state"] == "stopped" {
             acts.remove(&s(&e["activity"]));
-        } else if exp >= self.now {
+        } else if exp > self.now {
+            // gone at its expires_at (§12.9, spec-gap 141)
             acts.insert(s(&e["activity"]), exp);
         }
         if acts.is_empty() {
@@ -870,7 +871,7 @@ impl Client {
         self.now += n;
         let now = self.now;
         for acts in self.shown.values_mut() {
-            acts.retain(|_, t| *t >= now);
+            acts.retain(|_, t| *t > now);
         }
         self.shown.retain(|_, a| !a.is_empty());
         if self.pending_read && self.last_read_sent.is_some_and(|t| self.now - t >= READ_MIN_INTERVAL_S) {

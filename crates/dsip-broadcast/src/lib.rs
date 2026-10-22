@@ -7,17 +7,19 @@
 //! records), §22.2 (integrity modes `metadata-only` / `derivative-bound`),
 //! §22.3 (provenance statements from relays and transcoders that never
 //! overwrite the publisher), §16.4 (policy is displayed and enforced by
-//! receivers, not magic).
+//! receivers, not magic); the Presence Profile's P§3 (records kept and carried by
+//! the authority), P§4 (combined by the subscriber) and P§8 (timers).
 //!
-//! Three pieces: [`authority::Authority`] (the target's relay/domain endpoint),
-//! [`subscriber::Subscriber`], and the receiver-side stateless checks in
-//! [`receiver`]. All are clockless and IO-free; the relay binary and the CLI
+//! Four pieces: [`authority::Authority`] (the target's relay/domain endpoint),
+//! [`subscriber::Subscriber`], the receiver-side stateless checks in
+//! [`receiver`], and the presence combining rule in [`presence`]. All are clockless and IO-free; the relay binary and the CLI
 //! wrap them.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 pub mod authority;
+pub mod presence;
 pub mod receiver;
 pub mod subscriber;
 

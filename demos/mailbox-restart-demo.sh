@@ -28,6 +28,13 @@ wait_for() { # file pattern seconds
   for _ in $(seq $((n * 5))); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
   echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -30 "$f"; return 1
 }
+wait_more() { # file pattern count seconds: wait until the log holds more than `count` matching lines (one already
+  # there from an earlier step must not count again)
+  local f=$1 pat=$2 k=$3 n=${4:-20}
+  for _ in $(seq $((n * 5))); do [ "$(grep -cE "$pat" "$f" 2>/dev/null || true)" -gt "$k" ] && return 0; sleep 0.2; done
+  echo "TIMEOUT waiting for a new /$pat/ in $f"; echo "--- $f"; tail -8 "$f"; return 1
+}
+seen() { grep -cE "$2" "$1" 2>/dev/null || true; } # file pattern: how many matching lines the log holds now
 count() { grep -cE "$2" "$1" || true; }
 wait_nth() { # file pattern n seconds: the n-th matching line (logs are appended across restarts)
   for _ in $(seq $(($4 * 5))); do [ "$(count "$1" "$2")" -ge "$3" ] && return 0; sleep 0.2; done
@@ -77,7 +84,7 @@ sleep 1
 [ "$(count "$DIR/b.log" "^RECV $ALICE: Before anything breaks")" = 1 ] || { echo "FAIL: Bob's resync replayed an old message"; exit 1; }
 
 echo "=== the hub crashes with fan-out to a mailbox that is down"
-echo "offline" >&4; wait_for "$DIR/b.log" "OK offline" 10
+N=$(seen "$DIR/b.log" "OK offline"); echo "offline" >&4; wait_more "$DIR/b.log" "OK offline" "$N" 10
 crash "$MBX_B"
 SEQ=$(send_a "Queued at the hub")
 send_a "And queued behind it" >/dev/null
@@ -92,7 +99,7 @@ wait_for "$DIR/b.log" "^RECV $ALICE: Queued at the hub" 90
 wait_for "$DIR/b.log" "^RECV $ALICE: And queued behind it" 30
 
 echo "=== the reloaded hub still validates commits"
-echo "live" >&3; wait_for "$DIR/a.log" "OK connected" 15
+N=$(seen "$DIR/a.log" "OK connected"); echo "live" >&3; wait_more "$DIR/a.log" "OK connected" "$N" 15
 echo "rekey" >&3; wait_for "$DIR/a.log" "^OK rekeyed epoch=2 " 30
 wait_for "$DIR/b.log" "^EPOCH 2 kind=direct by=$ALICE" 30
 echo "send After the rekey" >&3; wait_for "$DIR/b.log" "^RECV $ALICE: After the rekey" 30

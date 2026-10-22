@@ -11,7 +11,8 @@
 //! never-seen recipients get `transport.unknown-recipient` — spec-gap 17),
 //! §19.4 (introductions: mandatory per-sender and per-inbox rate limits; unknown
 //! and offline recipients treated identically — Impl, spec-gap 14), §13.6
-//! (service scope: open by default, private with `--serve` — spec-gap 100).
+//! (service scope: open by default, private with `--serve` — spec-gap 100), Presence Profile P§3 (a served
+//! device's `presence` record goes to this relay's authority, and notify bodies carry the signed record).
 //!
 //! Envelopes are forwarded as the exact text frames received (§10.2: the
 //! signature covers the bytes; a relay never re-serializes).
@@ -153,6 +154,8 @@ struct State {
     records: HashMap<String, String>,
     /// Provenance statement frames by publication id (statements reference a specific record, §22.3).
     statements: HashMap<String, Vec<String>>,
+    /// Presence record frames by record id, with their `expires_at` (P§3: notify bodies carry the signed record).
+    presence_frames: HashMap<String, (String, i64)>,
     /// `delegation-revocation` records handed to this relay (§7.4, v0.8; spec-gap 57): applied to every later
     /// `hello` and frame. A `did:key` identity has no document, so this is where its revocations reach the relay.
     revocations: Vec<Envelope>,
@@ -184,6 +187,14 @@ impl State {
                             body["statements"] = json!(st);
                         }
                     }
+                    // P§3: each presence record rides as the device's signed envelope beside its fields
+                    if let Some(recs) = body.get_mut("records").and_then(Value::as_array_mut) {
+                        for r in recs {
+                            if let Some((f, _)) = r["id"].as_str().and_then(|id| self.presence_frames.get(id)) {
+                                r["frame"] = f.clone().into();
+                            }
+                        }
+                    }
                     p["subscription"] = send["subscription"].clone();
                     p["seq"] = send["seq"].clone();
                     p["state"] = send["state"].clone();
@@ -191,6 +202,13 @@ impl State {
                         p["reason"] = r.clone();
                     }
                     p["body"] = body;
+                } else if send["type"] == "error" {
+                    // P§3: a refused presence record is answered in reply to it, with `retry_after` when rate-limited
+                    for k in ["in_reply_to", "reason", "retry_after"] {
+                        if let Some(v) = send.get(k) {
+                            p[k] = v.clone();
+                        }
+                    }
                 } else {
                     p["session"] = send["session"].clone();
                     p["reason"] = send["reason"].clone();
@@ -240,9 +258,9 @@ impl State {
         self.served.as_ref()?;
         match t {
             // §9.3/§22: the relay is the authority only for the identities it serves
-            "publish" | "unpublish" | "provenance" if !self.serves(sender_identity) => Some("relay does not serve this identity"),
+            "publish" | "unpublish" | "provenance" | "presence" if !self.serves(sender_identity) => Some("relay does not serve this identity"),
             "subscribe" if !self.serves(p["target"].as_str().unwrap_or("")) => Some("relay does not serve the target"),
-            "publish" | "unpublish" | "provenance" | "subscribe" => None,
+            "publish" | "unpublish" | "provenance" | "subscribe" | "presence" => None,
             _ => {
                 let recipient = self.identity_of(to);
                 if !self.serves(&recipient) && !self.serves(sender_identity) {
@@ -479,12 +497,19 @@ impl State {
         if t == "reject" && self.tracker.attempt_initiator(&sid).is_some_and(|i| i != sender) {
             self.reject_frames.insert((sid.clone(), sender.to_string()), inbound.frame.clone());
         }
-        if matches!(t.as_str(), "publish" | "unpublish" | "subscribe" | "provenance") {
-            // §9.3/§22: addressed to this relay as the target's authority (publish/unpublish carry no `to`).
-            if t == "subscribe" && to != self.key.did() {
-                let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some("subscribe must address this relay"));
+        if matches!(t.as_str(), "publish" | "unpublish" | "subscribe" | "provenance" | "presence") {
+            // §9.3/§22: addressed to this relay as the target's authority (publish/unpublish carry no `to`);
+            // P§3: a device publishes its presence record to the relay it binds to.
+            if (t == "subscribe" || t == "presence") && to != self.key.did() {
+                let why = if t == "subscribe" { "subscribe must address this relay" } else { "presence must address this relay" };
+                let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some(why));
                 self.deliver(sender, &f);
                 return;
+            }
+            if t == "presence" {
+                let now = now_s();
+                self.presence_frames.retain(|_, (_, exp)| *exp > now);
+                self.presence_frames.insert(id.clone(), (inbound.frame.clone(), p["expires_at"].as_i64().unwrap_or(now)));
             }
             let mut m = p.clone();
             m["from"] = sender.into();
@@ -575,6 +600,7 @@ async fn main() -> Result<()> {
         authority: Authority::new(now_s(), HashMap::new()),
         records: HashMap::new(),
         statements: HashMap::new(),
+        presence_frames: HashMap::new(),
         revocations: vec![],
         stats: status::Stats::new(now_s()),
     }));

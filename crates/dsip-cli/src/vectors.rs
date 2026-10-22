@@ -137,6 +137,7 @@ fn run_one(v: &Value) -> Result<(bool, Value, Value)> {
         "tn-binding" => dsip_number::run_vector(v),
         "alias-transparency" => dsip_kt::run_vector(v),
         "pkarr" => dsip_core::pkarr::run_vector(v),
+        "presence" => dsip_broadcast::presence::run_vector(v),
         "state" => return state(v),
         other => anyhow::bail!("unknown kind {other}"),
     };
@@ -240,6 +241,7 @@ impl Component {
             (Component::Relay(rl), "attempts") => rl.snapshot(names()),
             (Component::Relay(rl), "inbox") => rl.inbox_snapshot(),
             (Component::Authority(a), "publications") => a.snapshot_publications(),
+            (Component::Authority(a), "presence") => a.snapshot_presence(),
             (Component::Authority(a), "subscriptions") => a.snapshot_subscriptions(),
             (Component::Subscriber(s), "subscriptions") => s.snapshot(),
             _ => Value::Null,

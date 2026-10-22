@@ -34,6 +34,13 @@ wait_for() { # file pattern seconds
   for _ in $(seq $((n * 5))); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
   echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -30 "$f"; return 1
 }
+wait_more() { # file pattern count seconds: wait until the log holds more than `count` matching lines (one already
+  # there from an earlier step must not count again)
+  local f=$1 pat=$2 k=$3 n=${4:-20}
+  for _ in $(seq $((n * 5))); do [ "$(grep -cE "$pat" "$f" 2>/dev/null || true)" -gt "$k" ] && return 0; sleep 0.2; done
+  echo "TIMEOUT waiting for a new /$pat/ in $f"; echo "--- $f"; tail -8 "$f"; return 1
+}
+seen() { grep -cE "$2" "$1" 2>/dev/null || true; } # file pattern: how many matching lines the log holds now
 
 echo "=== mailboxes"
 $MBX --state "$DIR/mbx-a" --listen 127.0.0.1:9451 --owner "$ALICE" "${RESOLVER[@]}" --ca "$DIR/ca.pem" \
@@ -81,7 +88,7 @@ echo "=== store and forward: Bob disconnects, Alice sends, Bob returns (M§9.1)"
 echo "offline" >&4; wait_for "$DIR/b.log" "OK offline" 10
 echo "send Second one while you were away" >&3
 sleep 1
-echo "online" >&4; wait_for "$DIR/b.log" "OK connected" 15
+N=$(seen "$DIR/b.log" "OK connected"); echo "online" >&4; wait_more "$DIR/b.log" "OK connected" "$N" 15
 echo "sync" >&4
 wait_for "$DIR/b.log" "^RECV .*Second one while you were away" 30
 
