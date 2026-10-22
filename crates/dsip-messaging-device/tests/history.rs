@@ -1,9 +1,11 @@
 //! Receipts and history as both messaging clients drive them: the receipts machine's decisions as types, a read
 //! watermark held back by the interval coming back with the next event, what of a device's own objects is history,
 //! archive records opened once, restored history waiting for its conversation, and a sync's batch collected per
-//! conversation, a sibling's watermark in the personal group under the conversation it names.
+//! conversation, a sibling's watermark in the personal group under the conversation it names; objects keyed with
+//! their sender, and the first archive key under an `akid` kept.
 //!
-//! Spec: M§10.2, M§10.3, M§10.5 (spec-gap 52), M§11.2, M§12.2 (spec-gaps 51, 64, 68, 63), M§12.3, M§8.5.
+//! Spec: M§10.2, M§10.3, M§10.5 (spec-gap 52), M§11.2, M§12.1 (spec-gap 140), M§12.2 (spec-gaps 51, 64, 68, 63), M§12.3,
+//! M§8.5.
 
 use serde_json::json;
 
@@ -140,4 +142,27 @@ fn a_batch_collects_per_group_and_a_personal_group_receipt_goes_to_its_conversat
     // spec-gap 64: archived under the group it arrived in
     assert_eq!(items[1], json!({"seq": 7, "object": watermark, "src": "G-personal", "sender_device": "did:key:z6Sibling"}));
     assert_eq!(receipts::archived(items, 7).count(), 1);
+}
+
+#[test]
+fn objects_keyed_by_conversation_sender_and_id() {
+    // M§8.5: two senders may use one id in a conversation; they are two messages
+    let a = json!({"object": "content", "conversation": "c", "sender": "did:web:alice.example", "id": "x"});
+    let b = json!({"object": "content", "conversation": "c", "sender": "did:web:bob.example", "id": "x"});
+    assert_eq!(history::object_key(&a), "c|did:web:alice.example|x");
+    assert_ne!(history::object_key(&a), history::object_key(&b));
+    // M§13.3: one call event per session, whichever device reported it
+    let call = json!({"object": "call-event", "session": "s", "sender": "did:web:alice.example", "id": "y"});
+    assert_eq!(history::object_key(&call), "call|s");
+}
+
+#[test]
+fn the_first_archive_key_under_an_akid_is_kept() {
+    let mut held = std::collections::BTreeMap::new();
+    assert_eq!(archive::take_key(&mut held, "a1", vec![1; 32], 10), archive::KeyArrival::Fresh);
+    // a sibling's copy, or a redelivery
+    assert_eq!(archive::take_key(&mut held, "a1", vec![1; 32], 10), archive::KeyArrival::Held);
+    // spec-gap 140: another key under that akid never replaces it
+    assert_eq!(archive::take_key(&mut held, "a1", vec![2; 32], 11), archive::KeyArrival::Conflict);
+    assert_eq!(held["a1"], (vec![1; 32], 10));
 }

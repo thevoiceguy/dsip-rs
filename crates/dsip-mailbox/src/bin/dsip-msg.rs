@@ -40,7 +40,7 @@ use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::client::select_mailbox;
 use dsip_messaging_device::messenger::Messenger;
-use dsip_messaging_device::{blob, CallLog, Config, Store};
+use dsip_messaging_device::{blob, CallLog, Store};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{conversation_extension, digest, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
@@ -86,6 +86,11 @@ struct Args {
     /// RECOMMENDED 24 h).
     #[arg(long, default_value_t = dsip_messaging::client::HUB_TIMEOUT_S)]
     hub_timeout: i64,
+    /// Seconds before a deposit with no answer at all counts as the hub unreachable (M§9.4).
+    ///
+    /// Impl: spec-gap 72 sets no time; a local mailbox answers in milliseconds, so 20 s finds an outage soon.
+    #[arg(long, default_value_t = 20)]
+    no_answer_timeout: i64,
     /// Behavior disclosed to other identities (M§10.5): any of `read`, `played`, `activity`. `delivered` is on
     /// unless `--no-delivered`.
     #[arg(long, value_delimiter = ',')]
@@ -1750,13 +1755,19 @@ impl Client {
                 }
                 Ok(())
             }
+            "leave" => {
+                // M§7.3 "Leaving": this identity's Remove proposals; another member's device commits them
+                let gid = self.active()?;
+                let out = self.m.leave(&gid, now).map_err(messenger_err)?;
+                println!("OK leaving group={gid}");
+                self.handle(&out).await
+            }
             "decline-recording" => {
                 // C§5: declining is leaving the conversation (M§7.3)
                 let gid = self.active()?;
-                let frames = self.m.leave(&gid, now).map_err(messenger_err)?;
+                let out = self.m.leave(&gid, now).map_err(messenger_err)?;
                 println!("OK leaving group={gid} (declined being recorded, C§5)");
-                self.save()?;
-                self.send_frames(&frames).await
+                self.handle(&out).await
             }
             "device-event" => self.send_device_event(rest).await,
             "alarm-ack" => {
@@ -1915,13 +1926,14 @@ async fn main() -> Result<()> {
     }
     let identity_json = json!({"identity": args.identity, "device_seed_hex": hex(&keys.device.seed()), "delegation": delegation.frame(),
                                "controller_seed_hex": hex(&keys.controller.seed()), "display_name": args.identity}).to_string();
-    let mut m = Messenger::open(&identity_json, &mailbox.0, &mailbox.1, db, &state, Config::DSIP_MSG, now as f64).map_err(messenger_err)?;
+    let mut m = Messenger::open(&identity_json, &mailbox.0, &mailbox.1, db, &state, now as f64).map_err(messenger_err)?;
     // C§5: a recorder discloses nothing (it sends no receipts)
     let policy = json!({"delivered": !args.no_delivered && !args.recorder, "read": !args.recorder && args.disclose.iter().any(|d| d == "read"),
         "played": args.disclose.iter().any(|d| d == "played"), "activity": args.disclose.iter().any(|d| d == "activity")});
     m.set_receipt_policy(&policy.to_string(), now as f64).map_err(messenger_err)?;
     m.set_gap_timeout(args.gap_timeout);
     m.set_hub_timeout(args.hub_timeout as f64);
+    m.set_no_answer_timeout(args.no_answer_timeout);
     m.set_recorder_sends(args.recorder_misbehave);
     let mut client = Client {
         keys,

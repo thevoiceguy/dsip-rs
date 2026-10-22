@@ -98,6 +98,27 @@ pub fn device_leaves(group: &MlsGroup, device: &str) -> Vec<LeafNodeIndex> {
         .collect()
 }
 
+/// Whether an Add of `identity`, or of its `device` when one is named, is still needed in `group` after a lost conflict
+/// (M§6.5 "if still needed"): while no leaf authenticates as the identity, or while no leaf's credential names the
+/// device. A lapsed leaf of the device counts as there: an Add beside it would repeat the device's signature key, which
+/// MLS refuses; the device renews its delegation (M§6.2), or the leaf is removed, instead.
+pub fn add_needed(group: &MlsGroup, ctx: &Context, identity: &str, device: Option<&str>) -> bool {
+    match device {
+        Some(d) => device_leaves(group, d).is_empty(),
+        None => !has_member(group, ctx, identity, None),
+    }
+}
+
+/// The roster of `group` by identity, sorted, as recorded for the successor checks (M§7.5): every leaf's delegation
+/// subject, lapsed leaves included, since only a commit ends a membership (spec-gap 139). `None` while no leaf names
+/// one.
+pub fn roster(group: &MlsGroup) -> Option<Vec<String>> {
+    let mut ids: Vec<String> = group.members().filter_map(|m| dsip_mls::leaf_subject(group, m.index)).collect();
+    ids.sort();
+    ids.dedup();
+    (!ids.is_empty()).then_some(ids)
+}
+
 /// Whether `group` has a leaf that authenticates as `identity` (M§6.2), and as `device` of it when one is named.
 pub fn has_member(group: &MlsGroup, ctx: &Context, identity: &str, device: Option<&str>) -> bool {
     group.members().any(|m| {
