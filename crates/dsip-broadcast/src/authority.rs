@@ -5,7 +5,10 @@
 //! per-event caps; renewal replaces; `expires_in: 0` terminates; the first
 //! notify carries current state; terminal notifies carry a reason), §22.1
 //! (the publisher's record, keyed by stream), §22.3 (statements attached, never
-//! overwriting), §8.3 (newer replaces older; expired records are invalid).
+//! overwriting), §8.3 (newer replaces older; expired records are invalid); Presence Profile P§3 (a device's own
+//! presence record kept to its `expires_at`, refused in the profile's order, held through an unbind's grace, and
+//! carried in every presence notify beside the assertion for devices without one), P§4 (one record per device, `seq`
+//! per `(subject, device)`), P§8 (lifetime bounds, T-Presence-Grace, the publish interval).
 //!
 //! Impl (spec-gap 18): `publisher` MUST equal the verified identity; `stream_id`
 //! is namespaced under it. Impl (spec-gap 19): presence derives from device
@@ -18,6 +21,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use dsip_core::registry::SUBSCRIPTION_EVENTS;
+use dsip_core::PRESENCE_MAX_VALIDITY_S;
+
+/// A presence record's shortest lifetime, `expires_at − issued_at` (P§8).
+pub const RECORD_MIN_LIFETIME_S: i64 = 60;
+/// T-Presence-Grace's default: how long a record outlives its device's unbind (P§8; bounds 0–300 s).
+pub const PRESENCE_GRACE_S: i64 = 60;
+/// The shortest interval between two accepted records of one device (P§8).
+pub const PUBLISH_INTERVAL_S: i64 = 5;
+
+/// A device's current presence record, as the authority holds it (P§3).
+#[derive(Debug, Clone, PartialEq)]
+struct PresenceRecord {
+    id: String,
+    device: String,
+    state: String,
+    seq: i64,
+    expires_at: i64,
+}
 use dsip_session::event::{Emission, SendMsg};
 use dsip_session::Message;
 
@@ -142,7 +163,16 @@ pub struct Authority {
     pub subscriptions: BTreeMap<String, Subscription>,
     policy: HashMap<String, Policy>,
     capabilities: HashMap<String, String>,
-    bound: BTreeSet<String>,
+    /// identity → its bound devices.
+    bound: BTreeMap<String, BTreeSet<String>>,
+    /// (subject, device) → the device's current presence record (P§3).
+    records: BTreeMap<(String, String), PresenceRecord>,
+    /// device → when its record is dropped, after an unbind (P§3).
+    grace_until: BTreeMap<String, i64>,
+    /// device → when its last record was accepted (P§8).
+    last_accepted: HashMap<String, i64>,
+    /// T-Presence-Grace, the authority's choice within P§8's bounds.
+    pub presence_grace: i64,
     out: Vec<Emission>,
     /// Extra (non-Send) emissions in README shape, interleaved in order with sends via [`Authority::step`].
     events: Vec<Value>,
@@ -158,7 +188,11 @@ impl Authority {
             subscriptions: BTreeMap::new(),
             policy: HashMap::new(),
             capabilities: HashMap::new(),
-            bound: BTreeSet::new(),
+            bound: BTreeMap::new(),
+            records: BTreeMap::new(),
+            grace_until: BTreeMap::new(),
+            last_accepted: HashMap::new(),
+            presence_grace: PRESENCE_GRACE_S,
             out: vec![],
             events: vec![],
         }
@@ -171,7 +205,9 @@ impl Authority {
             .and_then(Value::as_object)
             .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
             .unwrap_or_default();
-        Authority::new(ctx["start"].as_i64().unwrap_or(0), ids)
+        let mut a = Authority::new(ctx["start"].as_i64().unwrap_or(0), ids);
+        a.presence_grace = ctx["presence_grace"].as_i64().unwrap_or(PRESENCE_GRACE_S);
+        a
     }
 
     /// Record that `device` acts for `identity`.
@@ -211,12 +247,25 @@ impl Authority {
             AuthorityEvent::Local(LocalPolicy::IssueCapability { token, target }) => self.issue_capability(token, target),
             AuthorityEvent::Relay(Binding::Bind { device, identity }) => {
                 self.learn_identity(device, identity);
-                self.bound.insert(identity.clone());
-                self.notify_all("presence", identity);
+                let before = self.presence_body(identity);
+                self.bound.entry(identity.clone()).or_default().insert(device.clone());
+                self.grace_until.remove(device); // P§3: back within the grace, the record stays
+                self.presence_changed(identity, &before);
             }
-            AuthorityEvent::Relay(Binding::Unbind { identity, .. }) => {
-                self.bound.remove(identity);
-                self.notify_all("presence", identity);
+            AuthorityEvent::Relay(Binding::Unbind { device, identity }) => {
+                let before = self.presence_body(identity);
+                if let Some(b) = self.bound.get_mut(identity) {
+                    b.remove(device);
+                }
+                if self.records.contains_key(&(identity.clone(), device.clone())) && !self.grace_until.contains_key(device) {
+                    // P§3: the record outlives the binding by T-Presence-Grace, from the first unbind; 0 drops it now
+                    if self.presence_grace == 0 {
+                        self.drop_record(identity, device);
+                    } else {
+                        self.grace_until.insert(device.clone(), self.now + self.presence_grace);
+                    }
+                }
+                self.presence_changed(identity, &before);
             }
         }
         std::mem::take(&mut self.events)
@@ -302,7 +351,70 @@ impl Authority {
                 self.notify_all("publication", &stream);
             }
             "subscribe" => self.recv_subscribe(m, &identity),
+            "presence" => self.recv_presence(m, &identity),
             _ => self.event(json!({"drop": "not-broadcast"})),
+        }
+    }
+
+    /// P§3: a device's own record, checked in the profile's order; accepted silently, refused with `error`.
+    fn recv_presence(&mut self, m: &Value, identity: &str) {
+        let from = m["from"].as_str().unwrap_or("").to_string();
+        let id = m["id"].as_str().unwrap_or("").to_string();
+        let refuse = |a: &mut Authority, reason: &str, extra: Vec<(&'static str, Value)>| {
+            a.send(SendMsg { msg_type: "error".into(), to: from.clone(), in_reply_to: Some(id.clone()), reason: Some(reason.into()), extra, ..Default::default() });
+        };
+        let device = m["device"].as_str().map(String::from);
+        let Some(device) = device.filter(|d| *d == from && m["subject"].as_str() == Some(identity)) else {
+            return refuse(self, "presence.signer-mismatch", vec![]);
+        };
+        let lifetime = m["expires_at"].as_i64().unwrap_or(0) - m["issued_at"].as_i64().unwrap_or(0);
+        if !(RECORD_MIN_LIFETIME_S..=PRESENCE_MAX_VALIDITY_S).contains(&lifetime) {
+            return refuse(self, "presence.lifetime", vec![]); // P§8
+        }
+        let seq = m["seq"].as_i64().unwrap_or(0);
+        let key = (identity.to_string(), device.clone());
+        if self.records.get(&key).is_some_and(|held| seq <= held.seq) {
+            return refuse(self, "presence.stale", vec![]); // P§4: seq is ordered per (subject, device)
+        }
+        if let Some(last) = self.last_accepted.get(&device).copied().filter(|last| self.now - last < PUBLISH_INTERVAL_S) {
+            return refuse(self, "policy.rate-limited", vec![("retry_after", json!(PUBLISH_INTERVAL_S - (self.now - last)))]); // P§8
+        }
+        let before = self.presence_body(identity);
+        let state = m["state"].as_str().unwrap_or("").to_string();
+        self.records.insert(key, PresenceRecord { id, device: device.clone(), state, seq, expires_at: m["expires_at"].as_i64().unwrap_or(0) });
+        self.last_accepted.insert(device, self.now);
+        self.presence_changed(identity, &before);
+    }
+
+    /// P§3: an expired record, or one whose grace ran out, is dropped and its seq forgotten.
+    fn drop_record(&mut self, subject: &str, device: &str) {
+        self.records.remove(&(subject.to_string(), device.to_string()));
+        self.grace_until.remove(device);
+    }
+
+    /// P§3: the assertion over the subject's devices that hold no record, and the records held, by device.
+    fn presence_body(&self, subject: &str) -> Value {
+        let unrecorded_bound = self
+            .bound
+            .get(subject)
+            .is_some_and(|devices| devices.iter().any(|d| !self.records.contains_key(&(subject.to_string(), d.clone()))));
+        let mut body = json!({"event": "presence", "state": if unrecorded_bound { "available" } else { "offline" }});
+        let records: Vec<Value> = self
+            .records
+            .iter()
+            .filter(|((s, _), _)| s == subject)
+            .map(|(_, r)| json!({"id": r.id, "device": r.device, "state": r.state, "seq": r.seq, "expires_at": r.expires_at}))
+            .collect();
+        if !records.is_empty() {
+            body["records"] = Value::Array(records);
+        }
+        body
+    }
+
+    /// P§3: subscriptions are told when an event changed the subject's body.
+    fn presence_changed(&mut self, subject: &str, before: &Value) {
+        if self.presence_body(subject) != *before {
+            self.notify_all("presence", subject);
         }
     }
 
@@ -320,7 +432,9 @@ impl Authority {
         if events.iter().any(|e| e == "publication") {
             return self.publications.contains_key(target);
         }
-        self.identities.values().any(|i| i == target) || self.bound.contains(target) || self.policy.contains_key(target)
+        self.identities.values().any(|i| i == target)
+            || self.bound.get(target).is_some_and(|d| !d.is_empty())
+            || self.policy.contains_key(target)
     }
 
     fn recv_subscribe(&mut self, m: &Value, identity: &str) {
@@ -376,7 +490,7 @@ impl Authority {
                 None => json!({"event": "publication", "state": "unknown"}),
             }
         } else {
-            json!({"event": "presence", "state": if self.bound.contains(&sub.target) { "available" } else { "offline" }})
+            self.presence_body(&sub.target)
         }
     }
 
@@ -429,6 +543,34 @@ impl Authority {
             self.event(json!({"publication": {"stream": stream, "state": "expired"}}));
             self.notify_all("publication", &stream);
         }
+        // P§3: records past expires_at, and those whose grace ran out, are dropped; one notify per subject, in order
+        let dropped: Vec<(String, String)> = self
+            .records
+            .iter()
+            .filter(|((_, d), r)| r.expires_at <= self.now || self.grace_until.get(d).is_some_and(|g| *g <= self.now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut changed = BTreeSet::new();
+        for (subject, device) in dropped {
+            self.drop_record(&subject, &device);
+            changed.insert(subject);
+        }
+        for subject in changed {
+            self.notify_all("presence", &subject);
+        }
+    }
+
+    /// README `presence` snapshot: `{subject: {device: {seq, state, expires_at, grace_until?}}}` (P§3).
+    pub fn snapshot_presence(&self) -> Value {
+        let mut out = serde_json::Map::new();
+        for ((subject, device), r) in &self.records {
+            let mut snap = json!({"seq": r.seq, "state": r.state, "expires_at": r.expires_at});
+            if let Some(g) = self.grace_until.get(device) {
+                snap["grace_until"] = json!(g);
+            }
+            out.entry(subject.clone()).or_insert_with(|| json!({}))[device] = snap;
+        }
+        Value::Object(out)
     }
 
     /// README `publications` snapshot.

@@ -58,6 +58,12 @@ pub const INTRODUCTION_MAX_VALIDITY_S: i64 = 604_800;
 /// own `expires_at` under this cap, not by the 300 s replay window.
 pub const HINT_MAX_VALIDITY_S: i64 = 3_600;
 
+/// Maximum validity of a `presence` record, in seconds.
+///
+/// Spec: §12.9 (v0.17, spec-gap 134), Presence Profile P§3, P§8 — the authority keeps a record and forwards it in
+/// `notify` bodies for its whole lifetime, so its age is bounded by its own `expires_at` under this cap.
+pub const PRESENCE_MAX_VALIDITY_S: i64 = 3_600;
+
 /// Maximum encoded envelope size on `ws/1.0`, a fixed binding constant.
 ///
 /// Spec: §13.2.

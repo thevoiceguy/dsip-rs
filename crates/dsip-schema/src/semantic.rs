@@ -4,13 +4,14 @@
 //! (selection ⊆ offer), §9.3 (subscription lifetime caps), §19.4
 //! (introduction size, grant references an introduction), §15.1/§14.3/§12.10/§22.2
 //! (registry membership with fallback), §7.5 (`key-rotation`: `from` = `subject`,
-//! `next` ≠ `previous`, signer = `previous` unless `recovery`). Schema README checks 5, 7, 9, 11, 12.
+//! `next` ≠ `previous`, signer = `previous` unless `recovery`), P§3 (a `presence` record's `device` is its signer),
+//! P§5 (an unknown presence state is shown as `available`). Schema README checks 5, 7, 9, 11, 12.
 
 use serde_json::{Map, Value};
 
 use dsip_core::registry::{
-    effective_answered_by, effective_integrity, effective_progress_status, resolve_reason, INTEGRITY_MODES,
-    REASON_BEARING_TYPES, SUBSCRIPTION_EVENTS,
+    effective_answered_by, effective_integrity, effective_presence_state, effective_progress_status, resolve_reason,
+    INTEGRITY_MODES, PRESENCE_STATES, REASON_BEARING_TYPES, SUBSCRIPTION_EVENTS,
 };
 use dsip_core::version::{check_version, Supported};
 use dsip_core::{RejectCode, Verdict, INTRODUCTION_MAX_BYTES};
@@ -152,6 +153,10 @@ pub fn check_semantic(payload: &Value, ctx: &SemanticContext) -> Verdict {
             }
         }
     }
+    if t == "presence" && payload.get("device").is_some() && s("device") != s("from") {
+        // P§3 (v0.17, spec-gap 135): a record describes the device that signs it
+        return Verdict::reject_with(RejectCode::PresenceSignerMismatch, "presence.signer-mismatch");
+    }
     if t == "key-rotation" {
         // §7.5 (v0.7, spec-gap 22): only the identity rotates its own keys, by its retiring key
         // unless a recovery key signs with `recovery: true`.
@@ -200,6 +205,15 @@ pub fn registry_effects(payload: &Value) -> Map<String, Value> {
     if t == "progress" {
         if let Some(st) = payload.get("status").and_then(Value::as_str) {
             eff.insert("status".into(), effective_progress_status(st).into());
+        }
+    }
+    if t == "presence" {
+        if let Some(st) = payload.get("state").and_then(Value::as_str) {
+            // P§5 (spec-gap 136): an unknown state is accepted and shown as available
+            eff.insert("state".into(), effective_presence_state(st).into());
+            if !PRESENCE_STATES.contains(&st) {
+                warnings.push("presence-state-unknown".into());
+            }
         }
     }
     if t == "publish" {

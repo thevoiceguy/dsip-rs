@@ -40,6 +40,8 @@ pub enum RejectCode {
     IntroductionValidity,
     /// A `reachability-hint` whose `expires_at − issued_at` exceeds 3,600 s (§12.9, v0.8; spec-gap 96).
     HintValidity,
+    /// A `presence` record whose `expires_at − issued_at` exceeds 3,600 s (§12.9, P§3, v0.17; spec-gap 134).
+    PresenceValidity,
     Expired,
     DuplicateId,
     UlidIssuedAtMismatch,
@@ -70,6 +72,8 @@ pub enum RejectCode {
     RotationSubjectMismatch,
     RotationNextSameAsPrevious,
     RotationSignerNotPrevious,
+    /// A `presence` record whose `device` is not its signer, `from` (P§3, v0.17; spec-gap 135).
+    PresenceSignerMismatch,
     BindingIceMode,
     BindingSdpMissing,
     BindingSdpInvalid,
