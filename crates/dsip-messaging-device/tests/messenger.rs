@@ -1,4 +1,5 @@
-//! The messaging device as a library: opened over any store with either client's `Config`, its state taken back, the
+//! The messaging device as a library: opened over any store, its state taken back (a browser's old message keys made
+//! again), the
 //! Recording Profile's rule for a recorder sibling, and the events a host renders from.
 //!
 //! Spec: M§5.4 (state kept with the MLS state, spec-gap 44), M§7.1 (the personal group), M§12.3 (a new device joins
@@ -13,7 +14,7 @@ use dsip_core::envelope::{sign, Envelope};
 use dsip_core::keys::KeyPair;
 use dsip_messaging::wire;
 use dsip_messaging_device::messenger::Messenger;
-use dsip_messaging_device::{Config, MemoryStore};
+use dsip_messaging_device::MemoryStore;
 use dsip_mls::Device;
 
 const NOW: i64 = 1_790_000_000;
@@ -46,10 +47,10 @@ fn key_packages(identity: &KeyPair, device: &KeyPair, caps: &[&str]) -> String {
 }
 
 #[test]
-fn opened_over_a_store_with_either_config() {
+fn opened_over_any_store() {
     let (alice, phone) = (KeyPair::from_fixture_name("alice"), KeyPair::from_fixture_name("alice-phone"));
     let id = identity_json(&alice, &phone);
-    let mut m = Messenger::open(&id, "did:key:mbx", "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null, Config::DSIP_MSG,
+    let mut m = Messenger::open(&id, "did:key:mbx", "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
                                 NOW as f64).unwrap();
     m.create_personal(NOW as f64).unwrap();
     let personal = m.personal().unwrap();
@@ -68,6 +69,13 @@ fn opened_over_a_store_with_either_config() {
     let reopened = Messenger::new(&id, "did:key:mbx", "wss://mbx.example/dsip", Some(record), NOW as f64).unwrap();
     assert_eq!(reopened.personal(), browser.personal());
     assert_eq!(reopened.state()["convs"], browser.state()["convs"], "the group reloads from the saved MLS storage");
+
+    // a message the browser saved keyed without its sender (`conversation:id`) is keyed with it (M§8.5)
+    let mut saved: Value = serde_json::from_str(&reopened.save()).unwrap();
+    let obj = json!({"object": "content", "conversation": "c", "sender": alice.did(), "id": "x", "text": "hi"});
+    saved["state"]["messages"] = json!([{"group": personal, "key": "c:x", "sender": alice.did(), "object": obj, "seq": 1, "mine": true}]);
+    let old = Messenger::new(&id, "did:key:mbx", "wss://mbx.example/dsip", Some(saved.to_string()), NOW as f64).unwrap();
+    assert_eq!(old.state()["messages"][0]["key"], json!(format!("c|{}|x", alice.did())));
 }
 
 #[test]
@@ -139,7 +147,7 @@ fn rekey_remove_device_and_rotate_the_archive_key() {
                                   KeyPair::from_fixture_name("alice-laptop"));
     let mut hub = Hub::new();
     let mut m = Messenger::open(&identity_json(&alice, &phone), &hub.did(), "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
-                                Config::DSIP_MSG, NOW as f64).unwrap();
+                                NOW as f64).unwrap();
     let out = m.create_personal(NOW as f64).unwrap();
     let ev = hub.drive(&mut m, &out);
     assert_eq!(ui(&ev, "archive_key_created").len(), 1, "{ev:?}");
@@ -175,7 +183,7 @@ fn activity_sealed_opened_and_attributed() {
                                           KeyPair::from_fixture_name("bob"), KeyPair::from_fixture_name("bob-phone"));
     let mut hub = Hub::new();
     let mut m = Messenger::open(&identity_json(&alice, &phone), &hub.did(), "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
-                                Config::DSIP_MSG, NOW as f64).unwrap();
+                                NOW as f64).unwrap();
     let out = m.create_direct(&bob.did(), &key_packages(&bob, &bob_phone, PLAIN), None, NOW as f64).unwrap();
     let ev = hub.drive(&mut m, &out);
     let gid = ui(&ev, "committed")[0]["group"].as_str().unwrap().to_string();
@@ -215,7 +223,7 @@ fn first_contact_and_any_object_sent() {
                                           KeyPair::from_fixture_name("bob"), KeyPair::from_fixture_name("bob-phone"));
     let mut hub = Hub::new();
     let mut m = Messenger::open(&identity_json(&alice, &phone), &hub.did(), "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
-                                Config::DSIP_MSG, NOW as f64).unwrap();
+                                NOW as f64).unwrap();
 
     // an introduction sealed to bob's key agreement key (a did:key's, M§6.9), announced to our own mailbox first
     let intro: Value = serde_json::from_str(&m.introduce(&bob.did(), "lunch?", false, NOW as f64).unwrap()).unwrap();
@@ -263,7 +271,7 @@ fn events_carry_what_a_host_prints() {
         KeyPair::from_fixture_name("bob"), KeyPair::from_fixture_name("bob-phone"), KeyPair::from_fixture_name("bob-recorder"));
     let mut hub = Hub::new();
     let mut m = Messenger::open(&identity_json(&alice, &phone), &hub.did(), "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
-                                Config::DSIP_MSG, NOW as f64).unwrap();
+                                NOW as f64).unwrap();
     let out = m.create_personal(NOW as f64).unwrap();
     hub.drive(&mut m, &out);
 
@@ -331,7 +339,7 @@ fn a_host_that_waits_for_its_commands_and_syncs_when_asked() {
         KeyPair::from_fixture_name("bob"), KeyPair::from_fixture_name("bob-phone"), KeyPair::from_fixture_name("bob-recorder"));
     let mut hub = Hub::new();
     let mut m = Messenger::open(&identity_json(&alice, &phone), &hub.did(), "wss://mbx.example/dsip", MemoryStore::default(), &Value::Null,
-                                Config::DSIP_MSG, NOW as f64).unwrap();
+                                NOW as f64).unwrap();
     assert!(m.settled(), "nothing done yet");
     let out = m.create_personal(NOW as f64).unwrap();
     assert!(!m.settled(), "the GroupInfo awaits its answer (M§5.3)");

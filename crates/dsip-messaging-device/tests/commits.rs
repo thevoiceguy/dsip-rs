@@ -1,7 +1,8 @@
 //! Commits both messaging clients make, on real MLS: an Add with its welcome and grants, a whole identity's leaves
-//! removed, a device's leaves found by credential, a move of the hub, and `CommitRetry`'s decisions read as types.
+//! removed, a device's leaves found by credential, a move of the hub, `CommitRetry`'s decisions read as types, and
+//! what a lapsed member's leaf still counts for: an Add of its device, and the roster recorded for successors.
 //!
-//! Spec: M§6.5 (spec-gap 58), M§7.2, M§7.3 (spec-gap 126), M§7.4 (spec-gap 60), M§14.2.
+//! Spec: M§6.5 (spec-gap 58), M§7.2, M§7.3 (spec-gap 126), M§7.4 (spec-gap 60), M§7.5 (spec-gap 139), M§14.2.
 
 use openmls::prelude::*;
 use serde_json::json;
@@ -17,8 +18,13 @@ use dsip_mls::{authenticate_key_package, Device};
 const NOW: i64 = 1_790_000_000;
 
 fn device(identity: &str, dev: &str) -> (String, String, Device) {
+    device_for(identity, dev, 7)
+}
+
+/// A device whose delegation lapses `days` from `NOW`.
+fn device_for(identity: &str, dev: &str, days: i64) -> (String, String, Device) {
     let (i, d) = (KeyPair::from_fixture_name(identity), KeyPair::from_fixture_name(dev));
-    let p = delegation_payload(&i.did(), &d.did(), NOW - 3600, NOW + 7 * 86400, &["dsip.signaling", "dsip.messaging"]);
+    let p = delegation_payload(&i.did(), &d.did(), NOW - 3600, NOW + days * 86400, &["dsip.signaling", "dsip.messaging"]);
     let e = sign(&p, &i, &i.kid());
     let did = d.did();
     (i.did(), did, Device::new(d, format!("{}.{}.{}", e.protected, e.payload, e.signature)))
@@ -104,4 +110,36 @@ fn retry_decisions_as_types() {
 
     // any other refusal: given up at once
     assert_eq!(Retry::default().answer(Some("auth.forbidden")), Answer::Discard { surface: Some("auth.forbidden".into()) });
+}
+
+#[test]
+fn a_lapsed_leaf_is_still_a_member() {
+    let resolver = StaticResolver::default();
+    let ctx = Context::new(NOW, &resolver);
+    let (alice, _, alice_dev) = device("alice", "alice-phone");
+    let (bob, bob_phone, bob_dev) = device_for("bob", "bob-phone", 2); // Bob's phone's delegation lapses in two days
+    let conv = json!({"conversation": "01K742SG00XZRF7H1Z8WN9CGAD", "kind": "direct",
+                      "hub": {"did": "did:web:mbx.example", "uri": "wss://mbx.example/dsip"}, "successor_of": null});
+    let mut g = alice_dev.create_group(b"group-3", &serde_json::to_vec(&conv).unwrap()).unwrap();
+    let kp = authenticate_key_package(&bob_dev.key_package().unwrap(), alice_dev.provider(), &ctx).unwrap().0;
+    commits::build(&alice_dev, &mut g, Change::Add(&[kp])).unwrap();
+    g.merge_pending_commit(alice_dev.provider()).unwrap();
+    let mut both = vec![alice.clone(), bob.clone()];
+    both.sort();
+
+    // today: Bob and his phone are there, and both identities are the roster
+    assert!(!commits::add_needed(&g, &ctx, &bob, Some(&bob_phone)));
+    assert!(!commits::add_needed(&g, &ctx, &bob, None));
+    assert_eq!(commits::roster(&g), Some(both.clone()));
+
+    // a week on, Bob's phone no longer authenticates, but its leaf is there until a commit removes it
+    let later = Context::new(NOW + 7 * 86400, &resolver);
+    assert!(!commits::has_member(&g, &later, &bob, None));
+    // M§6.5: an Add of the phone is not needed; one beside its lapsed leaf would repeat its signature key, refused
+    assert!(!commits::add_needed(&g, &later, &bob, Some(&bob_phone)));
+    let (_, _, renewed) = device_for("bob", "bob-phone", 30);
+    let kp = authenticate_key_package(&renewed.key_package().unwrap(), alice_dev.provider(), &later).unwrap().0;
+    assert!(commits::build(&alice_dev, &mut g, Change::Add(&[kp])).is_err(), "MLS refuses a second leaf with one signature key");
+    // M§7.5 (spec-gap 139): Bob stays in the roster recorded for successor checks
+    assert_eq!(commits::roster(&g), Some(both));
 }

@@ -318,12 +318,24 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    private read applied to the conversation, with the archived copy of it kept back so only the receipt can carry it);
    each fails on the code before. The test library holds or drops what a page's sockets receive, from an init script.
 
-   Where the two clients behave differently, stage 3 keeps each behaviour behind an option, and each option goes once
-   it is decided (with a vector where a rule is involved): the dedup key (with or without the sender); 20 s or 60 s before a deposit with no answer is an outage; a group's roster recorded for the successor
-   checks only when every leaf authenticates (dsip-msg) or from the leaves that do (browser); proposals stored
-   (browser); a welcome produced by a Remove deposited (dsip-msg) or dropped (browser); an Add of a named device still
-   needed while no leaf has its credential (dsip-msg) or no authenticated leaf is that device (browser); archive keys
-   overwritten or kept. Decided: when a call event is recorded (3j-1); the blob `tried` input (shared, 3j-1); a sealed
+   The last options go, and `Config` with them (2026-10-21): the `Messenger` behaves one way for both hosts, which set
+   only its timeouts. Decided by the spec: the dedup key carries the sender (M§8.5; the browser's saved messages are
+   keyed again on load); the object check is given the sender's device, so a `call-record` passes it (C§9) and is kept
+   when this device is a record-keeper; a leaver's proposals are stored and committed (M§7.3, spec-gap 125; dsip-msg
+   gains `leave`, and `group-demo.sh` has Alice's dsip-msg commit Carol's); and a welcome a commit produces is always
+   deposited (M§7.2). Left to the host: the no-answer timeout (spec-gap 72 sets none; `set_no_answer_timeout`, 60 s
+   unless set, dsip-msg `--no-answer-timeout` 20). Decided by the user: an Add of a named device is not needed while any
+   leaf carries its credential (a second leaf would repeat its signature key, which MLS refuses); the roster recorded
+   for the successor checks, and re-added by a successor's creator, is every leaf's delegation subject, lapsed leaves
+   included (spec-gap 139); and the first archive key under an `akid` is kept, a different one reported (spec-gap 140).
+   Found on the way: dsip-msg's `decline-recording` sent nothing, reading the leave's `[{send}]` as frames.
+
+   Where the two clients behaved differently, stage 3 kept each behaviour behind an option until it was decided: the
+   dedup key (with or without the sender); 20 s or 60 s before a deposit with no answer is an outage; a group's roster
+   recorded for the successor checks only when every leaf authenticates (dsip-msg) or from the leaves that do
+   (browser); proposals stored (browser); a welcome produced by a Remove deposited (dsip-msg) or dropped (browser); an
+   Add of a named device still needed while no leaf has its credential (dsip-msg) or no authenticated leaf is that
+   device (browser); archive keys overwritten or kept. Decided earlier: when a call event is recorded (3j-1); the blob `tried` input (shared, 3j-1); a sealed
    introduction opened without the identity key (shared, 3j-1: a device without the key keeps it unread); recorder
    content and acceptance keys (3j-3c); and with dsip-msg on the `Messenger` (3j-3d), the `Messenger`'s way for frames
    verified after the hello, receipt policy and activity, re-proposing once the sync is answered rather than waiting

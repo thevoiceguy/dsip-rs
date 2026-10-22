@@ -304,6 +304,27 @@ pub fn member_identity(group: &MlsGroup, index: LeafNodeIndex, ctx: &Context) ->
     authenticate_leaf_node(leaf, ctx).map_err(|c| MlsError(format!("sender leaf: {c}")))
 }
 
+/// The identity a member leaf belongs to, its delegation's `subject` (M§6.2), whether or not that delegation is still
+/// live: `None` when the leaf carries no single delegation naming its own credential's device. The leaf was
+/// authenticated when it entered the group; a lapsed delegation does not end its membership, a commit does.
+///
+/// Spec: M§6.2 (the identity a leaf belongs to), M§7.5 (the roster by identity).
+/// Impl: spec-gap 139 — the roster recorded for the successor checks counts lapsed leaves.
+pub fn leaf_subject(group: &MlsGroup, index: LeafNodeIndex) -> Option<String> {
+    let leaf = group.public_group().leaf(index)?;
+    let device = BasicCredential::try_from(leaf.credential().clone()).ok().map(|b| b.identity().to_vec())?;
+    let mut delegations = leaf.extensions().iter().filter_map(|e| match e {
+        Extension::Unknown(t, UnknownExtension(d)) if *t == EXT_DSIP_DELEGATION => Some(d.clone()),
+        _ => None,
+    });
+    let (Some(data), None) = (delegations.next(), delegations.next()) else { return None };
+    let text = String::from_utf8(data).ok()?;
+    let [protected, payload, signature] = text.split('.').collect::<Vec<_>>()[..] else { return None };
+    let deleg = dsip_core::envelope::Envelope { protected: protected.into(), payload: payload.into(), signature: signature.into() };
+    let (subject, named) = dsip_core::delegation::names(&deleg)?;
+    (named.as_bytes() == device.as_slice()).then_some(subject)
+}
+
 /// The `dsip_conversation` extension bytes of a group, if present.
 ///
 /// Spec: M§6.3.

@@ -6,8 +6,10 @@
 # every member's mailbox (M§6.5) and sends welcomes carrying the adder's own deposit as `origin`, which
 # the new member's mailbox verifies against its grant (M§14.2). Membership changes while members are
 # away: Bob adds Carol while Alice's device process is dead, and Alice removes Bob while Bob is
-# disconnected. Self-verifying: every expected line must appear, no device may hit an item it cannot
-# process, and Bob must not read anything sent after his removal.
+# disconnected; then Carol leaves, and Alice's device commits the Remove proposals Carol's deposited
+# (M§7.3 "Leaving": a member cannot commit its own removal). Self-verifying: every expected line must
+# appear, no device may hit an item it cannot process, and Bob must not read anything sent after his
+# removal.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -110,6 +112,13 @@ echo "sync" >&4
 wait_for "$DIR/b1.log" "^REMOVED from .* by=$ALICE" 30
 sleep 1
 
+echo "=== Carol leaves: her Remove proposal, committed by Alice's device (M§7.3, spec-gap 125)"
+echo "leave" >&5
+wait_for "$DIR/c1.log" "^OK leaving group=" 10
+wait_for "$DIR/a2.log" "^LEAVE committing the leave of $CAROL" 30
+wait_for "$DIR/a2.log" "^OK committed the leave of $CAROL" 30
+wait_for "$DIR/c1.log" "^REMOVED from .* by=$ALICE" 30
+
 echo "quit" >&3; echo "quit" >&4; echo "quit" >&5; sleep 0.5
 if grep -q "Just the two of us now" "$DIR/b1.log"; then
   echo "FAIL: Bob read a message sent after his removal"; exit 1
@@ -119,10 +128,11 @@ if grep -HE "^(\?\?|ERR)" "$DIR"/[abc][12].log; then
 fi
 for x in a b c; do
   echo "=== ${NAME[$x]}'s devices saw:"
-  grep -hE "^(JOINED|RECV|EPOCH|REMOVED|SELF|OK (added|removed|sent))" "$DIR/$x"[12].log 2>/dev/null
+  grep -hE "^(JOINED|RECV|EPOCH|REMOVED|SELF|LEAVE|OK (added|removed|sent|leaving|committed))" "$DIR/$x"[12].log 2>/dev/null
 done
 echo "=== hub (Alice's mailbox):"
 grep -E "hub sequenced|hubbing" "$DIR/mbx-a.log" | sed 's/.*dsip_mailbox[^ ]* //'
 echo
 echo "PASS: three identities, three mailboxes, forwarding to the hub, welcomes proven by origin,"
-echo "      an add while a member's device was dead, and a removal while the removed member was away."
+echo "      an add while a member's device was dead, a removal while the removed member was away,"
+echo "      and a leave committed by another member."

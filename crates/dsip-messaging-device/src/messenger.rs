@@ -1,7 +1,7 @@
 //! The messaging device, sans-I/O: this identity's device key under its delegation, its MLS groups and the state
 //! the Messaging Profile asks a device to keep, driven with JSON strings and emitting frames and events. The host
 //! moves frames between it and the mailbox and keeps the clock. The browser (`dsip-wasm`) and dsip-msg are its hosts,
-//! their differences behind [`Config`].
+//! which set its timeouts and nothing else of its behaviour.
 //!
 //! Spec: M§4.2 (the mailbox a `did:key` identity names in its reachability hint; the peer's found the same way),
 //! M§4.3 (bind with a verified `hello`; the delegation carries `dsip.messaging`), M§5.2–M§5.5 (`deposit`,
@@ -28,7 +28,8 @@
 //! state in one `save()` that the host writes as one record after each step — the atomic commit of spec-gap 44 in a
 //! browser; natively a SQLite database, where each item's MLS writes and delivery state commit in one transaction and
 //! the host writes [`Messenger::state`] after each step. A reload restores both. Pending deposits (not yet `accepted`) are kept with their bytes and re-deposited on the next bind (M§9.3:
-//! idempotent at the hub by digest). Where the clients still differ, [`Config`] holds both behaviours.
+//! idempotent at the hub by digest). The no-answer timeout (M§9.4) is the host's to set: spec-gap 72 counts a deposit
+//! with no answer as the hub unreachable without saying after how long.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -47,7 +48,7 @@ use crate::receipts::{self, Emission};
 use crate::successors::{self, Converge, Create, Successors};
 use crate::{archive, blob, calls, first_contact, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
     Receipts, Retry, Route};
-use crate::{Config, Store};
+use crate::Store;
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::mls_wire::{open, seal, SealUse};
@@ -72,6 +73,11 @@ fn s_of(v: &Value) -> String {
 fn compact(e: &Envelope) -> String {
     format!("{}.{}.{}", e.protected, e.payload, e.signature)
 }
+
+/// Seconds before a deposit with no answer at all counts as the hub unreachable (M§9.4), until the host sets it.
+///
+/// Impl: spec-gap 72 sets no time; 60 s covers a slow mobile link (the browser's), dsip-msg sets 20.
+const NO_ANSWER_S: i64 = 60;
 
 /// One group this device is in.
 struct Conv {
@@ -252,8 +258,6 @@ pub struct Messenger<S: Store = MemoryStore> {
     /// Deposits awaiting their answer, by deposit id: what each was, the hub it went to, when an application deposit
     /// went out (M§9.4), and those the group's new hub refused before it hosted the group, due again (spec-gap 129).
     pending: Deposits<Pending>,
-    /// Where the two clients still behave differently (dsip-rs stage 3i): this host's behaviour.
-    config: Config,
     /// Application items not yet accepted, per group, oldest first: `{id, mls, obj}` (M§9.2).
     outbox: Outbox,
     /// The thread, every content object shown, in arrival order: `{group, key, sender, sender_device, object, seq, mine}`.
@@ -332,12 +336,12 @@ pub struct Messenger<S: Store = MemoryStore> {
 impl Messenger<MemoryStore> {
     /// The browser's device: `identity_json` as returned by `create_identity`; `mailbox_did`/`mailbox_uri` this
     /// identity's mailbox (M§4.2: the operator's, from `config.json`, or the person's); `saved_json` what
-    /// [`Messenger::save`] returned, or null for a fresh device. It behaves as [`Config::BROWSER`].
+    /// [`Messenger::save`] returned, or null for a fresh device.
     pub fn new(identity_json: &str, mailbox_did: &str, mailbox_uri: &str, saved_json: Option<String>, now: f64) -> Result<Messenger, Error> {
         let saved: Value = saved_json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
         // the MLS storage as saved: `{b64url key: b64url value}`
         let store = MemoryStore::from_mls_json(&saved["mls"]);
-        Messenger::open(identity_json, mailbox_did, mailbox_uri, store, &saved["state"], Config::BROWSER, now)
+        Messenger::open(identity_json, mailbox_did, mailbox_uri, store, &saved["state"], now)
     }
 
     /// Everything to keep: the MLS storage and this device's delivery state, as one JSON record. The host writes it
@@ -349,8 +353,8 @@ impl Messenger<MemoryStore> {
 
 impl<S: Store> Messenger<S> {
     /// A device over `store`, which holds its MLS state, with the delivery state `state` that [`Messenger::state`]
-    /// returned (null for a fresh device), behaving as `config` says where the clients differ.
-    pub fn open(identity_json: &str, mailbox_did: &str, mailbox_uri: &str, store: S, state: &Value, config: Config, now: f64) -> Result<Messenger<S>, Error> {
+    /// returned (null for a fresh device).
+    pub fn open(identity_json: &str, mailbox_did: &str, mailbox_uri: &str, store: S, state: &Value, now: f64) -> Result<Messenger<S>, Error> {
         let id: Value = serde_json::from_str(identity_json).map_err(err)?;
         let device = KeyPair::from_seed(unhex(id["device_seed_hex"].as_str().unwrap_or(""))?);
         let delegation = Envelope::from_frame(id["delegation"].as_str().unwrap_or("")).map_err(|v| Error::from(format!("{:?}", v.code)))?;
@@ -379,10 +383,9 @@ impl<S: Store> Messenger<S> {
             personal: st["personal"].as_str().map(String::from),
             resume: Resume::new(if st["resume"].is_object() { &st["resume"] } else { &Value::Null }),
             own: st["own"].as_array().into_iter().flatten().map(s_of).collect(),
-            config,
             // M§9.3: deposits awaiting an answer are sent again at the next binding (redeposit_pending)
             pending: {
-                let mut d = Deposits::new(config.no_answer_s);
+                let mut d = Deposits::new(NO_ANSWER_S);
                 for (id, p) in st["pending"].as_object().into_iter().flatten() {
                     if let Some(p) = Pending::from_json(p) {
                         d.insert(id.clone(), p);
@@ -391,8 +394,10 @@ impl<S: Store> Messenger<S> {
                 d
             },
             outbox: Outbox { items: serde_json::from_value(st["outbox"].clone()).unwrap_or_default(), ..Outbox::new(dsip_messaging::client::HUB_TIMEOUT_S) },
-            messages: st["messages"].as_array().cloned().unwrap_or_default(),
-            shown: st["messages"].as_array().into_iter().flatten().map(|m| s_of(&m["key"])).collect(),
+            // a key saved by the browser before the sender was in it (`conversation:id`) is made again (M§8.5)
+            messages: st["messages"].as_array().cloned().unwrap_or_default().into_iter()
+                .map(|mut m| { m["key"] = json!(history::object_key(&m["object"])); m }).collect(),
+            shown: st["messages"].as_array().into_iter().flatten().map(|m| history::object_key(&m["object"])).collect(),
             grants_held: serde_json::from_value(st["grants_held"].clone()).unwrap_or_default(),
             archive_keys: st["archive_keys"].as_object().into_iter().flatten()
                 .map(|(a, v)| (a.clone(), (unb64(&v["key"]), v["created_at"].as_i64().unwrap_or(0)))).collect(),
@@ -483,6 +488,12 @@ impl<S: Store> Messenger<S> {
     /// Seconds a seq gap may stay open before the group counts as lost (M§6.5, spec-gap 69).
     pub fn set_gap_timeout(&mut self, seconds: i64) {
         self.gap_timeout = seconds;
+    }
+
+    /// Seconds after which a deposit with no answer at all counts as the hub unreachable (M§9.4, spec-gap 72), 60 unless
+    /// set.
+    pub fn set_no_answer_timeout(&mut self, seconds: i64) {
+        self.pending.no_answer = seconds;
     }
 
     /// Whether this device's delegation carries `dsip.messaging` (M§4.3): without it the mailbox refuses the binding.
@@ -604,7 +615,7 @@ impl<S: Store> Messenger<S> {
     /// follow once the successor holds its members (M§9.4). Frames.
     pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<String, Error> {
         let now_i = now as i64;
-        self.track_rosters(now_i);
+        self.track_rosters();
         let me = self.keys.identity.clone();
         let peers = match self.successors.create(dead, &me) {
             Create::Use(w) => {
@@ -1703,10 +1714,8 @@ impl<S: Store> Messenger<S> {
                 (Change::Add(&packages), grants.as_slice())
             }
         };
-        let mut built = commits::build(&self.mls, &mut c.group, change).map_err(err)?;
-        if !self.config.deposits_welcome(matches!(op, Op::Add { .. })) {
-            built.welcome = None;
-        }
+        // M§7.2: a welcome, whatever commit produced it, goes with the commit, or a member it adds is left out
+        let built = commits::build(&self.mls, &mut c.group, change).map_err(err)?;
         let fields = built.fields(grants);
         let frame = self.hub_deposit(gid, "handshake", fields.clone(), now);
         let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
@@ -1799,7 +1808,7 @@ impl<S: Store> Messenger<S> {
         };
         if obj["object"] == "content" {
             // shown at once as ours; its seq is filled in by the hub's accepted (M§8.5)
-            let key = self.config.object_key(obj);
+            let key = history::object_key(obj);
             self.shown.insert(key.clone());
             self.messages.push(json!({"group": gid, "key": key, "sender": self.keys.identity, "sender_device": self.keys.device.did(),
                 "object": obj, "seq": null, "mine": true, "item": item["id"]}));
@@ -1942,7 +1951,7 @@ impl<S: Store> Messenger<S> {
                     out.extend(self.receipt_sends(&gid, emissions, now));
                     // M§12.2: our own content is archived under the seq of its accepted (spec-gap 51); our read watermark
                     // (spec-gap 68) and call events (spec-gap 63) too, as state for a device added later
-                    let decisions = self.history.sent(&gid, seq, &self.config.object_key(&obj), &obj);
+                    let decisions = self.history.sent(&gid, seq, &history::object_key(&obj), &obj);
                     let (me, dev) = (self.keys.identity.clone(), self.keys.device.did());
                     out.extend(self.archive_requests(&gid, &decisions, &obj, &me, &dev, seq, now));
                 }
@@ -2080,7 +2089,7 @@ impl<S: Store> Messenger<S> {
                 Op::RemoveDevice { device, .. } => self.convs.get(&gid).is_some_and(|c| !commits::device_leaves(&c.group, device).is_empty()),
                 Op::Add { peer, device, .. } => {
                     let ctx = self.ctx(now);
-                    self.convs.get(&gid).is_some_and(|c| self.config.add_needed(&c.group, &ctx, peer, device.as_deref()))
+                    self.convs.get(&gid).is_some_and(|c| commits::add_needed(&c.group, &ctx, peer, device.as_deref()))
                 }
             };
             let moved = self.hub_moved_since(&gid);
@@ -2207,7 +2216,7 @@ impl<S: Store> Messenger<S> {
             let mut delivery = Inbound { resume: &mut self.resume, own: &self.own, gaps: &mut self.gaps, held_items: &mut self.held_items,
                                          gap_timeout: self.gap_timeout };
             // committed: the delivery state records the item with its MLS effect (the host saves both together)
-            delivery.commit_processed(mls.provider(), item, || process(mls, target, &class, &bytes, &ctx, &me, self.config.process))
+            delivery.commit_processed(mls.provider(), item, || process(mls, target, &class, &bytes, &ctx, &me))
         };
         let outcome = match result {
             Ok(o) => o,
@@ -2336,9 +2345,10 @@ impl<S: Store> Messenger<S> {
             Some("archive-key") => {
                 let akid = s_of(&object["akid"]);
                 let created = object["created_at"].as_i64().unwrap_or(0);
-                let fresh = !self.archive_keys.contains_key(&akid);
-                if fresh || self.config.replace_archive_keys {
-                    self.archive_keys.insert(akid.clone(), (unb64(&object["key"]), created));
+                let arrival = archive::take_key(&mut self.archive_keys, &akid, unb64(&object["key"]), created);
+                let fresh = arrival == archive::KeyArrival::Fresh;
+                if arrival == archive::KeyArrival::Conflict {
+                    out.push(json!({"ui": "dropped", "why": format!("archive-key {akid} from {sender_device}: another key under an akid already held; the first is kept (spec-gap 140)")}));
                 }
                 // M§12.3 step 5 (spec-gap 51): records kept for this key open now
                 // what the machine held for this key is released from held_archive below
@@ -2353,7 +2363,7 @@ impl<S: Store> Messenger<S> {
             }
             Some("call-event") => {
                 // M§13.3: every device of the identity shows one entry per call, whichever device sent it
-                let key = self.config.object_key(&object);
+                let key = history::object_key(&object);
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
                 let decisions = self.history.mls(gid, seq, epoch, &key, &object);
                 out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
@@ -2386,7 +2396,7 @@ impl<S: Store> Messenger<S> {
                 out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
             }
             Some("content") => {
-                let key = self.config.object_key(&object);
+                let key = history::object_key(&object);
                 if !self.shown.insert(key.clone()) {
                     out.push(json!({"ui": "duplicate_content", "seq": seq}));
                     return out;
@@ -2517,12 +2527,14 @@ impl<S: Store> Messenger<S> {
                 let pending: Vec<Value> = items.iter().map(|i| json!({"item": i["id"], "id": i["obj"]["id"]})).collect();
                 self.messages.retain(|m| !ids.contains(&m["item"]));
                 for i in &items {
-                    self.shown.remove(&self.config.object_key(&i["obj"]));
+                    self.shown.remove(&history::object_key(&i["obj"]));
                 }
                 self.handover.entry(gid.to_string()).or_default().extend(items.into_iter().map(|i| i["obj"].clone()));
-                self.track_rosters(now);
+                self.track_rosters();
                 let me = self.keys.identity.clone();
-                let roster: Vec<String> = self.member_identities(gid, now).into_iter().filter(|i| *i != me).collect();
+                // M§7.5: the roster the members check it against (spec-gap 139), so it adds nobody they would refuse
+                let roster: Vec<String> = self.convs.get(gid).and_then(|c| commits::roster(&c.group)).unwrap_or_default()
+                    .into_iter().filter(|i| *i != me).collect();
                 out.push(json!({"successor_due": {"group": gid, "peers": roster, "kind": self.convs.get(gid).map(|c| c.kind.clone()),
                     "existing": self.successors.successor(gid), "pending": pending}}));
             }
@@ -2540,7 +2552,7 @@ impl<S: Store> Messenger<S> {
             self.convs.get(group).map(|c| successors::creator(&c.group, &ctx)).unwrap_or_default()
         };
         // the predecessor's roster as this device last processed it; the new group itself is not tracked yet
-        self.track_rosters_but(Some(group), now);
+        self.track_rosters_but(Some(group));
         for d in self.successors.welcome(group, pred, &creator, &roster) {
             if let Converge::Join(_) = d {
                 out.push(json!({"ui": "successor", "group": group, "of": pred, "creator": creator}));
@@ -2549,7 +2561,7 @@ impl<S: Store> Messenger<S> {
                 let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
                 self.messages.retain(|m| !ids.contains(&m["item"]));
                 for i in &items {
-                    self.shown.remove(&self.config.object_key(&i["obj"]));
+                    self.shown.remove(&history::object_key(&i["obj"]));
                 }
                 let mut waiting = self.handover.remove(pred).unwrap_or_default();
                 waiting.extend(items.into_iter().map(|i| i["obj"].clone()));
@@ -2597,15 +2609,14 @@ impl<S: Store> Messenger<S> {
     }
 
     /// Record every group's roster by identity for the successor checks (M§7.5: the last roster this device processed).
-    fn track_rosters(&mut self, now: i64) {
-        self.track_rosters_but(None, now);
+    fn track_rosters(&mut self) {
+        self.track_rosters_but(None);
     }
 
     /// [`Self::track_rosters`], except for `skip`.
-    fn track_rosters_but(&mut self, skip: Option<&str>, now: i64) {
-        let ctx = Context::new(now, &self.resolver);
+    fn track_rosters_but(&mut self, skip: Option<&str>) {
         let rosters: Vec<(String, Vec<String>)> = self.convs.iter().filter(|(g, _)| Some(g.as_str()) != skip)
-            .filter_map(|(g, c)| self.config.roster(&c.group, &ctx).map(|r| (g.clone(), r))).collect();
+            .filter_map(|(g, c)| commits::roster(&c.group).map(|r| (g.clone(), r))).collect();
         for (g, r) in rosters {
             self.successors.member_of(&g, &r);
         }
@@ -2897,7 +2908,7 @@ impl<S: Store> Messenger<S> {
             Err(archive::OpenError::NotJson) => return out,
         };
         let obj = opened.record["payload"].clone();
-        let key_id = self.config.object_key(&obj);
+        let key_id = history::object_key(&obj);
         let decisions = self.history.opened(item, &opened, &key_id);
         let (gid, seq, record) = (opened.group, opened.seq, opened.record);
         let sender = s_of(&record["sender"]);

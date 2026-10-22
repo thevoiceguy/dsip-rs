@@ -78,7 +78,7 @@ pub enum Outcome {
         /// The identities left.
         remaining: Vec<String>,
     },
-    /// A proposal stored for the next commit (M§7.3 "Leaving", [`ProcessOptions::store_proposals`]): the proposer's
+    /// A proposal stored for the next commit (M§7.3 "Leaving"): the proposer's
     /// pending proposals in this epoch, Remove ones as `{identity, device}` and the count of others, with the roster.
     Proposal {
         /// `{identity, device}` of the proposer.
@@ -92,20 +92,6 @@ pub enum Outcome {
     },
     /// Nothing to act on.
     Nothing,
-}
-
-/// Where the two clients differ today; stage 3 keeps each client's behaviour, and each option goes once it is decided.
-///
-/// Impl: the browser sets every option, `dsip-msg` none (the stage 3 plan's behaviour differences 12 and 13); each
-/// client's are in its [`crate::Config`] preset.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ProcessOptions {
-    /// Give the object check the sender's device (`leaf_device`) as well as its identity.
-    pub leaf_device_in_check: bool,
-    /// C§9: keep call records (`store: call-record`), which render nothing, as objects for a record-keeper.
-    pub keep_call_records: bool,
-    /// M§7.3 "Leaving": store a member's proposals for the next commit and report them (else they are ignored).
-    pub store_proposals: bool,
 }
 
 fn mls_err<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> MlsError {
@@ -125,7 +111,7 @@ fn leaf_device(group: &MlsGroup, idx: LeafNodeIndex) -> String {
 /// Process one MLS item: `group` is the target group with its conversation id and kind (a welcome needs none),
 /// `class` the item's class (`welcome`, else a handshake or application message), `me` this device's identity.
 pub fn process<P: OpenMlsProvider>(mls: &Device<P>, group: Option<(&mut MlsGroup, &str, &str)>, class: &str, bytes: &[u8], ctx: &Context,
-                                   me: &str, opts: ProcessOptions) -> Result<Outcome, MlsError> {
+                                   me: &str) -> Result<Outcome, MlsError> {
     if class == "welcome" {
         let (joined, adder) = match mls.join_from(bytes) {
             Ok(g) => g,
@@ -160,10 +146,7 @@ pub fn process<P: OpenMlsProvider>(mls: &Device<P>, group: Option<(&mut MlsGroup
             if let Some(device) = lapsed_leaf {
                 return Ok(Outcome::Unauthenticated(format!("{} from {device}: its delegation no longer verifies", obj["id"])));
             }
-            let mut octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender});
-            if opts.leaf_device_in_check {
-                octx["leaf_device"] = json!(sender_device);
-            }
+            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender, "leaf_device": sender_device});
             let verdict = check_object(&obj, &octx);
             if verdict["verdict"] != "accept" {
                 return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));
@@ -172,7 +155,7 @@ pub fn process<P: OpenMlsProvider>(mls: &Device<P>, group: Option<(&mut MlsGroup
                 // C§5: content from a recorder leaf is treated as from an unauthenticated leaf: not rendered, not archived
                 return Ok(Outcome::RecorderContent { device: sender_device, id: obj["id"].clone() });
             }
-            if opts.keep_call_records && verdict["effective"]["store"] == "call-record" {
+            if verdict["effective"]["store"] == "call-record" {
                 return Ok(Outcome::Object { sender, sender_device, object: obj }); // C§9: kept, never rendered
             }
             if verdict["effective"]["render"] == "ignore" {
@@ -247,7 +230,7 @@ pub fn process<P: OpenMlsProvider>(mls: &Device<P>, group: Option<(&mut MlsGroup
             }
             Ok(Outcome::Epoch { epoch: group.epoch().as_u64(), by: sender, added, removed, left, hub })
         }
-        ProcessedMessageContent::ProposalMessage(qp) if opts.store_proposals => {
+        ProcessedMessageContent::ProposalMessage(qp) => {
             // M§7.3 "Leaving" (spec-gap 125): stored for the commit that covers it; the decision is the caller's
             group.store_pending_proposal(mls.provider().storage(), *qp).map_err(mls_err("store proposal"))?;
             let leaf = |idx: LeafNodeIndex| member_identity(group, idx, ctx).ok().map(|w| json!({"identity": w.identity, "device": w.device}));

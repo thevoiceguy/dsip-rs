@@ -1,10 +1,39 @@
 //! Archive records: content shown from MLS sealed under an archive key for later devices, and archive items opened.
 //!
-//! Spec: M§12.1 (archive keys), M§12.2 (the `archive-record`, sealed with AAD `group_id ‖ seq`), M§12.3 step 5
+//! Spec: M§12.1 (archive keys, the first under an `akid` kept: spec-gap 140), M§12.2 (the `archive-record`, sealed with AAD `group_id ‖ seq`), M§12.3 step 5
 //! (history from the archive).
+
+use std::collections::BTreeMap;
 
 use dsip_messaging::mls_wire::{open, seal, SealUse};
 use serde_json::{json, Value};
+
+/// What a received `archive-key` was to the keys a device holds, by `akid`: `(key, created_at)` (M§12.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyArrival {
+    /// New: now held.
+    Fresh,
+    /// The key already held under its `akid` (a sibling's copy, or one redelivered).
+    Held,
+    /// Another key under an `akid` already held: the first stays (spec-gap 140).
+    Conflict,
+}
+
+/// Take a received `archive-key` into `held`: the first key under an `akid` is the one kept, so archive records already
+/// sealed under it stay readable.
+///
+/// Spec: M§12.1 (devices keep every archive key).
+/// Impl: spec-gap 140 — a different key under an `akid` already held is ignored and reported, never replaces it.
+pub fn take_key(held: &mut BTreeMap<String, (Vec<u8>, i64)>, akid: &str, key: Vec<u8>, created_at: i64) -> KeyArrival {
+    match held.get(akid) {
+        None => {
+            held.insert(akid.to_string(), (key, created_at));
+            KeyArrival::Fresh
+        }
+        Some((k, _)) if *k == key => KeyArrival::Held,
+        Some(_) => KeyArrival::Conflict,
+    }
+}
 
 /// Where an archived object was received, and from whom.
 pub struct Received<'a> {

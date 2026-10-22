@@ -1,5 +1,5 @@
 //! The shared item processing on real MLS: a welcome joined and attributed to the member who added us, content
-//! checked and handed over, a forged sender dropped, and a leave proposal ignored or stored as the host's options say.
+//! checked and handed over, a forged sender dropped, and a member's leave proposals stored and reported together.
 //!
 //! Spec: M§6.2, M§7.3 ("Leaving", spec-gap 125), M§8.1.
 
@@ -12,11 +12,10 @@ use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{sign, Context};
 use dsip_core::keys::KeyPair;
 use dsip_core::ulid::Ulid;
-use dsip_messaging_device::{process, Outcome, ProcessOptions};
+use dsip_messaging_device::{process, Outcome};
 use dsip_mls::{authenticate_key_package, Device};
 
 const NOW: i64 = 1_790_000_000;
-const ALL: ProcessOptions = ProcessOptions { leaf_device_in_check: true, keep_call_records: true, store_proposals: true };
 
 fn ulid(n: u8) -> String {
     Ulid::from_parts((NOW as u64) * 1000 + u64::from(n), [n; 10]).as_str().to_string()
@@ -52,7 +51,7 @@ fn one_processing_for_every_host() {
     ag.merge_pending_commit(alice_dev.provider()).unwrap();
 
     // a welcome: joined, every member authenticated, the add attributed to Alice (M§6.2, M§7.3)
-    let joined = process(&bob_phone, None, "welcome", &bytes(&welcome), &ctx, &bob, ProcessOptions::default()).unwrap();
+    let joined = process(&bob_phone, None, "welcome", &bytes(&welcome), &ctx, &bob).unwrap();
     let Outcome::Joined { members, conv: got, by, .. } = joined else { panic!("{joined:?}") };
     assert_eq!(by, alice);
     assert!(members.contains(&alice) && members.contains(&bob));
@@ -67,23 +66,24 @@ fn one_processing_for_every_host() {
                                             "kind": "text", "purpose": "message", "content_type": "text/plain", "text": "Dinner at 7?"});
     let send = |g: &mut MlsGroup, o: &Value| bytes(&g.create_message(alice_dev.provider(), &alice_dev.signer(), &serde_json::to_vec(o).unwrap()).unwrap());
     let m = send(&mut ag, &text(3, &alice));
-    let out = process(&bob_laptop, Some((&mut bg, &conversation, "group")), "application", &m, &ctx, &bob, ALL).unwrap();
+    let out = process(&bob_laptop, Some((&mut bg, &conversation, "group")), "application", &m, &ctx, &bob).unwrap();
     assert!(matches!(&out, Outcome::Object { sender, object, .. } if *sender == alice && object["text"] == "Dinner at 7?"), "{out:?}");
     let forged = send(&mut ag, &text(4, &bob));
-    let out = process(&bob_laptop, Some((&mut bg, &conversation, "group")), "application", &forged, &ctx, &bob, ALL).unwrap();
+    let out = process(&bob_laptop, Some((&mut bg, &conversation, "group")), "application", &forged, &ctx, &bob).unwrap();
     assert!(matches!(out, Outcome::Dropped(_)), "{out:?}");
     assert_eq!(bg.group_id().as_slice(), gid.as_slice());
 
-    // a leave proposal (M§7.3 "Leaving"): ignored without store_proposals, stored and reported with it
-    let own = bytes(&bg.leave_group(bob_laptop.provider(), &bob_laptop.signer()).unwrap());
-    let out = process(&alice_dev, Some((&mut ag, &conversation, "group")), "handshake", &own, &ctx, &alice, ProcessOptions::default()).unwrap();
-    assert_eq!(out, Outcome::Nothing);
-    assert_eq!(ag.pending_proposals().count(), 0, "not stored");
+    // leave proposals (M§7.3 "Leaving"): each stored for the next commit, reported with the proposer's others
+    let laptop_leaves = bytes(&bg.leave_group(bob_laptop.provider(), &bob_laptop.signer()).unwrap());
+    let out = process(&alice_dev, Some((&mut ag, &conversation, "group")), "handshake", &laptop_leaves, &ctx, &alice).unwrap();
+    let Outcome::Proposal { removes, .. } = out else { panic!("{out:?}") };
+    assert_eq!(removes, vec![json!({"identity": bob, "device": bob_laptop.did()})]);
     let phone_leaves = bytes(&pg.leave_group(bob_phone.provider(), &bob_phone.signer()).unwrap());
-    let out = process(&alice_dev, Some((&mut ag, &conversation, "group")), "handshake", &phone_leaves, &ctx, &alice, ALL).unwrap();
+    let out = process(&alice_dev, Some((&mut ag, &conversation, "group")), "handshake", &phone_leaves, &ctx, &alice).unwrap();
     let Outcome::Proposal { proposer, removes, others, roster } = out else { panic!("{out:?}") };
     assert_eq!(proposer, json!({"identity": bob, "device": bob_phone.did()}));
-    assert_eq!(removes, vec![json!({"identity": bob, "device": bob_phone.did()})]);
+    assert_eq!(removes.len(), 2, "both of Bob's leaves: {removes:?}");
+    assert!(removes.contains(&json!({"identity": bob, "device": bob_phone.did()})));
     assert_eq!((others, roster.len()), (0, 3));
-    assert_eq!(ag.pending_proposals().count(), 1, "stored for the next commit");
+    assert_eq!(ag.pending_proposals().count(), 2, "stored for the next commit");
 }

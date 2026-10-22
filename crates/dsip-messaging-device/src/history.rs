@@ -17,6 +17,16 @@ use serde_json::{json, Value};
 
 use crate::archive::{self, Opened, Received};
 
+/// The key an object is shown and deduplicated by: `conversation|sender|id` (M§8.5), and for a call event
+/// `call|session`, one per session whichever device reported it (M§13.3, spec-gap 63).
+pub fn object_key(obj: &Value) -> String {
+    let s = |k: &str| obj[k].as_str().unwrap_or("");
+    if obj["object"] == "call-event" {
+        return format!("call|{}", s("session"));
+    }
+    format!("{}|{}|{}", s("conversation"), s("sender"), s("id"))
+}
+
 /// What the history machine decided.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
