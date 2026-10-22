@@ -204,8 +204,8 @@ impl Hub {
             return out;
         }
         if class == "ephemeral" {
-            // M§11.2: never sequenced or stored; dropped once expired
-            if d["expires_at"].as_i64().unwrap_or(0) < self.now {
+            // M§11.2: never sequenced or stored; dropped once expired (from expires_at, spec-gap 141)
+            if d["expires_at"].as_i64().unwrap_or(0) <= self.now {
                 return vec![];
             }
             if !self.roster.contains_key(&ident) {

@@ -284,16 +284,19 @@ pub fn verify(env: &Envelope, ctx: &Context, frame: Option<&str>) -> Result<Veri
         // Impl (spec-gap 7): symmetric window
         return Err(Verdict::reject(RejectCode::ReplayWindow));
     }
-    if ea < ctx.now {
+    // §12.9 (spec-gap 141): expires_at is the first instant the message is no longer valid
+    if ea <= ctx.now {
         return Err(if msg_type == "invite" {
             Verdict::reject_with(RejectCode::Expired, "session.expired")
         } else {
             Verdict::reject(RejectCode::Expired)
         });
     }
-    // Stage 10: dedup
+    // Stage 10: dedup. Not for a record kept and forwarded for its lifetime (§12.9, spec-gap 141): §8.3 decides a
+    // re-observed hint, `seq` a re-observed presence record (P§3)
     let id = p["id"].as_str().ok_or_else(|| shape("id"))?;
-    if ctx.seen_ids.contains(id) {
+    let kept = matches!(msg_type.as_str(), "reachability-hint" | "presence");
+    if !kept && ctx.seen_ids.contains(id) {
         return Err(Verdict::reject(RejectCode::DuplicateId));
     }
     // Stage 11: ULID timestamp vs issued_at (§20.6)

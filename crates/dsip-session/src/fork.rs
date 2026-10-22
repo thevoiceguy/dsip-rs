@@ -189,10 +189,10 @@ impl Relay {
     }
 
     /// Expire the legs that have sent nothing — no `progress`, `answer` or `reject` — once the invite has expired
-    /// (`expires_at < now`), and complete the attempt when that leaves no leg outstanding.
+    /// (from `expires_at`, spec-gap 141), and complete the attempt when that leaves no leg outstanding.
     ///
     /// Spec: §12.7 rules 3 and 6 (a leg terminates by answering, rejecting or expiring; the relay signals the
-    /// outcome, `transport.no-response` when every leg expired), §12.9 (expired is `expires_at < now`; T-Ring-Local).
+    /// outcome, `transport.no-response` when every leg expired), §12.9 (expired from `expires_at`, spec-gap 141; T-Ring-Local).
     /// §12.7 rule 3 (v0.16, spec-gap 132): a responder acts only on an unexpired invite and acts at once, so a leg still silent past
     /// the invite's expiry never processed it; a leg that rang ends itself with `reject user.no-answer` at
     /// T-Ring-Local. Attempts in id order, legs in device order (spec-gap 89). An attempt with no invite on record
@@ -201,7 +201,7 @@ impl Relay {
         let now = self.now;
         let sids: Vec<String> = self.attempts.keys().cloned().collect();
         for sid in sids {
-            if !self.invites.get(&sid).and_then(|inv| inv.expires_at).is_some_and(|e| e < now) {
+            if !self.invites.get(&sid).and_then(|inv| inv.expires_at).is_some_and(|e| e <= now) {
                 continue;
             }
             let att = self.attempts.get_mut(&sid).expect("listed");
@@ -403,7 +403,7 @@ impl Relay {
                     .map(|a| a.session.clone())
                     .collect();
                 for sid in live {
-                    let fresh = self.invites.get(&sid).map(|inv| inv.expires_at.unwrap_or(self.now + 1) >= self.now).unwrap_or(false); // `expired` is expires_at < now (§12.9)
+                    let fresh = self.invites.get(&sid).map(|inv| inv.expires_at.unwrap_or(self.now + 1) > self.now).unwrap_or(false); // `expired` from expires_at (§12.9, spec-gap 141)
                     if fresh {
                         let att = self.attempts.get_mut(&sid).expect("live");
                         att.legs.insert(device.clone(), LegState::Delivered);

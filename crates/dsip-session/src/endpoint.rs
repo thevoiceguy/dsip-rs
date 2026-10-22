@@ -555,8 +555,8 @@ impl Endpoint {
             }
             LocalEvent::Alert { ring_timeout, .. } => {
                 if s.role == Role::Responder && s.state == SessionState::Offered {
-                    if self.now > s.invite_expires_at.unwrap_or(i64::MAX) {
-                        // §12.4/§12.9: invite expires_at passed before alerting began
+                    if self.now >= s.invite_expires_at.unwrap_or(i64::MAX) {
+                        // §12.4/§12.9: the invite expired (from expires_at, spec-gap 141) before alerting began
                         self.send_simple("reject", &s.peer, &sid, Some("session.expired"));
                         self.end(&sid, None, false);
                         return;

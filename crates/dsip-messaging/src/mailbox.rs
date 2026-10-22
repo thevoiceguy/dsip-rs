@@ -397,7 +397,7 @@ impl Mailbox {
     fn advance(&mut self, n: i64) -> Vec<Value> {
         self.now += n;
         let now = self.now;
-        self.items.retain(|it| it.expires_at.is_none_or(|t| t >= now)); // §19.4: held until the envelope expires
+        self.items.retain(|it| it.expires_at.is_none_or(|t| t > now)); // §19.4: held until the envelope expires (at expires_at, spec-gap 141)
         let expired: Vec<String> = self
             .groups
             .iter()
@@ -523,7 +523,7 @@ impl Mailbox {
         if class == "ephemeral" {
             // M§11.2: pushed to bound devices, never stored, never acknowledged; dropped at the
             // originating deposit's expires_at (spec-gap 49)
-            if e["expires_at"].as_i64().is_some_and(|t| t < self.now) {
+            if e["expires_at"].as_i64().is_some_and(|t| t <= self.now) {
                 return out;
             }
             out.extend(self.bound.iter().map(|d| json!({"push": {"to": d, "class": "ephemeral"}})));

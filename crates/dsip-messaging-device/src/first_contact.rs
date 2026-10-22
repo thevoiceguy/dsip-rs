@@ -84,7 +84,7 @@ pub fn received(item: &Value, to: &str, ctx: &Context, now: i64, seed: Option<&[
         ver.payload["type"] == class
             && ver.payload["to"] == json!(to)
             // an introduction lives until its expires_at; a grant's delivery expiry has passed, its valid_until has not (§19.4)
-            && ver.payload[if class == "grant" { "valid_until" } else { "expires_at" }].as_i64().unwrap_or(0) >= now
+            && ver.payload[if class == "grant" { "valid_until" } else { "expires_at" }].as_i64().unwrap_or(0) > now
             && dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, ctx).ok()
     });
     let Some(ver) = checked else { return Received::DoesNotVerify };

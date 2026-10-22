@@ -195,8 +195,8 @@ pub fn evaluate(frame: &str, ctx: &Context, existing: Option<&Envelope>) -> Eval
     if let Some(ex_env) = existing {
         if let Some(ex) = payload_of(ex_env) {
             let ex_seq = ex["seq"].as_i64().unwrap_or(0);
-            if ex["expires_at"].as_i64().unwrap_or(0) < ctx.now {
-                // §8.3: records past expiration are invalid — the existing one carries no weight
+            if ex["expires_at"].as_i64().unwrap_or(0) <= ctx.now {
+                // §8.3: records past expiration (from expires_at, spec-gap 141) are invalid — the existing one carries no weight
             } else if hint.seq > ex_seq {
                 (winner, conflict) = ("input", Conflict::NewerSeq);
             } else if hint.seq < ex_seq {
