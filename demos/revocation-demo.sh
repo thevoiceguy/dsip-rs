@@ -29,6 +29,13 @@ wait_for() { # file pattern seconds
   for _ in $(seq $((n * 5))); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
   echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -30 "$f"; return 1
 }
+wait_more() { # file pattern count seconds: wait until the log holds more than `count` matching lines (one already
+  # there from an earlier step must not count again)
+  local f=$1 pat=$2 k=$3 n=${4:-20}
+  for _ in $(seq $((n * 5))); do [ "$(grep -cE "$pat" "$f" 2>/dev/null || true)" -gt "$k" ] && return 0; sleep 0.2; done
+  echo "TIMEOUT waiting for a new /$pat/ in $f"; echo "--- $f"; tail -8 "$f"; return 1
+}
+seen() { grep -cE "$2" "$1" 2>/dev/null || true; } # file pattern: how many matching lines the log holds now
 
 echo "=== mailboxes, documents, devices"
 $MBX --state "$DIR/mbx-a" --listen 127.0.0.1:9501 --owner "$ALICE" "${RESOLVER[@]}" --ca "$DIR/ca.pem" >"$DIR/mbx-a.log" 2>&1 &
@@ -82,7 +89,7 @@ wait_for "$DIR/bl.log" "^DISCONNECTED by the mailbox" 15
 wait_for "$DIR/mbx-b.log" "closed the binding of revoked device $LAPTOP" 5
 
 echo "=== Alice syncs after the revocation: the laptop's last message is unauthenticated, not shown (M§6.2)"
-echo "online" >&3; wait_for "$DIR/a.log" "OK connected" 15; echo "sync" >&3
+N=$(seen "$DIR/a.log" "OK connected"); echo "online" >&3; wait_more "$DIR/a.log" "OK connected" "$N" 15; echo "sync" >&3
 wait_for "$DIR/a.log" "^UNAUTHENTICATED .* from $LAPTOP: its delegation no longer verifies" 30
 if grep -q "^RECV $BOB: Sent just before the revocation" "$DIR/a.log"; then echo "FAIL: Alice showed a revoked device's message"; exit 1; fi
 

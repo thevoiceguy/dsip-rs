@@ -26,6 +26,13 @@ wait_for() { # file pattern seconds
   for _ in $(seq $((n * 5))); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
   echo "TIMEOUT waiting for /$pat/ in $f"; echo "--- $f"; tail -40 "$f"; return 1
 }
+wait_more() { # file pattern count seconds: wait until the log holds more than `count` matching lines (one already
+  # there from an earlier step must not count again)
+  local f=$1 pat=$2 k=$3 n=${4:-20}
+  for _ in $(seq $((n * 5))); do [ "$(grep -cE "$pat" "$f" 2>/dev/null || true)" -gt "$k" ] && return 0; sleep 0.2; done
+  echo "TIMEOUT waiting for a new /$pat/ in $f"; echo "--- $f"; tail -8 "$f"; return 1
+}
+seen() { grep -cE "$2" "$1" 2>/dev/null || true; } # file pattern: how many matching lines the log holds now
 fail() { echo "FAIL: $*"; exit 1; }
 grant_to() { # fd file out: send a grant and keep the new GRANT line (the log may hold earlier ones)
   local before; before=$(grep -c "^GRANT " "$2" || true)
@@ -126,9 +133,9 @@ PY
 ! grep -qE "^(ARCHIVE-KEY|HISTORY)" "$DIR/br.log" || fail "the recorder obtained Bob's archive"
 
 echo "=== conversations created after the recorder exists are recorded too, whoever creates them (C§5, M§7.2)"
-echo "kp 4" >&5; wait_for "$DIR/br.log" "OK uploaded" 10
-echo "kp 3" >&4; wait_for "$DIR/bp.log" "OK uploaded" 10
-echo "kp 3" >&3; wait_for "$DIR/a.log" "OK uploaded" 10
+N=$(seen "$DIR/br.log" "OK uploaded"); echo "kp 4" >&5; wait_more "$DIR/br.log" "OK uploaded" "$N" 10
+N=$(seen "$DIR/bp.log" "OK uploaded"); echo "kp 3" >&4; wait_more "$DIR/bp.log" "OK uploaded" "$N" 10
+N=$(seen "$DIR/a.log" "OK uploaded"); echo "kp 3" >&3; wait_more "$DIR/a.log" "OK uploaded" "$N" 10
 NB=$(grep -c "^JOINED .* kind=group" "$DIR/br.log" || true)
 echo "  Alice creates a group with Bob: every Bob device is added — his phone AND his recorder"
 grant_to 4 "$DIR/bp.log" "$DIR/grant2.txt" "$ALICE"
@@ -151,8 +158,9 @@ echo "  both new conversations are recorded and disclosed to Alice: $(grep -c '^
 
 echo "=== a misbehaving recorder sends anyway: both members drop it (C§5: receive-only)"
 kill $BR; wait $BR 2>/dev/null || true
+N=$(seen "$DIR/br.log" "OK connected")
 start_recorder --recorder-misbehave
-wait_for "$DIR/br.log" "OK connected" 20
+wait_more "$DIR/br.log" "OK connected" "$N" 20
 echo "live" >&5; sleep 2
 echo "send Speaking for Bob" >&5
 wait_for "$DIR/a.log" "^DROP recorder content from $REC" 30

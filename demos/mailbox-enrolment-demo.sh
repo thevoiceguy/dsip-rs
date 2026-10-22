@@ -31,6 +31,13 @@ wait_for() { # file pattern seconds
   for _ in $(seq $((n * 5))); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
   echo "--- $f"; tail -12 "$f"; echo "TIMEOUT waiting for /$pat/ in $f"; return 1
 }
+wait_more() { # file pattern count seconds: wait until the log holds more than `count` matching lines (one already
+  # there from an earlier step must not count again)
+  local f=$1 pat=$2 k=$3 n=${4:-20}
+  for _ in $(seq $((n * 5))); do [ "$(grep -cE "$pat" "$f" 2>/dev/null || true)" -gt "$k" ] && return 0; sleep 0.2; done
+  echo "TIMEOUT waiting for a new /$pat/ in $f"; echo "--- $f"; tail -8 "$f"; return 1
+}
+seen() { grep -cE "$2" "$1" 2>/dev/null || true; } # file pattern: how many matching lines the log holds now
 count() { grep -cE "$2" "$1" 2>/dev/null || true; }
 wait_more() { # file pattern count-before seconds: wait until the pattern appears more often than before
   for _ in $(seq $(($4 * 5))); do [ "$(count "$1" "$2")" -gt "$3" ] && return 0; sleep 0.2; done
@@ -92,11 +99,12 @@ grep -q "not serving $CAROL" "$DIR/mbx.log"
 echo "    ok: $(grep -m1 'ERR "mailbox.not-served"' "$DIR/c.log")"
 
 echo "=== the enrolment survives a mailbox restart"
+N=$(seen "$DIR/b.log" "OK connected")
 kill $MBX_PID; wait $MBX_PID 2>/dev/null || true
 mailbox
 wait_for "$DIR/mbx.log" "restored state: 1 owner" 20
 echo "    ok: $(grep 'restored state' "$DIR/mbx.log" | tail -1 | sed 's/.*restored/restored/')"
-wait_for "$DIR/b.log" "OK connected" 30   # the devices reconnect on their own
+wait_more "$DIR/b.log" "OK connected" "$N" 30   # the devices reconnect on their own
 sleep 3
 
 echo "=== Bob releases: accepted, everything held for him deleted, his binding closed"
