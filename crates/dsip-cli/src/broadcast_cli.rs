@@ -3,7 +3,8 @@
 //! Spec: §22.1 (publish a signed record to the publisher's authority), §9.3
 //! (subscribe; first notify carries current state; renewal), §22.2–§22.3
 //! (receiver verifies the publisher and every provenance statement, selects a
-//! compatible variant, and displays the delivery path honestly), §27 (flow).
+//! compatible variant, and displays the delivery path honestly), §27 (flow); and presence: a device's own record
+//! (P§3, P§8) and a watched identity's combined state (P§4).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -157,6 +158,7 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
     let resolver = StaticResolver::default();
     let mut seq_seen = 0u64;
+    let mut watch = dsip_broadcast::presence::Watch::new(target);
     loop {
         let events = tokio::select! {
             ev = agent.next() => ev?,
@@ -176,7 +178,22 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
                              payload.get("reason").and_then(Value::as_str).map(|r| format!("  reason {r}")).unwrap_or_default());
                     let body = &payload["body"];
                     if body["event"] == "presence" {
-                        println!("           presence: {}   (authority-asserted, §9.2/§9.4)", body["state"]);
+                        watch.notify(&payload, |f| agent.verify_record(f));
+                        let c = watch.combined(now_s());
+                        let from = match c.source {
+                            "record" => "from a device's signed record",
+                            "assertion" => "the authority's claim, no device record",
+                            _ => "no record, nothing bound",
+                        };
+                        println!("           presence: {}{}  ({from})   P§4", c.state, if c.token != c.state { format!(" (shown raw: {})", c.token) } else { String::new() });
+                        let held = body["records"].as_array().map_or(0, Vec::len);
+                        for r in watch.records() {
+                            println!("             device {} {} seq {}  ✓ verified   P§3", short(r["device"].as_str().unwrap_or("")), r["state"].as_str().unwrap_or(""), r["seq"]);
+                        }
+                        if held > watch.records().len() {
+                            println!("             {} record(s) did not verify: ignored   P§3", held - watch.records().len());
+                        }
+                        println!("           assertion: {}   (authority-asserted, §9.3)", body["state"]);
                     } else {
                         println!("           publication state: {}", body["state"]);
                         if let Some(record) = body["record"].as_str() {
@@ -198,6 +215,67 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
                     println!("← reject   {} from {}   (uniform for unauthorized and nonexistent targets, §9.3)", payload["reason"], short(&identity));
                     agent.close().await;
                     return Ok(());
+                }
+                AgentEvent::Rejected(code, detail) => println!("✗ inbound rejected: {code} {detail}"),
+                _ => {}
+            }
+        }
+    }
+    println!("· wait over");
+    agent.close().await;
+    Ok(())
+}
+
+/// `dsip presence publish`: send this device's presence record to its relay (the authority) and keep it fresh,
+/// following `then` (`SECONDS:STATE`, `none` to stop) and printing what the authority refuses.
+///
+/// Spec: P§3, P§8, P§9.
+pub async fn presence_publish(c: &Conn, state: &str, then: &[String], lifetime: i64, wait: u64) -> Result<()> {
+    let mut agent = connect(c).await?;
+    let start = now_s();
+    let mut plan: Vec<(i64, Option<String>)> = then
+        .iter()
+        .map(|t| {
+            let (secs, st) = t.split_once(':').context("--then wants SECONDS:STATE")?;
+            Ok((start + secs.parse::<i64>()?, (st != "none").then(|| st.to_string())))
+        })
+        .collect::<Result<_>>()?;
+    plan.sort_by_key(|(at, _)| *at);
+    plan.reverse();
+    let mut publisher = dsip_broadcast::presence::Publisher::new(agent.identity_did(), agent.device_did(), &agent.relay().did.clone(), lifetime);
+    let mut out = publisher.set(Some(state), now_s());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    loop {
+        if let Some(p) = out.take() {
+            let (st, seq) = (p["state"].clone(), p["seq"].clone());
+            agent.send_payload(p, publisher.lifetime()).await?;
+            println!("→ presence {} seq {seq} for {} s to the authority   P§3", st.as_str().unwrap_or(""), publisher.lifetime());
+        }
+        let now = now_s();
+        if let Some(&(at, ref st)) = plan.last() {
+            if now >= at {
+                println!("· state → {}", st.as_deref().unwrap_or("none (stop publishing; the record lapses at its expires_at)"));
+                out = publisher.set(st.as_deref(), now);
+                plan.pop();
+                continue;
+            }
+        }
+        out = publisher.tick(now);
+        if out.is_some() {
+            continue;
+        }
+        let events = tokio::select! {
+            ev = agent.next() => ev?,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => vec![],
+            _ = tokio::time::sleep_until(deadline) => break,
+        };
+        for ev in events {
+            match ev {
+                AgentEvent::Received { message, payload, .. } if message.msg_type == "error" => {
+                    let reason = payload["reason"].as_str().unwrap_or("");
+                    let retry = payload["retry_after"].as_i64();
+                    println!("← error    {reason}{}   (the authority refused the record, P§3)", retry.map(|r| format!(" retry_after {r}")).unwrap_or_default());
+                    publisher.refused(reason, retry, now_s());
                 }
                 AgentEvent::Rejected(code, detail) => println!("✗ inbound rejected: {code} {detail}"),
                 _ => {}

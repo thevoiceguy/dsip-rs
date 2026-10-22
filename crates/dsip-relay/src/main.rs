@@ -68,6 +68,9 @@ struct Args {
     /// Rate-limit window in seconds.
     #[arg(long, default_value_t = 3600)]
     intro_window: i64,
+    /// T-Presence-Grace: seconds a device's presence record outlives its unbind (P§8: 0–300; 0 drops it at the unbind).
+    #[arg(long, default_value_t = dsip_broadcast::authority::PRESENCE_GRACE_S, value_parser = clap::value_parser!(i64).range(0..=300))]
+    presence_grace: i64,
     /// Maximum queued envelopes per recipient (§13.3 store-and-forward boundary).
     #[arg(long, default_value_t = 100)]
     inbox_cap: usize,
@@ -355,6 +358,9 @@ impl State {
     fn advance(&mut self) {
         let em = self.tick();
         self.apply(em, None, None, "");
+        // P§3, §22.1: presence records past expires_at or their unbind grace, and lapsed subscriptions, end with notifies
+        let em = self.authority.advance_to(now_s());
+        self.apply_authority(em);
     }
 
     /// This binary's own tables follow what the tracker and the authority still hold, at most once a second (spec-gap
@@ -520,7 +526,8 @@ impl State {
             if t == "provenance" {
                 self.statements.entry(p["original_publication"].as_str().unwrap_or("").to_string()).or_default().push(inbound.frame.clone());
             }
-            let _ = self.authority.advance_to(now_s());
+            let em = self.authority.advance_to(now_s());
+            self.apply_authority(em);
             let em = self.authority.recv_value(&m);
             self.apply_authority(em);
             return;
@@ -597,7 +604,11 @@ async fn main() -> Result<()> {
         queue_budget_bytes: args.queue_budget_bytes,
         served,
         offline_retention: args.offline_retention,
-        authority: Authority::new(now_s(), HashMap::new()),
+        authority: {
+            let mut a = Authority::new(now_s(), HashMap::new());
+            a.presence_grace = args.presence_grace;
+            a
+        },
         records: HashMap::new(),
         statements: HashMap::new(),
         presence_frames: HashMap::new(),
@@ -747,7 +758,8 @@ async fn serve(
         st.advance();
         let em = st.tracker.step(&RelayEvent::Relay(RelayAction::Bind { device: device.clone(), identity: identity.clone() }));
         st.apply(em, None, None, "");
-        let _ = st.authority.advance_to(now_s());
+        let em = st.authority.advance_to(now_s());
+        st.apply_authority(em);
         let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Bind { device: device.clone(), identity: identity.clone() }));
         st.apply_authority(em);
     }
@@ -833,10 +845,9 @@ async fn serve(
         }
     }
     let _ = st.tracker.step(&RelayEvent::Relay(RelayAction::Unbind { device: device.clone(), identity: identity.clone() }));
-    if st.identities.get(&identity).is_none_or(|s| s.is_empty()) {
-        let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Unbind { device: device.clone(), identity: identity.clone() }));
-        st.apply_authority(em);
-    }
+    // P§3: every device's unbind, not only the identity's last: its own record's grace starts from it
+    let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Unbind { device: device.clone(), identity: identity.clone() }));
+    st.apply_authority(em);
     tracing::info!("{peer}: unbound {device}");
     result
 }

@@ -246,6 +246,9 @@ test/call-recording.mjs  the call glue against the CLI: a recorded caller is ans
 test/call-records.mjs   call records (C§9): a record-keeper opens the conversation with each party, every call leg
                         yields a record, held until that conversation exists (spec-gaps 121, 123); a party accepts
                         the recorder before writing there (C§5)
+test/presence.mjs       presence (Presence Profile draft): automatic shows the relay's claim, marked as a claim; Bob's
+                        busy, away and invisible come as his device's signed records, verified and combined in Alice's
+                        browser (P§3–P§5); Carol on relay B is watched at her relay, found through her hint (spec-gap 143)
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named

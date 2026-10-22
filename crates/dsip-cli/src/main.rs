@@ -178,6 +178,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BroadcastCmd,
     },
+    /// Presence (Presence Profile): publish this device's state, or watch an identity's.
+    Presence {
+        #[command(subcommand)]
+        cmd: PresenceCmd,
+    },
     /// Wait for calls through a relay.
     Answer {
         #[command(flatten)]
@@ -212,6 +217,41 @@ impl BConn {
     fn conn(self) -> broadcast_cli::Conn {
         broadcast_cli::Conn { identity: self.identity, relay: self.relay, ca: self.ca }
     }
+}
+
+#[derive(Subcommand)]
+enum PresenceCmd {
+    /// Publish this device's presence record to its relay and keep it fresh (P§3).
+    Publish {
+        #[command(flatten)]
+        conn: BConn,
+        /// The state (`dsip-presence-state`: available, busy, away, dnd, offline, or any newer token, P§5).
+        #[arg(long)]
+        state: String,
+        /// Later changes, each `SECONDS:STATE` counted from the start (`STATE` `none` stops publishing).
+        #[arg(long)]
+        then: Vec<String>,
+        /// Record lifetime in seconds (P§8: 60–3,600).
+        #[arg(long, default_value_t = 300)]
+        lifetime: i64,
+        /// Seconds to stay bound.
+        #[arg(long, default_value_t = 20)]
+        wait: u64,
+    },
+    /// Watch an identity's presence: subscribe at its relay, verify each record, show the combined state (P§4).
+    Watch {
+        #[command(flatten)]
+        conn: BConn,
+        /// The identity watched.
+        #[arg(long)]
+        target: String,
+        /// Requested subscription lifetime (§9.3: at most 3,600 s for presence).
+        #[arg(long, default_value_t = 3600)]
+        expires_in: i64,
+        /// Seconds to listen.
+        #[arg(long, default_value_t = 20)]
+        wait: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -641,6 +681,12 @@ async fn main() -> Result<()> {
         Cmd::Introduce { opts, to, purpose, token, wait } => {
             finish(console::run(opts.into_console(), console::Mode::Introduce { to, purpose, token, wait }).await)
         }
+        Cmd::Presence { cmd } => finish(match cmd {
+            PresenceCmd::Publish { conn, state, then, lifetime, wait } => broadcast_cli::presence_publish(&conn.conn(), &state, &then, lifetime, wait).await,
+            PresenceCmd::Watch { conn, target, expires_in, wait } => {
+                broadcast_cli::subscribe(&conn.conn(), &target, vec!["presence".into()], expires_in, wait, vec![], vec![]).await
+            }
+        }),
         Cmd::Broadcast { cmd } => {
             let r = match cmd {
                 BroadcastCmd::Publish { conn, stream, title, state, variants, ttl, policy } => {

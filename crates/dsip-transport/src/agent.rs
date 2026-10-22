@@ -221,6 +221,12 @@ impl Agent {
         Ok(frame)
     }
 
+    /// Verify a record carried inside another message (a presence record in a `notify` body): its payload and the
+    /// identity its signer acts for. Spec: P§3.
+    pub fn verify_record(&self, frame: &str) -> Option<(serde_json::Value, String)> {
+        self.core.verify_record(frame, now_s())
+    }
+
     /// Whether `device` presented a delegation granting `capability` (Recording Profile C§6).
     pub fn peer_has_capability(&self, device: &str, capability: &str) -> bool {
         self.core.peer_has_capability(device, capability, crate::now_s())

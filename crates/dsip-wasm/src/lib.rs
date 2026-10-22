@@ -421,6 +421,14 @@ pub fn downgrade_summary(losses_json: &str) -> String {
     dsip_core::trust::downgrade_summary(&losses.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
+/// A watched identity's presence, as the page shows it. Spec: P§4.
+fn presence_json(w: &dsip_broadcast::presence::Watch, now: i64) -> String {
+    let c = w.combined(now);
+    json!({"target": w.target(), "state": c.state, "token": c.token, "source": c.source, "records": w.records().len(),
+           "terminated": w.terminated()})
+    .to_string()
+}
+
 /// A browser endpoint: the engine + verifier + builder behind a JSON API, with the call glue
 /// ([`dsip_endpoint::calls`]): the page is the media host, doing the media work the glue asks for.
 #[wasm_bindgen]
@@ -431,6 +439,9 @@ pub struct Endpoint {
     resolver: StaticResolver,
     seen: SeenIds,
     hello_id: Option<String>,
+    presence: Option<dsip_broadcast::presence::Publisher>,
+    presence_state: Option<String>,
+    watches: std::collections::BTreeMap<String, dsip_broadcast::presence::Watch>,
 }
 
 #[wasm_bindgen]
@@ -486,7 +497,99 @@ impl Endpoint {
             resolver,
             seen: SeenIds::default(),
             hello_id: None,
+            presence: None,
+            presence_state: None,
+            watches: Default::default(),
         })
+    }
+
+    /// Bound to the relay `authority` (its DID, from its `hello`): our presence record goes there. Returns the signed
+    /// record to send now, or `null`. Spec: P§3.
+    pub fn presence_bound(&mut self, authority: &str, now: f64) -> Result<Option<String>, JsValue> {
+        let now = now as i64;
+        let out = match self.presence.as_mut() {
+            Some(p) => p.rebind(authority, now),
+            None => {
+                let k = self.core.keys();
+                let mut p = dsip_broadcast::presence::Publisher::new(&k.identity, &k.device.did(), authority, 300);
+                let out = p.set(self.presence_state.as_deref(), now);
+                self.presence = Some(p);
+                out
+            }
+        };
+        self.sign_presence(out, now)
+    }
+
+    /// The user picked a presence state (`null` stops publishing). Returns the signed record to send now, or `null`
+    /// (not bound yet, or P§8's publish interval holds it back: [`Endpoint::presence_tick`] returns it then).
+    /// Spec: P§3, P§5, P§8.
+    pub fn presence_set(&mut self, state: Option<String>, now: f64) -> Result<Option<String>, JsValue> {
+        self.presence_state = state;
+        let out = self.presence.as_mut().and_then(|p| p.set(self.presence_state.as_deref(), now as i64));
+        self.sign_presence(out, now as i64)
+    }
+
+    /// Our presence record due at `now` (a refresh, or one held back), signed, or `null`. Spec: P§8.
+    pub fn presence_tick(&mut self, now: f64) -> Result<Option<String>, JsValue> {
+        let out = self.presence.as_mut().and_then(|p| p.tick(now as i64));
+        self.sign_presence(out, now as i64)
+    }
+
+    /// The authority refused our record with `reason` (an `error` whose `in_reply_to` is the record). Spec: P§9.
+    pub fn presence_refused(&mut self, reason: &str, retry_after: Option<f64>, now: f64) {
+        if let Some(p) = self.presence.as_mut() {
+            p.refused(reason, retry_after.map(|r| r as i64), now as i64);
+        }
+    }
+
+    fn sign_presence(&mut self, out: Option<Value>, now: i64) -> Result<Option<String>, JsValue> {
+        let Some(p) = out else { return Ok(None) };
+        let lifetime = self.presence.as_ref().map_or(300, |p| p.lifetime());
+        self.core.sign_payload(p, now, lifetime).map(Some).map_err(js)
+    }
+
+    /// A signed `subscribe` to `target`'s presence at its authority `authority` (the relay that answers for it,
+    /// §9.3), for `expires_in` seconds (at most 3,600 for presence; a renewal replaces). Returns
+    /// `{"frame", "subscription"}`; the host sends the frame on its connection to that relay.
+    /// Spec: §9.3, P§3.
+    pub fn presence_subscribe(&mut self, target: &str, authority: &str, expires_in: f64, now: f64) -> Result<String, JsValue> {
+        let p = json!({"dsip": dsip_core::version::version_block(&self.supported, &[dsip_broadcast::PROFILE]),
+                       "type": "subscribe", "to": authority, "target": target, "events": ["presence"], "expires_in": expires_in as i64});
+        let frame = self.core.sign_payload(p, now as i64, 30).map_err(js)?;
+        let sub = Envelope::from_frame(&frame)
+            .ok()
+            .and_then(|e| dsip_core::b64::decode(&e.payload))
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v["id"].as_str().map(String::from))
+            .unwrap_or_default();
+        // §9.3: a renewal replaces the subscription; the watch follows the new one
+        self.watches.retain(|_, w| w.target() != target);
+        self.watches.insert(sub.clone(), dsip_broadcast::presence::Watch::new(target));
+        Ok(json!({"frame": frame, "subscription": sub}).to_string())
+    }
+
+    /// A verified presence `notify` payload (from a `received` event). Each carried record is verified here, independently
+    /// of the authority. Returns `{"target", "state", "token", "source", "records", "terminated"}` (P§4: `source` is
+    /// `record`, `assertion` — the authority's claim — or `none`), or `null` when it is for no presence watch of ours
+    /// or out of order. Spec: §9.3, P§3, P§4.
+    pub fn presence_notify(&mut self, payload_json: &str, now: f64) -> Option<String> {
+        let payload: Value = serde_json::from_str(payload_json).ok()?;
+        let sub = payload["subscription"].as_str()?.to_string();
+        let core = &self.core;
+        let w = self.watches.get_mut(&sub)?;
+        if !w.notify(&payload, |f| core.verify_record(f, now as i64)) {
+            return None;
+        }
+        let out = presence_json(w, now as i64);
+        if w.terminated() {
+            self.watches.remove(&sub);
+        }
+        Some(out)
+    }
+
+    /// Every watched identity's presence at `now`, as [`Endpoint::presence_notify`] gives it (records expire, P§4).
+    pub fn presence_all(&self, now: f64) -> String {
+        Value::Array(self.watches.values().map(|w| serde_json::from_str(&presence_json(w, now as i64)).unwrap_or(Value::Null)).collect()).to_string()
     }
 
     /// The client `hello` frame to send first on a connection (§13.2).
