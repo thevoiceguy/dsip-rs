@@ -104,8 +104,9 @@ function renderContacts() {
     const asked = Object.values(file.requests || {}).some(([who]) => who === c.did);
     const status = held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them'
       : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant';
-    return { c, status };
+    return { c, status, presence: presenceShown.get(c.did) };
   });
+  // presence is left out: a badge changes in place (presenceRefresh), so a notify never rebuilds the rows under a click
   const key = JSON.stringify(rows.map(({ c, status }) => [c.name, c.did, c.numbers, status]));
   if (key !== shownContacts) { shownContacts = key; renderContactRows(rows); }
   renderRequests();
@@ -115,10 +116,12 @@ function renderContactRows(rows) {
   const ul = $('contact-list');
   ul.innerHTML = '';
   if (!rows.length) ul.innerHTML = '<li class="muted small">no contacts yet: paste a DID above</li>';
-  for (const { c, status } of rows) {
+  for (const { c, status, presence } of rows) {
     const li = document.createElement('li');
-    li.innerHTML = `<span class="name"></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
+    li.dataset.did = c.did;
+    li.innerHTML = `<span class="name"></span><span class="presence"></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
     li.querySelector('.name').textContent = c.name || '(unnamed)';
+    renderPresence(li.querySelector('.presence'), presence);
     li.querySelector('.did').textContent = c.did;
     li.querySelector('.num').textContent = (c.numbers || []).join(' ');
     const b = (text, cls, fn) => { const x = document.createElement('button'); x.textContent = text; if (cls) x.className = cls; x.onclick = fn; return x; };
@@ -188,6 +191,7 @@ function renderSettings() {
   $('set-first-contact').checked = !!settings.first_contact_required;
   $('set-seal').checked = !!settings.seal;
   $('set-recording-accept').value = settings.recording_accept || 'ask';
+  $('presence-select').value = settings.presence || '';
   $('set-read-disclosed').checked = !!settings.read_disclosed;
   $('set-record-keeper').value = settings.record_keeper || '';
   $('record-keeper-status').textContent = settings.record_keeper ? `records go to ${nameOf(settings.record_keeper) || short(settings.record_keeper)}${messenger?.held_records() ? `; ${messenger.held_records()} held until it opens the conversation` : ''}` : 'none: no call records are sent';
@@ -391,7 +395,10 @@ async function onReceived(r) {
     renderContacts();   // the request is listed now, with its purpose and basis
     return;
   }
+  if (m.type === 'notify' && p.body?.event === 'presence') { presenceNotified(p); return; }
   if (m.type === 'error') log(`   error ${m.reason || ''}${p.detail ? ': ' + (typeof p.detail === 'string' ? p.detail : JSON.stringify(p.detail)) : ''}`, '§15');
+  if (m.type === 'error' && presenceSent.has(m.in_reply_to)) { presenceRefused(m.reason, p.retry_after); return; }
+  if (m.type === 'reject' && presenceSubFor(m.session)) { presenceBlocked(m.session); return; }
   if (m.type === 'error' && m.reason === 'policy.rate-limited') {
     notify(`the relay limits introductions (§19.4): try again in ${p.retry_after ?? '?'} s`);
     return;
@@ -676,7 +683,7 @@ async function placeCall(to, video, destination) {
       $('call-route').textContent = `via their relay ${hint.uri} (a hint from the nodes, signed by ${short(hint.signer)}, expires in ${Math.max(0, Math.round(hint.expires_at - now()))} s; hint-sourced, not authoritative, §8.1)`;
       $('call-route').classList.remove('hidden');
       r = await openCallRelay(hint.uri, route);
-      if (call !== me) { r?.close(); callRelays.delete(route); return; }
+      if (call !== me) { callRelays.delete(route); releasePeerRelay(r); return; }
       if (!r) { log(`their relay ${hint.uri} did not bind us; trying our own relay instead`, '§8.1'); $('call-route').textContent += ' — unreachable; through our own relay'; }
     } else if (hint) { $('call-route').textContent = `their hint names our relay (${hint.uri})`; $('call-route').classList.remove('hidden'); }
     // the call glue asks for the SDP offer (onMediaRequest); the invite carries it (B§: the transport binding object)
@@ -742,25 +749,61 @@ async function discover(did) {
   return out.hint;
 }
 
-/** A connection to another relay for one call: our hello binds this device there, and the session's frames go
- *  through it (routed by `to` on that relay); closed when the call ends. Resolves to null if it refuses or is not
- *  reachable within 8 s. */
-function openCallRelay(uri, sid) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
-    const r = new Relay(uri, engine.ep, {
-      bound: (info) => { r.did = info.did; log(`← hello        their relay ${short(info.did)} bound us for this call (in_reply_to matched)`, '§13.2 · §20.5'); done(r); },
-      refused: (x) => { log(`✗ their relay's hello rejected: ${x.code}`, '§20.5'); r.close(); done(null); },
-      rejected: (code) => { log(`✗ their relay refused our hello: ${code}`, '§13.2'); r.close(); done(null); },
+/** Route a call (or an introduction, keyed by the peer's DID) through another relay: the shared connection there
+ *  (peerRelay), recorded against `sid` until the call ends. Resolves to null if it refuses or does not bind in 8 s. */
+async function openCallRelay(uri, sid) {
+  const shared = peerRelays.get(uri)?.bound;
+  const r = await peerRelay(uri, 'this call');
+  if (r) {
+    callRelays.set(sid, r);
+    if (shared) log(`their relay ${uri}: using the connection already open there`, '§13.2');
+  }
+  return r;
+}
+
+/** Our one connection to another relay, shared by the calls and introductions routed through it and by the presence
+ *  watches of contacts bound there: a second binding of this device there would replace the first, and each would
+ *  reconnect and replace the other in turn (§13.2). Our hello binds this device there; frames go through it, routed
+ *  by `to` on that relay. Resolves to null if it refuses or does not bind within 8 s; releasePeerRelay closes it
+ *  once nothing uses it. */
+const peerRelays = new Map();   // relay URI → the connection
+function peerRelay(uri, why) {
+  let r = peerRelays.get(uri);
+  if (r?.bound) return Promise.resolve(r);
+  if (!r) {
+    const conn = new Relay(uri, engine.ep, {
+      bound: (info) => {
+        conn.did = info.did;
+        log(`← hello        their relay ${short(info.did)} bound us for ${why} (in_reply_to matched)`, '§13.2 · §20.5');
+        for (const s of presenceSubs.values()) if (s.relay === conn) s.renewAt = now();   // reconnected: watch again
+        conn.waiting.splice(0).forEach((w) => w(conn));
+      },
+      refused: (x) => { log(`✗ their relay's hello rejected: ${x.code}`, '§20.5'); dropPeerRelay(conn); },
+      rejected: (code) => { log(`✗ their relay refused our hello: ${code}`, '§13.2'); dropPeerRelay(conn); },
       frame: (text) => engine.inbound(text),
-      closed: () => { if (settled && callRelays.get(sid) === r && !r.closedByUs) log(`their relay ${uri} dropped the connection; reconnecting`, '§13.2'); },
+      closed: (was) => { if (was && !conn.closedByUs) log(`their relay ${uri} dropped the connection; reconnecting`, '§13.2'); },
       dropped: (f) => log(`✗ their relay not connected: a ${JSON.parse(f).type || 'frame'} was not sent`),
     }, now);
-    callRelays.set(sid, r);
-    r.connect();
-    setTimeout(() => { if (!settled) { r.close(); callRelays.delete(sid); done(null); } }, 8000);
-  }).then((r) => { if (!r) callRelays.delete(sid); return r; });
+    conn.waiting = [];
+    peerRelays.set(uri, conn);
+    conn.connect();
+    r = conn;
+  }
+  return new Promise((resolve) => {
+    const w = (x) => { clearTimeout(t); resolve(x); };
+    const t = setTimeout(() => {
+      r.waiting = r.waiting.filter((x) => x !== w);
+      resolve(null);
+      if (!r.bound) releasePeerRelay(r);
+    }, 8000);
+    r.waiting.push(w);
+  });
+}
+
+function dropPeerRelay(r) {
+  r.close();
+  if (peerRelays.get(r.url) === r) peerRelays.delete(r.url);
+  r.waiting.splice(0).forEach((w) => w(null));
 }
 
 /** Publish our reachability hint on the nodes (DHT Hints Profile §10 `POST /dsip/v1/hints`): signed by this
@@ -1084,7 +1127,7 @@ function endCall(stay = false) {
   if (!call) return;
   call.media?.close();
   const cr = callRelays.get(call.sid);
-  if (cr) { const sid = call.sid; setTimeout(() => { cr.close(); callRelays.delete(sid); log(`their relay ${cr.url}: connection for the call closed`, '§13.2'); }, 1000); }
+  if (cr) { const sid = call.sid; setTimeout(() => { callRelays.delete(sid); log(releasePeerRelay(cr) ? `their relay ${cr.url}: connection for the call closed` : `their relay ${cr.url}: the call is done with the connection; kept, still in use`, '§13.2'); }, 1000); }
   $('local').srcObject = null; $('remote').srcObject = null;
   $('view-incoming').classList.add('hidden');
   const ended = call; call = null;
@@ -1130,8 +1173,16 @@ function closePeerRelay(did) {
   const r = callRelays.get(did);
   if (!r) return;
   callRelays.delete(did);
+  log(releasePeerRelay(r) ? `their relay ${r.url}: connection for the introduction closed` : `their relay ${r.url}: the introduction is done with the connection; kept, still in use`, '§13.2');
+}
+
+/** Close a connection to a peer's relay that a call or an introduction no longer needs, unless presence notifies
+ *  still come over it (or another call uses it). Returns whether it was closed. */
+function releasePeerRelay(r) {
+  if (!r || r.waiting?.length || [...presenceSubs.values()].some((s) => s.relay === r) || [...callRelays.values()].includes(r)) return false;
   r.close();
-  log(`their relay ${r.url}: connection for the introduction closed`, '§13.2');
+  if (peerRelays.get(r.url) === r) peerRelays.delete(r.url);
+  return true;
 }
 
 // ---------------------------------------------------------------- contacts
@@ -1237,6 +1288,7 @@ function connect() {
       log(`← hello        relay ${short(r.did)} bound (in_reply_to matched)`, '§13.2 · §20.5');
       ice = null; iceServers().catch(() => {});   // credentials are the relay's origin's: fetch them on each bind
       publishReachability();
+      presenceBound(r.did);
     },
     refused: (r) => { renderRelay(`relay hello refused: ${r.code}`, 'bad'); log(`✗ relay hello rejected: ${r.code} (anti-splicing)`, '§20.5'); },
     rejected: (code) => {
@@ -1252,6 +1304,119 @@ function connect() {
   relay.connect();
 }
 
+// ---------------------------------------------------------------- presence (Presence Profile draft, P§3–P§5)
+
+const presenceShown = new Map();   // contact DID → {state, token, source} (P§4), as the contact list shows it
+const presenceSent = new Set();    // ids of our records, to recognise the authority's refusal (P§3)
+const presenceSubs = new Map();    // contact DID → {sub, relay, renewAt, retryAt}: our watch on it (§9.3)
+const PRESENCE_SUB_S = 3600;       // §9.3: the presence event class's cap; renewed before it lapses
+let presenceTimer = null;
+
+/** Send our signed presence record (or nothing) to our relay, the authority (P§3). */
+function presenceSend(frame) {
+  if (!frame || !relay?.bound) return;
+  const p = payloadOf(frame);
+  presenceSent.add(p.id);
+  if (presenceSent.size > 32) presenceSent.delete(presenceSent.values().next().value);
+  relay.send(frame);
+  log(`→ presence     ${p.state} seq ${p.seq} for ${p.expires_at - p.issued_at} s to our relay`, 'P§3');
+}
+
+/** Bound to our relay: our record goes to it, and every contact is watched (again). */
+function presenceBound(authority) {
+  presenceSend(engine.ep.presence_bound(authority, now()));
+  for (const s of presenceSubs.values()) if (s.relay === relay) s.renewAt = 0;
+  clearInterval(presenceTimer);
+  presenceTimer = setInterval(presenceTick, 1000);
+  presenceTick();
+}
+
+/** The user picked a state (`null`: automatic, no record; the last one lapses at its expires_at). */
+function presenceSet(state) {
+  presenceSend(engine.ep.presence_set(state, now()));
+  if (!state) log('presence automatic: no record sent; your relay says available while you are bound', '§9.3');
+}
+
+function presenceRefused(reason, retryAfter) {
+  log(`✗ our presence record was refused: ${reason}${retryAfter ? `, retry after ${retryAfter} s` : ''}`, 'P§9');
+  engine.ep.presence_refused(reason, retryAfter ?? undefined, now());
+}
+
+/** Once a second: our record's refresh, watches to open or renew, and records that expired since (P§4). */
+function presenceTick() {
+  presenceSend(engine.ep.presence_tick(now()));
+  const t = now();
+  for (const c of contacts) {
+    const s = presenceSubs.get(c.did);
+    // a contact's relay that dropped us forgot the subscription: watched again once it binds us again
+    if (s?.relay && s.relay !== relay) { if (!s.relay.bound) s.down = true; else if (s.down) { s.down = false; s.renewAt = t; } }
+    if (!s || (s.renewAt && t >= s.renewAt) || (s.retryAt && t >= s.retryAt)) presenceWatch(c.did);
+  }
+  for (const did of presenceSubs.keys()) if (!contacts.some((c) => c.did === did)) presenceSubs.delete(did);
+  presenceRefresh(JSON.parse(engine.ep.presence_all(now())));
+}
+
+/** Watch a contact's presence: subscribe at the relay that answers for it, ours or, when its hint names another,
+ *  that one over the connection we keep there (§8.1: hint-sourced, not authoritative).
+ *  Spec: §9.3 (spec-gap 143): we bind at their relay to subscribe there, and that binding makes this device
+ *  reachable there too. Their records are verified here whatever relay carries them (§9.4, P§3). */
+async function presenceWatch(did) {
+  const pending = { renewAt: 0, retryAt: now() + 60 };   // until it is answered, not asked again for a minute
+  presenceSubs.set(did, pending);
+  let r = relay;
+  const hint = await discover(did).catch(() => null);
+  if (hint?.uri && hint.uri !== relayUrl()) r = (await peerRelay(hint.uri, 'presence')) || relay;
+  if (!r?.bound) return;
+  const authority = r === relay ? relayInfo?.did : r.did;
+  if (!authority) return;
+  const out = JSON.parse(engine.ep.presence_subscribe(did, authority, PRESENCE_SUB_S, now()));
+  Object.assign(pending, { sub: out.subscription, relay: r, renewAt: now() + PRESENCE_SUB_S - 300, retryAt: 0 });
+  r.send(out.frame);
+  log(`→ subscribe    presence of ${short(did)} at ${r === relay ? 'our relay' : r.url} for ${PRESENCE_SUB_S} s`, '§9.3');
+}
+
+function presenceSubFor(sub) { return [...presenceSubs.entries()].find(([, s]) => s.sub === sub)?.[0]; }
+
+/** The authority answered `reject policy.blocked`: uniform for a target it does not know or will not show (§9.3);
+ *  tried again in a minute (the contact may bind there by then). */
+function presenceBlocked(sub) {
+  const did = presenceSubFor(sub);
+  const s = presenceSubs.get(did);
+  if (s) Object.assign(s, { renewAt: 0, retryAt: now() + 60 });
+  log(`presence of ${short(did)}: not available from that relay (§9.3: unknown and not allowed look the same); trying again later`, '§9.3');
+}
+
+/** A presence notify: the wasm verifies each record and combines them (P§3, P§4). */
+function presenceNotified(p) {
+  const out = engine.ep.presence_notify(JSON.stringify(p), now());
+  if (!out) return;
+  const v = JSON.parse(out);
+  log(`◇ presence     ${short(v.target)}: ${v.state}${v.token !== v.state ? ` (${v.token})` : ''}, ${v.source === 'record' ? `from ${v.records} signed record(s)` : v.source === 'assertion' ? "the relay's claim" : 'nothing bound'}`, 'P§4');
+  if (v.terminated) { const s = presenceSubs.get(v.target); if (s) Object.assign(s, { renewAt: now() }); }
+  presenceRefresh([v]);
+}
+
+function presenceRefresh(list) {
+  for (const v of list) {
+    if (!v?.target) continue;
+    const shown = { state: v.state, token: v.token, source: v.source };
+    if (JSON.stringify(presenceShown.get(v.target)) === JSON.stringify(shown)) continue;
+    presenceShown.set(v.target, shown);
+    const li = [...$('contact-list').children].find((x) => x.dataset.did === v.target);
+    if (li) renderPresence(li.querySelector('.presence'), shown);
+  }
+}
+
+/** P§4: the combined state; an unknown token is shown raw beside its fallback (P§5); the relay's own assertion is
+ *  rendered as its claim (§9.3). */
+function renderPresence(el, v) {
+  if (!v) { el.textContent = ''; return; }
+  const label = { available: 'available', busy: 'busy', away: 'away', dnd: 'do not disturb', offline: 'offline' }[v.state] || v.state;
+  el.textContent = v.source === 'assertion' ? `${label} (relay says)` : v.token !== v.state ? `${label} (${v.token})` : label;
+  el.className = `presence ${v.state}${v.source === 'assertion' ? ' claim' : ''}`;
+  el.title = v.source === 'record' ? 'from a record their device signed (P§4)' : v.source === 'assertion' ? 'their relay says they are bound; no device of theirs has said more (§9.3)' : 'no record and nothing bound';
+}
+
 // ---------------------------------------------------------------- boot
 
 async function startEngine() {
@@ -1259,6 +1424,7 @@ async function startEngine() {
   engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required, one_call: true,
     seal: !!settings.seal, recording: settings.recording_accept || 'ask' }, now);
   engine.loadContactsFile(await store.get(key('engine.contacts')));
+  engine.ep.presence_set(settings.presence || null, now());   // P§3: sent once our relay binds us
   for (const r of revoked) engine.ep.hold_revocation(r.frame);   // §7.4: revocations this identity issued apply here too
   for (const d of Object.values(documents)) engine.ep.add_document(JSON.stringify(d));   // §8.1: documents held
   engine.on = {
@@ -1979,6 +2145,7 @@ function renderMessages() {
   $('set-first-contact').onchange = async (e) => { settings.first_contact_required = e.target.checked; await saveSettings(); location.reload(); };
   $('set-seal').onchange = async (e) => { settings.seal = e.target.checked; await saveSettings(); engine.setSeal(settings.seal); log(`call bodies ${settings.seal ? 'sealed to the callee when its key resolves' : 'sent in clear'}`, '§10.4'); };
   $('set-recording-accept').onchange = async (e) => { settings.recording_accept = e.target.value; await saveSettings(); location.reload(); };
+  $('presence-select').onchange = async (e) => { settings.presence = e.target.value || null; await saveSettings(); presenceSet(settings.presence); };
   for (const id of ['in-recording', 'call-recording']) {
     $(`${id}-accept`).onclick = () => callRecording(true);
     $(`${id}-decline`).onclick = () => callRecording(false);
@@ -2055,6 +2222,9 @@ function renderMessages() {
     inWarning: () => $('in-tn-warning').textContent,
     downgrade: () => $('call-downgrade').textContent,
     contacts: () => contacts.map((c) => c.did),
+    presence: (did) => presenceShown.get(did) || null,
+    presenceBadge: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.presence').textContent || null,
+    setPresence: async (state) => { settings.presence = state || null; $('presence-select').value = state || ''; await saveSettings(); presenceSet(settings.presence); },
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
     requests: () => engine.requests(),
     saved: () => lastPersist,   // resolves once the latest contact-file write is in storage

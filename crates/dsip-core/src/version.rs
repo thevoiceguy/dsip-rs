@@ -28,12 +28,14 @@ impl Default for Supported {
 
 impl Supported {
     /// Everything this implementation speaks: both v1.0 profiles (provenance is a core
-    /// message since v0.7; no extension id) and sealed bodies (`sealed-body/1.0`, §10.4).
+    /// message since v0.7; no extension id), the Presence Profile draft (`presence/0.1`, P§3) and sealed bodies
+    /// (`sealed-body/1.0`, §10.4).
     /// Live endpoints and relays use this; the vectors pin negotiation with explicit contexts.
+    /// Spec: §9.4 (a presence record names `presence/0.1`; a processor of records lists it, spec-gap 142).
     pub fn all_known() -> Supported {
         Supported {
             core: "1.0".into(),
-            profiles: vec!["interactive-media/1.0".into(), "verified-broadcast/1.0".into()],
+            profiles: vec!["interactive-media/1.0".into(), "verified-broadcast/1.0".into(), "presence/0.1".into()],
             extensions: vec!["sealed-body/1.0".into()],
         }
     }

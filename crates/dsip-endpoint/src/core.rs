@@ -605,6 +605,31 @@ impl Core {
         Ok(out)
     }
 
+    /// Verify a record carried inside another message, such as a presence record in a `notify` body, and return its
+    /// payload and the identity its signer acts for: the subject of a delegation it presents for itself (§7.4), else the
+    /// signer. Nothing is recorded: the frame is not marked seen and no identity is learned. `None` when it does not
+    /// verify, or names a `did:web` document the core does not hold.
+    ///
+    /// Spec: P§3 (a subscriber verifies each record independently of the authority), §10.2, §7.4.
+    pub fn verify_record(&self, frame: &str, now: i64) -> Option<(Value, String)> {
+        let mut seen = crate::verify::SeenIds::default();
+        let sem = dsip_schema::SemanticContext { supported: self.supported.clone(), ..Default::default() };
+        let inbound = verify_frame_with(frame, now, &self.resolver, &self.peer_delegations, &self.revocations, &mut seen, &sem).ok()?;
+        let signer = inbound.verified.signer_did.clone();
+        let ctx = Context::new(now, &self.resolver);
+        let identity = inbound
+            .verified
+            .header
+            .delegations
+            .iter()
+            .find_map(|d| {
+                let (subject, device) = dsip_core::delegation::names(d)?;
+                (device == signer && dsip_core::delegation::verify_delegation(d, &subject, &device, &ctx).ok()).then_some(subject)
+            })
+            .unwrap_or(signer);
+        Some((inbound.verified.payload, identity))
+    }
+
     fn rejected(&self, v: dsip_core::Verdict, mut out: Vec<CoreEvent>) -> Vec<CoreEvent> {
         out.push(CoreEvent::Rejected {
             code: v.code.and_then(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).unwrap_or_default(),
@@ -688,7 +713,7 @@ impl Core {
         }
         let msg = Message::from_payload(&p).ok_or(Error::PayloadShape("not a session message"))?;
         let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
-        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation");
+        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation" | "presence");
         out.push(CoreEvent::Received { message: msg.clone(), identity, display_name, payload: p });
         if session_scoped {
             // Broadcast/subscription traffic (§9.3, §22) is handled by the host, not the §12 engine.

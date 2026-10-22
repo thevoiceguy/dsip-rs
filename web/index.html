@@ -14,6 +14,11 @@
     <code id="me-did" class="did" title="click to copy your identity DID"></code>
   </div>
   <div class="relay"><span id="relay-dot" class="dot"></span><span id="relay-status" class="small muted">connecting…</span></div>
+  <label class="presence-pick small muted" title="your presence, as a record this device signs and keeps at your relay (Presence Profile P§3); automatic sends none, and your relay says available while you are bound (§9.3)">
+    <select id="presence-select">
+      <option value="">automatic</option><option value="available">available</option><option value="busy">busy</option>
+      <option value="away">away</option><option value="dnd">do not disturb</option><option value="offline">invisible</option>
+    </select></label>
   <nav>
     <button data-view="contacts">Contacts</button>
     <button data-view="messages">Messages</button>

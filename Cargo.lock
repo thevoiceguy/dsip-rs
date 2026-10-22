@@ -1633,6 +1633,7 @@ name = "dsip-wasm"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "dsip-broadcast",
  "dsip-core",
  "dsip-dht",
  "dsip-endpoint",

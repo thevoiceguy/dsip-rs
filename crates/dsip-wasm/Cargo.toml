@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 dsip-core = { workspace = true, features = ["wasm"] }
 dsip-schema.workspace = true
 dsip-session.workspace = true
+dsip-broadcast.workspace = true
 dsip-endpoint = { workspace = true, features = ["wasm"] }
 dsip-number.workspace = true
 dsip-dht = { workspace = true, default-features = false }
