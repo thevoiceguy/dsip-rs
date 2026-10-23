@@ -8,7 +8,9 @@
 //! overwriting), §8.3 (newer replaces older; expired records are invalid); Presence Profile P§3 (a device's own
 //! presence record kept to its `expires_at`, refused in the profile's order, held through an unbind's grace, and
 //! carried in every presence notify beside the assertion for devices without one), P§4 (one record per device, `seq`
-//! per `(subject, device)`), P§8 (lifetime bounds, T-Presence-Grace, the publish interval).
+//! per `(subject, device)`), P§6 (who may watch: the subject's own devices, a presented grant, a capability, the
+//! authority's policy, private by default; audiences; a body per subscription), P§7 (a grant's `valid_until` and a
+//! `grant-revocation` end the subscriptions it admitted), P§8 (lifetime bounds, T-Presence-Grace, the publish interval).
 //!
 //! Impl (spec-gap 18): `publisher` MUST equal the verified identity; `stream_id`
 //! is namespaced under it. Impl (spec-gap 19): presence derives from device
@@ -30,7 +32,7 @@ pub const PRESENCE_GRACE_S: i64 = 60;
 /// The shortest interval between two accepted records of one device (P§8).
 pub const PUBLISH_INTERVAL_S: i64 = 5;
 
-/// A device's current presence record, as the authority holds it (P§3).
+/// A device's current presence record for one audience, as the authority holds it (P§3, P§6).
 #[derive(Debug, Clone, PartialEq)]
 struct PresenceRecord {
     id: String,
@@ -38,7 +40,15 @@ struct PresenceRecord {
     state: String,
     seq: i64,
     expires_at: i64,
+    audience: Option<String>,
 }
+
+/// Records are kept per `(subject, device, audience)`; `""` is the record without an audience (P§6).
+type RecordKey = (String, String, String);
+
+/// What admitting a presence subscriber fixes (P§6): admitted as the target's own device, the admitting grant and its
+/// `valid_until`, the audience.
+type Admission = (bool, Option<(String, i64)>, Option<String>);
 use dsip_session::event::{Emission, SendMsg};
 use dsip_session::Message;
 
@@ -78,6 +88,18 @@ pub struct Subscription {
     pub expires_at: i64,
     /// Last seq sent.
     pub seq: u64,
+    /// Admitted as the target's own device: sees every record (P§6 rule 1).
+    #[serde(default)]
+    pub own: bool,
+    /// The grant that admitted it (P§6 rule 2), and that grant's `valid_until` (P§7).
+    #[serde(default)]
+    pub grant: Option<(String, i64)>,
+    /// Its audience (P§6): the records with this `audience`, and those with none, are the ones it sees.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// The body of its last notify; a presence event notifies it only when this changes (P§6).
+    #[serde(default)]
+    pub body: Value,
 }
 
 /// Authorization policy for one target.
@@ -87,6 +109,9 @@ pub struct Policy {
     pub mode: String,
     /// Allowed subscriber identities (mode `allow`).
     pub allow: Vec<String>,
+    /// The presence audience the policy admits subscribers to (P§6).
+    #[serde(default)]
+    pub audience: Option<String>,
 }
 
 /// Events into the authority.
@@ -122,6 +147,9 @@ pub enum LocalPolicy {
         /// Allowlist.
         #[serde(default)]
         allow: Vec<String>,
+        /// The presence audience it admits to (P§6).
+        #[serde(default)]
+        audience: Option<String>,
     },
     /// Issue a capability token for a target (e.g. a follow token).
     IssueCapability {
@@ -165,12 +193,14 @@ pub struct Authority {
     capabilities: HashMap<String, String>,
     /// identity → its bound devices.
     bound: BTreeMap<String, BTreeSet<String>>,
-    /// (subject, device) → the device's current presence record (P§3).
-    records: BTreeMap<(String, String), PresenceRecord>,
-    /// device → when its record is dropped, after an unbind (P§3).
+    /// (subject, device, audience) → the device's current record for that audience (P§3, P§6).
+    records: BTreeMap<RecordKey, PresenceRecord>,
+    /// device → when its records are dropped, after an unbind (P§3).
     grace_until: BTreeMap<String, i64>,
-    /// device → when its last record was accepted (P§8).
-    last_accepted: HashMap<String, i64>,
+    /// (device, audience) → when its last record was accepted (P§8, per audience P§6).
+    last_accepted: HashMap<(String, String), i64>,
+    /// (granting identity, grant id) → the grant's `valid_until`, until which the revocation is kept (P§7).
+    revoked: HashMap<(String, String), i64>,
     /// T-Presence-Grace, the authority's choice within P§8's bounds.
     pub presence_grace: i64,
     out: Vec<Emission>,
@@ -192,6 +222,7 @@ impl Authority {
             records: BTreeMap::new(),
             grace_until: BTreeMap::new(),
             last_accepted: HashMap::new(),
+            revoked: HashMap::new(),
             presence_grace: PRESENCE_GRACE_S,
             out: vec![],
             events: vec![],
@@ -217,7 +248,7 @@ impl Authority {
 
     /// Set a target's policy.
     pub fn set_policy(&mut self, target: &str, mode: &str, allow: Vec<String>) {
-        self.policy.insert(target.into(), Policy { mode: mode.into(), allow });
+        self.policy.insert(target.into(), Policy { mode: mode.into(), allow, audience: None });
     }
 
     /// Issue a capability token.
@@ -243,29 +274,30 @@ impl Authority {
                 self.expire();
             }
             AuthorityEvent::Recv { recv } => self.recv(recv),
-            AuthorityEvent::Local(LocalPolicy::Policy { target, mode, allow }) => self.set_policy(target, mode, allow.clone()),
+            AuthorityEvent::Local(LocalPolicy::Policy { target, mode, allow, audience }) => {
+                self.policy.insert(target.clone(), Policy { mode: mode.clone(), allow: allow.clone(), audience: audience.clone() });
+            }
             AuthorityEvent::Local(LocalPolicy::IssueCapability { token, target }) => self.issue_capability(token, target),
             AuthorityEvent::Relay(Binding::Bind { device, identity }) => {
                 self.learn_identity(device, identity);
-                let before = self.presence_body(identity);
                 self.bound.entry(identity.clone()).or_default().insert(device.clone());
                 self.grace_until.remove(device); // P§3: back within the grace, the record stays
-                self.presence_changed(identity, &before);
+                self.presence_changed(identity);
             }
             AuthorityEvent::Relay(Binding::Unbind { device, identity }) => {
-                let before = self.presence_body(identity);
                 if let Some(b) = self.bound.get_mut(identity) {
                     b.remove(device);
                 }
-                if self.records.contains_key(&(identity.clone(), device.clone())) && !self.grace_until.contains_key(device) {
-                    // P§3: the record outlives the binding by T-Presence-Grace, from the first unbind; 0 drops it now
+                if self.holds_record(identity, device) && !self.grace_until.contains_key(device) {
+                    // P§3: the records outlive the binding by T-Presence-Grace, from the first unbind; 0 drops them now
                     if self.presence_grace == 0 {
-                        self.drop_record(identity, device);
+                        self.drop_device(identity, device);
                     } else {
                         self.grace_until.insert(device.clone(), self.now + self.presence_grace);
                     }
                 }
-                self.presence_changed(identity, &before);
+                // P§3, P§6: a binding change notifies only the subscriptions whose body it changes
+                self.presence_changed(identity);
             }
         }
         std::mem::take(&mut self.events)
@@ -352,6 +384,7 @@ impl Authority {
             }
             "subscribe" => self.recv_subscribe(m, &identity),
             "presence" => self.recv_presence(m, &identity),
+            "grant-revocation" => self.recv_revocation(m, &identity),
             _ => self.event(json!({"drop": "not-broadcast"})),
         }
     }
@@ -372,38 +405,71 @@ impl Authority {
             return refuse(self, "presence.lifetime", vec![]); // P§8
         }
         let seq = m["seq"].as_i64().unwrap_or(0);
-        let key = (identity.to_string(), device.clone());
+        let audience = m["audience"].as_str().map(String::from);
+        let aud = audience.clone().unwrap_or_default();
+        let key = (identity.to_string(), device.clone(), aud.clone());
         if self.records.get(&key).is_some_and(|held| seq <= held.seq) {
-            return refuse(self, "presence.stale", vec![]); // P§4: seq is ordered per (subject, device)
+            return refuse(self, "presence.stale", vec![]); // P§4, P§6: seq is ordered per (subject, device, audience)
         }
-        if let Some(last) = self.last_accepted.get(&device).copied().filter(|last| self.now - last < PUBLISH_INTERVAL_S) {
-            return refuse(self, "policy.rate-limited", vec![("retry_after", json!(PUBLISH_INTERVAL_S - (self.now - last)))]); // P§8
+        let last_key = (device.clone(), aud);
+        if let Some(last) = self.last_accepted.get(&last_key).copied().filter(|last| self.now - last < PUBLISH_INTERVAL_S) {
+            // P§8, per audience (P§6)
+            return refuse(self, "policy.rate-limited", vec![("retry_after", json!(PUBLISH_INTERVAL_S - (self.now - last)))]);
         }
-        let before = self.presence_body(identity);
         let state = m["state"].as_str().unwrap_or("").to_string();
-        self.records.insert(key, PresenceRecord { id, device: device.clone(), state, seq, expires_at: m["expires_at"].as_i64().unwrap_or(0) });
-        self.last_accepted.insert(device, self.now);
-        self.presence_changed(identity, &before);
+        let expires_at = m["expires_at"].as_i64().unwrap_or(0);
+        self.records.insert(key, PresenceRecord { id, device, state, seq, expires_at, audience });
+        self.last_accepted.insert(last_key, self.now);
+        self.presence_changed(identity);
     }
 
-    /// P§3: an expired record, or one whose grace ran out, is dropped and its seq forgotten.
-    fn drop_record(&mut self, subject: &str, device: &str) {
-        self.records.remove(&(subject.to_string(), device.to_string()));
+    /// P§7, §19.4: a grant withdrawn by a device of its grantor; every subscription it admitted ends at once.
+    fn recv_revocation(&mut self, m: &Value, identity: &str) {
+        let grant = m["grant"].as_str().unwrap_or("").to_string();
+        self.revoked.insert((identity.to_string(), grant.clone()), m["valid_until"].as_i64().unwrap_or(0));
+        let ended: Vec<String> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, s)| s.target == identity && s.grant.as_ref().is_some_and(|(g, _)| *g == grant))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for sid in ended {
+            self.notify(&sid, "terminated", Some("policy.terminated"));
+        }
+    }
+
+    fn holds_record(&self, subject: &str, device: &str) -> bool {
+        self.records.keys().any(|(s, d, _)| s == subject && d == device)
+    }
+
+    /// P§3: a device whose grace ran out loses every record, and their seqs are forgotten.
+    fn drop_device(&mut self, subject: &str, device: &str) {
+        self.records.retain(|(s, d, _), _| !(s == subject && d == device));
         self.grace_until.remove(device);
     }
 
-    /// P§3: the assertion over the subject's devices that hold no record, and the records held, by device.
-    fn presence_body(&self, subject: &str) -> Value {
+    /// P§3, P§6: over the records `sub` sees, the assertion for the subject's bound devices that hold none of them, and
+    /// those records by device, then audience (none first). `sub` None: every record.
+    fn presence_body(&self, subject: &str, sub: Option<&Subscription>) -> Value {
+        let sees = |r: &PresenceRecord| match (sub, &r.audience) {
+            (None, _) | (_, None) => true,
+            (Some(s), Some(a)) => s.own || s.audience.as_deref() == Some(a.as_str()),
+        };
+        let seen: Vec<&PresenceRecord> = self.records.iter().filter(|((s, _, _), r)| s == subject && sees(r)).map(|(_, r)| r).collect();
         let unrecorded_bound = self
             .bound
             .get(subject)
-            .is_some_and(|devices| devices.iter().any(|d| !self.records.contains_key(&(subject.to_string(), d.clone()))));
+            .is_some_and(|devices| devices.iter().any(|d| seen.iter().all(|r| r.device != *d)));
         let mut body = json!({"event": "presence", "state": if unrecorded_bound { "available" } else { "offline" }});
-        let records: Vec<Value> = self
-            .records
+        let records: Vec<Value> = seen
             .iter()
-            .filter(|((s, _), _)| s == subject)
-            .map(|(_, r)| json!({"id": r.id, "device": r.device, "state": r.state, "seq": r.seq, "expires_at": r.expires_at}))
+            .map(|r| {
+                let mut v = json!({"id": r.id, "device": r.device, "state": r.state, "seq": r.seq, "expires_at": r.expires_at});
+                if let Some(a) = &r.audience {
+                    v["audience"] = json!(a);
+                }
+                v
+            })
             .collect();
         if !records.is_empty() {
             body["records"] = Value::Array(records);
@@ -411,11 +477,48 @@ impl Authority {
         body
     }
 
-    /// P§3: subscriptions are told when an event changed the subject's body.
-    fn presence_changed(&mut self, subject: &str, before: &Value) {
-        if self.presence_body(subject) != *before {
-            self.notify_all("presence", subject);
+    /// P§6 (spec-gap 146): each presence subscription to the subject is notified exactly when its own body changed.
+    fn presence_changed(&mut self, subject: &str) {
+        let changed: Vec<String> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, s)| s.target == subject && s.events.iter().any(|e| e == "presence") && self.body_for(s) != s.body)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for sid in changed {
+            self.notify(&sid, "active", None);
         }
+    }
+
+    /// P§6 (spec-gap 144): the first rule that admits a presence subscriber — its own identity, a presented grant, a
+    /// capability, the authority's policy — as a subscription template carrying what it fixes (`own`, the grant, the
+    /// audience). With no policy for the target only the first three can admit: presence is private by default.
+    fn admit_presence(&self, target: &str, identity: &str, m: &Value) -> Option<Admission> {
+        if identity == target {
+            return Some((true, None, None));
+        }
+        for claim in m["claims"].as_array().into_iter().flatten() {
+            if claim["type"] != "dsip-grant" {
+                continue;
+            }
+            let g = &claim["grant"];
+            let id = g["id"].as_str().unwrap_or("");
+            let until = g["valid_until"].as_i64().unwrap_or(0);
+            if g["verified"].as_bool() != Some(false)
+                && g["identity"].as_str() == Some(target)
+                && g["to"].as_str() == Some(identity)
+                && g["scope"].as_array().is_some_and(|s| s.iter().any(|x| x == "dsip.subscribe"))
+                && until > self.now // §12.9: valid while now < valid_until
+                && !self.revoked.contains_key(&(target.to_string(), id.to_string()))
+            {
+                return Some((false, Some((id.to_string(), until)), g["presence_audience"].as_str().map(String::from)));
+            }
+        }
+        if m["capability"].as_str().is_some_and(|t| self.capabilities.get(t).map(String::as_str) == Some(target)) {
+            return Some((false, None, None));
+        }
+        let p = self.policy.get(target)?;
+        (p.mode == "public" || p.allow.iter().any(|a| a == identity)).then(|| (false, None, p.audience.clone()))
     }
 
     fn authorized(&self, target: &str, identity: &str, token: Option<&str>) -> bool {
@@ -428,6 +531,8 @@ impl Authority {
         }
     }
 
+    /// §9.3: a target this authority has seen. Impl (spec-gap 149): an identity it holds a device for, one with a bound
+    /// device, or one with a policy; a capability alone does not make a target seen.
     fn target_exists(&self, target: &str, events: &[String]) -> bool {
         if events.iter().any(|e| e == "publication") {
             return self.publications.contains_key(target);
@@ -460,10 +565,14 @@ impl Authority {
             return;
         }
         // §9.3 anti-enumeration: unauthorized and nonexistent targets get the identical reject
-        if !self.target_exists(&target, &events) || !self.authorized(&target, identity, m["capability"].as_str()) {
+        let presence = events.iter().any(|e| e == "presence");
+        let admitted = if presence { self.admit_presence(&target, identity, m) } else { Some((false, None, None)) };
+        let Some((own, grant, audience)) = admitted.filter(|_| {
+            self.target_exists(&target, &events) && (presence || self.authorized(&target, identity, m["capability"].as_str()))
+        }) else {
             self.send(SendMsg { msg_type: "reject".into(), to: from, session: Some(id), reason: Some("policy.blocked".into()), ..Default::default() });
             return;
-        }
+        };
         let cap = events.iter().map(|e| SUBSCRIPTION_EVENTS.iter().find(|(n, _)| n == e).map(|(_, c)| *c).unwrap_or(86_400)).min().unwrap_or(86_400);
         let lifetime = expires_in.min(cap);
         if let Some(sid) = existing {
@@ -472,7 +581,7 @@ impl Authority {
         }
         self.subscriptions.insert(
             id.clone(),
-            Subscription { subscriber: identity.into(), device: from, target, events, expires_at: self.now + lifetime, seq: 0 },
+            Subscription { subscriber: identity.into(), device: from, target, events, expires_at: self.now + lifetime, seq: 0, own, grant, audience, body: Value::Null },
         );
         self.notify(&id, "active", None);
     }
@@ -490,7 +599,7 @@ impl Authority {
                 None => json!({"event": "publication", "state": "unknown"}),
             }
         } else {
-            self.presence_body(&sub.target)
+            self.presence_body(&sub.target, Some(sub))
         }
     }
 
@@ -503,6 +612,7 @@ impl Authority {
         sub.seq += 1;
         let (to, seq) = (sub.device.clone(), sub.seq);
         let body = self.body_for(self.subscriptions.get(sid).expect("exists"));
+        self.subscriptions.get_mut(sid).expect("exists").body = body.clone();
         let mut extra = vec![("subscription", json!(sid)), ("seq", json!(seq)), ("state", json!(state))];
         if let Some(r) = reason {
             extra.push(("reason", json!(r)));
@@ -527,11 +637,25 @@ impl Authority {
     }
 
     fn expire(&mut self) {
-        let lapsed: Vec<String> = self.subscriptions.iter().filter(|(_, s)| s.expires_at <= self.now).map(|(k, _)| k.clone()).collect();
-        for sid in lapsed {
-            // §9.3: soft state — lapsed subscriptions end with a terminal notify carrying session.expired
-            self.notify(&sid, "terminated", Some("session.expired"));
+        let ending: Vec<(String, bool)> = self
+            .subscriptions
+            .iter()
+            .filter_map(|(k, s)| {
+                let lapsed = s.expires_at <= self.now;
+                (lapsed || s.grant.as_ref().is_some_and(|(_, until)| *until <= self.now)).then(|| (k.clone(), lapsed))
+            })
+            .collect();
+        for (sid, lapsed) in ending {
+            if lapsed {
+                // §9.3: soft state — lapsed subscriptions end with a terminal notify carrying session.expired
+                self.notify(&sid, "terminated", Some("session.expired"));
+            } else {
+                self.notify(&sid, "terminated", Some("policy.terminated")); // P§7: the admitting grant (the share) ended
+            }
         }
+        // P§7: a revocation is kept until the revoked grant's valid_until
+        let now = self.now;
+        self.revoked.retain(|_, until| *until > now);
         let expired: Vec<String> = self
             .publications
             .iter()
@@ -543,32 +667,37 @@ impl Authority {
             self.event(json!({"publication": {"stream": stream, "state": "expired"}}));
             self.notify_all("publication", &stream);
         }
-        // P§3: records past expires_at, and those whose grace ran out, are dropped; one notify per subject, in order
-        let dropped: Vec<(String, String)> = self
-            .records
-            .iter()
-            .filter(|((_, d), r)| r.expires_at <= self.now || self.grace_until.get(d).is_some_and(|g| *g <= self.now))
-            .map(|(k, _)| k.clone())
-            .collect();
+        // P§3: records past expires_at, and every record of a device whose grace ran out, are dropped; one notify per
+        // subscription whose body changed, subjects in order
         let mut changed = BTreeSet::new();
-        for (subject, device) in dropped {
-            self.drop_record(&subject, &device);
-            changed.insert(subject);
+        let graced: Vec<String> = self.grace_until.iter().filter(|(_, g)| **g <= self.now).map(|(d, _)| d.clone()).collect();
+        let now = self.now;
+        self.records.retain(|(subject, device, _), r| {
+            let keep = r.expires_at > now && !graced.contains(device);
+            if !keep {
+                changed.insert(subject.clone());
+            }
+            keep
+        });
+        for d in graced {
+            self.grace_until.remove(&d);
         }
         for subject in changed {
-            self.notify_all("presence", &subject);
+            self.presence_changed(&subject);
         }
     }
 
-    /// README `presence` snapshot: `{subject: {device: {seq, state, expires_at, grace_until?}}}` (P§3).
+    /// README `presence` snapshot: `{subject: {device: {seq, state, expires_at, grace_until?}}}` (P§3); a record with
+    /// an audience is keyed `device/audience` (P§6).
     pub fn snapshot_presence(&self) -> Value {
         let mut out = serde_json::Map::new();
-        for ((subject, device), r) in &self.records {
+        for ((subject, device, audience), r) in &self.records {
             let mut snap = json!({"seq": r.seq, "state": r.state, "expires_at": r.expires_at});
             if let Some(g) = self.grace_until.get(device) {
                 snap["grace_until"] = json!(g);
             }
-            out.entry(subject.clone()).or_insert_with(|| json!({}))[device] = snap;
+            let key = if audience.is_empty() { device.clone() } else { format!("{device}/{audience}") };
+            out.entry(subject.clone()).or_insert_with(|| json!({}))[key] = snap;
         }
         Value::Object(out)
     }
@@ -588,7 +717,20 @@ impl Authority {
         let m: serde_json::Map<String, Value> = self
             .subscriptions
             .iter()
-            .map(|(k, s)| (k.clone(), json!({"subscriber": s.subscriber, "target": s.target, "events": s.events, "seq": s.seq, "expires_at": s.expires_at})))
+            .map(|(k, s)| {
+                let mut v = json!({"subscriber": s.subscriber, "target": s.target, "events": s.events, "seq": s.seq, "expires_at": s.expires_at});
+                // P§6: how a presence subscription was admitted, when not by policy or a capability
+                if s.own {
+                    v["own"] = json!(true);
+                }
+                if let Some((g, _)) = &s.grant {
+                    v["grant"] = json!(g);
+                }
+                if let Some(a) = &s.audience {
+                    v["audience"] = json!(a);
+                }
+                (k.clone(), v)
+            })
             .collect();
         Value::Object(m)
     }

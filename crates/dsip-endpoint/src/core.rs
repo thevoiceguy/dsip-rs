@@ -630,6 +630,36 @@ impl Core {
         Some((inbound.verified.payload, identity))
     }
 
+    /// The grants we hold from `target` that let us watch its presence, as `subscribe` `claims` entries
+    /// `{"type": "dsip-grant", "grant": <the signed grant envelope>}`: live (`valid_until` after `now`), with
+    /// `dsip.subscribe` in their scope, and whose signed bytes we kept.
+    ///
+    /// Spec: §9.3, P§6 (a grant presented in `claims` admits a presence subscriber), §19.4.
+    pub fn presence_claims(&self, target: &str, now: i64) -> Vec<Value> {
+        self.ep
+            .contacts
+            .grants_held
+            .iter()
+            .filter(|(_, g)| g.identity == target && g.valid_until > now && g.scope.iter().any(|s| s == "dsip.subscribe"))
+            .filter_map(|(id, _)| {
+                let mut parts = self.grant_frames.get(id)?.split('.');
+                let (protected, payload, signature) = (parts.next()?, parts.next()?, parts.next()?);
+                Some(json!({"type": "dsip-grant", "grant": {"protected": protected, "payload": payload, "signature": signature}}))
+            })
+            .collect()
+    }
+
+    /// A signed `grant-revocation` for a grant we issued, addressed to our authority (`to`), or `None` when we issued no
+    /// grant `grant`. The host sends it before revoking the grant locally ([`LocalEvent::Revoke`]).
+    ///
+    /// Spec: §19.4, P§7 (spec-gap 147).
+    pub fn grant_revocation(&mut self, grant: &str, authority: &str, now: i64) -> Result<Option<String>> {
+        let Some(g) = self.ep.contacts.grants_issued.get(grant).cloned() else { return Ok(None) };
+        let p = json!({"dsip": dsip_core::version::version_block(&self.supported, &[]), "type": "grant-revocation", "to": authority,
+                       "grant": grant, "grantee": g.identity, "valid_until": g.valid_until});
+        self.sign_payload(p, now, 30).map(Some)
+    }
+
     fn rejected(&self, v: dsip_core::Verdict, mut out: Vec<CoreEvent>) -> Vec<CoreEvent> {
         out.push(CoreEvent::Rejected {
             code: v.code.and_then(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).unwrap_or_default(),
@@ -713,7 +743,7 @@ impl Core {
         }
         let msg = Message::from_payload(&p).ok_or(Error::PayloadShape("not a session message"))?;
         let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
-        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation" | "presence");
+        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation" | "presence" | "grant-revocation");
         out.push(CoreEvent::Received { message: msg.clone(), identity, display_name, payload: p });
         if session_scoped {
             // Broadcast/subscription traffic (§9.3, §22) is handled by the host, not the §12 engine.

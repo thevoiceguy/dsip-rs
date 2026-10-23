@@ -801,7 +801,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     }
                     "grant" => {
                         if let Some(intro) = arg.clone().or_else(latest_request) {
-                            agent.local(LocalEvent::Grant { introduction: intro, id: Ulid::generate().to_string(), scope: vec!["dsip.invite".into()], valid_until: year }).await?;
+                            agent.local(LocalEvent::Grant { introduction: intro, id: Ulid::generate().to_string(), scope: vec!["dsip.invite".into(), "dsip.subscribe".into()], valid_until: year }).await?;
                         } else { println!("no pending request"); }
                         agent.save_contacts()?;
                         continue;
@@ -813,7 +813,16 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         continue;
                     }
                     "revoke" => {
-                        if let Some(g) = arg.clone() { agent.local(LocalEvent::Revoke { grant: g }).await?; agent.save_contacts()?; }
+                        // no argument: every grant we issued
+                        let grants: Vec<String> = match arg.clone() {
+                            Some(g) => vec![g],
+                            None => agent.endpoint().contacts.grants_issued.keys().cloned().collect(),
+                        };
+                        for g in grants {
+                            // §19.4, P§7: the revocation goes to our relay too, which ends what the grant admitted there
+                            if agent.revoke_grant(&g).await? { println!("→ grant-revocation  …{}  to our relay   P§7", sid8(&g)); } else { println!("no grant {g} issued"); }
+                        }
+                        agent.save_contacts()?;
                         continue;
                     }
                     "token" => {

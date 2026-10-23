@@ -553,8 +553,14 @@ impl Endpoint {
     /// `{"frame", "subscription"}`; the host sends the frame on its connection to that relay.
     /// Spec: §9.3, P§3.
     pub fn presence_subscribe(&mut self, target: &str, authority: &str, expires_in: f64, now: f64) -> Result<String, JsValue> {
-        let p = json!({"dsip": dsip_core::version::version_block(&self.supported, &[dsip_broadcast::PROFILE]),
-                       "type": "subscribe", "to": authority, "target": target, "events": ["presence"], "expires_in": expires_in as i64});
+        let mut p = json!({"dsip": dsip_core::version::version_block(&self.supported, &[dsip_broadcast::PROFILE]),
+                           "type": "subscribe", "to": authority, "target": target, "events": ["presence"], "expires_in": expires_in as i64});
+        // P§6: presence is private by default; the grants we hold from the target admit us
+        let claims = self.core.presence_claims(target, now as i64);
+        let presented = claims.len();
+        if presented > 0 {
+            p["claims"] = Value::Array(claims);
+        }
         let frame = self.core.sign_payload(p, now as i64, 30).map_err(js)?;
         let sub = Envelope::from_frame(&frame)
             .ok()
@@ -565,7 +571,21 @@ impl Endpoint {
         // §9.3: a renewal replaces the subscription; the watch follows the new one
         self.watches.retain(|_, w| w.target() != target);
         self.watches.insert(sub.clone(), dsip_broadcast::presence::Watch::new(target));
-        Ok(json!({"frame": frame, "subscription": sub}).to_string())
+        Ok(json!({"frame": frame, "subscription": sub, "grants": presented}).to_string())
+    }
+
+    /// Signed `grant-revocation`s, addressed to our authority, for every grant we issued to `identity` (P§7, §19.4):
+    /// sent before the grants are revoked locally, so the authority ends what they admitted. Returns a JSON array of
+    /// `{"grant", "frame"}`.
+    pub fn grant_revocations(&mut self, identity: &str, authority: &str, now: f64) -> Result<String, JsValue> {
+        let ids: Vec<String> = self.core.contacts().grants_issued.iter().filter(|(_, g)| g.identity == identity).map(|(id, _)| id.clone()).collect();
+        let mut out = vec![];
+        for id in ids {
+            if let Some(frame) = self.core.grant_revocation(&id, authority, now as i64).map_err(js)? {
+                out.push(json!({"grant": id, "frame": frame}));
+            }
+        }
+        Ok(Value::Array(out).to_string())
     }
 
     /// A verified presence `notify` payload (from a `received` event). Each carried record is verified here, independently
