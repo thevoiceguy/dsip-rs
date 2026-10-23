@@ -78,6 +78,9 @@ pub const RESOLVE_RETRY_S: i64 = 60;
 pub const RESOLVE_MAX_HELD: usize = 64;
 /// See [`RESOLVE_MAX_HELD`].
 pub const RESOLVE_MAX_PENDING: usize = 16;
+/// How many of our own `subscribe` ids the core remembers to recognise their refusals (§9.3).
+/// Impl: a host renews each watch with a fresh `subscribe` (a renewal replaces, §9.3), so only recent ids matter.
+const SUBSCRIPTIONS_KEPT: usize = 64;
 
 /// Persisted first-contact state.
 ///
@@ -270,6 +273,9 @@ pub struct Core {
     offers: HashMap<String, Value>,
     /// Signed grants held, by id, compact (§19.4; presented as credentials, M§14.2).
     grant_frames: std::collections::BTreeMap<String, String>,
+    /// Ids of the `subscribe`s we signed, newest last (bounded): a `reject` or `error` naming one in `session` answers
+    /// our subscription (§9.3), not a §12 session.
+    subscriptions: std::collections::VecDeque<String>,
     peer_delegations: Vec<Envelope>,
     /// `delegation-revocation` records this endpoint holds (§7.4, v0.8): applied to every verification.
     revocations: Vec<Envelope>,
@@ -318,6 +324,7 @@ impl Core {
             seen: SeenIds::default(),
             offers: HashMap::new(),
             grant_frames: Default::default(),
+            subscriptions: Default::default(),
             peer_delegations: vec![],
             revocations: vec![],
             pending_sdp: None,
@@ -368,6 +375,12 @@ impl Core {
         }
         if p.get("expires_at").is_none() {
             p["expires_at"] = (now + ttl).into();
+        }
+        if p["type"] == "subscribe" {
+            self.subscriptions.push_back(p["id"].as_str().unwrap_or_default().to_string());
+            if self.subscriptions.len() > SUBSCRIPTIONS_KEPT {
+                self.subscriptions.pop_front();
+            }
         }
         Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.keys.device, &self.keys.device.kid(), vec![self.keys.delegation.clone()]).frame())
     }
@@ -743,7 +756,11 @@ impl Core {
         }
         let msg = Message::from_payload(&p).ok_or(Error::PayloadShape("not a session message"))?;
         let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
-        let session_scoped = !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation" | "presence" | "grant-revocation");
+        // §9.3: an authority refuses a subscription with `reject` (or `error`) naming it in `session`; the host's watch
+        // takes it, and the §12 engine, which knows no such session, must not answer it with `session.unknown-session`
+        let ours = msg.session.as_ref().is_some_and(|sid| self.subscriptions.contains(sid));
+        let session_scoped = !ours
+            && !matches!(msg.msg_type.as_str(), "publish" | "unpublish" | "subscribe" | "notify" | "hello" | "reachability-hint" | "provenance" | "key-rotation" | "presence" | "grant-revocation");
         out.push(CoreEvent::Received { message: msg.clone(), identity, display_name, payload: p });
         if session_scoped {
             // Broadcast/subscription traffic (§9.3, §22) is handled by the host, not the §12 engine.
