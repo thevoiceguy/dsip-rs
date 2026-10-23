@@ -65,6 +65,14 @@ pub const HINT_MAX_VALIDITY_S: i64 = 3_600;
 /// `notify` bodies for its whole lifetime, so its age is bounded by its own `expires_at` under this cap.
 pub const PRESENCE_MAX_VALIDITY_S: i64 = 3_600;
 
+/// Whether `a` is a presence audience token: `[a-z][a-z0-9-]*`, at most 64 characters (the schemas check the same
+/// pattern on a record's `audience` and a grant's `presence_audience`).
+///
+/// Spec: Presence Profile P§6 (spec-gap 145).
+pub fn is_presence_audience(a: &str) -> bool {
+    a.len() <= 64 && a.starts_with(|c: char| c.is_ascii_lowercase()) && a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// Maximum encoded envelope size on `ws/1.0`, a fixed binding constant.
 ///
 /// Spec: §13.2.

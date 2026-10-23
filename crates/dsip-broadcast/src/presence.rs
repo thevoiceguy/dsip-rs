@@ -16,6 +16,13 @@ use dsip_core::registry::{effective_presence_state, PRESENCE_STATES};
 /// profiles refuses the payload).
 pub const PROFILE: &str = "presence/0.1";
 
+/// Whether `a` is an audience token: `[a-z][a-z0-9-]*`, at most 64 characters (the schemas check the same pattern).
+///
+/// Spec: P§6.
+pub fn is_audience(a: &str) -> bool {
+    dsip_core::is_presence_audience(a)
+}
+
 /// The identity's presence as P§4 combines it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Combined {
@@ -79,28 +86,47 @@ pub fn run_vector(v: &Value) -> Value {
     }
 }
 
-/// A device's own presence record, kept fresh at its authority.
+/// A device's own presence records, kept fresh at its authority: one with no audience and one per audience it shares
+/// with, each signed by itself.
 ///
-/// Clockless: the host calls [`Publisher::set`] when the user picks a state and [`Publisher::tick`] on its timer, signs
-/// each payload returned with the record's lifetime as its validity (`expires_at − issued_at`), and sends it to the
-/// authority. It reports an authority's `error` with [`Publisher::refused`].
+/// Clockless: the host calls [`Publisher::set`] (or [`Publisher::set_for`] for an audience) when the user picks a
+/// state and [`Publisher::tick`] on its timer, until it returns `None`; it signs each payload returned with the
+/// record's lifetime as its validity (`expires_at − issued_at`) and sends it to the authority. It reports an
+/// authority's `error` with [`Publisher::refused_for`], naming the audience of the record refused (its `audience`).
 ///
-/// Spec: P§3 (the record: `to` the authority, `subject` the identity, `device` the signer; `seq` per `(subject, device)`
-/// must grow), P§8 (lifetime 60–3,600 s, at least 5 s between two accepted records; devices publish again before
-/// expiry).
+/// Spec: P§3 (the record: `to` the authority, `subject` the identity, `device` the signer; `seq` must grow), P§6
+/// (a record MAY carry `audience`; records, `seq` and the publish interval are per `(device, audience)`, a record
+/// without one counting as an audience of its own), P§8 (lifetime 60–3,600 s, at least 5 s between two accepted
+/// records of one device and audience; devices publish again before expiry).
 /// Impl: `seq` is the larger of the last one plus one and the current time, as for reachability hints, so it keeps
-/// growing across restarts; the record is published again at ⅔ of its lifetime, as hints are re-signed (DHT Hints
-/// Profile §2). Client behaviour only: the authority's checks are what the vectors pin.
+/// growing across restarts; each record is published again at ⅔ of its lifetime, as hints are re-signed (DHT Hints
+/// Profile §2); when several are due, the one with no audience goes first, then audiences in code-point order. Client
+/// behaviour only: the authority's checks are what the vectors pin.
 #[derive(Debug, Clone)]
 pub struct Publisher {
     identity: String,
     device: String,
     authority: String,
     lifetime: i64,
-    state: Option<String>,
+    /// By audience (`None`: the record with no audience); ordered, so ties go no-audience first.
+    records: std::collections::BTreeMap<Option<String>, Published>,
+}
+
+/// One record a [`Publisher`] keeps fresh.
+#[derive(Debug, Clone)]
+struct Published {
+    state: String,
     seq: i64,
     last_sent: Option<i64>,
     due: Option<i64>,
+}
+
+impl Published {
+    /// When it may next be sent: its own due time, held back by P§8's interval after the last one.
+    fn ready_at(&self) -> Option<i64> {
+        let due = self.due?;
+        Some(self.last_sent.map_or(due, |l| due.max(l + crate::authority::PUBLISH_INTERVAL_S)))
+    }
 }
 
 impl Publisher {
@@ -112,10 +138,7 @@ impl Publisher {
             device: device.into(),
             authority: authority.into(),
             lifetime: lifetime.clamp(crate::authority::RECORD_MIN_LIFETIME_S, dsip_core::PRESENCE_MAX_VALIDITY_S),
-            state: None,
-            seq: 0,
-            last_sent: None,
-            due: None,
+            records: Default::default(),
         }
     }
 
@@ -124,68 +147,110 @@ impl Publisher {
         self.lifetime
     }
 
-    /// The state being published, if any.
+    /// The state published with no audience, if any.
     pub fn state(&self) -> Option<&str> {
-        self.state.as_deref()
+        self.state_for(None)
     }
 
-    /// A new authority (the device bound to another relay): the next record goes there at once.
+    /// The state published for `audience` (`None`: no audience), if any.
+    pub fn state_for(&self, audience: Option<&str>) -> Option<&str> {
+        self.records.get(&audience.map(String::from)).map(|r| r.state.as_str())
+    }
+
+    /// Every audience published for, with its state; the record with no audience first.
+    pub fn states(&self) -> impl Iterator<Item = (Option<&str>, &str)> {
+        self.records.iter().map(|(a, r)| (a.as_deref(), r.state.as_str()))
+    }
+
+    /// A new authority (the device bound to another relay): every record goes there at once. Returns the first due;
+    /// [`Publisher::tick`] returns the rest.
     pub fn rebind(&mut self, authority: &str, now: i64) -> Option<Value> {
         self.authority = authority.into();
-        self.last_sent = None;
-        self.due = self.state.as_ref().map(|_| now);
-        self.tick(now)
-    }
-
-    /// The user picked `state` (`None` stops publishing; the record then lapses at its `expires_at`). Returns the
-    /// payload to sign now, or `None` when P§8's publish interval holds it back: [`Publisher::tick`] sends it then.
-    pub fn set(&mut self, state: Option<&str>, now: i64) -> Option<Value> {
-        self.state = state.map(String::from);
-        self.due = self.state.as_ref().map(|_| now);
-        self.tick(now)
-    }
-
-    /// The payload to sign at `now`, if one is due.
-    pub fn tick(&mut self, now: i64) -> Option<Value> {
-        let state = self.state.clone()?;
-        let mut due = self.due?;
-        if let Some(last) = self.last_sent {
-            // P§8: at least the publish interval between two records of this device
-            due = due.max(last + crate::authority::PUBLISH_INTERVAL_S);
+        for r in self.records.values_mut() {
+            r.last_sent = None;
+            r.due = Some(now);
         }
-        if now < due {
-            self.due = Some(due);
+        self.tick(now)
+    }
+
+    /// The user picked `state` for the record with no audience (`None` stops publishing it). See [`Publisher::set_for`].
+    pub fn set(&mut self, state: Option<&str>, now: i64) -> Option<Value> {
+        self.set_for(None, state, now)
+    }
+
+    /// The user picked `state` for `audience` (`None` stops publishing that record; it then lapses at its
+    /// `expires_at`). Returns the payload to sign now, or `None` when P§8's publish interval holds it back:
+    /// [`Publisher::tick`] sends it then.
+    ///
+    /// Spec: P§6 (a token `[a-z][a-z0-9-]*` of at most 64 characters; the host checks it), P§8.
+    pub fn set_for(&mut self, audience: Option<&str>, state: Option<&str>, now: i64) -> Option<Value> {
+        let key = audience.map(String::from);
+        match state {
+            None => {
+                self.records.remove(&key);
+                None
+            }
+            Some(st) => {
+                let r = self.records.entry(key.clone()).or_insert(Published { state: st.into(), seq: 0, last_sent: None, due: None });
+                r.state = st.into();
+                r.due = Some(now);
+                self.send(&key, now)
+            }
+        }
+    }
+
+    /// A payload to sign at `now`, if one is due: call until `None`.
+    pub fn tick(&mut self, now: i64) -> Option<Value> {
+        let key = self.records.iter().find(|(_, r)| r.ready_at().is_some_and(|t| t <= now)).map(|(k, _)| k.clone())?;
+        self.send(&key, now)
+    }
+
+    fn send(&mut self, key: &Option<String>, now: i64) -> Option<Value> {
+        let lifetime = self.lifetime;
+        let r = self.records.get_mut(key)?;
+        let ready = r.ready_at()?;
+        if now < ready {
+            // P§8: at least the publish interval between two records of this device and audience
+            r.due = Some(ready);
             return None;
         }
-        self.seq = (self.seq + 1).max(now);
-        self.last_sent = Some(now);
-        self.due = Some(now + self.lifetime * 2 / 3);
-        Some(json!({
+        r.seq = (r.seq + 1).max(now);
+        r.last_sent = Some(now);
+        r.due = Some(now + lifetime * 2 / 3);
+        let mut p = json!({
             "dsip": {"core": "1.0", "min_core": "1.0", "profiles": [PROFILE], "extensions": [], "critical": []},
             "type": "presence", "to": self.authority, "subject": self.identity, "device": self.device,
-            "state": state, "seq": self.seq,
-        }))
+            "state": r.state, "seq": r.seq,
+        });
+        if let Some(a) = key {
+            p["audience"] = a.as_str().into();
+        }
+        Some(p)
     }
 
     /// When [`Publisher::tick`] next has something to send.
     pub fn next_deadline(&self) -> Option<i64> {
-        self.state.as_ref()?;
-        let due = self.due?;
-        Some(self.last_sent.map_or(due, |l| due.max(l + crate::authority::PUBLISH_INTERVAL_S)))
+        self.records.values().filter_map(Published::ready_at).min()
     }
 
-    /// The authority refused the last record with `reason` (P§9). `policy.rate-limited` is tried again after its
-    /// `retry_after`; `presence.stale` again at once with a larger `seq`; anything else is not sent again until the
-    /// user picks a state (P§9: the device publishes a corrected record).
+    /// The authority refused the last record with no audience. See [`Publisher::refused_for`].
     pub fn refused(&mut self, reason: &str, retry_after: Option<i64>, now: i64) {
+        self.refused_for(None, reason, retry_after, now)
+    }
+
+    /// The authority refused the last record for `audience` with `reason` (P§9). `policy.rate-limited` is tried again
+    /// after its `retry_after`; `presence.stale` again at once with a larger `seq`; anything else is not sent again
+    /// until the user picks a state for it (P§9: the device publishes a corrected record).
+    pub fn refused_for(&mut self, audience: Option<&str>, reason: &str, retry_after: Option<i64>, now: i64) {
+        let Some(r) = self.records.get_mut(&audience.map(String::from)) else { return };
         match reason {
-            "policy.rate-limited" => self.due = Some(now + retry_after.unwrap_or(crate::authority::PUBLISH_INTERVAL_S)),
+            "policy.rate-limited" => r.due = Some(now + retry_after.unwrap_or(crate::authority::PUBLISH_INTERVAL_S)),
             "presence.stale" => {
-                self.seq += 1;
-                self.last_sent = None;
-                self.due = Some(now);
+                r.seq += 1;
+                r.last_sent = None;
+                r.due = Some(now);
             }
-            _ => self.due = None,
+            _ => r.due = None,
         }
     }
 }

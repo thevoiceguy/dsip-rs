@@ -228,7 +228,12 @@ enum PresenceCmd {
         /// The state (`dsip-presence-state`: available, busy, away, dnd, offline, or any newer token, P§5).
         #[arg(long)]
         state: String,
-        /// Later changes, each `SECONDS:STATE` counted from the start (`STATE` `none` stops publishing).
+        /// A record for an audience, `AUDIENCE=STATE` (repeatable): seen only by subscriptions admitted for that
+        /// audience, besides the record with no audience (P§6).
+        #[arg(long = "audience")]
+        audiences: Vec<String>,
+        /// Later changes, each `SECONDS:STATE` or `SECONDS:AUDIENCE=STATE` counted from the start (`STATE` `none`
+        /// stops publishing that record).
         #[arg(long)]
         then: Vec<String>,
         /// Record lifetime in seconds (P§8: 60–3,600).
@@ -682,7 +687,9 @@ async fn main() -> Result<()> {
             finish(console::run(opts.into_console(), console::Mode::Introduce { to, purpose, token, wait }).await)
         }
         Cmd::Presence { cmd } => finish(match cmd {
-            PresenceCmd::Publish { conn, state, then, lifetime, wait } => broadcast_cli::presence_publish(&conn.conn(), &state, &then, lifetime, wait).await,
+            PresenceCmd::Publish { conn, state, audiences, then, lifetime, wait } => {
+                broadcast_cli::presence_publish(&conn.conn(), &state, &audiences, &then, lifetime, wait).await
+            }
             PresenceCmd::Watch { conn, target, expires_in, wait } => {
                 broadcast_cli::subscribe(&conn.conn(), &target, vec!["presence".into()], expires_in, wait, vec![], vec![]).await
             }

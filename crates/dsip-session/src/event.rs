@@ -123,6 +123,9 @@ pub enum LocalEvent {
         scope: Vec<String>,
         /// Grant lifetime.
         valid_until: i64,
+        /// The presence audience the grant admits to (P§6, spec-gap 145).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presence_audience: Option<String>,
     },
     /// Decline a pending introduction.
     RejectIntroduction {
@@ -407,6 +410,8 @@ pub enum Refusal {
     UnknownSession,
     /// No such introduction.
     UnknownIntroduction,
+    /// A grant's `presence_audience` is not an audience token (P§6).
+    InvalidAudience,
     /// No such grant.
     UnknownGrant,
     /// §12.8 rule 2: an update is already outstanding, in either direction.
@@ -422,6 +427,7 @@ impl Refusal {
             Refusal::InvalidState => "invalid-state",
             Refusal::UnknownSession => "unknown-session",
             Refusal::UnknownIntroduction => "unknown-introduction",
+            Refusal::InvalidAudience => "invalid-audience",
             Refusal::UnknownGrant => "unknown-grant",
             Refusal::UpdatePending => "update-pending",
             Refusal::NoPendingUpdate => "no-pending-update",
