@@ -440,7 +440,8 @@ pub struct Endpoint {
     seen: SeenIds,
     hello_id: Option<String>,
     presence: Option<dsip_broadcast::presence::Publisher>,
-    presence_state: Option<String>,
+    /// The states picked, by audience (`None`: no audience), kept for the publisher created at the first binding.
+    presence_states: std::collections::BTreeMap<Option<String>, String>,
     watches: std::collections::BTreeMap<String, dsip_broadcast::presence::Watch>,
 }
 
@@ -498,13 +499,13 @@ impl Endpoint {
             seen: SeenIds::default(),
             hello_id: None,
             presence: None,
-            presence_state: None,
+            presence_states: Default::default(),
             watches: Default::default(),
         })
     }
 
-    /// Bound to the relay `authority` (its DID, from its `hello`): our presence record goes there. Returns the signed
-    /// record to send now, or `null`. Spec: P§3.
+    /// Bound to the relay `authority` (its DID, from its `hello`): our presence records go there. Returns the first
+    /// signed record to send now, or `null`; [`Endpoint::presence_tick`] returns the rest. Spec: P§3, P§6.
     pub fn presence_bound(&mut self, authority: &str, now: f64) -> Result<Option<String>, JsValue> {
         let now = now as i64;
         let out = match self.presence.as_mut() {
@@ -512,7 +513,10 @@ impl Endpoint {
             None => {
                 let k = self.core.keys();
                 let mut p = dsip_broadcast::presence::Publisher::new(&k.identity, &k.device.did(), authority, 300);
-                let out = p.set(self.presence_state.as_deref(), now);
+                for (audience, state) in &self.presence_states {
+                    p.set_for(audience.as_deref(), Some(state), now);
+                }
+                let out = p.rebind(authority, now);
                 self.presence = Some(p);
                 out
             }
@@ -520,25 +524,47 @@ impl Endpoint {
         self.sign_presence(out, now)
     }
 
-    /// The user picked a presence state (`null` stops publishing). Returns the signed record to send now, or `null`
-    /// (not bound yet, or P§8's publish interval holds it back: [`Endpoint::presence_tick`] returns it then).
+    /// The user picked a presence state with no audience (`null` stops publishing). See [`Endpoint::presence_set_for`].
     /// Spec: P§3, P§5, P§8.
     pub fn presence_set(&mut self, state: Option<String>, now: f64) -> Result<Option<String>, JsValue> {
-        self.presence_state = state;
-        let out = self.presence.as_mut().and_then(|p| p.set(self.presence_state.as_deref(), now as i64));
+        self.presence_set_for(None, state, now)
+    }
+
+    /// The user picked a presence state for `audience` (`null`: the record with no audience; a state of `null` stops
+    /// publishing that record). Returns the signed record to send now, or `null` (not bound yet, or P§8's publish
+    /// interval holds it back: [`Endpoint::presence_tick`] returns it then). An audience that is not a P§6 token
+    /// (`[a-z][a-z0-9-]*`, at most 64 characters) is an error.
+    /// Spec: P§3, P§5, P§6, P§8.
+    pub fn presence_set_for(&mut self, audience: Option<String>, state: Option<String>, now: f64) -> Result<Option<String>, JsValue> {
+        if let Some(a) = &audience {
+            if !dsip_broadcast::presence::is_audience(a) {
+                return Err(JsValue::from_str(&format!("not an audience token (P§6): {a}")));
+            }
+        }
+        match &state {
+            Some(st) => self.presence_states.insert(audience.clone(), st.clone()),
+            None => self.presence_states.remove(&audience),
+        };
+        let out = self.presence.as_mut().and_then(|p| p.set_for(audience.as_deref(), state.as_deref(), now as i64));
         self.sign_presence(out, now as i64)
     }
 
-    /// Our presence record due at `now` (a refresh, or one held back), signed, or `null`. Spec: P§8.
+    /// The states being published, as a JSON object from audience (`""`: no audience) to state. Spec: P§6.
+    pub fn presence_states(&self) -> String {
+        Value::Object(self.presence_states.iter().map(|(a, s)| (a.clone().unwrap_or_default(), Value::from(s.as_str()))).collect()).to_string()
+    }
+
+    /// One presence record due at `now` (a refresh, or one held back), signed, or `null`: call until `null`. Spec: P§8.
     pub fn presence_tick(&mut self, now: f64) -> Result<Option<String>, JsValue> {
         let out = self.presence.as_mut().and_then(|p| p.tick(now as i64));
         self.sign_presence(out, now as i64)
     }
 
-    /// The authority refused our record with `reason` (an `error` whose `in_reply_to` is the record). Spec: P§9.
-    pub fn presence_refused(&mut self, reason: &str, retry_after: Option<f64>, now: f64) {
+    /// The authority refused our record for `audience` (`null`: no audience; the refused record's `audience`) with
+    /// `reason` (an `error` whose `in_reply_to` is the record). Spec: P§9.
+    pub fn presence_refused(&mut self, reason: &str, retry_after: Option<f64>, now: f64, audience: Option<String>) {
         if let Some(p) = self.presence.as_mut() {
-            p.refused(reason, retry_after.map(|r| r as i64), now as i64);
+            p.refused_for(audience.as_deref(), reason, retry_after.map(|r| r as i64), now as i64);
         }
     }
 

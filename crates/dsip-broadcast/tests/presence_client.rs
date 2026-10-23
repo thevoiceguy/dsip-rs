@@ -52,6 +52,37 @@ fn publisher_lifetime_is_clamped_to_p8() {
     assert_eq!(Publisher::new("i", "d", "a", 9999).lifetime(), 3600);
 }
 
+#[test]
+fn publisher_keeps_one_record_per_audience_each_with_its_own_interval_and_seq() {
+    let mut p = Publisher::new("did:web:bob.example", "did:key:zPhone", "did:key:zRelay", 300);
+    let plain = p.set(Some("available"), T).expect("sent at once");
+    assert!(plain.get("audience").is_none(), "P§6: the record with no audience carries none");
+    // P§6, P§8: the interval runs per (device, audience), so a family record in the same second is not held back
+    let fam = p.set_for(Some("family"), Some("busy"), T).expect("another audience is not held back");
+    assert_eq!((fam["audience"].as_str(), fam["state"].as_str()), (Some("family"), Some("busy")));
+    assert!(p.set_for(Some("family"), Some("dnd"), T + 1).is_none(), "but the same audience is, inside 5 s");
+    assert_eq!(p.next_deadline(), Some(T + 5));
+    assert_eq!(p.tick(T + 5).expect("the held family record")["state"], "dnd");
+    assert!(p.tick(T + 5).is_none(), "nothing else is due");
+    assert_eq!(p.states().collect::<Vec<_>>(), vec![(None, "available"), (Some("family"), "dnd")]);
+}
+
+#[test]
+fn publisher_rebinds_every_audience_and_a_refusal_holds_only_its_own() {
+    let mut p = Publisher::new("did:web:bob.example", "did:key:zPhone", "did:key:zRelay", 300);
+    p.set(Some("available"), T);
+    p.set_for(Some("work"), Some("away"), T);
+    let first = p.rebind("did:key:zOther", T + 100).expect("no audience first");
+    assert!(first.get("audience").is_none() && first["to"] == "did:key:zOther");
+    let second = p.tick(T + 100).expect("then work");
+    assert_eq!(second["audience"], "work");
+    assert!(p.tick(T + 100).is_none());
+    p.refused_for(Some("work"), "presence.lifetime", None, T + 101);
+    assert_eq!(p.next_deadline(), Some(T + 100 + 200), "work is held until the user picks again; the plain one still refreshes");
+    p.set_for(Some("work"), None, T + 102);
+    assert_eq!(p.state_for(Some("work")), None, "stopped: that record lapses at its expires_at");
+}
+
 fn notify(seq: i64, asserted: &str, frames: &[&str]) -> Value {
     json!({"type": "notify", "seq": seq, "state": "active",
            "body": {"event": "presence", "state": asserted, "records": frames.iter().map(|f| json!({"frame": f})).collect::<Vec<_>>()}})

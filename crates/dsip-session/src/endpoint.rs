@@ -433,15 +433,20 @@ impl Endpoint {
         }
     }
 
-    /// §19.4 outcome 1: a signed contact grant — the consent receipt (§19.3) in message form.
-    fn issue_grant(&mut self, gid: &str, grantee: &str, scope: Vec<String>, valid_until: i64, introduction: &str) {
+    /// §19.4 outcome 1: a signed contact grant — the consent receipt (§19.3) in message form; P§6: it may name the
+    /// presence audience it admits to.
+    fn issue_grant(&mut self, gid: &str, grantee: &str, scope: Vec<String>, valid_until: i64, introduction: &str, presence_audience: Option<&str>) {
         self.contacts.grants_issued.insert(gid.into(), Grant { identity: grantee.into(), scope: scope.clone(), valid_until });
+        let mut extra = vec![("scope", json!(scope)), ("valid_until", json!(valid_until))];
+        if let Some(a) = presence_audience {
+            extra.push(("presence_audience", json!(a)));
+        }
         self.send(SendMsg {
             msg_type: "grant".into(),
             to: grantee.into(),
             session: Some(introduction.into()),
             id: Some(gid.into()),
-            extra: vec![("scope", json!(scope)), ("valid_until", json!(valid_until))],
+            extra,
             ..Default::default()
         });
     }
@@ -485,13 +490,19 @@ impl Endpoint {
                 self.send(SendMsg { msg_type: "introduction".into(), to: to.clone(), id: Some(id.clone()), extra, ..Default::default() });
                 return;
             }
-            LocalEvent::Grant { introduction, id, scope, valid_until } => {
-                let Some((identity, _)) = self.contacts.requests.remove(introduction) else {
+            LocalEvent::Grant { introduction, id, scope, valid_until, presence_audience } => {
+                if !self.contacts.requests.contains_key(introduction) {
                     self.emit(Emission::Refused(Refusal::UnknownIntroduction));
                     return;
-                };
+                }
+                if presence_audience.as_deref().is_some_and(|a| !dsip_core::is_presence_audience(a)) {
+                    // P§6: an audience is a token; nothing is sent and the request stays pending
+                    self.emit(Emission::Refused(Refusal::InvalidAudience));
+                    return;
+                }
+                let (identity, _) = self.contacts.requests.remove(introduction).expect("checked above");
                 let scope = if scope.is_empty() { vec!["dsip.invite".to_string()] } else { scope.clone() };
-                self.issue_grant(id, &identity, scope, *valid_until, introduction);
+                self.issue_grant(id, &identity, scope, *valid_until, introduction, presence_audience.as_deref());
                 return;
             }
             LocalEvent::RejectIntroduction { introduction, reason } => {
@@ -759,7 +770,7 @@ impl Endpoint {
             // §19.4: a valid out-of-band contact token MAY be auto-granted per recipient policy (single use)
             self.ui(UiEvent::IntroductionReceived { from: identity.clone(), token: true });
             let until = self.now + 31_536_000;
-            self.issue_grant(&gid, &identity, vec!["dsip.invite".into()], until, &m.id);
+            self.issue_grant(&gid, &identity, vec!["dsip.invite".into()], until, &m.id, None);
             return;
         }
         // §19.4 UX requirement: a distinct requests surface — never a ring, never call history

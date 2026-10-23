@@ -232,36 +232,67 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
     Ok(())
 }
 
-/// `dsip presence publish`: send this device's presence record to its relay (the authority) and keep it fresh,
-/// following `then` (`SECONDS:STATE`, `none` to stop) and printing what the authority refuses.
+/// `AUDIENCE=STATE` (or `STATE`, for the record with no audience): the audience, checked as a P§6 token, and the state
+/// (`none`: stop publishing that record).
+fn audience_state(arg: &str) -> Result<(Option<String>, Option<String>)> {
+    let (audience, state) = match arg.split_once('=') {
+        Some((a, st)) => {
+            anyhow::ensure!(dsip_broadcast::presence::is_audience(a), "not an audience token (P§6: [a-z][a-z0-9-]*): {a}");
+            (Some(a.to_string()), st)
+        }
+        None => (None, arg),
+    };
+    Ok((audience, (state != "none").then(|| state.to_string())))
+}
+
+/// `dsip presence publish`: send this device's presence records to its relay (the authority) and keep them fresh: one
+/// with no audience and one per `--audience`, following `then` (`SECONDS:STATE` or `SECONDS:AUDIENCE=STATE`, `none`
+/// to stop) and printing what the authority refuses.
 ///
-/// Spec: P§3, P§8, P§9.
-pub async fn presence_publish(c: &Conn, state: &str, then: &[String], lifetime: i64, wait: u64) -> Result<()> {
+/// Spec: P§3, P§6, P§8, P§9.
+pub async fn presence_publish(c: &Conn, state: &str, audiences: &[String], then: &[String], lifetime: i64, wait: u64) -> Result<()> {
     let mut agent = connect(c).await?;
     let start = now_s();
-    let mut plan: Vec<(i64, Option<String>)> = then
+    let mut plan: Vec<(i64, Option<String>, Option<String>)> = then
         .iter()
         .map(|t| {
-            let (secs, st) = t.split_once(':').context("--then wants SECONDS:STATE")?;
-            Ok((start + secs.parse::<i64>()?, (st != "none").then(|| st.to_string())))
+            let (secs, rest) = t.split_once(':').context("--then wants SECONDS:STATE or SECONDS:AUDIENCE=STATE")?;
+            let (audience, st) = audience_state(rest)?;
+            Ok((start + secs.parse::<i64>()?, audience, st))
         })
         .collect::<Result<_>>()?;
-    plan.sort_by_key(|(at, _)| *at);
+    plan.sort_by_key(|(at, ..)| *at);
     plan.reverse();
     let mut publisher = dsip_broadcast::presence::Publisher::new(agent.identity_did(), agent.device_did(), &agent.relay().did.clone(), lifetime);
     let mut out = publisher.set(Some(state), now_s());
+    let mut pending: Vec<Value> = vec![];
+    for a in audiences {
+        let (audience, st) = audience_state(a)?;
+        anyhow::ensure!(audience.is_some(), "--audience wants AUDIENCE=STATE");
+        pending.extend(publisher.set_for(audience.as_deref(), st.as_deref(), now_s()));
+    }
+    // P§9: a refusal names the record in `in_reply_to`; it is held back for its own audience only
+    let mut sent: std::collections::HashMap<String, Option<String>> = Default::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
     loop {
-        if let Some(p) = out.take() {
-            let (st, seq) = (p["state"].clone(), p["seq"].clone());
-            agent.send_payload(p, publisher.lifetime()).await?;
-            println!("→ presence {} seq {seq} for {} s to the authority   P§3", st.as_str().unwrap_or(""), publisher.lifetime());
+        if let Some(p) = out.take().or_else(|| pending.pop()) {
+            let (st, seq, audience) = (p["state"].clone(), p["seq"].clone(), p["audience"].as_str().map(String::from));
+            let frame = agent.send_payload(p, publisher.lifetime()).await?;
+            if let Some(id) = Envelope::from_frame(&frame).ok().and_then(|e| dsip_core::b64::decode(&e.payload)).and_then(|b| {
+                serde_json::from_slice::<Value>(&b).ok()?["id"].as_str().map(String::from)
+            }) {
+                sent.insert(id, audience.clone());
+            }
+            let to = audience.map(|a| format!(" (audience {a})")).unwrap_or_default();
+            println!("→ presence {}{to} seq {seq} for {} s to the authority   P§3", st.as_str().unwrap_or(""), publisher.lifetime());
+            continue;
         }
         let now = now_s();
-        if let Some(&(at, ref st)) = plan.last() {
+        if let Some((at, audience, st)) = plan.last().cloned() {
             if now >= at {
-                println!("· state → {}", st.as_deref().unwrap_or("none (stop publishing; the record lapses at its expires_at)"));
-                out = publisher.set(st.as_deref(), now);
+                let what = audience.as_ref().map(|a| format!("{a}: ")).unwrap_or_default();
+                println!("· state → {what}{}", st.as_deref().unwrap_or("none (stop publishing; the record lapses at its expires_at)"));
+                out = publisher.set_for(audience.as_deref(), st.as_deref(), now);
                 plan.pop();
                 continue;
             }
@@ -280,8 +311,10 @@ pub async fn presence_publish(c: &Conn, state: &str, then: &[String], lifetime: 
                 AgentEvent::Received { message, payload, .. } if message.msg_type == "error" => {
                     let reason = payload["reason"].as_str().unwrap_or("");
                     let retry = payload["retry_after"].as_i64();
-                    println!("← error    {reason}{}   (the authority refused the record, P§3)", retry.map(|r| format!(" retry_after {r}")).unwrap_or_default());
-                    publisher.refused(reason, retry, now_s());
+                    let audience = message.in_reply_to.as_ref().and_then(|id| sent.get(id)).cloned().flatten();
+                    let of = audience.as_ref().map(|a| format!(" (audience {a})")).unwrap_or_default();
+                    println!("← error    {reason}{}   (the authority refused the record{of}, P§3)", retry.map(|r| format!(" retry_after {r}")).unwrap_or_default());
+                    publisher.refused_for(audience.as_deref(), reason, retry, now_s());
                 }
                 AgentEvent::Rejected(code, detail) => println!("✗ inbound rejected: {code} {detail}"),
                 _ => {}

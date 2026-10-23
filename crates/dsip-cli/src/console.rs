@@ -598,7 +598,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
             intro_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(*wait));
         }
         Mode::Answer { .. } => {
-            println!("waiting… (commands: accept | screen | decline | escalate | answer-update | reject-update | info | hangup | requests | grant [id] | reject-intro [id] | revoke <grant> | quit)");
+            println!("waiting… (commands: accept | screen | decline | escalate | answer-update | reject-update | info | hangup | requests | grant [id] [audience=NAME] [for=SECONDS] | reject-intro [id] | revoke <grant> | quit)");
         }
     }
 
@@ -800,8 +800,17 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         continue;
                     }
                     "grant" => {
-                        if let Some(intro) = arg.clone().or_else(latest_request) {
-                            agent.local(LocalEvent::Grant { introduction: intro, id: Ulid::generate().to_string(), scope: vec!["dsip.invite".into(), "dsip.subscribe".into()], valid_until: year }).await?;
+                        // `grant [id] [audience=NAME] [for=SECONDS]`: P§6 a presence audience, P§7 a time-boxed share
+                        let words: Vec<&str> = arg.as_deref().unwrap_or("").split_whitespace().collect();
+                        let audience = words.iter().find_map(|w| w.strip_prefix("audience=")).map(String::from);
+                        let until = match words.iter().find_map(|w| w.strip_prefix("for=")).map(str::parse::<i64>) {
+                            Some(Ok(secs)) if secs > 0 => dsip_transport::now_s() + secs,
+                            Some(_) => { println!("for= wants a number of seconds"); continue; }
+                            None => year,
+                        };
+                        let id = words.iter().find(|w| !w.contains('=')).map(|w| w.to_string());
+                        if let Some(intro) = id.or_else(latest_request) {
+                            agent.local(LocalEvent::Grant { introduction: intro, id: Ulid::generate().to_string(), scope: vec!["dsip.invite".into(), "dsip.subscribe".into()], valid_until: until, presence_audience: audience }).await?;
                         } else { println!("no pending request"); }
                         agent.save_contacts()?;
                         continue;
