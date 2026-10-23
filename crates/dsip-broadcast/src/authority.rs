@@ -531,8 +531,8 @@ impl Authority {
         }
     }
 
-    /// §9.3: a target this authority has seen. Impl (spec-gap 149): an identity it holds a device for, one with a bound
-    /// device, or one with a policy; a capability alone does not make a target seen.
+    /// §9.3: a target this authority has seen (spec-gap 149 (a)): for presence, an identity it holds a device for, one
+    /// with a bound device, or one it holds a policy or an issued capability for; for publication, a published stream.
     fn target_exists(&self, target: &str, events: &[String]) -> bool {
         if events.iter().any(|e| e == "publication") {
             return self.publications.contains_key(target);
@@ -540,6 +540,7 @@ impl Authority {
         self.identities.values().any(|i| i == target)
             || self.bound.get(target).is_some_and(|d| !d.is_empty())
             || self.policy.contains_key(target)
+            || self.capabilities.values().any(|t| t == target)
     }
 
     fn recv_subscribe(&mut self, m: &Value, identity: &str) {
