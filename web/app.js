@@ -38,6 +38,7 @@ let call = null;
 const invites = new Map();   // session → the verified invite (`received`), until the call glue rings it
 let relayInfo = null;
 let purposes = {};    // introduction id → {purpose, basis}: what a request shows (the engine keeps only the ids)
+let grantAudiences = {};   // grant id we issued → its presence audience (P§6): the engine keeps scope and valid_until only
 let links = [];       // contact links issued here: {token, url, created}
 let onBound = null;   // one action deferred until the relay is bound (a contact link opened before connecting)
 let devices = [];     // {device, enrolled?}: this identity's devices as this browser knows them (no registry for did:key)
@@ -99,11 +100,21 @@ function renderContacts() {
   const file = JSON.parse(engine.contactsFile());     // grants by id → {identity, scope, valid_until}
   const rows = contacts.map((c) => {
     const held = Object.values(file.grants_held || {}).some((g) => g.identity === c.did);
-    const issued = Object.values(file.grants_issued || {}).some((g) => g.identity === c.did);
+    const t = now();
+    const mine = Object.entries(file.grants_issued || {}).filter(([, g]) => g.identity === c.did && g.valid_until > t);
+    const issued = mine.length > 0;
+    // P§6, P§7: what we share with them, and until when when it is a time-boxed share
+    const shares = mine.map(([id, g]) => {
+      const audience = grantAudiences[id];
+      const until = g.valid_until - t < 31536000 - 86400   // a time-boxed share, not "until removed"
+        ? new Date(g.valid_until * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+      return audience || until ? `${audience || 'presence'}${until ? ` until ${until}` : ''}` : null;
+    }).filter(Boolean);
     const pending = Object.values(file.pending_sent || {}).includes(c.did);
     const asked = Object.values(file.requests || {}).some(([who]) => who === c.did);
-    const status = held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them'
-      : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant';
+    const status = (held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them'
+      : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant')
+      + (issued && shares.length ? ` (${shares.join('; ')})` : '');
     return { c, status, presence: presenceShown.get(c.did) };
   });
   // presence is left out: a badge changes in place (presenceRefresh), so a notify never rebuilds the rows under a click
@@ -131,9 +142,15 @@ function renderContactRows(rows) {
   }
 }
 
+function noteGrantAudience(id, audience) { grantAudiences[id] = audience; store.set(key('grant-audiences'), grantAudiences); }
+
+/** How long a grant lasts (P§7: a share ends at the grant's valid_until; calls and messages end with it). */
+const SHARE_LENGTHS = [['until removed', 31536000], ['for 1 hour', 3600], ['for 1 day', 86400], ['for 1 week', 604800]];
+
 function renderRequests() {
   const reqs = engine.requests();
-  const key = JSON.stringify(reqs.map(([id, who]) => [id, who, nameOf(who), purposes[id]?.purpose, purposes[id]?.basis]));
+  const audiences = Object.keys(settings.presence_audiences || {});
+  const key = JSON.stringify([audiences, reqs.map(([id, who]) => [id, who, nameOf(who), purposes[id]?.purpose, purposes[id]?.basis])]);
   if (key === shownRequests) return;
   shownRequests = key;
   const rl = $('request-list');
@@ -145,11 +162,25 @@ function renderRequests() {
     li.querySelector('.did').textContent = who;
     li.querySelector('.purpose').textContent = purposes[id]?.purpose ? `“${purposes[id].purpose}”  (a claim, §18.2)` : '(no purpose given)';
     li.querySelector('.basis').textContent = purposes[id]?.basis || '';
+    const aud = document.createElement('select'); aud.className = 'grant-audience';
+    aud.title = 'the presence they see: your main record, plus an audience\'s if you pick one (P§6)';
+    aud.append(new Option('presence: everyone\'s', ''));
+    for (const a of audiences) aud.append(new Option(`presence: ${a}`, a));
+    const len = document.createElement('select'); len.className = 'grant-length';
+    len.title = 'a share ends at the grant\'s valid_until, calls and messages with it (P§7); Remove ends it sooner';
+    for (const [label, secs] of SHARE_LENGTHS) len.append(new Option(label, String(secs)));
     const g = document.createElement('button'); g.textContent = 'Grant'; g.className = 'primary';
-    g.onclick = () => engine.local({ local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message', 'dsip.subscribe'], valid_until: Math.floor(now()) + 31536000 });   // §19.4; M§14.2: calls and messages; P§6: presence
+    g.onclick = () => {
+      const ev = { local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message', 'dsip.subscribe'],
+                   valid_until: Math.floor(now()) + Number(len.value) };   // §19.4; M§14.2: calls and messages; P§6: presence
+      if (aud.value) { ev.presence_audience = aud.value; noteGrantAudience(ev.id, aud.value); }   // P§6 (spec-gap 145)
+      const secs = Number(len.value);
+      log(`granting ${nameOf(who) || short(who)}${aud.value ? ` the ${aud.value} audience` : ''}${secs < 31536000 ? `, a share ending in ${secs} s` : ''}`, 'P§6 · P§7');
+      engine.local(ev);
+    };
     const r = document.createElement('button'); r.textContent = 'Ignore';
     r.onclick = () => engine.local({ local: 'reject_introduction', introduction: id, reason: 'user.declined' });
-    li.append(g, r);
+    li.append(aud, len, g, r);
     rl.append(li);
   }
 }
@@ -192,6 +223,7 @@ function renderSettings() {
   $('set-seal').checked = !!settings.seal;
   $('set-recording-accept').value = settings.recording_accept || 'ask';
   $('presence-select').value = settings.presence || '';
+  renderAudiences();
   $('set-read-disclosed').checked = !!settings.read_disclosed;
   $('set-record-keeper').value = settings.record_keeper || '';
   $('record-keeper-status').textContent = settings.record_keeper ? `records go to ${nameOf(settings.record_keeper) || short(settings.record_keeper)}${messenger?.held_records() ? `; ${messenger.held_records()} held until it opens the conversation` : ''}` : 'none: no call records are sent';
@@ -397,7 +429,7 @@ async function onReceived(r) {
   }
   if (m.type === 'notify' && p.body?.event === 'presence') { presenceNotified(p); return; }
   if (m.type === 'error') log(`   error ${m.reason || ''}${p.detail ? ': ' + (typeof p.detail === 'string' ? p.detail : JSON.stringify(p.detail)) : ''}`, '§15');
-  if (m.type === 'error' && presenceSent.has(m.in_reply_to)) { presenceRefused(m.reason, p.retry_after); return; }
+  if (m.type === 'error' && presenceSent.has(m.in_reply_to)) { presenceRefused(m.reason, p.retry_after, presenceSent.get(m.in_reply_to)); return; }
   if (m.type === 'reject' && presenceSubFor(m.session)) { presenceBlocked(m.session); return; }
   if (m.type === 'error' && m.reason === 'policy.rate-limited') {
     notify(`the relay limits introductions (§19.4): try again in ${p.retry_after ?? '?'} s`);
@@ -1318,7 +1350,7 @@ function connect() {
 // ---------------------------------------------------------------- presence (Presence Profile draft, P§3–P§5)
 
 const presenceShown = new Map();   // contact DID → {state, token, source} (P§4), as the contact list shows it
-const presenceSent = new Set();    // ids of our records, to recognise the authority's refusal (P§3)
+const presenceSent = new Map();    // ids of our records → their audience (or null), to route the authority's refusal (P§3)
 const presenceSubs = new Map();    // contact DID → {sub, relay, renewAt, retryAt}: our watch on it (§9.3)
 const PRESENCE_SUB_S = 3600;       // §9.3: the presence event class's cap; renewed before it lapses
 let presenceTimer = null;
@@ -1327,10 +1359,15 @@ let presenceTimer = null;
 function presenceSend(frame) {
   if (!frame || !relay?.bound) return;
   const p = payloadOf(frame);
-  presenceSent.add(p.id);
-  if (presenceSent.size > 32) presenceSent.delete(presenceSent.values().next().value);
+  presenceSent.set(p.id, p.audience ?? null);
+  if (presenceSent.size > 32) presenceSent.delete(presenceSent.keys().next().value);
   relay.send(frame);
-  log(`→ presence     ${p.state} seq ${p.seq} for ${p.expires_at - p.issued_at} s to our relay`, 'P§3');
+  log(`→ presence     ${p.state}${p.audience ? ` for audience ${p.audience}` : ''} seq ${p.seq} for ${p.expires_at - p.issued_at} s to our relay`, p.audience ? 'P§3 · P§6' : 'P§3');
+}
+
+/** Every record due now: one per audience at most (P§6, P§8). */
+function presenceDrain() {
+  for (let i = 0, f; i < 16 && (f = engine.ep.presence_tick(now())); i++) presenceSend(f);
 }
 
 /** Bound to our relay: our record goes to it, and every contact is watched (again). */
@@ -1348,14 +1385,45 @@ function presenceSet(state) {
   if (!state) log('presence automatic: no record sent; your relay says available while you are bound', '§9.3');
 }
 
-function presenceRefused(reason, retryAfter) {
-  log(`✗ our presence record was refused: ${reason}${retryAfter ? `, retry after ${retryAfter} s` : ''}`, 'P§9');
-  engine.ep.presence_refused(reason, retryAfter ?? undefined, now());
+function presenceRefused(reason, retryAfter, audience) {
+  log(`✗ our presence record${audience ? ` for audience ${audience}` : ''} was refused: ${reason}${retryAfter ? `, retry after ${retryAfter} s` : ''}`, 'P§9');
+  engine.ep.presence_refused(reason, retryAfter ?? undefined, now(), audience ?? undefined);
+}
+
+/** The user set an audience's state (`null` removes the audience: its record lapses at its expires_at). P§6. */
+async function audienceSet(name, state) {
+  const all = { ...(settings.presence_audiences || {}) };
+  if (state) all[name] = state; else delete all[name];
+  settings.presence_audiences = all;
+  await saveSettings();
+  presenceSend(engine.ep.presence_set_for(name, state || null, now()));
+  if (!state) log(`presence audience ${name} removed: no more records for it; the last lapses at its expires_at`, 'P§6');
+  renderAudiences();
+  shownRequests = null; renderRequests();   // the Grant choices list the audiences
+}
+
+const PRESENCE_LABELS = { available: 'available', busy: 'busy', away: 'away', dnd: 'do not disturb', offline: 'invisible' };
+
+function renderAudiences() {
+  const ul = $('audience-list');
+  const all = Object.entries(settings.presence_audiences || {});
+  ul.innerHTML = all.length ? '' : '<li class="muted small">none: everyone you grant presence sees the same record</li>';
+  for (const [name, state] of all) {
+    const li = document.createElement('li');
+    li.dataset.audience = name;
+    li.innerHTML = '<span class="name"></span> <select></select> <button>Remove</button>';
+    li.querySelector('.name').textContent = name;
+    const sel = li.querySelector('select');
+    for (const [v, label] of Object.entries(PRESENCE_LABELS)) sel.append(new Option(label, v, false, v === state));
+    sel.onchange = () => audienceSet(name, sel.value);
+    li.querySelector('button').onclick = () => audienceSet(name, null);
+    ul.append(li);
+  }
 }
 
 /** Once a second: our record's refresh, watches to open or renew, and records that expired since (P§4). */
 function presenceTick() {
-  presenceSend(engine.ep.presence_tick(now()));
+  presenceDrain();
   const t = now();
   for (const c of contacts) {
     const s = presenceSubs.get(c.did);
@@ -1449,6 +1517,7 @@ async function startEngine() {
     seal: !!settings.seal, recording: settings.recording_accept || 'ask' }, now);
   engine.loadContactsFile(await store.get(key('engine.contacts')));
   engine.ep.presence_set(settings.presence || null, now());   // P§3: sent once our relay binds us
+  for (const [a, st] of Object.entries(settings.presence_audiences || {})) engine.ep.presence_set_for(a, st, now());   // P§6
   for (const r of revoked) engine.ep.hold_revocation(r.frame);   // §7.4: revocations this identity issued apply here too
   for (const d of Object.values(documents)) engine.ep.add_document(JSON.stringify(d));   // §8.1: documents held
   engine.on = {
@@ -2086,6 +2155,7 @@ function renderMessages() {
   } catch { /* no operator config: every setting is the person's or built in */ }
   contacts = (await store.get(key('contacts'))) || [];
   purposes = (await store.get(key('purposes'))) || {};
+  grantAudiences = (await store.get(key('grant-audiences'))) || {};
   links = (await store.get(key('links'))) || [];
   identity = await store.get(key('identity'));
   devices = (await store.get(key('devices'))) || [];
@@ -2170,6 +2240,14 @@ function renderMessages() {
   $('set-seal').onchange = async (e) => { settings.seal = e.target.checked; await saveSettings(); engine.setSeal(settings.seal); log(`call bodies ${settings.seal ? 'sealed to the callee when its key resolves' : 'sent in clear'}`, '§10.4'); };
   $('set-recording-accept').onchange = async (e) => { settings.recording_accept = e.target.value; await saveSettings(); location.reload(); };
   $('presence-select').onchange = async (e) => { settings.presence = e.target.value || null; await saveSettings(); presenceSet(settings.presence); };
+  $('audience-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const name = $('audience-name').value.trim();
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) { $('audience-status').textContent = 'a-z, 0-9 and -, starting with a letter (P§6)'; return; }
+    $('audience-status').textContent = '';
+    $('audience-name').value = '';
+    await audienceSet(name, $('audience-state').value);
+  };
   for (const id of ['in-recording', 'call-recording']) {
     $(`${id}-accept`).onclick = () => callRecording(true);
     $(`${id}-decline`).onclick = () => callRecording(false);
@@ -2250,6 +2328,8 @@ function renderMessages() {
     watchPresence: (did) => presenceWatch(did),   // subscribe now, not at the next tick (a test after a grant)
     presenceBadge: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.presence').textContent || null,
     setPresence: async (state) => { settings.presence = state || null; $('presence-select').value = state || ''; await saveSettings(); presenceSet(settings.presence); },
+    setAudience: (name, state) => audienceSet(name, state || null),
+    audiences: () => ({ ...(settings.presence_audiences || {}) }),
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
     requests: () => engine.requests(),
     saved: () => lastPersist,   // resolves once the latest contact-file write is in storage
