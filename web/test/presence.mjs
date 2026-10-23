@@ -37,6 +37,8 @@ try {
   await until(alice.page, () => /presence of .*: not available from that relay/.test(document.getElementById('log').textContent), null, 30000);
   check('private by default: before Bob grants her, his relay refuses Alice and she shows nothing (P§6)',
     (await shown(alice, bob)) === null && !(await badge(alice, bob)), JSON.stringify(await shown(alice, bob)));
+  check('the refusal is answered with nothing: no error goes back to the relay (§9.3)',
+    !/→ error/.test(await alice.page.textContent('#log')));
 
   await granted(alice, bob);
   await alice.page.evaluate((did) => window.dsip.watchPresence(did), bob.did);
