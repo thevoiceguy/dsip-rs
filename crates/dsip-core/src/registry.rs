@@ -129,6 +129,7 @@ pub const MESSAGE_TYPES: &[&str] = &[
     "delegation-revocation",                           // v0.8: §7.4 (spec-gap 57)
     "alias-monitor",                                   // v0.14: Alias Transparency T§8 (spec-gap 124)
     "presence",                                        // v0.17: §9.4 / Presence Profile P§3 (spec-gap 134)
+    "grant-revocation",                                // v0.17: §19.4 / P§7 (spec-gap 147)
 ];
 
 /// `dsip-presence-state` registered values (P§5, v0.17, spec-gap 136). The registry is open: any other well-formed

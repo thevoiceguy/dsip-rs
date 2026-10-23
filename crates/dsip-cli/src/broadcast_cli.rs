@@ -146,7 +146,13 @@ pub async fn provenance(c: &Conn, stream: &str, publication: &str, operation: &s
 pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: i64, wait: u64, codecs: Vec<String>, transports: Vec<String>) -> Result<()> {
     let mut agent = connect(c).await?;
     let authority = agent.relay().did.clone();
-    let p = json!({"dsip": bcast_version(), "type": "subscribe", "to": authority, "target": target, "events": events, "expires_in": expires_in});
+    let mut p = json!({"dsip": bcast_version(), "type": "subscribe", "to": authority, "target": target, "events": events, "expires_in": expires_in});
+    // P§6: presence is private by default; the grants we hold from the target admit us
+    let claims = if p["events"].as_array().is_some_and(|e| e.iter().any(|x| x == "presence")) { agent.presence_claims(target) } else { vec![] };
+    if !claims.is_empty() {
+        println!("· presenting {} grant(s) from {} with dsip.subscribe   P§6", claims.len(), short(target));
+        p["claims"] = Value::Array(claims);
+    }
     let frame = agent.send_payload(p, 30).await?;
     let sub_id = Envelope::from_frame(&frame)
         .ok()

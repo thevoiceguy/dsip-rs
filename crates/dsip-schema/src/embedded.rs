@@ -37,6 +37,7 @@ pub const SCHEMAS: &[(&str, &str)] = &[
     schema!("reachability-hint"),
     schema!("alias-monitor"),
     schema!("presence"),
+    schema!("grant-revocation"),
     schema!("webrtc-info-data"),
     schema!("dtmf-info-data"),
     schema!("envelope"),

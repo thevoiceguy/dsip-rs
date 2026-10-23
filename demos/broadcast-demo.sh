@@ -9,7 +9,8 @@ B=target/debug; D=${DEMO_DIR:-/tmp/dsip-bcast-demo}; rm -rf "$D"; mkdir -p "$D"
 R=wss://127.0.0.1:8443/dsip
 for who in alice bob carol; do $B/dsip identity init --dir "$D/$who" --name "${who^}" >/dev/null; done
 BOB=$(python3 -c "import json;print(json.load(open('$D/bob/identity.json'))['identity'])")
-$B/dsip-relay --listen 127.0.0.1:8443 --state "$D/relay" >"$D/relay.log" 2>&1 & RELAY=$!
+# P§6: presence is private by default; bob is a broadcaster, so this relay's policy makes his presence public
+$B/dsip-relay --listen 127.0.0.1:8443 --state "$D/relay" --presence-public "$BOB" >"$D/relay.log" 2>&1 & RELAY=$!
 trap 'kill $RELAY 2>/dev/null || true' EXIT; sleep 1.5; CA="$D/relay/cert.pem"
 STREAM="$BOB:radio:main"
 

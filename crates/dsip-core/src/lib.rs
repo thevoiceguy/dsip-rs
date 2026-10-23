@@ -19,6 +19,7 @@ pub mod b64;
 pub mod delegation;
 pub mod did;
 pub mod envelope;
+pub mod grant;
 pub mod hpke;
 pub mod keys;
 pub mod pkarr;

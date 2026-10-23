@@ -146,7 +146,7 @@ function renderRequests() {
     li.querySelector('.purpose').textContent = purposes[id]?.purpose ? `“${purposes[id].purpose}”  (a claim, §18.2)` : '(no purpose given)';
     li.querySelector('.basis').textContent = purposes[id]?.basis || '';
     const g = document.createElement('button'); g.textContent = 'Grant'; g.className = 'primary';
-    g.onclick = () => engine.local({ local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message'], valid_until: Math.floor(now()) + 31536000 });   // §19.4; M§14.2: calls and messages
+    g.onclick = () => engine.local({ local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message', 'dsip.subscribe'], valid_until: Math.floor(now()) + 31536000 });   // §19.4; M§14.2: calls and messages; P§6: presence
     const r = document.createElement('button'); r.textContent = 'Ignore';
     r.onclick = () => engine.local({ local: 'reject_introduction', introduction: id, reason: 'user.declined' });
     li.append(g, r);
@@ -1199,7 +1199,18 @@ async function addContact(name, did, number = '') {
   await saveContacts();
 }
 
-async function removeContact(did) { contacts = contacts.filter((c) => c.did !== did); await saveContacts(); }
+/** Removing a contact withdraws the grants we issued them (§19.4), at our relay too, so it stops showing them our
+ *  presence at once (P§7). */
+async function removeContact(did) {
+  const revocations = relay?.bound && relayInfo?.did ? JSON.parse(engine.ep.grant_revocations(did, relayInfo.did, now())) : [];
+  for (const { grant, frame } of revocations) {
+    relay.send(frame);
+    log(`→ grant-revocation of our grant to ${short(did)} to our relay`, 'P§7 · §19.4');
+    await engine.local({ local: 'revoke', grant });
+  }
+  contacts = contacts.filter((c) => c.did !== did);
+  await saveContacts();
+}
 
 // ---------------------------------------------------------------- identity and settings
 
@@ -1372,7 +1383,7 @@ async function presenceWatch(did) {
   const out = JSON.parse(engine.ep.presence_subscribe(did, authority, PRESENCE_SUB_S, now()));
   Object.assign(pending, { sub: out.subscription, relay: r, renewAt: now() + PRESENCE_SUB_S - 300, retryAt: 0 });
   r.send(out.frame);
-  log(`→ subscribe    presence of ${short(did)} at ${r === relay ? 'our relay' : r.url} for ${PRESENCE_SUB_S} s`, '§9.3');
+  log(`→ subscribe    presence of ${short(did)} at ${r === relay ? 'our relay' : r.url} for ${PRESENCE_SUB_S} s${out.grants ? `, presenting ${out.grants} grant(s) of theirs` : ', no grant of theirs to present'}`, '§9.3 · P§6');
 }
 
 function presenceSubFor(sub) { return [...presenceSubs.entries()].find(([, s]) => s.sub === sub)?.[0]; }
@@ -1383,7 +1394,15 @@ function presenceBlocked(sub) {
   const did = presenceSubFor(sub);
   const s = presenceSubs.get(did);
   if (s) Object.assign(s, { renewAt: 0, retryAt: now() + 60 });
-  log(`presence of ${short(did)}: not available from that relay (§9.3: unknown and not allowed look the same); trying again later`, '§9.3');
+  presenceForget(did);
+  log(`presence of ${short(did)}: not available from that relay (§9.3: unknown and not allowed look the same; P§6: private unless they granted us); trying again later`, '§9.3 · P§6');
+}
+
+/** Nothing shown for a contact we may no longer watch (refused, or a share ended, P§7). */
+function presenceForget(did) {
+  if (!presenceShown.delete(did)) return;
+  const li = [...$('contact-list').children].find((x) => x.dataset.did === did);
+  if (li) renderPresence(li.querySelector('.presence'), null);
 }
 
 /** A presence notify: the wasm verifies each record and combines them (P§3, P§4). */
@@ -1392,7 +1411,12 @@ function presenceNotified(p) {
   if (!out) return;
   const v = JSON.parse(out);
   log(`◇ presence     ${short(v.target)}: ${v.state}${v.token !== v.state ? ` (${v.token})` : ''}, ${v.source === 'record' ? `from ${v.records} signed record(s)` : v.source === 'assertion' ? "the relay's claim" : 'nothing bound'}`, 'P§4');
-  if (v.terminated) { const s = presenceSubs.get(v.target); if (s) Object.assign(s, { renewAt: now() }); }
+  if (v.terminated) {
+    const s = presenceSubs.get(v.target);
+    if (s) Object.assign(s, { renewAt: now() });
+    // P§7: the grant that admitted us ended or was revoked; nothing more is shown unless a renewal is admitted
+    if (p.reason === 'policy.terminated') { log(`presence of ${short(v.target)}: they stopped sharing it with us`, 'P§7'); presenceForget(v.target); return; }
+  }
   presenceRefresh([v]);
 }
 
@@ -2223,6 +2247,7 @@ function renderMessages() {
     downgrade: () => $('call-downgrade').textContent,
     contacts: () => contacts.map((c) => c.did),
     presence: (did) => presenceShown.get(did) || null,
+    watchPresence: (did) => presenceWatch(did),   // subscribe now, not at the next tick (a test after a grant)
     presenceBadge: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.presence').textContent || null,
     setPresence: async (state) => { settings.presence = state || null; $('presence-select').value = state || ''; await saveSettings(); presenceSet(settings.presence); },
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,

@@ -71,6 +71,11 @@ struct Args {
     /// T-Presence-Grace: seconds a device's presence record outlives its unbind (P§8: 0–300; 0 drops it at the unbind).
     #[arg(long, default_value_t = dsip_broadcast::authority::PRESENCE_GRACE_S, value_parser = clap::value_parser!(i64).range(0..=300))]
     presence_grace: i64,
+    /// An identity whose presence anyone may watch: this relay's own policy for it (P§6 rule 4), as for a broadcaster.
+    /// Repeatable. Every other identity's presence is private (P§6, §9.2): watched by its own devices and by subscribers
+    /// presenting a grant of its with `dsip.subscribe`.
+    #[arg(long = "presence-public")]
+    presence_public: Vec<String>,
     /// Maximum queued envelopes per recipient (§13.3 store-and-forward boundary).
     #[arg(long, default_value_t = 100)]
     inbox_cap: usize,
@@ -222,6 +227,32 @@ impl State {
                 tracing::info!("authority: {e}");
             }
         }
+    }
+
+    /// P§6 (spec-gap 144): the grants a `subscribe` presents in `claims`, each verified as a credential (§19.4: its
+    /// signature and its signer's delegation, now; not its delivery window) and summarised for the authority as
+    /// `{type: dsip-grant, grant: {id, from, identity, to, scope, valid_until, presence_audience?}}`. One that does not
+    /// verify is left out: it could not admit.
+    fn presented_grants(&self, p: &Value) -> Value {
+        let mut ctx = dsip_core::envelope::Context::new(now_s(), &self.resolver);
+        ctx.revocations = self.revocations.clone();
+        let out: Vec<Value> = p["claims"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["type"] == "dsip-grant")
+            .filter_map(|c| {
+                let env = dsip_core::envelope::Envelope::from_value(&c["grant"]).ok()?;
+                let g = dsip_core::grant::credential(&env, &ctx)?;
+                let mut summary = json!({"id": g["id"], "from": g["from"], "identity": g["from"], "to": g["to"],
+                                         "scope": g["scope"], "valid_until": g["valid_until"]});
+                if let Some(a) = g.get("presence_audience") {
+                    summary["presence_audience"] = a.clone();
+                }
+                Some(json!({"type": "dsip-grant", "grant": summary}))
+            })
+            .collect();
+        Value::Array(out)
     }
 
     fn error_frame(&mut self, to: &str, reason: &str, in_reply_to: Option<&str>, session: Option<&str>, detail: Option<&str>) -> String {
@@ -503,11 +534,12 @@ impl State {
         if t == "reject" && self.tracker.attempt_initiator(&sid).is_some_and(|i| i != sender) {
             self.reject_frames.insert((sid.clone(), sender.to_string()), inbound.frame.clone());
         }
-        if matches!(t.as_str(), "publish" | "unpublish" | "subscribe" | "provenance" | "presence") {
+        if matches!(t.as_str(), "publish" | "unpublish" | "subscribe" | "provenance" | "presence" | "grant-revocation") {
             // §9.3/§22: addressed to this relay as the target's authority (publish/unpublish carry no `to`);
-            // P§3: a device publishes its presence record to the relay it binds to.
-            if (t == "subscribe" || t == "presence") && to != self.key.did() {
-                let why = if t == "subscribe" { "subscribe must address this relay" } else { "presence must address this relay" };
+            // P§3: a device publishes its presence record to the relay it binds to; P§7: and revokes its grants there.
+            if matches!(t.as_str(), "subscribe" | "presence" | "grant-revocation") && to != self.key.did() {
+                let why = format!("{t} must address this relay");
+                let why = why.as_str();
                 let f = self.error_frame(sender, "transport.routing-refused", Some(&id), None, Some(why));
                 self.deliver(sender, &f);
                 return;
@@ -519,6 +551,9 @@ impl State {
             }
             let mut m = p.clone();
             m["from"] = sender.into();
+            if t == "subscribe" {
+                m["claims"] = self.presented_grants(p);
+            }
             self.authority.learn_identity(sender, sender_identity);
             if t == "publish" {
                 self.records.insert(id.clone(), inbound.frame.clone());
@@ -607,6 +642,9 @@ async fn main() -> Result<()> {
         authority: {
             let mut a = Authority::new(now_s(), HashMap::new());
             a.presence_grace = args.presence_grace;
+            for did in &args.presence_public {
+                a.set_policy(did, "public", vec![]);
+            }
             a
         },
         records: HashMap::new(),

@@ -227,6 +227,21 @@ impl Agent {
         self.core.verify_record(frame, now_s())
     }
 
+    /// Withdraw a grant we issued: a signed `grant-revocation` to our relay, the authority, so it ends what the grant
+    /// admitted there (P§7), then the local revocation (§19.4). Returns whether we had issued it.
+    pub async fn revoke_grant(&mut self, grant: &str) -> Result<bool> {
+        let authority = self.conn.relay.did.clone();
+        let Some(frame) = self.core.grant_revocation(grant, &authority, now_s())? else { return Ok(false) };
+        self.conn.send(&dsip_core::envelope::Envelope::from_frame(&frame)?).await?;
+        self.local(LocalEvent::Revoke { grant: grant.to_string() }).await?;
+        Ok(true)
+    }
+
+    /// The held grants from `target` to present when watching its presence (`subscribe` `claims`). Spec: P§6.
+    pub fn presence_claims(&self, target: &str) -> Vec<serde_json::Value> {
+        self.core.presence_claims(target, now_s())
+    }
+
     /// Whether `device` presented a delegation granting `capability` (Recording Profile C§6).
     pub fn peer_has_capability(&self, device: &str, capability: &str) -> bool {
         self.core.peer_has_capability(device, capability, crate::now_s())

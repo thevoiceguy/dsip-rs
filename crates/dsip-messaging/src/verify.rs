@@ -103,27 +103,7 @@ pub fn verify_frame(frame: &str, ctx: &Context) -> Result<Inbound, Rejection> {
 /// Spec: §19.4, §7.4, M§14.2. Impl: before this check was added a grant signed by any device was accepted as
 /// consent from the identity it named.
 pub fn grant_credential(compact: &str, ctx: &Context) -> Option<serde_json::Value> {
-    let mut parts = compact.split('.');
-    let env = Envelope { protected: parts.next()?.to_string(), payload: parts.next()?.to_string(), signature: parts.next()?.to_string() };
-    let ver = envelope::verify_raw(&env, ctx, false).ok()?;
-    let from = ver.payload.get("from")?.as_str()?;
-    if !dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, ctx).ok() {
-        return None;
-    }
-    let mut payload = ver.payload.clone();
-    if from == ver.signer_did {
-        // Impl: a core endpoint names its device in `from` and acts for the identity its delegation binds it to
-        // (§13.2, §7.4); the granter is that identity, taken from the delegation presented in the header, so the
-        // grant reads the same as one whose `from` is the identity (the console's).
-        let identity = ver.header.delegations.iter().find_map(|d| {
-            let (subject, device) = dsip_core::delegation::names(d)?;
-            (device == ver.signer_did && dsip_core::delegation::verify_delegation(d, &subject, &device, ctx).ok()).then_some(subject)
-        });
-        if let Some(id) = identity {
-            payload["from"] = serde_json::Value::String(id);
-        }
-    }
-    (payload.get("type")? == "grant").then_some(payload)
+    dsip_core::grant::credential_compact(compact, ctx)
 }
 
 #[cfg(test)]
