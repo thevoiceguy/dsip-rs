@@ -70,7 +70,9 @@ try {
   await alice.page.evaluate((did) => window.dsip.watchPresence(did), carol.did);
   check('Carol on relay B: Alice subscribes at Carol\'s relay and shows her record (§9.3, P§4)',
     await shows(alice, carol, "v.source === 'record' && v.state === 'dnd'", 40000), JSON.stringify(await shown(alice, carol)));
-  check('Alice\'s log names the connection to relay B for presence', (await alice.page.textContent('#log')).includes('bound us for presence'));
+  // the introduction above already opened the one shared connection to relay B (bound "for this call"); the watch reuses it
+  check('Alice subscribed at relay B, over her connection there (§9.3, §13.2)', (await alice.page.textContent('#log')).includes('bound us for')
+    && (await alice.page.textContent('#log')).includes(`at ${RELAY_B} for`));
   check('Alice presented Carol\'s grant (P§6)', /presence of .* at wss:.*presenting 1 grant/.test(await alice.page.textContent('#log')));
 
   // Bob removes Alice: the grant is revoked at his relay, which ends her watch at once (P§7)
