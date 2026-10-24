@@ -1265,6 +1265,10 @@ async fn serve(tls: http::Prefixed<Tls>, service: Arc<Mutex<Service>>) -> Result
     {
         let mut st = service.lock().await;
         st.stats.bound();
+        // The clocks move on ticks and frames: bring them to now before the hello, or it is stamped up to a tick early
+        // and an enrolment can be released as idle before its retention has run (M§4.1). Before the binding is
+        // recorded, so an enrolment that did run out closes only the bindings it had.
+        st.catch_up(now_s());
         // A device may hold a second, short-lived connection beside its binding (a KeyPackage fetch at its own mailbox):
         // that connection gets its replies on itself and changes nothing about the binding, its live push included.
         let second = st.bound.get(&device).is_some_and(|t| !t.is_closed());
