@@ -772,6 +772,8 @@ async fn serve(
 
     // --- bind and answer with the relay hello
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // a weak handle: it does not keep the channel open, so a replaced connection still sees its queue close
+    let mine = tx.downgrade();
     {
         let mut st = state.lock().await;
         if st.devices.insert(device.clone(), tx).is_some() {
@@ -875,6 +877,13 @@ async fn serve(
 
     let mut st = state.lock().await;
     st.stats.unbound();
+    // §13.2: a connection replaced by a newer hello leaves the binding to it: removing the device here would drop the
+    // new connection's queue (closing it too) and unbind a device that is still bound
+    let replaced = st.devices.get(&device).is_some_and(|t| mine.upgrade().is_none_or(|m| !m.same_channel(t)));
+    if replaced {
+        tracing::info!("{peer}: replaced connection of {device} closed");
+        return result;
+    }
     st.devices.remove(&device);
     if let Some(set) = st.identities.get_mut(&identity) {
         set.remove(&device);

@@ -58,6 +58,11 @@ $B/dsip presence watch --identity "$D/carol" --relay $R --ca "$CA" --target "$BO
 grep -q 'reject   "policy.blocked"' "$D/after.log" || fail "an ended share still admitted Carol"
 echo "  refused: policy.blocked"
 
+# one device key binds once (§13.2: a second hello replaces the first): the phone's publisher is done before Bob's
+# phone runs the regrant
+wait $PUB
+! grep -q "^← error" "$D/publish.log" || fail "the authority refused a record"
+
 echo "=== Bob narrows Alice's grant to calls only: a grant that follows it, the old one revoked at his relay (§19.4, P§7)"
 ALICE=$(python3 -c "import json;print(json.load(open('$D/alice/identity.json'))['identity'])")
 AGRANT=$(python3 -c "import json;g=json.load(open('$D/bob/contacts.json'))['grants_issued'];print(next(k for k,v in g.items() if v['identity']=='$ALICE'))")
@@ -65,7 +70,7 @@ $B/dsip presence watch --identity "$D/alice" --relay $R --ca "$CA" --target "$BO
 sleep 2
 $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --script "sleep 2; regrant $AGRANT audience=Family; regrant $AGRANT calls-only; sleep 2; quit" >"$D/regrant.log" 2>&1
 wait $W || true
-grep -E "no live grant|follows it" "$D/regrant.log" | sed 's/^ */  /'
+grep -E "no live grant|follows it" "$D/regrant.log" | sed 's/^ */  /' || true
 grep -q "an audience that is not a token" "$D/regrant.log" || fail "a regrant naming an audience that is not a token was not refused"
 grep -q "follows it" "$D/regrant.log" || fail "Bob's phone did not send the following grant"
 python3 -c "import json;g=json.load(open('$D/bob/contacts.json'))['grants_issued'];n=[v for v in g.values() if v['identity']=='$ALICE'];assert len(n)==1 and n[0]['scope']==['dsip.invite'],n" \
@@ -75,8 +80,6 @@ echo "  Alice's watch: ended, policy.terminated; Bob now holds one grant for her
 $B/dsip presence watch --identity "$D/alice" --relay $R --ca "$CA" --target "$BOB" --wait 3 >"$D/after-narrow.log" 2>&1 || true
 grep -q 'reject   "policy.blocked"' "$D/after-narrow.log" || fail "the old grant still admitted Alice after it was followed"
 echo "  a new watch: refused, policy.blocked"
-wait $PUB
-! grep -q "^← error" "$D/publish.log" || fail "the authority refused a record"
 echo
 echo "PASS: one device published a record per audience; the family grant saw busy, the plain share saw available"
 echo "      only, and the 25 s share ended Carol's watch at its valid_until, after which she was refused; a grant that"
