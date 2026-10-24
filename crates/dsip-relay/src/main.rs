@@ -776,9 +776,13 @@ async fn serve(
     let mine = tx.downgrade();
     {
         let mut st = state.lock().await;
-        if st.devices.insert(device.clone(), tx).is_some() {
-            // §13.2: a new verified hello from an already-bound device replaces the prior connection
+        if let Some(old) = st.devices.insert(device.clone(), tx) {
+            // §13.2: a new verified hello from an already-bound device replaces the prior connection, and the relay
+            // says so on it (spec-gap 158) so that its client does not reconnect and replace this one in turn. The
+            // old connection sends what is queued, this last, then sees its queue end and closes.
             tracing::info!("{peer}: rebinding {device} (replacing prior connection)");
+            let f = st.error_frame(&device, "transport.replaced", None, None, Some("this device bound here on another connection"));
+            let _ = old.send(f);
         }
         st.identities.entry(identity.clone()).or_default().insert(device.clone());
         let now = now_s();
@@ -867,7 +871,11 @@ async fn serve(
                 },
                 outbound = rx.recv() => match outbound {
                     Some(frame) => ws.send(WsMessage::Text(frame.into())).await?,
-                    None => break,
+                    None => {
+                        // replaced (§13.2) or revoked: the binding has moved on, close cleanly
+                        let _ = ws.close(None).await;
+                        break;
+                    }
                 },
             }
         }

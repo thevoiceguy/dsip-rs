@@ -13,7 +13,7 @@ export class Relay {
   }
 
   connect() {
-    this.closedByUs = false;
+    this.closedByUs = false; this.replacedByRelay = false;
     const ws = new WebSocket(this.url);
     this.ws = ws; this.bound = false;
     ws.onopen = () => { ws.send(this.engine.hello_frame(this.now())); };
@@ -43,4 +43,9 @@ export class Relay {
   send(frame) { if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(frame); else this.on.dropped?.(frame); }
 
   close() { this.closedByUs = true; clearTimeout(this.retry); this.retry = null; this.ws?.close(); }
+
+  /** The relay said `transport.replaced` (verified by the engine): this device bound there on another connection (another
+   *  tab, another window), and the relay is closing this one. Do not reconnect: that would replace the other in turn
+   *  (§13.2, spec-gap 158). `connect()` again, on the user's word, takes the binding back. */
+  replaced() { this.replacedByRelay = true; this.close(); }
 }

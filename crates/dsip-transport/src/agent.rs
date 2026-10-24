@@ -109,6 +109,10 @@ pub struct Agent {
     did_resolver: Arc<dyn DidResolver>,
     resolved_tx: mpsc::UnboundedSender<Resolution>,
     resolved_rx: mpsc::UnboundedReceiver<Resolution>,
+    /// §13.2: the relay said `transport.replaced` on this connection; its close is then not an unexpected loss
+    replaced: bool,
+    /// ... and the connection has closed: [`Agent::next`] returns [`Error::Replaced`] once its events are handed over
+    replaced_closed: bool,
 }
 
 impl Agent {
@@ -144,7 +148,7 @@ impl Agent {
         let did_resolver = cfg.did_resolver.clone().unwrap_or_else(|| Arc::new(DidWebResolver::new()));
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let calls = cfg.calls.map(Calls::new);
-        Ok(Agent { id, cfg, supported, resolver, conn, core, calls, events: vec![], did_resolver, resolved_tx, resolved_rx })
+        Ok(Agent { id, cfg, supported, resolver, conn, core, calls, events: vec![], did_resolver, resolved_tx, resolved_rx, replaced: false, replaced_closed: false })
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -343,6 +347,9 @@ impl Agent {
                 }
                 CoreEvent::Emission(em) => self.events.push(AgentEvent::Emission(em)),
                 CoreEvent::Received { message, identity, display_name, payload } => {
+                    if payload["type"] == "error" && payload["reason"] == "transport.replaced" && identity == self.conn.relay.did {
+                        self.replaced = true; // §13.2: our relay is about to close this connection
+                    }
                     self.events.push(AgentEvent::Received { message, identity, display_name, payload })
                 }
                 CoreEvent::Rejected { code, detail } => self.events.push(AgentEvent::Rejected(code, detail)),
@@ -369,12 +376,20 @@ impl Agent {
             if !self.events.is_empty() {
                 return Ok(std::mem::take(&mut self.events));
             }
+            if self.replaced_closed {
+                return Err(crate::Error::Replaced { relay: self.conn.relay.did.clone() });
+            }
             let wait = self.core.next_deadline().map(|d| (d - now_s()).max(0) as u64).unwrap_or(3600);
             tokio::select! {
                 frame = self.conn.recv() => match frame {
                     Ok(Some(text)) => {
                         let out = self.core.inbound(&text, now_s())?;
                         self.dispatch(out).await?;
+                    }
+                    // §13.2: a connection the relay replaced is not reconnected; that would replace the other one
+                    Ok(None) | Err(_) if self.replaced => {
+                        self.replaced_closed = true;
+                        continue;
                     }
                     Ok(None) => self.reconnect().await?,
                     Err(e) => {

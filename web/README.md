@@ -256,6 +256,8 @@ test/presence-audiences.mjs
                         family, sees busy, Carol with a 30 s share and no audience sees available; the share ends her watch
                         at its end; "Change grant" sends a grant that follows Alice's (spec-gap 150): calls only ends her
                         watch, presence again lets her watch with the new grant, no introduction needed
+test/relay-replaced.mjs one device in two tabs (§13.2, spec-gap 158): the second tab's hello replaces the first's connection;
+                        the relay says transport.replaced and the first tab says so and does not reconnect; both bind once
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
                         client, with config.json, /turn and the node proxied) on 127.0.0.1:8443, relay B on 8444, a dsip-node
                         and two gateways, and runs the Playwright tests in the browser(s) named
