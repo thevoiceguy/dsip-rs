@@ -93,6 +93,13 @@ pub enum Error {
     /// A PEM file holds no private key.
     #[error("{0}: no private key")]
     NoPrivateKey(PathBuf),
+    /// The relay closed this connection because this device bound there again on another one (§13.2,
+    /// `transport.replaced`): the agent does not reconnect, which would replace that one in turn.
+    #[error("relay {relay} replaced this connection: this device bound there on another one (transport.replaced, §13.2); not reconnecting")]
+    Replaced {
+        /// The relay's DID.
+        relay: String,
+    },
 }
 
 /// How the `hello` exchange failed (§13.2, §20.5).

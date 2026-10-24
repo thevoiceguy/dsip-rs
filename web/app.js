@@ -482,6 +482,7 @@ async function onReceived(r) {
     return;
   }
   if (m.type === 'notify' && p.body?.event === 'presence') { presenceNotified(p); return; }
+  if (m.type === 'error' && m.reason === 'transport.replaced') { relayReplaced(r.identity); return; }
   if (m.type === 'error') log(`   error ${m.reason || ''}${p.detail ? ': ' + (typeof p.detail === 'string' ? p.detail : JSON.stringify(p.detail)) : ''}`, '§15');
   if (m.type === 'error' && presenceSent.has(m.in_reply_to)) { presenceRefused(m.reason, p.retry_after, presenceSent.get(m.in_reply_to)); return; }
   if (m.type === 'reject' && presenceSubFor(m.session)) { presenceBlocked(m.session); return; }
@@ -853,8 +854,8 @@ async function openCallRelay(uri, sid) {
 }
 
 /** Our one connection to another relay, shared by the calls and introductions routed through it and by the presence
- *  watches of contacts bound there: a second binding of this device there would replace the first, and each would
- *  reconnect and replace the other in turn (§13.2). Our hello binds this device there; frames go through it, routed
+ *  watches of contacts bound there: a second binding of this device there would replace the first, which then stops
+ *  (§13.2: the relay says `transport.replaced`, spec-gap 158). Our hello binds this device there; frames go through it, routed
  *  by `to` on that relay. Resolves to null if it refuses or does not bind within 8 s; releasePeerRelay closes it
  *  once nothing uses it. */
 const peerRelays = new Map();   // relay URI → the connection
@@ -889,6 +890,23 @@ function peerRelay(uri, why) {
     }, 8000);
     r.waiting.push(w);
   });
+}
+
+/** §13.2 (spec-gap 158): a relay we are bound at said this device bound there again on another connection (another tab
+ *  or window of this browser, most often), and is closing ours. We do not reconnect, or each would replace the other. */
+function relayReplaced(relayDid) {
+  if (relay && relayInfo?.did === relayDid) {
+    relay.replaced();
+    renderRelay('this device is connected to the relay elsewhere (another tab or window): reload to use it here', 'bad');
+    log(`✗ relay ${short(relayDid)} replaced this connection: this device bound there on another one; not reconnecting`, '§13.2');
+    notify('This device connected to your relay from another tab or window, which now has it. Reload this one to take it back.');
+    return;
+  }
+  const peer = [...peerRelays.values()].find((c) => c.did === relayDid);
+  if (peer) {
+    log(`✗ their relay ${short(relayDid)} replaced our connection: this device bound there on another one; not reconnecting`, '§13.2');
+    peer.replaced(); dropPeerRelay(peer);
+  }
 }
 
 function dropPeerRelay(r) {

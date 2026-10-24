@@ -68,6 +68,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("transport.unknown-recipient", &["error"]),
     ("transport.rate-limited", &["error"]),
     ("transport.no-response", &["error"]), // §12.7 rule 6 (spec-gap 76)
+    ("transport.replaced", &["error"]), // §13.2: the connection a newer hello replaced (spec-gap 158)
     ("gateway.unreachable", &["reject", "bye", "error"]),
     ("gateway.downgraded", &["error"]),
     ("gateway.mapped", &["reject", "bye", "error"]),
