@@ -29,6 +29,9 @@ pub struct SemanticContext {
     pub offer: Option<Value>,
     /// Pending introduction ids a `grant` may reference; `None` skips the check.
     pub known_introductions: Option<Vec<String>>,
+    /// Live grants held from the signer's identity, which a `grant` may follow instead of an introduction (§19.4,
+    /// spec-gap 150); consulted only with `known_introductions`.
+    pub held_grants: Vec<String>,
     /// Encoded envelope size in bytes, when known (introduction cap).
     pub encoded_size: Option<usize>,
     /// The `kid` that signed the envelope, when known (`key-rotation` signer rule, §7.5).
@@ -50,6 +53,11 @@ impl SemanticContext {
             known_introductions: ctx.get("known_introductions").and_then(Value::as_array).map(|a| {
                 a.iter().filter_map(Value::as_str).map(String::from).collect()
             }),
+            held_grants: ctx
+                .get("held_grants")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default(),
             encoded_size: ctx.get("encoded_size").and_then(Value::as_u64).map(|n| n as usize),
             signer_kid: ctx.get("signer_kid").and_then(Value::as_str).map(String::from),
             unseal_key: ctx.get("unseal_key_hex").and_then(Value::as_str).and_then(|h| {
@@ -148,8 +156,9 @@ pub fn check_semantic(payload: &Value, ctx: &SemanticContext) -> Verdict {
     }
     if t == "grant" {
         if let Some(known) = &ctx.known_introductions {
-            if !s("session").is_some_and(|sid| known.iter().any(|k| k == sid)) {
-                return Verdict::reject(RejectCode::GrantUnknownIntroduction); // §19.4
+            // §19.4: an introduction we sent, or (spec-gap 150) a live grant held from the signer that this one follows
+            if !s("session").is_some_and(|sid| known.iter().chain(&ctx.held_grants).any(|k| k == sid)) {
+                return Verdict::reject(RejectCode::GrantUnknownIntroduction);
             }
         }
     }

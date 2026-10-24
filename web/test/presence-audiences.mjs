@@ -2,7 +2,9 @@
 // available, and a second record for his `family` audience, busy, each signed by itself. He grants Alice the family
 // audience and Carol a short share with none. Alice sees busy (both records, combined, P§4); Carol sees only the record
 // with no audience. A change to the family state reaches Alice and not Carol. At the end of Carol's share Bob's relay
-// ends her watch (policy.terminated) and she shows nothing. Run by test/run.sh.
+// ends her watch (policy.terminated) and she shows nothing. Last, Bob changes Alice's grant with a grant that follows
+// it (spec-gap 150): to calls only, which ends her watch while she stays granted, then back to presence with no audience,
+// which she watches again without introducing herself. Run by test/run.sh.
 import { launch, person, until, checker, dump, addContact, rowButton, submit, sleep, which } from './lib.mjs';
 
 const check = checker();
@@ -69,6 +71,27 @@ try {
     await carol.page.waitForFunction((did) => window.dsip.presence(did) === null, bob.did, { timeout: 20000 }).then(() => true, () => false)
     && /they stopped sharing it with us/.test(await carol.page.textContent('#log')), JSON.stringify(await shown(carol, bob)));
   check('Alice still sees Bob (her grant lasts)', (await shown(alice, bob))?.state === 'dnd', JSON.stringify(await shown(alice, bob)));
+
+  /** Bob opens the grant editor on Alice's row and applies it with `presence` and `audience`. */
+  const change = async (presence, audience) => {
+    const row = bob.page.locator('#contact-list li', { has: bob.page.locator(`code.did:text-is("${alice.did}")`) });
+    await row.locator('button:text-is("Change grant")').click();
+    const box = row.locator('.grant-edit');
+    await box.locator('select.grant-audience').selectOption(audience);
+    await box.locator('input.grant-presence').setChecked(presence);
+    await box.locator('button:text-is("Apply")').click();
+  };
+  await change(false, '');
+  check('Calls only: a grant follows Alice\'s, the old one revoked at Bob\'s relay; her watch ends (§19.4, P§7)',
+    await alice.page.waitForFunction((did) => window.dsip.presence(did) === null, bob.did, { timeout: 20000 }).then(() => true, () => false)
+    && /grant-revocation of our grant to .* before the grant that follows it/.test(await bob.page.textContent('#log')), JSON.stringify(await shown(alice, bob)));
+  check('Alice still holds a grant from Bob: she need not introduce herself again (spec-gap 150)',
+    /granted you|mutual grant/.test(await alice.page.evaluate((d) => window.dsip.contactStatus(d), bob.did) || ''),
+    await alice.page.evaluate((d) => window.dsip.contactStatus(d), bob.did));
+  await sleep(1500);   // the next change revokes the grant just issued: let it reach Alice first
+  await change(true, '');
+  check('Presence again, no audience: Alice watches again with the new grant and sees his main record, available (P§6)',
+    await shows(alice, bob, "v.source === 'record' && v.state === 'available'", 30000), JSON.stringify(await shown(alice, bob)));
 } catch (e) {
   check.fail(e.message);
   await dump(...[alice, bob, carol].filter(Boolean));

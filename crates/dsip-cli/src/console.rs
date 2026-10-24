@@ -598,7 +598,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
             intro_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(*wait));
         }
         Mode::Answer { .. } => {
-            println!("waiting… (commands: accept | screen | decline | escalate | answer-update | reject-update | info | hangup | requests | grant [id] [audience=NAME] [for=SECONDS] | reject-intro [id] | revoke <grant> | quit)");
+            println!("waiting… (commands: accept | screen | decline | escalate | answer-update | reject-update | info | hangup | requests | grant [id] [audience=NAME] [for=SECONDS] | reject-intro [id] | revoke <grant> | regrant [grant] [audience=NAME] [for=SECONDS] [calls-only] | quit)");
         }
     }
 
@@ -812,6 +812,27 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         if let Some(intro) = id.or_else(latest_request) {
                             agent.local(LocalEvent::Grant { introduction: intro, id: Ulid::generate().to_string(), scope: vec!["dsip.invite".into(), "dsip.subscribe".into()], valid_until: until, presence_audience: audience }).await?;
                         } else { println!("no pending request"); }
+                        agent.save_contacts()?;
+                        continue;
+                    }
+                    "regrant" => {
+                        // `regrant [grant] [audience=NAME] [for=SECONDS] [calls-only]`: a grant that follows a grant we
+                        // issued (§19.4, spec-gap 150) — another audience or length, or calls without presence (P§7)
+                        let words: Vec<&str> = arg.as_deref().unwrap_or("").split_whitespace().collect();
+                        let audience = words.iter().find_map(|w| w.strip_prefix("audience=")).map(String::from);
+                        let until = match words.iter().find_map(|w| w.strip_prefix("for=")).map(str::parse::<i64>) {
+                            Some(Ok(secs)) if secs > 0 => dsip_transport::now_s() + secs,
+                            Some(_) => { println!("for= wants a number of seconds"); continue; }
+                            None => year,
+                        };
+                        let scope: Vec<String> = if words.contains(&"calls-only") { vec!["dsip.invite".into()] } else { vec!["dsip.invite".into(), "dsip.subscribe".into()] };
+                        let old = words.iter().find(|w| !w.contains('=') && **w != "calls-only").map(|w| w.to_string())
+                            .or_else(|| agent.endpoint().contacts.grants_issued.keys().last().cloned());
+                        let Some(old) = old else { println!("no grant issued"); continue; };
+                        let id = Ulid::generate().to_string();
+                        if agent.regrant(&old, id.clone(), scope, until, audience).await? {
+                            println!("→ grant-revocation  …{}  to our relay; → grant  …{} follows it   §19.4", sid8(&old), sid8(&id));
+                        } else { println!("no live grant {old} issued, or an audience that is not a token"); }
                         agent.save_contacts()?;
                         continue;
                     }
