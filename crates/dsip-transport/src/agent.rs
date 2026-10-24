@@ -237,6 +237,22 @@ impl Agent {
         Ok(true)
     }
 
+    /// Replace a live grant we issued with one that follows it (§19.4, spec-gap 150): the old grant's revocation to our
+    /// relay, which ends what it admitted there (P§7), then the new grant, sent to the same grantee. Returns `false`,
+    /// sending nothing, when we issued no live grant `grant` or `presence_audience` is not a P§6 token.
+    pub async fn regrant(&mut self, grant: &str, id: String, scope: Vec<String>, valid_until: i64, presence_audience: Option<String>) -> Result<bool> {
+        let live = self.endpoint().contacts.grants_issued.get(grant).is_some_and(|g| g.valid_until > now_s());
+        if !live || presence_audience.as_deref().is_some_and(|a| !dsip_core::is_presence_audience(a)) {
+            return Ok(false);
+        }
+        let authority = self.conn.relay.did.clone();
+        if let Some(frame) = self.core.grant_revocation(grant, &authority, now_s())? {
+            self.conn.send(&dsip_core::envelope::Envelope::from_frame(&frame)?).await?;
+        }
+        self.local(LocalEvent::Regrant { grant: grant.to_string(), id, scope, valid_until, presence_audience }).await?;
+        Ok(true)
+    }
+
     /// The held grants from `target` to present when watching its presence (`subscribe` `claims`). Spec: P§6.
     pub fn presence_claims(&self, target: &str) -> Vec<serde_json::Value> {
         self.core.presence_claims(target, now_s())

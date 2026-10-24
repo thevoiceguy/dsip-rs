@@ -434,8 +434,8 @@ impl Endpoint {
     }
 
     /// §19.4 outcome 1: a signed contact grant — the consent receipt (§19.3) in message form; P§6: it may name the
-    /// presence audience it admits to.
-    fn issue_grant(&mut self, gid: &str, grantee: &str, scope: Vec<String>, valid_until: i64, introduction: &str, presence_audience: Option<&str>) {
+    /// presence audience it admits to. `session` is the introduction it answers, or the grant it follows (spec-gap 150).
+    fn issue_grant(&mut self, gid: &str, grantee: &str, scope: Vec<String>, valid_until: i64, session: &str, presence_audience: Option<&str>) {
         self.contacts.grants_issued.insert(gid.into(), Grant { identity: grantee.into(), scope: scope.clone(), valid_until });
         let mut extra = vec![("scope", json!(scope)), ("valid_until", json!(valid_until))];
         if let Some(a) = presence_audience {
@@ -444,7 +444,7 @@ impl Endpoint {
         self.send(SendMsg {
             msg_type: "grant".into(),
             to: grantee.into(),
-            session: Some(introduction.into()),
+            session: Some(session.into()),
             id: Some(gid.into()),
             extra,
             ..Default::default()
@@ -505,6 +505,21 @@ impl Endpoint {
                 self.issue_grant(id, &identity, scope, *valid_until, introduction, presence_audience.as_deref());
                 return;
             }
+            LocalEvent::Regrant { grant, id, scope, valid_until, presence_audience } => {
+                // §19.4 (spec-gap 150): a grant may follow a live grant we issued, without an introduction
+                let Some(old) = self.contacts.grants_issued.get(grant).filter(|g| g.valid_until > self.now).cloned() else {
+                    self.emit(Emission::Refused(Refusal::UnknownGrant));
+                    return;
+                };
+                if presence_audience.as_deref().is_some_and(|a| !dsip_core::is_presence_audience(a)) {
+                    self.emit(Emission::Refused(Refusal::InvalidAudience)); // P§6, as for a grant: the old grant is kept
+                    return;
+                }
+                self.contacts.grants_issued.remove(grant); // issuing the new grant withdraws the one it follows
+                let scope = if scope.is_empty() { vec!["dsip.invite".to_string()] } else { scope.clone() };
+                self.issue_grant(id, &old.identity, scope, *valid_until, grant, presence_audience.as_deref());
+                return;
+            }
             LocalEvent::RejectIntroduction { introduction, reason } => {
                 let Some((identity, _)) = self.contacts.requests.remove(introduction) else {
                     self.emit(Emission::Refused(Refusal::UnknownIntroduction));
@@ -536,6 +551,7 @@ impl Endpoint {
             LocalEvent::PlaceCall { .. }
             | LocalEvent::Introduce { .. }
             | LocalEvent::Grant { .. }
+            | LocalEvent::Regrant { .. }
             | LocalEvent::RejectIntroduction { .. }
             | LocalEvent::Revoke { .. }
             // handled before the session lookup, which returned for each of them
@@ -779,12 +795,17 @@ impl Endpoint {
     }
 
     fn recv_grant(&mut self, m: &Message) {
-        let Some(intro) = m.session.clone().filter(|i| self.contacts.pending_sent.contains_key(i)) else {
-            self.emit(Emission::Drop(DropReason::UnknownIntroduction));
-            return;
-        };
-        self.contacts.pending_sent.remove(&intro);
         let by = self.identity_of(&m.from).to_string();
+        let session = m.session.clone().unwrap_or_default();
+        let follows = self.contacts.grants_held.get(&session).is_some_and(|g| g.identity == by && g.valid_until > self.now);
+        if self.contacts.pending_sent.remove(&session).is_none() {
+            if !follows {
+                self.emit(Emission::Drop(DropReason::UnknownIntroduction));
+                return;
+            }
+            // §19.4 (spec-gap 150): it follows a live grant we hold from the same identity, and replaces it
+            self.contacts.grants_held.remove(&session);
+        }
         self.contacts.grants_held.insert(
             m.id.clone(),
             Grant { identity: by.clone(), scope: m.scope.clone().unwrap_or_default(), valid_until: m.valid_until.unwrap_or(0) },

@@ -138,11 +138,65 @@ function renderContactRows(rows) {
     const b = (text, cls, fn) => { const x = document.createElement('button'); x.textContent = text; if (cls) x.className = cls; x.onclick = fn; return x; };
     li.append(b('Call', 'primary', () => placeCall(c.did, false)), b('Video', '', () => placeCall(c.did, true)),
       b('Message', '', () => messagePeer(c.did)), b('Introduce', '', () => introduce(c.did)));
-    // §19.4, P§7: withdraws the whole grant, so calls as well as presence; the contact stays
-    if (issued) li.append(b('Revoke grant', 'ghost', () => revokeGrants(c.did)));
+    // §19.4 (spec-gap 150): a grant that follows ours changes it; P§7: revoking withdraws all of it, the contact stays
+    if (issued) li.append(b('Change grant', 'ghost', () => editGrant(li, c.did)), b('Revoke grant', 'ghost', () => revokeGrants(c.did)));
     li.append(b('Remove', 'ghost', () => removeContact(c.did)));
     ul.append(li);
   }
+}
+
+/** The audience and length pickers of a grant (P§6, P§7). */
+function grantPickers(audience = '') {
+  const aud = document.createElement('select'); aud.className = 'grant-audience';
+  aud.title = 'the presence they see: your main record, plus an audience\'s if you pick one (P§6)';
+  aud.append(new Option('presence: everyone\'s', ''));
+  for (const a of Object.keys(settings.presence_audiences || {})) aud.append(new Option(`presence: ${a}`, a));
+  aud.value = audience;
+  const len = document.createElement('select'); len.className = 'grant-length';
+  len.title = 'a share ends at the grant\'s valid_until, calls and messages with it (P§7); Remove ends it sooner';
+  for (const [label, secs] of SHARE_LENGTHS) len.append(new Option(label, String(secs)));
+  return [aud, len];
+}
+
+/** The editor under a contact row for the grant we issued them: another audience or length, or calls without presence. */
+function editGrant(li, did) {
+  if (li.querySelector('.grant-edit')) return;
+  const ours = liveGrantTo(did);
+  const box = document.createElement('div'); box.className = 'grant-edit small';
+  const [aud, len] = grantPickers(ours ? grantAudiences[ours] || '' : '');
+  const share = document.createElement('label');
+  share.innerHTML = '<input type="checkbox" class="grant-presence" checked> share presence';
+  const apply = document.createElement('button'); apply.textContent = 'Apply'; apply.className = 'primary';
+  apply.onclick = () => changeGrant(did, { audience: aud.value, secs: Number(len.value), presence: share.querySelector('input').checked });
+  box.append(aud, len, share, apply);
+  li.append(box);
+}
+
+/** The live grant we issued `did` (the newest), if any. */
+function liveGrantTo(did) {
+  const t = now();
+  return Object.entries(JSON.parse(engine.contactsFile()).grants_issued || {})
+    .filter(([, g]) => g.identity === did && g.valid_until > t).map(([id]) => id).sort().pop() || null;
+}
+
+/** §19.4 (spec-gap 150): a grant that follows the one we issued `did`, so they need not introduce again. The old one is
+ *  revoked at our relay first, which ends what it admitted there (P§7); they watch again presenting the new one. */
+async function changeGrant(did, { audience, secs, presence }) {
+  const old = liveGrantTo(did);
+  if (!old) return notify('no live grant to change: they need to introduce themselves again');
+  if (relay?.bound && relayInfo?.did) {
+    for (const { grant, frame } of JSON.parse(engine.ep.grant_revocations(did, relayInfo.did, now()))) {
+      if (grant !== old) continue;
+      relay.send(frame);
+      log(`→ grant-revocation of our grant to ${short(did)} to our relay, before the grant that follows it`, 'P§7 · §19.4');
+    }
+  }
+  const ev = { local: 'regrant', grant: old, id: engine.newId(), valid_until: Math.floor(now()) + secs,
+               scope: ['dsip.invite', 'dsip.message', ...(presence ? ['dsip.subscribe'] : [])] };
+  if (presence && audience) { ev.presence_audience = audience; noteGrantAudience(ev.id, audience); }
+  log(`changing our grant to ${nameOf(did) || short(did)}: ${presence ? `presence${audience ? ` (${audience})` : ''}` : 'calls and messages only'}${secs < 31536000 ? `, ending in ${secs} s` : ''}`, '§19.4 · P§7');
+  await engine.local(ev);
+  persist(); renderContacts();
 }
 
 function noteGrantAudience(id, audience) { grantAudiences[id] = audience; store.set(key('grant-audiences'), grantAudiences); }
@@ -165,13 +219,7 @@ function renderRequests() {
     li.querySelector('.did').textContent = who;
     li.querySelector('.purpose').textContent = purposes[id]?.purpose ? `“${purposes[id].purpose}”  (a claim, §18.2)` : '(no purpose given)';
     li.querySelector('.basis').textContent = purposes[id]?.basis || '';
-    const aud = document.createElement('select'); aud.className = 'grant-audience';
-    aud.title = 'the presence they see: your main record, plus an audience\'s if you pick one (P§6)';
-    aud.append(new Option('presence: everyone\'s', ''));
-    for (const a of audiences) aud.append(new Option(`presence: ${a}`, a));
-    const len = document.createElement('select'); len.className = 'grant-length';
-    len.title = 'a share ends at the grant\'s valid_until, calls and messages with it (P§7); Remove ends it sooner';
-    for (const [label, secs] of SHARE_LENGTHS) len.append(new Option(label, String(secs)));
+    const [aud, len] = grantPickers();
     const g = document.createElement('button'); g.textContent = 'Grant'; g.className = 'primary';
     g.onclick = () => {
       const ev = { local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message', 'dsip.subscribe'],
@@ -629,7 +677,12 @@ async function onEmission(e) {
     if (e.ui === 'introduction_received' && e.token) { notify(`${short(e.from)} used your contact link: granted`); if (!contacts.some((c) => c.did === e.from)) await addContact('', e.from); }
     else if (e.ui === 'introduction_received') notify(`Introduction from ${nameOf(e.from) || short(e.from)}: see Requests`);
     if (e.ui === 'introduction_rejected') notify(`an introduction of yours was declined${e.reason ? ` (${e.reason})` : ''}`);
-    if (e.ui === 'granted') { notify(`${nameOf(e.by) || short(e.by)} granted you contact`); closePeerRelay(e.by); }
+    if (e.ui === 'granted') {
+      notify(`${nameOf(e.by) || short(e.by)} granted you contact`); closePeerRelay(e.by);
+      // a grant that follows another (spec-gap 150) may change what we may watch: ask again at once with what we hold
+      const s = presenceSubs.get(e.by);
+      if (s) Object.assign(s, { renewAt: now(), retryAt: 0 });
+    }
     return;
   }
   if (e.info) { log(`ℹ info for ${e.info.about}`, '§12.12'); return; }

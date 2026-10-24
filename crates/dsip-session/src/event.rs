@@ -127,6 +127,22 @@ pub enum LocalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         presence_audience: Option<String>,
     },
+    /// Issue a grant that follows (and replaces) the live grant `grant` we issued, without an introduction (§19.4,
+    /// spec-gap 150).
+    Regrant {
+        /// The grant this one follows.
+        grant: String,
+        /// The new grant's id.
+        id: String,
+        /// Scopes.
+        #[serde(default)]
+        scope: Vec<String>,
+        /// Grant lifetime.
+        valid_until: i64,
+        /// The presence audience the grant admits to (P§6, spec-gap 145).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presence_audience: Option<String>,
+    },
     /// Decline a pending introduction.
     RejectIntroduction {
         /// Introduction id.
@@ -155,6 +171,7 @@ impl LocalEvent {
         match self {
             LocalEvent::Introduce { .. }
             | LocalEvent::Grant { .. }
+            | LocalEvent::Regrant { .. }
             | LocalEvent::RejectIntroduction { .. }
             | LocalEvent::Revoke { .. }
             | LocalEvent::IssueToken { .. } => "",
