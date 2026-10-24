@@ -10,7 +10,8 @@
 //! carried in every presence notify beside the assertion for devices without one), P§4 (one record per device, `seq`
 //! per `(subject, device)`), P§6 (who may watch: the subject's own devices, a presented grant, a capability, the
 //! authority's policy, private by default; audiences; a body per subscription), P§7 (a grant's `valid_until` and a
-//! `grant-revocation` end the subscriptions it admitted), P§8 (lifetime bounds, T-Presence-Grace, the publish interval).
+//! `grant-revocation` end the subscriptions it admitted), P§8 (lifetime bounds, T-Presence-Grace, the publish interval),
+//! P§12.6 (sealed records kept and routed as any other, given only to subscriptions that listed `presence/0.2`).
 //!
 //! Impl (spec-gap 18): `publisher` MUST equal the verified identity; `stream_id`
 //! is namespaced under it. Impl (spec-gap 19): presence derives from device
@@ -37,7 +38,10 @@ pub const PUBLISH_INTERVAL_S: i64 = 5;
 struct PresenceRecord {
     id: String,
     device: String,
-    state: String,
+    /// The state of a plain record; a sealed one carries `kid` and `sealed_state` instead (P§12.2).
+    state: Option<String>,
+    kid: Option<String>,
+    sealed_state: Option<String>,
     seq: i64,
     expires_at: i64,
     audience: Option<String>,
@@ -97,6 +101,9 @@ pub struct Subscription {
     /// Its audience (P§6): the records with this `audience`, and those with none, are the ones it sees.
     #[serde(default)]
     pub audience: Option<String>,
+    /// Its `subscribe` listed `presence/0.2`: it is given sealed records (P§12.6).
+    #[serde(default)]
+    pub sealed: bool,
     /// The body of its last notify; a presence event notifies it only when this changes (P§6).
     #[serde(default)]
     pub body: Value,
@@ -416,9 +423,11 @@ impl Authority {
             // P§8, per audience (P§6)
             return refuse(self, "policy.rate-limited", vec![("retry_after", json!(PUBLISH_INTERVAL_S - (self.now - last)))]);
         }
-        let state = m["state"].as_str().unwrap_or("").to_string();
+        // P§12.6: a sealed record is kept and routed as any other; its state is not the authority's to read
+        let field = |k: &str| m[k].as_str().map(String::from);
+        let (state, kid, sealed_state) = (field("state"), field("kid"), field("sealed_state"));
         let expires_at = m["expires_at"].as_i64().unwrap_or(0);
-        self.records.insert(key, PresenceRecord { id, device, state, seq, expires_at, audience });
+        self.records.insert(key, PresenceRecord { id, device, state, kid, sealed_state, seq, expires_at, audience });
         self.last_accepted.insert(last_key, self.now);
         self.presence_changed(identity);
     }
@@ -452,6 +461,8 @@ impl Authority {
     /// those records by device, then audience (none first). `sub` None: every record.
     fn presence_body(&self, subject: &str, sub: Option<&Subscription>) -> Value {
         let sees = |r: &PresenceRecord| match (sub, &r.audience) {
+            // P§12.6 (spec-gap 156): a subscription that did not list presence/0.2 is given no sealed record
+            (Some(s), _) if r.sealed_state.is_some() && !s.sealed => false,
             (None, _) | (_, None) => true,
             (Some(s), Some(a)) => s.own || s.audience.as_deref() == Some(a.as_str()),
         };
@@ -464,9 +475,11 @@ impl Authority {
         let records: Vec<Value> = seen
             .iter()
             .map(|r| {
-                let mut v = json!({"id": r.id, "device": r.device, "state": r.state, "seq": r.seq, "expires_at": r.expires_at});
-                if let Some(a) = &r.audience {
-                    v["audience"] = json!(a);
+                let mut v = json!({"id": r.id, "device": r.device, "seq": r.seq, "expires_at": r.expires_at});
+                for (k, f) in [("state", &r.state), ("kid", &r.kid), ("sealed_state", &r.sealed_state), ("audience", &r.audience)] {
+                    if let Some(f) = f {
+                        v[k] = json!(f);
+                    }
                 }
                 v
             })
@@ -582,7 +595,19 @@ impl Authority {
         }
         self.subscriptions.insert(
             id.clone(),
-            Subscription { subscriber: identity.into(), device: from, target, events, expires_at: self.now + lifetime, seq: 0, own, grant, audience, body: Value::Null },
+            Subscription {
+                subscriber: identity.into(),
+                device: from,
+                target,
+                events,
+                expires_at: self.now + lifetime,
+                seq: 0,
+                own,
+                grant,
+                audience,
+                sealed: m["profiles"].as_array().is_some_and(|p| p.iter().any(|p| p == dsip_core::presence_seal::PROFILE)),
+                body: Value::Null,
+            },
         );
         self.notify(&id, "active", None);
     }
@@ -693,7 +718,12 @@ impl Authority {
     pub fn snapshot_presence(&self) -> Value {
         let mut out = serde_json::Map::new();
         for ((subject, device, audience), r) in &self.records {
-            let mut snap = json!({"seq": r.seq, "state": r.state, "expires_at": r.expires_at});
+            let mut snap = json!({"seq": r.seq, "expires_at": r.expires_at});
+            match (&r.state, &r.kid) {
+                (Some(st), _) => snap["state"] = json!(st),
+                (None, Some(kid)) => snap["kid"] = json!(kid),
+                (None, None) => {}
+            }
             if let Some(g) = self.grace_until.get(device) {
                 snap["grace_until"] = json!(g);
             }
@@ -729,6 +759,9 @@ impl Authority {
                 }
                 if let Some(a) = &s.audience {
                     v["audience"] = json!(a);
+                }
+                if s.sealed {
+                    v["sealed"] = json!(true);
                 }
                 (k.clone(), v)
             })

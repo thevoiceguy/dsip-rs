@@ -4,7 +4,7 @@
 //! Spec: P§4 (the combining rule: valid records and the authority's assertion as candidates, ranked `dnd` > `busy` >
 //! `available` > `away` > `offline`, ties broken deterministically: a record before the assertion, a registered state
 //! before an unknown one, code-point order), P§5 (an unknown state ranks and shows as
-//! `available`, its token kept).
+//! `available`, its token kept), P§12.4 (a subscriber's view of sealed records: one it cannot read takes no part).
 
 use serde_json::{json, Value};
 
@@ -71,16 +71,88 @@ pub fn combine(records: &[Value], asserted: Option<&str>, now: i64) -> Combined 
     }
 }
 
-/// Run a `presence` vector (`input.check` `aggregate`).
+/// The identity's presence from a body's records, sealed ones (P§12) opened with the keys `keys` returns: a record
+/// that cannot be read takes no part in combining, and its device is listed. Returns the combined presence and the
+/// unreadable devices, sorted.
 ///
-/// Spec: P§4.
+/// Spec: P§12.4, P§4.
+pub fn view(records: &[Value], keys: impl Fn(&str) -> Option<[u8; 32]>, asserted: Option<&str>, now: i64) -> (Combined, Vec<String>) {
+    use dsip_core::presence_seal::{open_record, RecordFields};
+    let mut readable = Vec::new();
+    let mut unreadable = std::collections::BTreeSet::new();
+    for r in records {
+        let state = match r["sealed_state"].as_str() {
+            Some(sealed) => match RecordFields::of(r).map(|f| open_record(&f, sealed, &keys)) {
+                Some(Ok(state)) => state,
+                _ => {
+                    unreadable.insert(r["device"].as_str().unwrap_or("").to_string());
+                    continue;
+                }
+            },
+            None => r["state"].as_str().unwrap_or("").to_string(),
+        };
+        readable.push(json!({"state": state, "expires_at": r["expires_at"]}));
+    }
+    (combine(&readable, asserted, now), unreadable.into_iter().collect())
+}
+
+fn unhex<const N: usize>(h: &Value) -> [u8; N] {
+    let mut out = [0u8; N];
+    let s = h.as_str().unwrap_or("");
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = s.get(2 * i..2 * i + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
+    }
+    out
+}
+
+fn hex32(h: &Value) -> [u8; 32] {
+    unhex(h)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Run a `presence` vector: `input.check` `aggregate` (P§4), and `audience-tag`, `key`, `seal-record`, `open-record`,
+/// `grant-keys-open`, `view` (P§12).
+///
+/// Spec: P§4, P§12.
 pub fn run_vector(v: &Value) -> Value {
+    use dsip_core::presence_seal as seal;
     let i = &v["input"];
+    let now = v["context"]["now"].as_i64().unwrap_or(0);
+    let keys = |kid: &str| i["keys"].get(kid).map(hex32);
+    let reject = |code: &str| json!({"verdict": "reject", "code": code});
     match i["check"].as_str() {
         Some("aggregate") => {
             let records = i["records"].as_array().cloned().unwrap_or_default();
-            let c = combine(&records, i["asserted"].as_str(), v["context"]["now"].as_i64().unwrap_or(0));
+            let c = combine(&records, i["asserted"].as_str(), now);
             json!({"state": c.state, "token": c.token, "source": c.source})
+        }
+        Some("audience-tag") => {
+            json!({"tag": seal::audience_tag(&hex32(&i["secret_hex"]), i["subject"].as_str().unwrap_or(""), i["label"].as_str().unwrap_or(""))})
+        }
+        Some("key") => json!({"key_hex": hex(&seal::key(&hex32(&i["secret_hex"]), i["subject"].as_str().unwrap_or(""), i["kid"].as_str().unwrap_or("")))}),
+        Some("seal-record") => {
+            let Some(f) = seal::RecordFields::of(&i["record"]) else { return json!({"error": "record fields"}) };
+            json!({"sealed_state": seal::seal_record(&f, i["state"].as_str().unwrap_or(""), &hex32(&i["key_hex"]), &unhex(&i["nonce_hex"]))})
+        }
+        Some("open-record") => {
+            let r = &i["record"];
+            match seal::RecordFields::of(r).map(|f| seal::open_record(&f, r["sealed_state"].as_str().unwrap_or(""), keys)) {
+                Some(Ok(state)) => json!({"verdict": "accept", "state": state}),
+                Some(Err(e)) => reject(e.code()),
+                None => json!({"error": "record fields"}),
+            }
+        }
+        Some("grant-keys-open") => match seal::open_grant_keys(&i["grant"], &hex32(&i["recipient_secret_hex"])) {
+            Ok(k) => json!({"verdict": "accept", "keys": k.iter().map(|(kid, k)| (kid.clone(), json!(hex(k)))).collect::<serde_json::Map<_, _>>()}),
+            Err(e) => reject(e.code()),
+        },
+        Some("view") => {
+            let records = i["records"].as_array().cloned().unwrap_or_default();
+            let (c, unreadable) = view(&records, keys, i["asserted"].as_str(), now);
+            json!({"state": c.state, "token": c.token, "source": c.source, "unreadable": unreadable})
         }
         other => json!({"error": format!("unknown presence check {other:?}")}),
     }

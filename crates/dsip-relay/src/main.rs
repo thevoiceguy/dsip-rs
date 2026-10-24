@@ -553,6 +553,7 @@ impl State {
             m["from"] = sender.into();
             if t == "subscribe" {
                 m["claims"] = self.presented_grants(p);
+                m["profiles"] = p["dsip"]["profiles"].clone(); // P§12.6: whether it reads sealed records
             }
             self.authority.learn_identity(sender, sender_identity);
             if t == "publish" {

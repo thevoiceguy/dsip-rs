@@ -74,6 +74,9 @@ pub enum RejectCode {
     RotationSignerNotPrevious,
     /// A `presence` record whose `device` is not its signer, `from` (P§3, v0.17; spec-gap 135).
     PresenceSignerMismatch,
+    /// A sealed `presence` record without `presence/0.2`, or whose `kid` is not for its audience (P§12.2, v0.17;
+    /// spec-gaps 152, 157).
+    PresenceSealedInvalid,
     BindingIceMode,
     BindingSdpMissing,
     BindingSdpInvalid,
