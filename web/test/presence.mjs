@@ -3,8 +3,8 @@
 // relay refuses her and she shows nothing. Once he grants it (the grant carries dsip.subscribe), she presents it and
 // sees his relay's claim (§9.3); once he picks a state, his signed record, verified in her browser (P§3) and combined
 // (P§4); "invisible" publishes offline (P§5). Carol binds to relay B: Alice watches her there, over a connection to
-// Carol's relay found through her hint (§9.3). Last, Bob removes Alice: his browser revokes the grant at his relay,
-// which ends her watch (P§7). Run by test/run.sh; env RELAY_B.
+// Carol's relay found through her hint (§9.3). Last, Bob revokes his grant to Alice, keeping her as a contact: his
+// browser sends the revocation to his relay, which ends her watch (P§7). Run by test/run.sh; env RELAY_B.
 import { launch, person, until, checker, dump, addContact, rowButton, submit, sleep, which } from './lib.mjs';
 
 const RELAY_B = process.env.RELAY_B || 'wss://127.0.0.1:8444/dsip';
@@ -77,12 +77,16 @@ try {
     && (await alice.page.textContent('#log')).includes(`at ${RELAY_B} for`));
   check('Alice presented Carol\'s grant (P§6)', /presence of .* at wss:.*presenting 1 grant/.test(await alice.page.textContent('#log')));
 
-  // Bob removes Alice: the grant is revoked at his relay, which ends her watch at once (P§7)
-  await rowButton(bob, alice, 'Remove');
+  // Bob revokes his grant to Alice: it is revoked at his relay, which ends her watch at once (P§7); she stays a contact
+  await rowButton(bob, alice, 'Revoke grant');
   check('Bob\'s browser sent the revocation to his relay (§19.4)', /→ grant-revocation of our grant/.test(await bob.page.textContent('#log')));
   check('Alice: the watch ended (policy.terminated) and Bob shows nothing (P§7)',
     await alice.page.waitForFunction((did) => window.dsip.presence(did) === null, bob.did, { timeout: 20000 }).then(() => true, () => false)
     && /they stopped sharing it with us/.test(await alice.page.textContent('#log')), JSON.stringify(await shown(alice, bob)));
+  const after = await bob.page.evaluate((d) => window.dsip.contactStatus(d), alice.did);
+  const row = bob.page.locator('#contact-list li', { has: bob.page.locator(`code.did:text-is("${alice.did}")`) });
+  check('Bob: Alice is still a contact, his grant gone and nothing left to revoke (§19.4)',
+    after !== null && !/you granted them|mutual grant/.test(after) && (await row.locator('button:text-is("Revoke grant")').count()) === 0, after);
 } catch (e) {
   check.fail(e.message);
   await dump(...[alice, bob, carol].filter(Boolean));

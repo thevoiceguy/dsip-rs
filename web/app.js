@@ -115,10 +115,10 @@ function renderContacts() {
     const status = (held && issued ? 'mutual grant' : held ? 'they granted you' : issued ? 'you granted them'
       : asked ? 'wants to connect: see Requests' : pending ? 'introduction sent, waiting' : 'no grant')
       + (issued && shares.length ? ` (${shares.join('; ')})` : '');
-    return { c, status, presence: presenceShown.get(c.did) };
+    return { c, status, issued, presence: presenceShown.get(c.did) };
   });
   // presence is left out: a badge changes in place (presenceRefresh), so a notify never rebuilds the rows under a click
-  const key = JSON.stringify(rows.map(({ c, status }) => [c.name, c.did, c.numbers, status]));
+  const key = JSON.stringify(rows.map(({ c, status, issued }) => [c.name, c.did, c.numbers, status, issued]));
   if (key !== shownContacts) { shownContacts = key; renderContactRows(rows); }
   renderRequests();
 }
@@ -127,7 +127,7 @@ function renderContactRows(rows) {
   const ul = $('contact-list');
   ul.innerHTML = '';
   if (!rows.length) ul.innerHTML = '<li class="muted small">no contacts yet: paste a DID above</li>';
-  for (const { c, status, presence } of rows) {
+  for (const { c, status, issued, presence } of rows) {
     const li = document.createElement('li');
     li.dataset.did = c.did;
     li.innerHTML = `<span class="name"></span><span class="presence"></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
@@ -137,7 +137,10 @@ function renderContactRows(rows) {
     li.querySelector('.num').textContent = (c.numbers || []).join(' ');
     const b = (text, cls, fn) => { const x = document.createElement('button'); x.textContent = text; if (cls) x.className = cls; x.onclick = fn; return x; };
     li.append(b('Call', 'primary', () => placeCall(c.did, false)), b('Video', '', () => placeCall(c.did, true)),
-      b('Message', '', () => messagePeer(c.did)), b('Introduce', '', () => introduce(c.did)), b('Remove', 'ghost', () => removeContact(c.did)));
+      b('Message', '', () => messagePeer(c.did)), b('Introduce', '', () => introduce(c.did)));
+    // §19.4, P§7: withdraws the whole grant, so calls as well as presence; the contact stays
+    if (issued) li.append(b('Revoke grant', 'ghost', () => revokeGrants(c.did)));
+    li.append(b('Remove', 'ghost', () => removeContact(c.did)));
     ul.append(li);
   }
 }
@@ -1231,15 +1234,24 @@ async function addContact(name, did, number = '') {
   await saveContacts();
 }
 
-/** Removing a contact withdraws the grants we issued them (§19.4), at our relay too, so it stops showing them our
- *  presence at once (P§7). */
-async function removeContact(did) {
+/** Withdraws the grants we issued `did` (§19.4), at our relay too, so it stops showing them our presence at once
+ *  (P§7). A grant is withdrawn whole: their calls need a new introduction too. */
+async function revokeGrants(did) {
   const revocations = relay?.bound && relayInfo?.did ? JSON.parse(engine.ep.grant_revocations(did, relayInfo.did, now())) : [];
-  for (const { grant, frame } of revocations) {
+  for (const { frame } of revocations) {
     relay.send(frame);
     log(`→ grant-revocation of our grant to ${short(did)} to our relay`, 'P§7 · §19.4');
-    await engine.local({ local: 'revoke', grant });
   }
+  if (!revocations.length && !relay?.bound) log(`our relay is not bound: the grant to ${short(did)} is withdrawn here only`, '§19.4');
+  // §19.4: the granting endpoint stops honouring the grant whether or not a revocation was sent
+  const issued = Object.entries(JSON.parse(engine.contactsFile()).grants_issued || {}).filter(([, g]) => g.identity === did);
+  for (const [grant] of issued) await engine.local({ local: 'revoke', grant });
+  persist(); renderContacts();
+}
+
+/** Removing a contact withdraws the grants we issued them first. */
+async function removeContact(did) {
+  await revokeGrants(did);
   contacts = contacts.filter((c) => c.did !== did);
   await saveContacts();
 }
