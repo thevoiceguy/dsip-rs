@@ -125,6 +125,8 @@ function renderContacts() {
 
 function renderContactRows(rows) {
   const ul = $('contact-list');
+  // an open grant editor survives a rebuild (another row's status changed, a share ended): the same box, its picks kept
+  const editing = new Map([...ul.querySelectorAll('li[data-did] > .grant-edit')].map((box) => [box.parentElement.dataset.did, box]));
   ul.innerHTML = '';
   if (!rows.length) ul.innerHTML = '<li class="muted small">no contacts yet: paste a DID above</li>';
   for (const { c, status, issued, presence } of rows) {
@@ -141,6 +143,7 @@ function renderContactRows(rows) {
     // §19.4 (spec-gap 150): a grant that follows ours changes it; P§7: revoking withdraws all of it, the contact stays
     if (issued) li.append(b('Change grant', 'ghost', () => editGrant(li, c.did)), b('Revoke grant', 'ghost', () => revokeGrants(c.did)));
     li.append(b('Remove', 'ghost', () => removeContact(c.did)));
+    if (issued && editing.has(c.did)) li.append(editing.get(c.did));
     ul.append(li);
   }
 }
@@ -167,7 +170,7 @@ function editGrant(li, did) {
   const share = document.createElement('label');
   share.innerHTML = '<input type="checkbox" class="grant-presence" checked> share presence';
   const apply = document.createElement('button'); apply.textContent = 'Apply'; apply.className = 'primary';
-  apply.onclick = () => changeGrant(did, { audience: aud.value, secs: Number(len.value), presence: share.querySelector('input').checked });
+  apply.onclick = () => box.remove() || changeGrant(did, { audience: aud.value, secs: Number(len.value), presence: share.querySelector('input').checked });
   box.append(aud, len, share, apply);
   li.append(box);
 }
@@ -2354,6 +2357,7 @@ function renderMessages() {
     seal: () => engine.seal(),
     setSeal: async (on) => { settings.seal = !!on; await saveSettings(); engine.setSeal(on); },
     relay: () => relayInfo?.did || null,
+    rebuildContacts: () => { shownContacts = null; renderContacts(); },   // tests: the rows rebuilt as when another row changes
     inboundPackets: () => (call?.media ? call.media.inboundPackets() : Promise.resolve(0)),
     remoteKinds: () => ($('remote').srcObject ? $('remote').srcObject.getTracks().map((t) => t.kind).sort() : []),
     exportIdentity: (pass) => exportIdentity(identity, pass),

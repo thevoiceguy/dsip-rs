@@ -79,7 +79,13 @@ try {
     const box = row.locator('.grant-edit');
     await box.locator('select.grant-audience').selectOption(audience);
     await box.locator('input.grant-presence').setChecked(presence);
+    // another row's change rebuilds the list (Carol's share has just ended): the open editor and its picks survive it
+    await bob.page.evaluate(() => window.dsip.rebuildContacts());
+    check('Bob\'s open grant editor survives the contact list being rebuilt, picks kept',
+      await box.locator('input.grant-presence').isChecked({ timeout: 2000 }).then((v) => v === presence, () => false)
+      && await box.locator('select.grant-audience').inputValue({ timeout: 2000 }).then((v) => v === audience, () => false));
     await box.locator('button:text-is("Apply")').click();
+    check('Apply closes the editor', await row.locator('.grant-edit').count() === 0);
   };
   await change(false, '');
   check('Calls only: a grant follows Alice\'s, the old one revoked at Bob\'s relay; her watch ends (§19.4, P§7)',
