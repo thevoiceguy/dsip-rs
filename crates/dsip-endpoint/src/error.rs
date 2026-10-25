@@ -13,6 +13,9 @@ pub enum Error {
     /// The engine asked the core to send a message type the core cannot build.
     #[error("engine asked to send unsupported type {0}")]
     UnsupportedType(String),
+    /// A record for a sealed presence scope, without the identity's secret to seal it (P§12.6: never sent in clear).
+    #[error("no identity secret to seal presence for {0}")]
+    PresenceSecret(String),
     /// A payload could not be serialized.
     #[error("serializing payload: {0}")]
     Json(#[from] serde_json::Error),

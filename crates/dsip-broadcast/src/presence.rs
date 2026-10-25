@@ -396,19 +396,35 @@ impl Watch {
                     .filter(|(p, identity)| {
                         p["type"] == "presence" && p["subject"] == self.target.as_str() && identity == &self.target && p["device"] == p["from"]
                     })
-                    .map(|(p, _)| json!({"device": p["device"], "state": p["state"], "seq": p["seq"], "expires_at": p["expires_at"]}))
+                    .map(|(p, _)| {
+                        let mut r = json!({"device": p["device"], "seq": p["seq"], "expires_at": p["expires_at"]});
+                        // P§12.2: a sealed record keeps what opening it needs, the AAD's fields among them
+                        for k in ["state", "subject", "audience", "kid", "sealed_state", "from", "type"] {
+                            if let Some(v) = p.get(k) {
+                                r[k] = v.clone();
+                            }
+                        }
+                        r
+                    })
                     .collect()
             })
             .unwrap_or_default();
         true
     }
 
-    /// The identity's presence at `now` (P§4).
+    /// The identity's presence at `now` (P§4). A sealed record takes no part: see [`Watch::view`].
     pub fn combined(&self, now: i64) -> Combined {
         combine(&self.records, self.asserted.as_deref(), now)
     }
 
-    /// The verified records held, each `{device, state, seq, expires_at}`.
+    /// The identity's presence at `now`, sealed records opened with the keys `keys` returns for a `kid`, and the
+    /// devices whose records could not be read (P§12.4).
+    pub fn view(&self, now: i64, keys: impl Fn(&str) -> Option<[u8; 32]>) -> (Combined, Vec<String>) {
+        view(&self.records, keys, self.asserted.as_deref(), now)
+    }
+
+    /// The verified records held, each `{device, seq, expires_at}` with `state`, or with `kid` and `sealed_state` when
+    /// sealed (and the record's `type`, `from`, `subject` and `audience`, if any).
     pub fn records(&self) -> &[Value] {
         &self.records
     }

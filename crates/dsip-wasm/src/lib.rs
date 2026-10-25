@@ -473,6 +473,7 @@ impl Endpoint {
             seal: cfgv["seal"].as_bool().unwrap_or(false),
             resolve_on_demand: true,
             unseal_keys: unseal_keys(&id, &keys)?,
+            presence: None,
         };
         let calls = CallsConfig {
             media: true,

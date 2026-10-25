@@ -135,6 +135,7 @@ impl Agent {
             first_contact_required: cfg.first_contact_required,
             seal: cfg.seal,
             resolve_on_demand: true,
+            presence: None,
             unseal_keys: vec![
                 (id.meta.identity.clone(), dsip_core::hpke::x25519_from_ed25519_seed(&id.controller.seed())),
                 (id.device.did(), dsip_core::hpke::x25519_from_ed25519_seed(&id.device.seed())),

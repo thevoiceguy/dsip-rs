@@ -24,4 +24,4 @@ pub mod verify;
 
 pub use calls::{AnswerPolicy, CallCommand, CallEvent, CallOut, Calls, CallsConfig, MediaRequest, MediaResult};
 pub use error::{Error, Result};
-pub use core::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite, InvitePatch};
+pub use core::{Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite, InvitePatch, PresenceSealing};

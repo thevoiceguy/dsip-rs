@@ -11,8 +11,14 @@
 //! and §16.3 does not exist yet. This core carries the SDP offer/answer as
 //! `transports[].sdp` on `invite`/`update`/`answer` and trickle candidates as
 //! `info.data.candidates` in the shape of the §12.12 example.
+//!
+//! Sealed presence (P§12): the engine decides which keys a grant carries and when a scope rotates (P§12.3, P§12.5);
+//! the core seals those keys into the grants it signs, opens them from the grants it holds, seals the device's records
+//! at the current epoch, opens a watched identity's records, and sends the revocations a rotation chain needs (P§7).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,11 +26,12 @@ use serde_json::{json, Value};
 use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{sign_bytes, Context, Envelope};
 use dsip_core::keys::KeyPair;
+use dsip_core::presence_seal;
 use dsip_core::ulid::Ulid;
 use dsip_core::version::{version_block, Supported};
 use dsip_session::endpoint::Grant;
 use dsip_session::event::SendMsg;
-use dsip_session::{Emission, Endpoint, EndpointConfig, Event, LocalEvent, Message};
+use dsip_session::{Emission, Endpoint, EndpointConfig, Event, LocalEvent, Message, PresenceKeys, PresenceKeysConfig};
 
 use crate::error::{Error, Result};
 use crate::verify::{verify_frame_with, SeenIds};
@@ -67,6 +74,21 @@ pub struct CoreConfig {
     /// not hold, hold the frame and ask the host for the document ([`CoreEvent::Resolve`]) instead of verifying
     /// without it. The host answers with [`Core::resolved`]. A host that cannot fetch leaves this off.
     pub resolve_on_demand: bool,
+    /// P§12: seal this device's presence records and put keys in the grants it issues; `None` seals nothing (a
+    /// grantee still opens the keys of the grants it holds). The identity's X25519 secret is the
+    /// [`CoreConfig::unseal_keys`] entry of the identity (P§12.1).
+    pub presence: Option<PresenceSealing>,
+}
+
+/// What a device seals, and how often it may rotate.
+///
+/// Spec: P§12.5, P§12.6 (sealing is chosen per audience), P§8 (T-Presence-Rotate).
+#[derive(Debug, Clone, Default)]
+pub struct PresenceSealing {
+    /// The scopes sealed: `main` (records with no audience) and audience tags ([`Core::audience_tag`]).
+    pub sealed: BTreeSet<String>,
+    /// T-Presence-Rotate override (seconds; clamped to P§8's bounds).
+    pub t_rotate: Option<i64>,
 }
 
 /// Seconds a frame waits for the documents it needs before it is verified without them (and rejected).
@@ -115,6 +137,12 @@ pub struct ContactFile {
     /// Spec: §19.4 — "the grantee also holds the signed grant".
     #[serde(default)]
     pub grant_frames: std::collections::BTreeMap<String, String>,
+    /// The presence key state: epochs, rotations waiting, and the epochs held from each grantor (P§12.4, P§12.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_keys: Option<PresenceKeys>,
+    /// The presence keys held, grantor identity → `kid` → the key, unpadded base64url (P§12.4).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub presence_held: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// What the core hands back to its host.
@@ -296,6 +324,14 @@ pub struct Core {
     resolving: std::collections::HashSet<String>,
     /// DIDs whose fetch failed, until when the core does not ask again.
     failed: HashMap<String, i64>,
+    /// The clock the engine's grant id mint reads: the `now` of the call being handled.
+    clock: Arc<AtomicI64>,
+    /// Presence keys held, grantor identity → `kid` → key, for the epochs the engine keeps (P§12.4).
+    held_keys: BTreeMap<String, BTreeMap<String, [u8; 32]>>,
+    /// Our presence authority (the relay we are bound to): where the revocations of a rotation chain go (P§7).
+    authority: Option<String>,
+    /// The grants we had issued before the request being handled: a revoked grant's grantee and `valid_until`.
+    issued_before: BTreeMap<String, Grant>,
 }
 
 impl Core {
@@ -315,12 +351,27 @@ impl Core {
             c.t_ring_local = t.clamp(30, 300);
         }
         c.first_contact_required = cfg.first_contact_required;
+        c.presence_keys = cfg.presence.as_ref().map(|p| PresenceKeysConfig {
+            sealed: p.sealed.clone(),
+            t_rotate: p.t_rotate.unwrap_or(dsip_session::endpoint::T_PRESENCE_ROTATE.0).clamp(dsip_session::endpoint::T_PRESENCE_ROTATE.1, dsip_session::endpoint::T_PRESENCE_ROTATE.2),
+            grant_ids: vec![],
+        });
+        let clock = Arc::new(AtomicI64::new(now));
+        let mut ep = Endpoint::new(c);
+        {
+            // P§12.5: a re-grant's id, a ULID of the time it is issued (its `issued_at`)
+            let (clock, counter) = (clock.clone(), AtomicU64::new(0));
+            ep.set_grant_ids(Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::Relaxed) % 1000;
+                Ulid::generate_at(clock.load(Ordering::Relaxed) as u64 * 1000 + n).to_string()
+            }));
+        }
         Core {
             keys,
             cfg,
             supported: Supported::all_known(),
             resolver,
-            ep: Endpoint::new(c),
+            ep,
             seen: SeenIds::default(),
             offers: HashMap::new(),
             grant_frames: Default::default(),
@@ -337,6 +388,10 @@ impl Core {
             held: vec![],
             resolving: Default::default(),
             failed: HashMap::new(),
+            clock,
+            held_keys: BTreeMap::new(),
+            authority: None,
+            issued_before: BTreeMap::new(),
         }
     }
 
@@ -495,6 +550,23 @@ impl Core {
         self.ep.contacts.pending_sent = file.pending_sent.clone();
         self.ep.contacts.tokens = file.tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         self.grant_frames = file.grant_frames.clone();
+        if let Some(k) = &file.presence_keys {
+            self.ep.keys = k.clone();
+            // a scope sealed since the state was saved starts at epoch 0, as at creation
+            let sealed: Option<Vec<String>> = self.ep.presence_keys_config().map(|pk| pk.sealed.iter().cloned().collect());
+            for sc in sealed.into_iter().flat_map(|s| std::iter::once(presence_seal::MAIN.to_string()).chain(s)) {
+                self.ep.keys.epochs.entry(sc).or_insert(0);
+            }
+        }
+        self.held_keys = file
+            .presence_held
+            .iter()
+            .map(|(by, kids)| {
+                let keys = kids.iter().filter_map(|(kid, k)| Some((kid.clone(), dsip_core::b64::decode(k)?.try_into().ok()?))).collect();
+                (by.clone(), keys)
+            })
+            .collect();
+        self.prune_held_keys();
     }
 
     /// Export first-contact state.
@@ -508,6 +580,12 @@ impl Core {
             pending_sent: self.ep.contacts.pending_sent.clone(),
             tokens: self.ep.contacts.tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             grant_frames: self.grant_frames.clone(),
+            presence_keys: (self.ep.keys != PresenceKeys::default()).then(|| self.ep.keys.clone()),
+            presence_held: self
+                .held_keys
+                .iter()
+                .map(|(by, kids)| (by.clone(), kids.iter().map(|(kid, k)| (kid.clone(), dsip_core::b64::encode(k))).collect()))
+                .collect(),
         }
     }
 
@@ -515,6 +593,7 @@ impl Core {
 
     /// Advance the engine clock to `now`; due timers fire.
     pub fn tick(&mut self, now: i64) -> Result<Vec<CoreEvent>> {
+        self.clock.store(now, Ordering::Relaxed);
         let delta = now - self.ep.now;
         if delta <= 0 {
             return Ok(vec![]);
@@ -601,12 +680,14 @@ impl Core {
             }
             Command::Engine(ev) => ev,
         };
+        self.issued_before = self.ep.contacts.grants_issued.clone();
         let em = self.ep.step(&Event::Local(ev));
         let handled = self.handle(em, now);
         self.pending_sdp = None;
         self.pending_claims.clear();
         self.invite_patch = None;
         self.pending_info_data = None;
+        self.issued_before.clear();
         out.extend(handled?);
         Ok(out)
     }
@@ -668,9 +749,116 @@ impl Core {
     /// Spec: §19.4, P§7 (spec-gap 147).
     pub fn grant_revocation(&mut self, grant: &str, authority: &str, now: i64) -> Result<Option<String>> {
         let Some(g) = self.ep.contacts.grants_issued.get(grant).cloned() else { return Ok(None) };
+        self.revocation_frame(grant, &g, authority, now).map(Some)
+    }
+
+    /// A signed `grant-revocation` of `grant`, issued to `g`'s grantee until `g`'s `valid_until` (a rotation chain
+    /// shares both, P§12.5).
+    fn revocation_frame(&mut self, grant: &str, g: &Grant, authority: &str, now: i64) -> Result<String> {
         let p = json!({"dsip": dsip_core::version::version_block(&self.supported, &[]), "type": "grant-revocation", "to": authority,
                        "grant": grant, "grantee": g.identity, "valid_until": g.valid_until});
-        self.sign_payload(p, now, 30).map(Some)
+        self.sign_payload(p, now, 30)
+    }
+
+    /// Our presence authority from now on (the relay we are bound to), or none. With one, ending or changing a share
+    /// ([`LocalEvent::Revoke`], [`LocalEvent::Regrant`]) sends a `grant-revocation` there for the grant and each grant
+    /// of its rotation chain, before the grant that changes it; without one the host sends them
+    /// ([`Core::grant_revocation`]).
+    ///
+    /// Spec: P§7, P§12.5 (spec-gap 159).
+    pub fn set_authority(&mut self, authority: Option<String>) {
+        self.authority = authority;
+    }
+
+    // ------------------------------------------------------------ sealed presence (P§12)
+
+    /// The identity's X25519 key agreement secret: the [`CoreConfig::unseal_keys`] entry of the identity.
+    ///
+    /// Spec: P§12.1.
+    fn identity_secret(&self) -> Option<[u8; 32]> {
+        self.cfg.unseal_keys.iter().find(|(did, _)| *did == self.keys.identity).map(|(_, sk)| *sk)
+    }
+
+    /// The wire tag of the audience this identity labels `label`, or `None` without the identity's secret.
+    ///
+    /// Spec: P§12.1 (a label stays on the subject's devices).
+    pub fn audience_tag(&self, label: &str) -> Option<String> {
+        Some(presence_seal::audience_tag(&self.identity_secret()?, &self.keys.identity, label))
+    }
+
+    /// Whether this device seals its records for `audience` (`None`: the records with no audience).
+    ///
+    /// Spec: P§12.6.
+    pub fn presence_sealed(&self, audience: Option<&str>) -> bool {
+        let scope = audience.unwrap_or(presence_seal::MAIN);
+        self.ep.presence_keys_config().is_some_and(|pk| pk.sealed.contains(scope))
+    }
+
+    /// The key `kid` of `subject`'s records: derived when `subject` is our identity (P§12.1), else one a grant from
+    /// `subject` carried, of the epochs kept (P§12.4).
+    ///
+    /// Spec: P§12.1, P§12.4.
+    pub fn presence_key(&self, subject: &str, kid: &str) -> Option<[u8; 32]> {
+        if subject == self.keys.identity {
+            let secret = self.identity_secret().filter(|_| presence_seal::is_kid(kid))?;
+            return Some(presence_seal::key(&secret, subject, kid));
+        }
+        self.held_keys.get(subject)?.get(kid).copied()
+    }
+
+    /// Sign one of this device's presence records (a `dsip_broadcast::presence::Publisher` payload), valid for
+    /// `ttl` seconds. A record for a sealed scope is sealed at the scope's current epoch: `kid` and `sealed_state` take
+    /// the place of `state`, and it names `presence/0.2`.
+    ///
+    /// Spec: P§12.2 (the AAD binds `seq` and `expires_at`, so both are set before sealing), P§12.5 (a device seals at
+    /// its current epoch), P§12.6 (a sealed scope is never sent in clear: without the identity's secret it is an error).
+    /// Impl: a random nonce per record.
+    pub fn sign_presence(&mut self, mut p: Value, now: i64, ttl: i64) -> Result<String> {
+        let scope = p["audience"].as_str().unwrap_or(presence_seal::MAIN).to_string();
+        if let (true, Some(state)) = (self.presence_sealed(Some(&scope)), p["state"].as_str().map(String::from)) {
+            let secret = self.identity_secret().ok_or_else(|| Error::PresenceSecret(scope.clone()))?;
+            p["issued_at"] = now.into();
+            p["expires_at"] = (now + ttl).into();
+            let kid = self.ep.keys.kid(&scope);
+            p["kid"] = kid.as_str().into();
+            if let Some(o) = p.as_object_mut() {
+                o.remove("state");
+            }
+            let fields = presence_seal::RecordFields::of(&p).ok_or(Error::PayloadShape("a presence record"))?;
+            let key = presence_seal::key(&secret, fields.subject, &kid);
+            let sealed = presence_seal::seal_record(&fields, &state, &key, &rand::random());
+            p["sealed_state"] = sealed.into();
+            p["dsip"]["profiles"] = json!([presence_seal::PROFILE]);
+        }
+        self.sign_payload(p, now, ttl)
+    }
+
+    /// A record of our own identity, verified and seen through our own watch (P§6 rule 1): a sibling's record at a
+    /// higher epoch moves ours there, and the grants we issued that carry that scope are re-granted. Our own records,
+    /// and records of other identities, change nothing.
+    ///
+    /// Spec: P§12.5.
+    pub fn own_record(&mut self, record: &Value, now: i64) -> Result<Vec<CoreEvent>> {
+        let mut out = self.tick(now)?;
+        if record["type"] != "presence" || record["subject"] != self.keys.identity.as_str() || record["from"] == self.keys.device.did().as_str() {
+            return Ok(out);
+        }
+        let Some(m) = Message::from_payload(record) else { return Ok(out) };
+        let em = self.ep.step(&Event::Recv { recv: m });
+        out.extend(self.handle(em, now)?);
+        Ok(out)
+    }
+
+    /// Drop the held keys of epochs the engine no longer keeps (P§12.4: the two highest per scope).
+    fn prune_held_keys(&mut self) {
+        let held = &self.ep.keys.held;
+        self.held_keys.retain(|by, kids| {
+            kids.retain(|kid, _| {
+                let (scope, epoch) = kid.rsplit_once('.').unwrap_or((kid, ""));
+                epoch.parse::<i64>().is_ok_and(|e| held.get(by).and_then(|s| s.get(scope)).is_some_and(|es| es.contains(&e)))
+            });
+            !kids.is_empty()
+        });
     }
 
     fn rejected(&self, v: dsip_core::Verdict, mut out: Vec<CoreEvent>) -> Vec<CoreEvent> {
@@ -754,7 +942,16 @@ impl Core {
         if p["type"] == "invite" || p["type"] == "update" {
             self.offers.insert(p["id"].as_str().unwrap_or("").to_string(), json!({"media": p["media"], "transports": p["transports"]}));
         }
-        let msg = Message::from_payload(&p).ok_or(Error::PayloadShape("not a session message"))?;
+        let mut msg = Message::from_payload(&p).ok_or(Error::PayloadShape("not a session message"))?;
+        // P§12.3: a grant's presence keys, opened with the identity's secret; the engine learns their ids
+        let mut opened = None;
+        if msg.msg_type == "grant" && p.get("presence_keys").is_some() {
+            // Impl (spec-gap 162): keys that do not open are ignored; the grant still admits, its records stay unreadable
+            if let Some(keys) = self.identity_secret().and_then(|sk| presence_seal::open_grant_keys(&p, &sk).ok()) {
+                msg.presence_keys = Some(keys.keys().cloned().collect());
+                opened = Some(keys);
+            }
+        }
         let display_name = p.pointer("/identity/display_name").and_then(Value::as_str).map(String::from);
         // §9.3: an authority refuses a subscription with `reject` (or `error`) naming it in `session`; the host's watch
         // takes it, and the §12 engine, which knows no such session, must not answer it with `session.unknown-session`
@@ -769,6 +966,10 @@ impl Core {
                 // §19.4: the grantee holds the signed grant — the bytes as received, for presenting as a credential
                 if let Ok(env) = Envelope::from_frame(frame) {
                     self.grant_frames.insert(msg.id.clone(), format!("{}.{}.{}", env.protected, env.payload, env.signature));
+                }
+                if let Some(keys) = opened.take() {
+                    self.held_keys.entry(identity_of_grant(&self.ep, &msg.id)).or_default().extend(keys);
+                    self.prune_held_keys();
                 }
             }
             out.extend(self.handle(em, now)?);
@@ -825,6 +1026,17 @@ impl Core {
                         session: m.session.clone().or_else(|| m.id.clone()).unwrap_or_default(),
                         to: m.to.clone(),
                     });
+                }
+                Emission::Revoke(ids) => {
+                    // P§7, P§12.5 (spec-gap 159): the grant and its chain, at our authority, before what follows
+                    let head = ids.first().and_then(|id| self.issued_before.get(id)).cloned();
+                    if let (Some(authority), Some(g)) = (self.authority.clone(), head) {
+                        for id in &ids {
+                            let frame = self.revocation_frame(id, &g, &authority, now)?;
+                            out.push(CoreEvent::Send { frame, msg_type: "grant-revocation".into(), session: id.clone(), to: authority.clone() });
+                        }
+                    }
+                    out.push(CoreEvent::Emission(Emission::Revoke(ids)));
                 }
                 other => out.push(CoreEvent::Emission(other)),
             }
@@ -911,7 +1123,20 @@ impl Core {
                 p["identity"] = json!({"display_name": self.keys.display_name, "claims": []});
                 ttl = 604_800;
             }
-            "grant" => {}
+            "grant" => {
+                // P§12.3: the engine names the keys by id; they are sealed to the grantee identity's key agreement key
+                // Impl (spec-gap 162): without our secret or the grantee's key the grant goes without them
+                if let Some(kids) = p.as_object_mut().and_then(|o| o.remove("presence_keys")) {
+                    let subject = self.keys.identity.clone();
+                    let keys: Option<BTreeMap<String, [u8; 32]>> = self.identity_secret().map(|sk| {
+                        kids.as_array().into_iter().flatten().filter_map(Value::as_str).map(|kid| (kid.to_string(), presence_seal::key(&sk, &subject, kid))).collect()
+                    });
+                    let pk = p["to"].as_str().and_then(|to| self.key_agreement_of(to));
+                    if let (Some(keys), Some(pk)) = (keys, pk) {
+                        p["presence_keys"] = presence_seal::seal_grant_keys(&p, &keys, &pk, &rand::random());
+                    }
+                }
+            }
             "invite" => {
                 let offer = self.media_offer(self.cfg.video);
                 self.offers.insert(session.clone(), offer.clone());
@@ -993,4 +1218,9 @@ impl Core {
         // The device signs; its delegation rides in the header so peers can learn and verify the identity (spec-gap 8).
         Ok(sign_bytes(&serde_json::to_vec(&p)?, &self.keys.device, &self.keys.device.kid(), vec![self.keys.delegation.clone()]))
     }
+}
+
+/// The grantor of a grant we hold.
+fn identity_of_grant(ep: &Endpoint, id: &str) -> String {
+    ep.contacts.grants_held.get(id).map(|g| g.identity.clone()).unwrap_or_default()
 }
