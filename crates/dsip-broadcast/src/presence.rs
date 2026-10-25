@@ -184,6 +184,11 @@ pub struct Publisher {
     records: std::collections::BTreeMap<Option<String>, Published>,
 }
 
+/// How long a [`Publisher`] holds a record back after the last one: P§8's publish interval and a second's margin.
+///
+/// Impl: spec-gap 160.
+pub const HOLD_BACK_S: i64 = crate::authority::PUBLISH_INTERVAL_S + 1;
+
 /// One record a [`Publisher`] keeps fresh.
 #[derive(Debug, Clone)]
 struct Published {
@@ -195,9 +200,13 @@ struct Published {
 
 impl Published {
     /// When it may next be sent: its own due time, held back by P§8's interval after the last one.
+    ///
+    /// Impl: the interval is measured between two records the authority accepted, on its clock (P§8), so the
+    /// publisher waits [`HOLD_BACK_S`]: a record that crossed a second boundary in transit and a next one that did
+    /// not would otherwise arrive 4 s apart and be refused `policy.rate-limited` (spec-gap 160).
     fn ready_at(&self) -> Option<i64> {
         let due = self.due?;
-        Some(self.last_sent.map_or(due, |l| due.max(l + crate::authority::PUBLISH_INTERVAL_S)))
+        Some(self.last_sent.map_or(due, |l| due.max(l + HOLD_BACK_S)))
     }
 }
 
@@ -316,7 +325,8 @@ impl Publisher {
     pub fn refused_for(&mut self, audience: Option<&str>, reason: &str, retry_after: Option<i64>, now: i64) {
         let Some(r) = self.records.get_mut(&audience.map(String::from)) else { return };
         match reason {
-            "policy.rate-limited" => r.due = Some(now + retry_after.unwrap_or(crate::authority::PUBLISH_INTERVAL_S)),
+            // Impl: a second past `retry_after`, as for HOLD_BACK_S (spec-gap 160)
+            "policy.rate-limited" => r.due = Some(now + retry_after.map_or(HOLD_BACK_S, |s| s + 1)),
             "presence.stale" => {
                 r.seq += 1;
                 r.last_sent = None;

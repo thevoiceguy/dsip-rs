@@ -25,8 +25,10 @@ fn publisher_keeps_the_publish_interval_and_seq_grows() {
     let mut p = Publisher::new("did:web:bob.example", "did:key:zPhone", "did:key:zRelay", 300);
     let a = p.set(Some("busy"), T).unwrap();
     assert!(p.set(Some("away"), T + 2).is_none(), "P§8: held back inside 5 s");
-    assert_eq!(p.next_deadline(), Some(T + 5));
-    let b = p.tick(T + 5).expect("sent once the interval has passed");
+    // spec-gap 160: a second past the interval, so the authority, on its own clock, sees 5 s between the two
+    assert_eq!(p.next_deadline(), Some(T + 6));
+    assert!(p.tick(T + 5).is_none(), "not at exactly 5 s");
+    let b = p.tick(T + 6).expect("sent once the interval and its margin have passed");
     assert_eq!(b["state"], "away");
     assert!(b["seq"].as_i64() > a["seq"].as_i64());
 }
@@ -36,12 +38,12 @@ fn publisher_follows_refusals() {
     let mut p = Publisher::new("did:web:bob.example", "did:key:zPhone", "did:key:zRelay", 300);
     let a = p.set(Some("busy"), T).unwrap();
     p.refused("policy.rate-limited", Some(4), T);
-    assert!(p.tick(T + 3).is_none());
-    assert!(p.tick(T + 5).is_some());
-    p.refused("presence.stale", None, T + 5);
-    let c = p.tick(T + 5).expect("stale: again at once");
+    assert!(p.tick(T + 5).is_none(), "spec-gap 160: not at exactly retry_after, nor inside the hold-back");
+    assert!(p.tick(T + 6).is_some());
+    p.refused("presence.stale", None, T + 6);
+    let c = p.tick(T + 6).expect("stale: again at once");
     assert!(c["seq"].as_i64() > a["seq"].as_i64());
-    p.refused("presence.signer-mismatch", None, T + 5);
+    p.refused("presence.signer-mismatch", None, T + 6);
     assert!(p.tick(T + 500).is_none(), "P§9: not sent again until the user picks a state");
     assert!(p.set(Some("dnd"), T + 500).is_some());
 }
@@ -61,9 +63,9 @@ fn publisher_keeps_one_record_per_audience_each_with_its_own_interval_and_seq() 
     let fam = p.set_for(Some("family"), Some("busy"), T).expect("another audience is not held back");
     assert_eq!((fam["audience"].as_str(), fam["state"].as_str()), (Some("family"), Some("busy")));
     assert!(p.set_for(Some("family"), Some("dnd"), T + 1).is_none(), "but the same audience is, inside 5 s");
-    assert_eq!(p.next_deadline(), Some(T + 5));
-    assert_eq!(p.tick(T + 5).expect("the held family record")["state"], "dnd");
-    assert!(p.tick(T + 5).is_none(), "nothing else is due");
+    assert_eq!(p.next_deadline(), Some(T + 6));
+    assert_eq!(p.tick(T + 6).expect("the held family record")["state"], "dnd");
+    assert!(p.tick(T + 6).is_none(), "nothing else is due");
     assert_eq!(p.states().collect::<Vec<_>>(), vec![(None, "available"), (Some("family"), "dnd")]);
 }
 
