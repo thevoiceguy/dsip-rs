@@ -554,6 +554,18 @@ pub enum Emission {
     },
     /// A local request was refused.
     Refused(Refusal),
+    /// The grants whose `grant-revocation` the host sends its authority: a grant, then its rotation chain newest first
+    /// (P§7, spec-gap 159).
+    Revoke(Vec<String>),
+    /// A presence key scope's epoch rose (P§12.5): by our own rotation, or seen in a sibling's record.
+    Keys {
+        /// `rotated` or `seen`.
+        action: KeysAction,
+        /// `main` or an audience tag.
+        scope: String,
+        /// The new epoch.
+        epoch: i64,
+    },
     /// A message was silently ignored.
     Drop(DropReason),
     /// Relay: deliver to a specific leg.
@@ -590,6 +602,25 @@ pub enum Emission {
         /// reached on a clock advance, spec-gap 132). Not part of the vector emission shape.
         session: String,
     },
+}
+
+/// How a presence key scope's epoch rose (P§12.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysAction {
+    /// This device rotated it.
+    Rotated,
+    /// A sibling's record carried it.
+    Seen,
+}
+
+impl KeysAction {
+    /// The README token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeysAction::Rotated => "rotated",
+            KeysAction::Seen => "seen",
+        }
+    }
 }
 
 impl Emission {
@@ -635,6 +666,8 @@ impl Emission {
             Emission::Queue { to, msg_type } => json!({"queue": {"to": to, "type": msg_type}}),
             Emission::Info { about } => json!({"info": {"about": about}}),
             Emission::Refused(r) => json!({ "refused": r.as_str() }),
+            Emission::Revoke(ids) => json!({ "revoke": ids }),
+            Emission::Keys { action, scope, epoch } => json!({"keys": action.as_str(), "scope": scope, "epoch": epoch}),
             Emission::Drop(r) => json!({ "drop": r.as_str() }),
             Emission::Deliver { leg, msg_type, reason, id } => {
                 let mut o = Map::new();

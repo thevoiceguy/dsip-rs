@@ -3,18 +3,20 @@
 //! Spec: §12.4 (states and transitions), §12.5 (cancel/answer race), §12.6
 //! (glare), §12.7 (forked answers, initiator side), §12.8 (renegotiation),
 //! §12.9 (timers), §12.10 (`progress`/queued timing), §12.11 (`cancel`),
-//! §12.12 (`info`), §14.3–§14.4 (`answered_by`, screening).
+//! §12.12 (`info`), §14.3–§14.4 (`answered_by`, screening), P§12.3–P§12.5 (presence keys in the grants this device
+//! issues and holds, rotation and re-granting).
 //!
 //! Every `Impl (spec-gap N)` comment has an entry in `impl/docs/spec-gaps.md`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use dsip_core::presence_seal::MAIN;
 use dsip_core::registry::{effective_answered_by, effective_progress_status, resolve_reason, INFO_ABOUT};
 
-use crate::event::{DropReason, Emission, Event, LocalEvent, MediaCommand, Refusal, SendMsg, TimerAction, TimerName, UiEvent};
+use crate::event::{DropReason, Emission, Event, KeysAction, LocalEvent, MediaCommand, Refusal, SendMsg, TimerAction, TimerName, UiEvent};
 use crate::message::Message;
 
 /// T-Establish default and bounds (seconds). Spec: §12.9.
@@ -25,6 +27,8 @@ pub const T_RING: (i64, i64, i64) = (120, 30, 300);
 pub const T_QUEUE_CAP: i64 = 1800;
 /// T-Ring-Local default and bounds (seconds). Spec: §12.9.
 pub const T_RING_LOCAL: (i64, i64, i64) = (120, 30, 300);
+/// T-Presence-Rotate default and bounds (seconds). Spec: P§8.
+pub const T_PRESENCE_ROTATE: (i64, i64, i64) = (60, 0, 3600);
 /// Consecutive re-queue limit. Spec: §12.10 (RECOMMENDED: 3).
 pub const MAX_CONSECUTIVE_REQUEUES: u32 = 3;
 
@@ -166,6 +170,20 @@ pub struct EndpointConfig {
     pub first_contact_required: bool,
     /// §19.4: identities admitted without a grant.
     pub allow: BTreeSet<String>,
+    /// P§12.3, P§12.5: presence keys; `None` keeps no key state.
+    pub presence_keys: Option<PresenceKeysConfig>,
+}
+
+/// What this device seals, and how often it may rotate (P§8, P§12.5, P§12.6).
+#[derive(Debug, Clone, Default)]
+pub struct PresenceKeysConfig {
+    /// The scopes it seals: `main` and audience tags.
+    pub sealed: BTreeSet<String>,
+    /// T-Presence-Rotate (clamped to bounds).
+    pub t_rotate: i64,
+    /// Ids for the grants it issues on its own (re-grants), in order. A host that mints ids sets
+    /// [`Endpoint::set_grant_ids`] instead.
+    pub grant_ids: Vec<String>,
 }
 
 impl EndpointConfig {
@@ -190,12 +208,17 @@ impl EndpointConfig {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
                 .unwrap_or_default(),
+            presence_keys: ctx.get("presence_keys").map(|pk| PresenceKeysConfig {
+                sealed: pk["sealed"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default(),
+                t_rotate: clamp(pk["t_rotate"].as_i64().unwrap_or(T_PRESENCE_ROTATE.0), T_PRESENCE_ROTATE),
+                grant_ids: pk["grant_ids"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default(),
+            }),
         }
     }
 }
 
 /// A contact grant (§19.4), issued or held.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Grant {
     /// Grantee (issued) or grantor (held) identity.
     pub identity: String,
@@ -203,6 +226,61 @@ pub struct Grant {
     pub scope: Vec<String>,
     /// Lifetime.
     pub valid_until: i64,
+    /// The presence audience it names (issued grants; P§6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_audience: Option<String>,
+    /// The scopes it carried presence keys for (issued grants; P§12.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// The grants it follows by re-granting, newest first: its rotation chain (P§12.5, spec-gap 159).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain: Vec<String>,
+    /// It ended and made its scopes due (P§12.5): a grant ends once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ended: bool,
+}
+
+/// This device's presence key state: epochs per scope, rotations waiting, keys held from grantors.
+///
+/// Spec: P§12.4, P§12.5.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceKeys {
+    /// The current epoch per scope.
+    pub epochs: BTreeMap<String, i64>,
+    /// When each scope was last rotated by this device.
+    pub last_rotated: BTreeMap<String, i64>,
+    /// Scopes waiting to rotate, and when.
+    pub due: BTreeMap<String, i64>,
+    /// Grantor identity → scope → the (at most two) highest epochs held (P§12.4).
+    pub held: BTreeMap<String, BTreeMap<String, BTreeSet<i64>>>,
+}
+
+impl PresenceKeys {
+    /// The key id of `scope` at its current epoch.
+    pub fn kid(&self, scope: &str) -> String {
+        format!("{scope}.{}", self.epochs.get(scope).copied().unwrap_or(0))
+    }
+
+    /// README snapshot shape, with `chains` from the issued grants.
+    pub fn snapshot(&self, contacts: &Contacts) -> Value {
+        let chains: serde_json::Map<String, Value> =
+            contacts.grants_issued.iter().filter(|(_, g)| !g.chain.is_empty()).map(|(id, g)| (id.clone(), json!(g.chain))).collect();
+        let held: serde_json::Map<String, Value> = self
+            .held
+            .iter()
+            .map(|(by, scopes)| (by.clone(), json!(scopes.iter().flat_map(|(sc, es)| es.iter().map(move |e| format!("{sc}.{e}"))).collect::<Vec<_>>())))
+            .collect();
+        json!({"epochs": self.epochs, "due": self.due, "chains": chains, "held": held})
+    }
+}
+
+/// Split a key id into scope and epoch (P§12.1).
+fn split_kid(kid: &str) -> Option<(&str, i64)> {
+    let (scope, epoch) = kid.rsplit_once('.')?;
+    if epoch.is_empty() || !epoch.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((scope, epoch.parse().ok()?))
 }
 
 /// First-contact state (§19.4): allowlist, grants, requests, pending introductions, tokens.
@@ -267,6 +345,10 @@ pub struct Endpoint {
     out: Vec<Emission>,
     /// First-contact state.
     pub contacts: Contacts,
+    /// Presence key state (P§12.4, P§12.5).
+    pub keys: PresenceKeys,
+    grant_ids: VecDeque<String>,
+    mint: Option<Box<dyn FnMut() -> String + Send>>,
 }
 
 impl Endpoint {
@@ -274,7 +356,25 @@ impl Endpoint {
     pub fn new(cfg: EndpointConfig) -> Endpoint {
         let now = cfg.start;
         let contacts = Contacts { allow: cfg.allow.clone(), ..Default::default() };
-        Endpoint { cfg, now, sessions: HashMap::new(), timers: vec![], seq: 0, out: vec![], contacts }
+        let mut keys = PresenceKeys::default();
+        let mut grant_ids = VecDeque::new();
+        if let Some(pk) = &cfg.presence_keys {
+            keys.epochs.insert(MAIN.into(), 0);
+            keys.epochs.extend(pk.sealed.iter().map(|s| (s.clone(), 0)));
+            grant_ids.extend(pk.grant_ids.iter().cloned());
+        }
+        Endpoint { cfg, now, sessions: HashMap::new(), timers: vec![], seq: 0, out: vec![], contacts, keys, grant_ids, mint: None }
+    }
+
+    /// Where ids for the grants this endpoint issues on its own come from, in place of
+    /// [`PresenceKeysConfig::grant_ids`]: a host minting ULIDs.
+    pub fn set_grant_ids(&mut self, mint: Box<dyn FnMut() -> String + Send>) {
+        self.mint = Some(mint);
+    }
+
+    /// The presence key configuration, if keys are on.
+    pub fn presence_keys_config(&self) -> Option<&PresenceKeysConfig> {
+        self.cfg.presence_keys.as_ref()
     }
 
     /// Look up a session.
@@ -306,9 +406,17 @@ impl Endpoint {
         Value::Object(m)
     }
 
-    /// Seconds until the next timer fires, if any (for a real scheduler).
+    /// When the next timer fires, a keyed grant ends or a scope rotates, if any (for a real scheduler).
     pub fn next_deadline(&self) -> Option<i64> {
-        self.timers.iter().map(|t| t.deadline).min()
+        self.instants().into_iter().min()
+    }
+
+    /// Every instant at which [`Endpoint::advance`] has something to do.
+    fn instants(&self) -> Vec<i64> {
+        let mut v: Vec<i64> = self.timers.iter().map(|t| t.deadline).collect();
+        v.extend(self.contacts.grants_issued.values().filter(|g| !g.keys.is_empty() && !g.ended).map(|g| g.valid_until));
+        v.extend(self.keys.due.values().copied());
+        v
     }
 
     /// Drive one event; returns the emissions in order.
@@ -402,13 +510,28 @@ impl Endpoint {
 
     // ------------------------------------------------------------ clock
 
-    /// Advance the clock; due timers fire in deadline order (ties by start order).
+    /// Advance the clock. Instants are taken in order: at each, the due timers fire in deadline order (ties by start
+    /// order), then the keyed grants whose `valid_until` it is end, in id order, then the scopes due rotate (P§12.5).
     pub fn advance(&mut self, seconds: i64) {
         let target = self.now + seconds;
-        while let Some(t) = self.timers.iter().filter(|t| t.deadline <= target).min_by_key(|t| (t.deadline, t.seq)).cloned() {
-            self.now = t.deadline;
-            self.timers.retain(|x| x.seq != t.seq);
-            self.fire(&t);
+        while let Some(at) = self.instants().into_iter().filter(|t| *t <= target).min() {
+            self.now = self.now.max(at);
+            while let Some(t) = self.timers.iter().filter(|t| t.deadline <= self.now).min_by_key(|t| (t.deadline, t.seq)).cloned() {
+                self.timers.retain(|x| x.seq != t.seq);
+                self.fire(&t);
+            }
+            // P§12.5: a share reaching its valid_until (spec-gap 141: at that instant) ends
+            let ending: Vec<String> = self
+                .contacts
+                .grants_issued
+                .iter()
+                .filter(|(_, g)| !g.keys.is_empty() && !g.ended && g.valid_until <= self.now)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in ending {
+                self.end_grant(&id, &[]);
+            }
+            self.rotate_due();
         }
         self.now = target;
     }
@@ -433,13 +556,57 @@ impl Endpoint {
         }
     }
 
+    /// P§12.3: the scopes a grant carries keys for: `main` and its audience, when it admits presence and either is
+    /// sealed.
+    fn key_scopes(&self, scope: &[String], audience: Option<&str>) -> Vec<String> {
+        let Some(pk) = &self.cfg.presence_keys else { return vec![] };
+        if !scope.iter().any(|s| s == "dsip.subscribe") || !(pk.sealed.contains(MAIN) || audience.is_some_and(|a| pk.sealed.contains(a))) {
+            return vec![];
+        }
+        std::iter::once(MAIN.to_string()).chain(audience.map(String::from)).collect()
+    }
+
     /// §19.4 outcome 1: a signed contact grant — the consent receipt (§19.3) in message form; P§6: it may name the
-    /// presence audience it admits to. `session` is the introduction it answers, or the grant it follows (spec-gap 150).
+    /// presence audience it admits to; P§12.3: it carries the keys of its scopes at their current epochs. `session` is
+    /// the introduction it answers, or the grant it follows (spec-gap 150).
     fn issue_grant(&mut self, gid: &str, grantee: &str, scope: Vec<String>, valid_until: i64, session: &str, presence_audience: Option<&str>) {
-        self.contacts.grants_issued.insert(gid.into(), Grant { identity: grantee.into(), scope: scope.clone(), valid_until });
+        self.issue_grant_in_chain(gid, grantee, scope, valid_until, session, presence_audience, vec![]);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_grant_in_chain(
+        &mut self,
+        gid: &str,
+        grantee: &str,
+        scope: Vec<String>,
+        valid_until: i64,
+        session: &str,
+        presence_audience: Option<&str>,
+        chain: Vec<String>,
+    ) {
+        let keys = self.key_scopes(&scope, presence_audience);
+        for sc in &keys {
+            self.keys.epochs.entry(sc.clone()).or_insert(0);
+        }
+        let kids: Vec<String> = keys.iter().map(|sc| self.keys.kid(sc)).collect();
+        self.contacts.grants_issued.insert(
+            gid.into(),
+            Grant {
+                identity: grantee.into(),
+                scope: scope.clone(),
+                valid_until,
+                presence_audience: presence_audience.map(String::from),
+                keys,
+                chain,
+                ended: false,
+            },
+        );
         let mut extra = vec![("scope", json!(scope)), ("valid_until", json!(valid_until))];
         if let Some(a) = presence_audience {
             extra.push(("presence_audience", json!(a)));
+        }
+        if !kids.is_empty() {
+            extra.push(("presence_keys", json!(kids)));
         }
         self.send(SendMsg {
             msg_type: "grant".into(),
@@ -449,6 +616,74 @@ impl Endpoint {
             extra,
             ..Default::default()
         });
+    }
+
+    /// P§12.5 (spec-gap 161): grant `id` ends; the scopes it carried keys for become due, except those in `keep`. A
+    /// grant ends once.
+    fn end_grant(&mut self, id: &str, keep: &[String]) {
+        let Some(g) = self.contacts.grants_issued.get_mut(id) else { return };
+        if g.ended {
+            return;
+        }
+        g.ended = true;
+        let scopes = g.keys.clone();
+        self.make_due(scopes.iter().filter(|s| !keep.contains(s)));
+    }
+
+    /// P§12.5: each scope rotates at once if never rotated or T-Presence-Rotate has passed since, else when it has; a
+    /// scope already waiting keeps its time.
+    fn make_due<'a>(&mut self, scopes: impl Iterator<Item = &'a String>) {
+        let t_rotate = self.cfg.presence_keys.as_ref().map_or(T_PRESENCE_ROTATE.0, |pk| pk.t_rotate);
+        for sc in scopes {
+            if self.keys.due.contains_key(sc) {
+                continue;
+            }
+            let at = match self.keys.last_rotated.get(sc) {
+                Some(last) if self.now < last + t_rotate => last + t_rotate,
+                _ => self.now,
+            };
+            self.keys.due.insert(sc.clone(), at);
+        }
+    }
+
+    /// P§12.5: every scope due now rotates together (`main` first, then tags in order), then the live grants carrying
+    /// any of them are re-granted.
+    fn rotate_due(&mut self) {
+        let mut scopes: Vec<String> = self.keys.due.iter().filter(|(_, t)| **t <= self.now).map(|(s, _)| s.clone()).collect();
+        scopes.sort_by_key(|s| (s != MAIN, s.clone()));
+        for sc in &scopes {
+            self.keys.due.remove(sc);
+            let e = self.keys.epochs.entry(sc.clone()).or_insert(0);
+            *e += 1;
+            let epoch = *e;
+            self.keys.last_rotated.insert(sc.clone(), self.now);
+            self.emit(Emission::Keys { action: KeysAction::Rotated, scope: sc.clone(), epoch });
+        }
+        self.regrant_carrying(&scopes);
+    }
+
+    /// P§12.5: a grant that follows each live grant carrying a key of `scopes`, with the same scope, `valid_until` and
+    /// audience and the current keys. The followed grant heads the new one's chain and is not revoked (spec-gap 159).
+    fn regrant_carrying(&mut self, scopes: &[String]) {
+        if scopes.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = self
+            .contacts
+            .grants_issued
+            .iter()
+            .filter(|(_, g)| g.valid_until > self.now && g.keys.iter().any(|k| scopes.contains(k)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let g = self.contacts.grants_issued.remove(&id).expect("listed above");
+            let new = match self.grant_ids.pop_front() {
+                Some(n) => n,
+                None => self.mint.as_mut().map(|m| m()).expect("an id for a re-grant: PresenceKeysConfig::grant_ids or set_grant_ids"),
+            };
+            let chain = std::iter::once(id.clone()).chain(g.chain.iter().cloned()).collect();
+            self.issue_grant_in_chain(&new, &g.identity, g.scope.clone(), g.valid_until, &id, g.presence_audience.as_deref(), chain);
+        }
     }
 
     // ------------------------------------------------------------ local events
@@ -515,9 +750,17 @@ impl Endpoint {
                     self.emit(Emission::Refused(Refusal::InvalidAudience)); // P§6, as for a grant: the old grant is kept
                     return;
                 }
+                // P§7 (spec-gap 159): the followed grant and its rotation chain are revoked at the authority
+                self.emit(Emission::Revoke(std::iter::once(grant.clone()).chain(old.chain.iter().cloned()).collect()));
                 self.contacts.grants_issued.remove(grant); // issuing the new grant withdraws the one it follows
                 let scope = if scope.is_empty() { vec!["dsip.invite".to_string()] } else { scope.clone() };
                 self.issue_grant(id, &old.identity, scope, *valid_until, grant, presence_audience.as_deref());
+                // P§12.5 (spec-gap 161): what the grantee keeps through the new grant is not rotated
+                let kept = self.contacts.grants_issued.get(id).map(|g| g.keys.clone()).unwrap_or_default();
+                if !old.ended {
+                    self.make_due(old.keys.iter().filter(|s| !kept.contains(s)));
+                }
+                self.rotate_due();
                 return;
             }
             LocalEvent::RejectIntroduction { introduction, reason } => {
@@ -531,9 +774,16 @@ impl Endpoint {
                 return;
             }
             LocalEvent::Revoke { grant } => {
-                if self.contacts.grants_issued.remove(grant).is_none() {
+                let Some(g) = self.contacts.grants_issued.remove(grant) else {
                     self.emit(Emission::Refused(Refusal::UnknownGrant));
+                    return;
+                };
+                // P§7 (spec-gap 159): with its rotation chain
+                self.emit(Emission::Revoke(std::iter::once(grant.clone()).chain(g.chain.iter().cloned()).collect()));
+                if !g.ended {
+                    self.make_due(g.keys.iter());
                 }
+                self.rotate_due();
                 return;
             }
             LocalEvent::IssueToken { token, grant_id } => {
@@ -734,6 +984,9 @@ impl Endpoint {
         if t == "grant" {
             return self.recv_grant(m);
         }
+        if t == "presence" {
+            return self.recv_own_record(m);
+        }
         if t == "reject" && m.session.as_ref().is_some_and(|sid| self.contacts.pending_sent.contains_key(sid)) {
             // §19.4 outcome 2: rejection addressed to the introduction id
             self.contacts.pending_sent.remove(m.session.as_deref().unwrap_or(""));
@@ -808,9 +1061,32 @@ impl Endpoint {
         }
         self.contacts.grants_held.insert(
             m.id.clone(),
-            Grant { identity: by.clone(), scope: m.scope.clone().unwrap_or_default(), valid_until: m.valid_until.unwrap_or(0) },
+            Grant { identity: by.clone(), scope: m.scope.clone().unwrap_or_default(), valid_until: m.valid_until.unwrap_or(0), ..Default::default() },
         );
+        // P§12.4: per scope, the keys of the two highest epochs
+        for (scope, epoch) in m.presence_keys.iter().flatten().filter_map(|k| split_kid(k)) {
+            let epochs = self.keys.held.entry(by.clone()).or_default().entry(scope.into()).or_default();
+            epochs.insert(epoch);
+            while epochs.len() > 2 {
+                epochs.pop_first();
+            }
+        }
         self.ui(UiEvent::Granted { by: by.clone() });
+    }
+
+    /// P§12.5: a record of our own identity from a sibling, seen through our own watch. A higher epoch is adopted and
+    /// our live grants carrying that scope are re-granted; anything else is ignored.
+    fn recv_own_record(&mut self, m: &Message) {
+        if self.cfg.presence_keys.is_none() || m.subject.as_deref() != Some(self.cfg.identity.as_str()) {
+            return;
+        }
+        let Some((scope, epoch)) = m.kid.as_deref().and_then(split_kid) else { return };
+        if self.keys.epochs.get(scope).is_some_and(|e| epoch <= *e) {
+            return;
+        }
+        self.keys.epochs.insert(scope.into(), epoch);
+        self.emit(Emission::Keys { action: KeysAction::Seen, scope: scope.into(), epoch });
+        self.regrant_carrying(&[scope.to_string()]);
     }
 
     fn recv_invite(&mut self, m: &Message) {

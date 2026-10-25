@@ -61,6 +61,16 @@ pub struct Message {
     /// `grant.valid_until`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<i64>,
+    /// `grant.presence_keys`, opened: the key ids it carried (P§12.3). [`Message::from_payload`] leaves it empty; the
+    /// host that opens the HPKE object fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_keys: Option<Vec<String>>,
+    /// `presence.subject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// `presence.kid`, on a sealed record (P§12.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
 }
 
 impl Message {
@@ -87,6 +97,9 @@ impl Message {
             contact_token: s("contact_token"),
             scope: p.get("scope").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()),
             valid_until: n("valid_until"),
+            presence_keys: None,
+            subject: s("subject"),
+            kid: s("kid"),
         })
     }
 
