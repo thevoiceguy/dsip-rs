@@ -124,3 +124,30 @@ fn watch_ignores_a_stale_notify_and_ends_on_terminated() {
     assert!(w.notify(&end, |_| None));
     assert!(w.terminated());
 }
+
+#[test]
+fn watch_opens_sealed_records_with_the_keys_held_and_lists_the_unreadable() {
+    use dsip_core::presence_seal::{seal_record, RecordFields};
+    let bob = "did:web:bob.example";
+    let key = [7u8; 32];
+    let sealed = |device: &str, kid: &str| {
+        let mut r = json!({"type": "presence", "from": device, "device": device, "subject": bob, "kid": kid, "seq": 1, "expires_at": T + 60});
+        let s = seal_record(&RecordFields::of(&r).unwrap(), "dnd", &key, &[1u8; 12]);
+        r["sealed_state"] = s.into();
+        r
+    };
+    let mut w = Watch::new(bob);
+    let verify = |f: &str| -> Option<(Value, String)> {
+        match f {
+            "phone" => Some((sealed("did:key:zPhone", "main.1"), bob.into())),
+            "laptop" => Some((sealed("did:key:zLaptop", "main.2"), bob.into())),
+            "tablet" => Some((rec("did:key:zTablet", bob, "away", T + 60), bob.into())),
+            _ => None,
+        }
+    };
+    assert!(w.notify(&notify(1, "offline", &["phone", "laptop", "tablet"]), verify));
+    assert_eq!(w.combined(T).state, "away", "a sealed record takes no part unopened");
+    let (c, unreadable) = w.view(T, |kid| (kid == "main.1").then_some(key));
+    assert_eq!((c.state.as_str(), c.source), ("dnd", "record"), "P§12.4: opened with the key held");
+    assert_eq!(unreadable, vec!["did:key:zLaptop".to_string()], "no key for main.2");
+}
