@@ -83,6 +83,8 @@ pub struct ConsoleOpts {
     pub mainline_bootstrap: Vec<String>,
     /// §10.4: seal outbound session bodies (`sealed-body/1.0`).
     pub seal: bool,
+    /// P§12: seal this identity's presence (keys in grants, rotation when a share ends).
+    pub seal_presence: bool,
     /// Media source spec (`none` disables media).
     pub media: String,
     /// Record inbound audio here.
@@ -396,7 +398,10 @@ fn print_emission(e: &Emission) {
         Emission::Info { about } => println!("  ℹ  info for {about}                          §12.12"),
         Emission::Refused(r) => println!("  ✗  refused: {r}"),
         Emission::Keys { action, scope, epoch } => println!("  🔑 presence key {scope} {} to epoch {epoch}        P§12.5", action.as_str()),
-        Emission::Revoke(_) => {}
+        Emission::Revoke(ids) => {
+            let ids: Vec<String> = ids.iter().map(|g| format!("…{}", sid8(g))).collect();
+            println!("  ⊘  grant-revocation to our relay: {}        P§7, P§12.5", ids.join(", "))
+        }
         Emission::Drop(r) => println!("  ·  dropped: {r}"),
         Emission::Send(_) | Emission::Deliver { .. } | Emission::Forward { .. } | Emission::Queue { .. } | Emission::Dequeue { .. } => {}
     }
@@ -520,6 +525,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         t_ring_local: opts.t_ring_local,
         first_contact_required: matches!(&mode, Mode::Answer { first_contact: true, .. }),
         seal: opts.seal,
+        presence: opts.seal_presence.then(|| dsip_transport::PresenceSealing { sealed: ["main".to_string()].into(), t_rotate: None }),
         did_resolver: None,
         calls: Some(CallsConfig { media: media_enabled(&opts), answer, recording: accept_policy, one_call: false }),
     };
@@ -804,7 +810,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                     "grant" => {
                         // `grant [id] [audience=NAME] [for=SECONDS]`: P§6 a presence audience, P§7 a time-boxed share
                         let words: Vec<&str> = arg.as_deref().unwrap_or("").split_whitespace().collect();
-                        let audience = words.iter().find_map(|w| w.strip_prefix("audience=")).map(String::from);
+                        let audience = words.iter().find_map(|w| w.strip_prefix("audience=")).map(|a| if opts.seal_presence { agent.audience_tag(a) } else { a.to_string() }); // P§12.1: a sealed audience goes as its tag
                         let until = match words.iter().find_map(|w| w.strip_prefix("for=")).map(str::parse::<i64>) {
                             Some(Ok(secs)) if secs > 0 => dsip_transport::now_s() + secs,
                             Some(_) => { println!("for= wants a number of seconds"); continue; }
@@ -821,7 +827,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
                         // `regrant [grant] [audience=NAME] [for=SECONDS] [calls-only]`: a grant that follows a grant we
                         // issued (§19.4, spec-gap 150) — another audience or length, or calls without presence (P§7)
                         let words: Vec<&str> = arg.as_deref().unwrap_or("").split_whitespace().collect();
-                        let audience = words.iter().find_map(|w| w.strip_prefix("audience=")).map(String::from);
+                        let audience = words.iter().find_map(|w| w.strip_prefix("audience=")).map(|a| if opts.seal_presence { agent.audience_tag(a) } else { a.to_string() }); // P§12.1: a sealed audience goes as its tag
                         let until = match words.iter().find_map(|w| w.strip_prefix("for=")).map(str::parse::<i64>) {
                             Some(Ok(secs)) if secs > 0 => dsip_transport::now_s() + secs,
                             Some(_) => { println!("for= wants a number of seconds"); continue; }

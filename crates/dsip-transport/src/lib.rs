@@ -22,7 +22,7 @@ pub mod status;
 pub mod tls;
 /// Inbound verification (re-exported from `dsip-endpoint`, where it is shared with the WASM build).
 pub use dsip_endpoint::verify;
-pub use dsip_endpoint::{calls, AnswerPolicy, CallCommand, CallEvent, CallsConfig, Command, Invite, InvitePatch, MediaRequest, MediaResult};
+pub use dsip_endpoint::{calls, AnswerPolicy, CallCommand, CallEvent, CallsConfig, Command, Invite, InvitePatch, MediaRequest, MediaResult, PresenceSealing};
 pub use error::{Error, HelloFailure, Result};
 pub use resolver::{Chain, DidResolver, DidWebResolver};
 
