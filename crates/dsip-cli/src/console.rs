@@ -395,6 +395,8 @@ fn print_emission(e: &Emission) {
         }
         Emission::Info { about } => println!("  ℹ  info for {about}                          §12.12"),
         Emission::Refused(r) => println!("  ✗  refused: {r}"),
+        Emission::Keys { action, scope, epoch } => println!("  🔑 presence key {scope} {} to epoch {epoch}        P§12.5", action.as_str()),
+        Emission::Revoke(_) => {}
         Emission::Drop(r) => println!("  ·  dropped: {r}"),
         Emission::Send(_) | Emission::Deliver { .. } | Emission::Forward { .. } | Emission::Queue { .. } | Emission::Dequeue { .. } => {}
     }

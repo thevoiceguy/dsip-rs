@@ -238,6 +238,7 @@ impl Component {
         match (self, key) {
             (Component::Endpoint(ep), "sessions") => ep.snapshot(names()),
             (Component::Endpoint(ep), "contacts") => ep.contacts.snapshot(),
+            (Component::Endpoint(ep), "presence_keys") => ep.keys.snapshot(&ep.contacts),
             (Component::Relay(rl), "attempts") => rl.snapshot(names()),
             (Component::Relay(rl), "inbox") => rl.inbox_snapshot(),
             (Component::Authority(a), "publications") => a.snapshot_publications(),

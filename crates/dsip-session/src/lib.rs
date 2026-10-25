@@ -26,7 +26,7 @@ pub mod event;
 pub mod fork;
 pub mod message;
 
-pub use endpoint::{Endpoint, EndpointConfig, Session, SessionState, Role};
-pub use event::{DequeueReason, DropReason, Emission, Event, LocalEvent, MediaCommand, Refusal, TimerAction, TimerName, UiEvent};
+pub use endpoint::{Endpoint, EndpointConfig, PresenceKeys, PresenceKeysConfig, Session, SessionState, Role};
+pub use event::{DequeueReason, DropReason, Emission, Event, KeysAction, LocalEvent, MediaCommand, Refusal, TimerAction, TimerName, UiEvent};
 pub use fork::{Attempt, LegState, Relay, RelayEvent};
 pub use message::Message;
