@@ -5,7 +5,8 @@
 //! (introduction size, grant references an introduction), §15.1/§14.3/§12.10/§22.2
 //! (registry membership with fallback), §7.5 (`key-rotation`: `from` = `subject`,
 //! `next` ≠ `previous`, signer = `previous` unless `recovery`), P§3 (a `presence` record's `device` is its signer),
-//! P§5 (an unknown presence state is shown as `available`). Schema README checks 5, 7, 9, 11, 12.
+//! P§5 (an unknown presence state is shown as `available`), P§12.2 (a sealed record names `presence/0.2` and a `kid` for
+//! its audience). Schema README checks 5, 7, 9, 11, 12.
 
 use serde_json::{Map, Value};
 
@@ -165,6 +166,15 @@ pub fn check_semantic(payload: &Value, ctx: &SemanticContext) -> Verdict {
     if t == "presence" && payload.get("device").is_some() && s("device") != s("from") {
         // P§3 (v0.17, spec-gap 135): a record describes the device that signs it
         return Verdict::reject_with(RejectCode::PresenceSignerMismatch, "presence.signer-mismatch");
+    }
+    if t == "presence" && payload.get("sealed_state").is_some() {
+        // P§12.2 (v0.17, spec-gaps 152, 157): a sealed record names presence/0.2, and its kid is for its audience
+        use dsip_core::presence_seal::{kid_scope, MAIN, PROFILE};
+        let names_profile = payload["dsip"]["profiles"].as_array().is_some_and(|p| p.iter().any(|p| p == PROFILE));
+        let audience = s("audience");
+        if !names_profile || audience == Some(MAIN) || s("kid").map(kid_scope) != Some(audience.unwrap_or(MAIN)) {
+            return Verdict::reject_with(RejectCode::PresenceSealedInvalid, "presence.sealed-invalid");
+        }
     }
     if t == "key-rotation" {
         // §7.5 (v0.7, spec-gap 22): only the identity rotates its own keys, by its retiring key

@@ -4,7 +4,7 @@
 //! Spec: P§4 (the combining rule: valid records and the authority's assertion as candidates, ranked `dnd` > `busy` >
 //! `available` > `away` > `offline`, ties broken deterministically: a record before the assertion, a registered state
 //! before an unknown one, code-point order), P§5 (an unknown state ranks and shows as
-//! `available`, its token kept).
+//! `available`, its token kept), P§12.4 (a subscriber's view of sealed records: one it cannot read takes no part).
 
 use serde_json::{json, Value};
 
@@ -71,16 +71,88 @@ pub fn combine(records: &[Value], asserted: Option<&str>, now: i64) -> Combined 
     }
 }
 
-/// Run a `presence` vector (`input.check` `aggregate`).
+/// The identity's presence from a body's records, sealed ones (P§12) opened with the keys `keys` returns: a record
+/// that cannot be read takes no part in combining, and its device is listed. Returns the combined presence and the
+/// unreadable devices, sorted.
 ///
-/// Spec: P§4.
+/// Spec: P§12.4, P§4.
+pub fn view(records: &[Value], keys: impl Fn(&str) -> Option<[u8; 32]>, asserted: Option<&str>, now: i64) -> (Combined, Vec<String>) {
+    use dsip_core::presence_seal::{open_record, RecordFields};
+    let mut readable = Vec::new();
+    let mut unreadable = std::collections::BTreeSet::new();
+    for r in records {
+        let state = match r["sealed_state"].as_str() {
+            Some(sealed) => match RecordFields::of(r).map(|f| open_record(&f, sealed, &keys)) {
+                Some(Ok(state)) => state,
+                _ => {
+                    unreadable.insert(r["device"].as_str().unwrap_or("").to_string());
+                    continue;
+                }
+            },
+            None => r["state"].as_str().unwrap_or("").to_string(),
+        };
+        readable.push(json!({"state": state, "expires_at": r["expires_at"]}));
+    }
+    (combine(&readable, asserted, now), unreadable.into_iter().collect())
+}
+
+fn unhex<const N: usize>(h: &Value) -> [u8; N] {
+    let mut out = [0u8; N];
+    let s = h.as_str().unwrap_or("");
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = s.get(2 * i..2 * i + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
+    }
+    out
+}
+
+fn hex32(h: &Value) -> [u8; 32] {
+    unhex(h)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Run a `presence` vector: `input.check` `aggregate` (P§4), and `audience-tag`, `key`, `seal-record`, `open-record`,
+/// `grant-keys-open`, `view` (P§12).
+///
+/// Spec: P§4, P§12.
 pub fn run_vector(v: &Value) -> Value {
+    use dsip_core::presence_seal as seal;
     let i = &v["input"];
+    let now = v["context"]["now"].as_i64().unwrap_or(0);
+    let keys = |kid: &str| i["keys"].get(kid).map(hex32);
+    let reject = |code: &str| json!({"verdict": "reject", "code": code});
     match i["check"].as_str() {
         Some("aggregate") => {
             let records = i["records"].as_array().cloned().unwrap_or_default();
-            let c = combine(&records, i["asserted"].as_str(), v["context"]["now"].as_i64().unwrap_or(0));
+            let c = combine(&records, i["asserted"].as_str(), now);
             json!({"state": c.state, "token": c.token, "source": c.source})
+        }
+        Some("audience-tag") => {
+            json!({"tag": seal::audience_tag(&hex32(&i["secret_hex"]), i["subject"].as_str().unwrap_or(""), i["label"].as_str().unwrap_or(""))})
+        }
+        Some("key") => json!({"key_hex": hex(&seal::key(&hex32(&i["secret_hex"]), i["subject"].as_str().unwrap_or(""), i["kid"].as_str().unwrap_or("")))}),
+        Some("seal-record") => {
+            let Some(f) = seal::RecordFields::of(&i["record"]) else { return json!({"error": "record fields"}) };
+            json!({"sealed_state": seal::seal_record(&f, i["state"].as_str().unwrap_or(""), &hex32(&i["key_hex"]), &unhex(&i["nonce_hex"]))})
+        }
+        Some("open-record") => {
+            let r = &i["record"];
+            match seal::RecordFields::of(r).map(|f| seal::open_record(&f, r["sealed_state"].as_str().unwrap_or(""), keys)) {
+                Some(Ok(state)) => json!({"verdict": "accept", "state": state}),
+                Some(Err(e)) => reject(e.code()),
+                None => json!({"error": "record fields"}),
+            }
+        }
+        Some("grant-keys-open") => match seal::open_grant_keys(&i["grant"], &hex32(&i["recipient_secret_hex"])) {
+            Ok(k) => json!({"verdict": "accept", "keys": k.iter().map(|(kid, k)| (kid.clone(), json!(hex(k)))).collect::<serde_json::Map<_, _>>()}),
+            Err(e) => reject(e.code()),
+        },
+        Some("view") => {
+            let records = i["records"].as_array().cloned().unwrap_or_default();
+            let (c, unreadable) = view(&records, keys, i["asserted"].as_str(), now);
+            json!({"state": c.state, "token": c.token, "source": c.source, "unreadable": unreadable})
         }
         other => json!({"error": format!("unknown presence check {other:?}")}),
     }
@@ -112,6 +184,11 @@ pub struct Publisher {
     records: std::collections::BTreeMap<Option<String>, Published>,
 }
 
+/// How long a [`Publisher`] holds a record back after the last one: P§8's publish interval and a second's margin.
+///
+/// Impl: spec-gap 160.
+pub const HOLD_BACK_S: i64 = crate::authority::PUBLISH_INTERVAL_S + 1;
+
 /// One record a [`Publisher`] keeps fresh.
 #[derive(Debug, Clone)]
 struct Published {
@@ -123,9 +200,13 @@ struct Published {
 
 impl Published {
     /// When it may next be sent: its own due time, held back by P§8's interval after the last one.
+    ///
+    /// Impl: the interval is measured between two records the authority accepted, on its clock (P§8), so the
+    /// publisher waits [`HOLD_BACK_S`]: a record that crossed a second boundary in transit and a next one that did
+    /// not would otherwise arrive 4 s apart and be refused `policy.rate-limited` (spec-gap 160).
     fn ready_at(&self) -> Option<i64> {
         let due = self.due?;
-        Some(self.last_sent.map_or(due, |l| due.max(l + crate::authority::PUBLISH_INTERVAL_S)))
+        Some(self.last_sent.map_or(due, |l| due.max(l + HOLD_BACK_S)))
     }
 }
 
@@ -244,7 +325,8 @@ impl Publisher {
     pub fn refused_for(&mut self, audience: Option<&str>, reason: &str, retry_after: Option<i64>, now: i64) {
         let Some(r) = self.records.get_mut(&audience.map(String::from)) else { return };
         match reason {
-            "policy.rate-limited" => r.due = Some(now + retry_after.unwrap_or(crate::authority::PUBLISH_INTERVAL_S)),
+            // Impl: a second past `retry_after`, as for HOLD_BACK_S (spec-gap 160)
+            "policy.rate-limited" => r.due = Some(now + retry_after.map_or(HOLD_BACK_S, |s| s + 1)),
             "presence.stale" => {
                 r.seq += 1;
                 r.last_sent = None;

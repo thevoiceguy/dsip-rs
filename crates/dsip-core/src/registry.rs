@@ -87,6 +87,7 @@ pub const REASONS: &[(&str, &[&str])] = &[
     ("mailbox.not-served", &["error"]), // v0.16 (spec-gap 130): an owner operation the mailbox will not serve (M§4.1)
     ("mailbox.not-enrolled", &["error"]), // v0.16 (spec-gap 130): a release for a configured identity (M§4.1)
     ("presence.signer-mismatch", &["error"]), // v0.17 (spec-gap 134): the record's device/subject is not its signer's (P§3)
+    ("presence.sealed-invalid", &["error"]), // v0.17 (spec-gaps 152, 157): a sealed record without presence/0.2 or a kid for its audience (P§12.2)
     ("presence.lifetime", &["error"]), // v0.17 (spec-gap 134): a record's lifetime outside 60–3,600 s (P§8)
     ("presence.stale", &["error"]), // v0.17 (spec-gap 134): a record not newer than the one held for its device (P§3)
 ];

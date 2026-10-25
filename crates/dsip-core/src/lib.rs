@@ -23,6 +23,7 @@ pub mod grant;
 pub mod hpke;
 pub mod keys;
 pub mod pkarr;
+pub mod presence_seal;
 pub mod registry;
 pub mod trust;
 pub mod ulid;
