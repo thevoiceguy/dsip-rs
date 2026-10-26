@@ -250,12 +250,18 @@ test/presence.mjs       presence (Presence Profile draft): automatic shows the r
                         busy, away and invisible come as his device's signed records, verified and combined in Alice's
                         browser (P§3–P§5); Carol on relay B is watched at her relay, found through her hint (spec-gap 143);
                         private by default until a grant (P§6); "Revoke grant" withdraws it at the relay and keeps the
-                        contact, and removing a contact revokes it too (P§7)
+                        contact, and removing a contact revokes it too (P§7); the badge appearing moves none of the row's
+                        buttons
 test/presence-audiences.mjs
                         audiences and shares (P§6, P§7): Bob's family audience is a second signed record; Alice, granted
                         family, sees busy, Carol with a 30 s share and no audience sees available; the share ends her watch
                         at its end; "Change grant" sends a grant that follows Alice's (spec-gap 150): calls only ends her
                         watch, presence again lets her watch with the new grant, no introduction needed
+test/presence-sealed.mjs
+                        sealed presence (P§12): Bob turns on "seal my presence"; Dave, granted before, sees that Bob has
+                        presence but cannot read it; Alice, granted family after, opens both of Bob's records (the family
+                        audience sent as its tag); revoking her grant revokes it at the relay and rotates both keys;
+                        "Change grant" gives Dave the new key; Bob's second device adopts the epoch from its own watch
 test/relay-replaced.mjs one device in two tabs (§13.2, spec-gap 158): the second tab's hello replaces the first's connection;
                         the relay says transport.replaced and the first tab says so and does not reconnect; both bind once
 test/run.sh             makes the gateway fixture, starts two mailboxes (A is relay A's operator default), relay A (serving the
