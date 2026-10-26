@@ -39,6 +39,11 @@ fn bcast_version() -> Value {
 }
 
 async fn connect(c: &Conn) -> Result<Agent> {
+    connect_with(c, None).await
+}
+
+/// [`connect`], sealing presence for the scopes in `presence` (P§12).
+async fn connect_with(c: &Conn, presence: Option<dsip_transport::PresenceSealing>) -> Result<Agent> {
     let id = Identity::load(&c.identity)?;
     let cfg = AgentConfig {
         relay_url: c.relay.clone(),
@@ -51,6 +56,7 @@ async fn connect(c: &Conn) -> Result<Agent> {
         seal: false,
         did_resolver: None,
         calls: None,
+        presence,
     };
     let agent = Agent::connect(id, cfg, StaticResolver::default()).await?;
     println!("identity  {}", agent.identity_did());
@@ -147,8 +153,13 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
     let mut agent = connect(c).await?;
     let authority = agent.relay().did.clone();
     let mut p = json!({"dsip": bcast_version(), "type": "subscribe", "to": authority, "target": target, "events": events, "expires_in": expires_in});
+    let presence = p["events"].as_array().is_some_and(|e| e.iter().any(|x| x == "presence"));
+    if presence {
+        // P§12.4: we open sealed records, so we ask for them
+        p["dsip"]["profiles"] = json!([PROFILE, dsip_core::presence_seal::PROFILE]);
+    }
     // P§6: presence is private by default; the grants we hold from the target admit us
-    let claims = if p["events"].as_array().is_some_and(|e| e.iter().any(|x| x == "presence")) { agent.presence_claims(target) } else { vec![] };
+    let claims = if presence { agent.presence_claims(target) } else { vec![] };
     if !claims.is_empty() {
         println!("· presenting {} grant(s) from {} with dsip.subscribe   P§6", claims.len(), short(target));
         p["claims"] = Value::Array(claims);
@@ -185,7 +196,7 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
                     let body = &payload["body"];
                     if body["event"] == "presence" {
                         watch.notify(&payload, |f| agent.verify_record(f));
-                        let c = watch.combined(now_s());
+                        let (c, unreadable) = watch.view(now_s(), |kid| agent.presence_key(target, kid));
                         let from = match c.source {
                             "record" => "from a device's signed record",
                             "assertion" => "the authority's claim, no device record",
@@ -194,7 +205,14 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
                         println!("           presence: {}{}  ({from})   P§4", c.state, if c.token != c.state { format!(" (shown raw: {})", c.token) } else { String::new() });
                         let held = body["records"].as_array().map_or(0, Vec::len);
                         for r in watch.records() {
-                            println!("             device {} {} seq {}  ✓ verified   P§3", short(r["device"].as_str().unwrap_or("")), r["state"].as_str().unwrap_or(""), r["seq"]);
+                            let device = r["device"].as_str().unwrap_or("");
+                            match r["kid"].as_str() {
+                                None => println!("             device {} {} seq {}  ✓ verified   P§3", short(device), r["state"].as_str().unwrap_or(""), r["seq"]),
+                                Some(kid) if unreadable.iter().any(|d| d == device) => {
+                                    println!("             device {} sealed {kid} seq {}  ✓ verified, unreadable: no key for {kid}   P§12.4", short(device), r["seq"])
+                                }
+                                Some(kid) => println!("             device {} sealed {kid} seq {}  ✓ verified, opened   P§12.4", short(device), r["seq"]),
+                            }
                         }
                         if held > watch.records().len() {
                             println!("             {} record(s) did not verify: ignored   P§3", held - watch.records().len());
@@ -233,12 +251,12 @@ pub async fn subscribe(c: &Conn, target: &str, events: Vec<String>, expires_in: 
 }
 
 /// `AUDIENCE=STATE` (or `STATE`, for the record with no audience): the audience, checked as a P§6 token, and the state
-/// (`none`: stop publishing that record).
-fn audience_state(arg: &str) -> Result<(Option<String>, Option<String>)> {
+/// (`none`: stop publishing that record). With `tag`, the audience is a label sent as its tag (P§12.1).
+fn audience_state(arg: &str, tag: Option<&dyn Fn(&str) -> String>) -> Result<(Option<String>, Option<String>)> {
     let (audience, state) = match arg.split_once('=') {
         Some((a, st)) => {
             anyhow::ensure!(dsip_broadcast::presence::is_audience(a), "not an audience token (P§6: [a-z][a-z0-9-]*): {a}");
-            (Some(a.to_string()), st)
+            (Some(tag.map_or_else(|| a.to_string(), |t| t(a))), st)
         }
         None => (None, arg),
     };
@@ -249,25 +267,45 @@ fn audience_state(arg: &str) -> Result<(Option<String>, Option<String>)> {
 /// with no audience and one per `--audience`, following `then` (`SECONDS:STATE` or `SECONDS:AUDIENCE=STATE`, `none`
 /// to stop) and printing what the authority refuses.
 ///
-/// Spec: P§3, P§6, P§8, P§9.
-pub async fn presence_publish(c: &Conn, state: &str, audiences: &[String], then: &[String], lifetime: i64, wait: u64) -> Result<()> {
-    let mut agent = connect(c).await?;
+/// With `sealed` the records are sealed (P§12.2): `main` and every audience named, each a label sent as its tag; the
+/// device also watches its own identity and moves to the epoch a sibling's record shows (P§12.5).
+///
+/// Spec: P§3, P§6, P§8, P§9, P§12.
+pub async fn presence_publish(c: &Conn, state: &str, audiences: &[String], then: &[String], lifetime: i64, wait: u64, sealed: bool) -> Result<()> {
+    let id = Identity::load(&c.identity)?;
+    let label_tag = |l: &str| dsip_transport::agent::audience_tag(&id, l);
+    let tag: Option<&dyn Fn(&str) -> String> = if sealed { Some(&label_tag) } else { None };
     let start = now_s();
     let mut plan: Vec<(i64, Option<String>, Option<String>)> = then
         .iter()
         .map(|t| {
             let (secs, rest) = t.split_once(':').context("--then wants SECONDS:STATE or SECONDS:AUDIENCE=STATE")?;
-            let (audience, st) = audience_state(rest)?;
+            let (audience, st) = audience_state(rest, tag)?;
             Ok((start + secs.parse::<i64>()?, audience, st))
         })
         .collect::<Result<_>>()?;
+    let named: Vec<Option<String>> = audiences.iter().map(|a| audience_state(a, tag).map(|(au, _)| au)).collect::<Result<_>>()?;
+    let presence = sealed.then(|| dsip_transport::PresenceSealing {
+        // P§12.6: sealing is per audience; here every scope this device publishes
+        sealed: std::iter::once("main".to_string()).chain(named.into_iter().flatten()).chain(plan.iter().filter_map(|(_, a, _)| a.clone())).collect(),
+        t_rotate: None,
+    });
+    let mut agent = connect_with(c, presence).await?;
+    let me = agent.identity_did().to_string();
+    if sealed {
+        // P§12.5: the device watches its own identity (admitted by P§6 rule 1) to learn its siblings' epochs
+        let p = json!({"dsip": {"core": "1.0", "min_core": "1.0", "profiles": [PROFILE, dsip_core::presence_seal::PROFILE], "extensions": [], "critical": []},
+                       "type": "subscribe", "to": agent.relay().did.clone(), "target": me, "events": ["presence"], "expires_in": 3600});
+        agent.send_payload(p, 30).await?;
+        println!("→ subscribe  target our own identity, sealed records too   P§12.5");
+    }
     plan.sort_by_key(|(at, ..)| *at);
     plan.reverse();
     let mut publisher = dsip_broadcast::presence::Publisher::new(agent.identity_did(), agent.device_did(), &agent.relay().did.clone(), lifetime);
     let mut out = publisher.set(Some(state), now_s());
     let mut pending: Vec<Value> = vec![];
     for a in audiences {
-        let (audience, st) = audience_state(a)?;
+        let (audience, st) = audience_state(a, tag)?;
         anyhow::ensure!(audience.is_some(), "--audience wants AUDIENCE=STATE");
         pending.extend(publisher.set_for(audience.as_deref(), st.as_deref(), now_s()));
     }
@@ -277,14 +315,18 @@ pub async fn presence_publish(c: &Conn, state: &str, audiences: &[String], then:
     loop {
         if let Some(p) = out.take().or_else(|| pending.pop()) {
             let (st, seq, audience) = (p["state"].clone(), p["seq"].clone(), p["audience"].as_str().map(String::from));
-            let frame = agent.send_payload(p, publisher.lifetime()).await?;
+            let frame = agent.send_presence(p, publisher.lifetime()).await?;
+            let kid = Envelope::from_frame(&frame).ok().and_then(|e| dsip_core::b64::decode(&e.payload)).and_then(|b| {
+                serde_json::from_slice::<Value>(&b).ok()?["kid"].as_str().map(String::from)
+            });
             if let Some(id) = Envelope::from_frame(&frame).ok().and_then(|e| dsip_core::b64::decode(&e.payload)).and_then(|b| {
                 serde_json::from_slice::<Value>(&b).ok()?["id"].as_str().map(String::from)
             }) {
                 sent.insert(id, audience.clone());
             }
             let to = audience.map(|a| format!(" (audience {a})")).unwrap_or_default();
-            println!("→ presence {}{to} seq {seq} for {} s to the authority   P§3", st.as_str().unwrap_or(""), publisher.lifetime());
+            let how = kid.map(|k| format!(" sealed under {k}   P§12.2")).unwrap_or_else(|| "   P§3".into());
+            println!("→ presence {}{to} seq {seq} for {} s to the authority{how}", st.as_str().unwrap_or(""), publisher.lifetime());
             continue;
         }
         let now = now_s();
@@ -315,6 +357,26 @@ pub async fn presence_publish(c: &Conn, state: &str, audiences: &[String], then:
                     let of = audience.as_ref().map(|a| format!(" (audience {a})")).unwrap_or_default();
                     println!("← error    {reason}{}   (the authority refused the record{of}, P§3)", retry.map(|r| format!(" retry_after {r}")).unwrap_or_default());
                     publisher.refused_for(audience.as_deref(), reason, retry, now_s());
+                }
+                AgentEvent::Received { message, payload, .. } if message.msg_type == "notify" && sealed => {
+                    // our own watch: each sibling record, verified, may carry a higher epoch (P§12.5)
+                    let frames: Vec<String> =
+                        payload["body"]["records"].as_array().into_iter().flatten().filter_map(|r| r["frame"].as_str().map(String::from)).collect();
+                    for f in frames {
+                        if let Some((rec, identity)) = agent.verify_record(&f) {
+                            if identity == me && rec["device"] == rec["from"] {
+                                agent.own_record(&rec).await?;
+                            }
+                        }
+                    }
+                }
+                AgentEvent::Emission(dsip_session::Emission::Keys { action, scope, epoch }) => {
+                    println!("· presence key {scope} {} to epoch {epoch}   P§12.5", action.as_str());
+                    agent.save_contacts()?;
+                }
+                AgentEvent::Sent { msg_type, session, .. } if msg_type == "grant" => {
+                    println!("→ grant following …{} with the new keys   P§12.5", &session[session.len().saturating_sub(8)..]);
+                    agent.save_contacts()?;
                 }
                 AgentEvent::Rejected(code, detail) => println!("✗ inbound rejected: {code} {detail}"),
                 _ => {}

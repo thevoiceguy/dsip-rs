@@ -132,7 +132,8 @@ function renderContactRows(rows) {
   for (const { c, status, issued, presence } of rows) {
     const li = document.createElement('li');
     li.dataset.did = c.did;
-    li.innerHTML = `<span class="name"></span><span class="presence"></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
+    // the badge sits under the name in a cell of fixed width: a presence change never moves the buttons under a click
+    li.innerHTML = `<span class="who"><span class="name"></span><span class="presence"></span></span><code class="did"></code><span class="muted small num"></span><span class="status">${status}</span>`;
     li.querySelector('.name').textContent = c.name || '(unnamed)';
     renderPresence(li.querySelector('.presence'), presence);
     li.querySelector('.did').textContent = c.did;

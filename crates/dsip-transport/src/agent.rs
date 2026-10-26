@@ -10,7 +10,7 @@ use std::time::Duration;
 use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
 use dsip_endpoint::{CallCommand, CallEvent, CallOut, Calls, CallsConfig, Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys,
-                    Invite, MediaRequest, MediaResult};
+                    Invite, MediaRequest, MediaResult, PresenceSealing};
 use dsip_session::{Emission, Endpoint, LocalEvent, Message};
 
 use std::sync::Arc;
@@ -92,6 +92,14 @@ pub struct AgentConfig {
     /// [`AgentEvent::Media`]; calls are placed with [`Agent::place`] and driven with [`Agent::call`]. `None` leaves
     /// all of that to the host.
     pub calls: Option<CallsConfig>,
+    /// P§12: seal this device's presence records for these scopes (`main` and audience tags, [`audience_tag`]) and put
+    /// keys in the grants it issues. `None` seals nothing; the keys of grants held open either way.
+    pub presence: Option<PresenceSealing>,
+}
+
+/// The wire tag of the audience `id`'s identity labels `label` (P§12.1): the label stays on the subject's devices.
+pub fn audience_tag(id: &Identity, label: &str) -> String {
+    dsip_core::presence_seal::audience_tag(&dsip_core::hpke::x25519_from_ed25519_seed(&id.controller.seed()), &id.meta.identity, label)
 }
 
 type Resolution = (String, std::result::Result<dsip_core::did::DidDocument, dsip_core::did::ResolveError>);
@@ -135,7 +143,7 @@ impl Agent {
             first_contact_required: cfg.first_contact_required,
             seal: cfg.seal,
             resolve_on_demand: true,
-            presence: None,
+            presence: cfg.presence.clone(),
             unseal_keys: vec![
                 (id.meta.identity.clone(), dsip_core::hpke::x25519_from_ed25519_seed(&id.controller.seed())),
                 (id.device.did(), dsip_core::hpke::x25519_from_ed25519_seed(&id.device.seed())),
@@ -146,6 +154,8 @@ impl Agent {
         let file: ContactFile =
             std::fs::read(id.dir.join("contacts.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         core.load_contacts(&file);
+        // P§7, P§12.5: our relay is the presence authority; the core sends it the revocations a share's end needs
+        core.set_authority(Some(conn.relay.did.clone()));
         let did_resolver = cfg.did_resolver.clone().unwrap_or_else(|| Arc::new(DidWebResolver::new()));
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let calls = cfg.calls.map(Calls::new);
@@ -232,12 +242,13 @@ impl Agent {
         self.core.verify_record(frame, now_s())
     }
 
-    /// Withdraw a grant we issued: a signed `grant-revocation` to our relay, the authority, so it ends what the grant
-    /// admitted there (P§7), then the local revocation (§19.4). Returns whether we had issued it.
+    /// Withdraw a grant we issued (§19.4): the core sends a signed `grant-revocation` to our relay, the authority, for
+    /// it and every grant of its rotation chain, so the relay ends what they admitted there (P§7, P§12.5), and rotates
+    /// the keys it carried. Returns whether we had issued it.
     pub async fn revoke_grant(&mut self, grant: &str) -> Result<bool> {
-        let authority = self.conn.relay.did.clone();
-        let Some(frame) = self.core.grant_revocation(grant, &authority, now_s())? else { return Ok(false) };
-        self.conn.send(&dsip_core::envelope::Envelope::from_frame(&frame)?).await?;
+        if !self.core.endpoint().contacts.grants_issued.contains_key(grant) {
+            return Ok(false);
+        }
         self.local(LocalEvent::Revoke { grant: grant.to_string() }).await?;
         Ok(true)
     }
@@ -250,10 +261,7 @@ impl Agent {
         if !live || presence_audience.as_deref().is_some_and(|a| !dsip_core::is_presence_audience(a)) {
             return Ok(false);
         }
-        let authority = self.conn.relay.did.clone();
-        if let Some(frame) = self.core.grant_revocation(grant, &authority, now_s())? {
-            self.conn.send(&dsip_core::envelope::Envelope::from_frame(&frame)?).await?;
-        }
+        // the core revokes the old grant and its chain at our relay before the new grant goes (P§7)
         self.local(LocalEvent::Regrant { grant: grant.to_string(), id, scope, valid_until, presence_audience }).await?;
         Ok(true)
     }
@@ -271,6 +279,31 @@ impl Agent {
     /// This side's recording declaration from now on (Recording Profile C§3).
     pub fn set_recording(&mut self, declaration: Option<serde_json::Value>) {
         self.core.set_recording(declaration);
+    }
+
+    /// Sign and send one of this device's presence records (a `Publisher` payload), sealed when its scope is
+    /// ([`AgentConfig::presence`]). Returns the frame. Spec: P§3, P§12.2.
+    pub async fn send_presence(&mut self, payload: serde_json::Value, ttl: i64) -> Result<String> {
+        let frame = self.core.sign_presence(payload, now_s(), ttl)?;
+        self.conn.send(&dsip_core::envelope::Envelope::from_frame(&frame)?).await?;
+        Ok(frame)
+    }
+
+    /// The key `kid` of `subject`'s presence records: ours derived, a grantor's from its grants (P§12.4).
+    pub fn presence_key(&self, subject: &str, kid: &str) -> Option<[u8; 32]> {
+        self.core.presence_key(subject, kid)
+    }
+
+    /// The wire tag of the audience our identity labels `label` (P§12.1).
+    pub fn audience_tag(&self, label: &str) -> String {
+        audience_tag(&self.id, label)
+    }
+
+    /// A verified record of our own identity, from our own watch: a sibling's higher epoch is adopted and the grants
+    /// that carry it are re-granted (P§12.5).
+    pub async fn own_record(&mut self, record: &serde_json::Value) -> Result<()> {
+        let out = self.core.own_record(record, now_s())?;
+        self.dispatch(out).await
     }
 
     /// Seal outbound session bodies from now on, or stop (§10.4).
@@ -423,6 +456,7 @@ impl Agent {
             match Connection::connect(&Self::params(&self.id, &self.cfg, &self.supported), &self.resolver, &mut seen).await {
                 Ok(c) => {
                     self.conn = c;
+                    self.core.set_authority(Some(self.conn.relay.did.clone()));
                     self.events.push(AgentEvent::Reconnected { attempts });
                     return Ok(());
                 }

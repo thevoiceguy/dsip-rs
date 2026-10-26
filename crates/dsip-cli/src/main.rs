@@ -242,6 +242,10 @@ enum PresenceCmd {
         /// Seconds to stay bound.
         #[arg(long, default_value_t = 20)]
         wait: u64,
+        /// Seal the records (P§12): `main` and every audience, each `AUDIENCE` a label sent as its tag. The device
+        /// also watches its own identity, so it seals at the epoch its siblings reached (P§12.5).
+        #[arg(long)]
+        sealed: bool,
     },
     /// Watch an identity's presence: subscribe at its relay, verify each record, show the combined state (P§4).
     Watch {
@@ -457,6 +461,11 @@ struct ConnOpts {
     /// (extension `sealed-body/1.0`, §10.4). Relays then see only routing fields. Inbound sealed bodies open either way.
     #[arg(long)]
     seal: bool,
+    /// Seal this identity's presence (P§12): the grants issued here carry the keys of `main` and their audience, and
+    /// ending a share rotates them and re-grants the others. Labels given with `grant audience=LABEL` go on the wire as
+    /// their tags.
+    #[arg(long)]
+    seal_presence: bool,
     /// Media source: `none`, `tone`, `tone:<hz>`, or `file:<path.ogg>`. Anything but none enables WebRTC media.
     #[arg(long, default_value = "none")]
     media: String,
@@ -511,7 +520,7 @@ impl ConnOpts {
         console::ConsoleOpts {
             identity: self.identity, relay: self.relay, ca: self.ca, video: self.video, script: self.script,
             did_documents: self.did_document, t_establish: self.t_establish, t_ring: self.t_ring, t_ring_local: self.t_ring_local,
-            dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal,
+            dht: self.dht, publish_hint: self.publish_hint, hint_ttl: self.hint_ttl, seal: self.seal, seal_presence: self.seal_presence,
             pkarr_relays: self.pkarr_relays, publish_pkarr: self.publish_pkarr, pkarr_device: self.pkarr_device,
             mainline: self.mainline, mainline_bootstrap: self.mainline_bootstrap,
             tn_binding: self.tn_binding, tn_policy: self.tn_policy, contacts: self.contacts, tn_nodes: self.tn_nodes,
@@ -687,8 +696,8 @@ async fn main() -> Result<()> {
             finish(console::run(opts.into_console(), console::Mode::Introduce { to, purpose, token, wait }).await)
         }
         Cmd::Presence { cmd } => finish(match cmd {
-            PresenceCmd::Publish { conn, state, audiences, then, lifetime, wait } => {
-                broadcast_cli::presence_publish(&conn.conn(), &state, &audiences, &then, lifetime, wait).await
+            PresenceCmd::Publish { conn, state, audiences, then, lifetime, wait, sealed } => {
+                broadcast_cli::presence_publish(&conn.conn(), &state, &audiences, &then, lifetime, wait, sealed).await
             }
             PresenceCmd::Watch { conn, target, expires_in, wait } => {
                 broadcast_cli::subscribe(&conn.conn(), &target, vec!["presence".into()], expires_in, wait, vec![], vec![]).await

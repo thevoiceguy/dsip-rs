@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
         // A recording the DSIP side declares (C§3) is accepted on the PSTN party's behalf, and the crossing is
         // downgraded `recording-not-disclosed` (spec-gap 133, decided): the gateway is not the recorded party's client.
         calls: Some(CallsConfig { media: true, answer: AnswerPolicy::Host, recording: AcceptPolicy::Always, one_call: false }),
+        presence: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     let my_did = agent.identity_did().to_string();

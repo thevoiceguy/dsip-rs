@@ -41,10 +41,15 @@ try {
     !/→ error/.test(await alice.page.textContent('#log')));
 
   await granted(alice, bob);
+  const buttonsAt = () => alice.page.evaluate((did) => [...[...document.querySelectorAll('#contact-list li')].find((li) => li.dataset.did === did)
+    .querySelectorAll('button')].map((x) => { const r = x.getBoundingClientRect(); return `${Math.round(r.x)},${Math.round(r.y)}`; }).join(' '), bob.did);
+  const before = (await badge(alice, bob)) ? null : await buttonsAt();
   await alice.page.evaluate((did) => window.dsip.watchPresence(did), bob.did);
   check('automatic: Bob sends no record, and Alice sees his relay\'s claim, marked as a claim (§9.3)',
     await shows(alice, bob, "v.source === 'assertion' && v.state === 'available'"), JSON.stringify(await shown(alice, bob)));
   check('the badge says it is the relay\'s word', (await badge(alice, bob)) === 'available (relay says)', await badge(alice, bob));
+  if (before) check('the badge appearing moved none of the row\'s buttons: a click aimed at one lands on it', (await buttonsAt()) === before,
+    `${before} → ${await buttonsAt()}`);
 
   await bob.page.evaluate(() => window.dsip.setPresence('busy'));
   check('Bob picks busy: his device signs a record, Alice verifies and shows it (P§3, P§4)',
