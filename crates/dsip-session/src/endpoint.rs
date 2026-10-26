@@ -313,14 +313,12 @@ impl Contacts {
         })
     }
 
-    /// §19.4: a live `dsip.invite` grant issued to `identity`, matched by reference or by grantee.
-    pub fn admits(&self, identity: &str, grant_ref: Option<&str>, now: i64) -> bool {
-        self.grants_issued.iter().any(|(gid, g)| {
-            g.identity == identity
-                && g.valid_until > now
-                && g.scope.iter().any(|s| s == "dsip.invite")
-                && grant_ref.is_none_or(|r| r == gid)
-        })
+    /// §19.4: a live `dsip.invite` grant issued to `identity`. An invite's `grant` reference is a hint for finding
+    /// the grant: it never admits and never refuses on its own (spec-gap 151).
+    pub fn admits(&self, identity: &str, now: i64) -> bool {
+        self.grants_issued
+            .values()
+            .any(|g| g.identity == identity && g.valid_until > now && g.scope.iter().any(|s| s == "dsip.invite"))
     }
 
     /// A live grant we hold from `identity`, if any (lowest id first).
@@ -1094,7 +1092,7 @@ impl Endpoint {
         let from_identity = self.identity_of(&m.from).to_string();
         if self.cfg.first_contact_required
             && !self.contacts.allow.contains(&from_identity)
-            && !self.contacts.admits(&from_identity, m.grant.as_deref(), self.now)
+            && !self.contacts.admits(&from_identity, self.now)
         {
             // §19.4: an invite from an identity holding no grant (and matching no allow policy) is rejected with
             // policy.first-contact-required. §12.4 responder: "Policy: auto-reject → send reject → ENDED" — no alerting.
