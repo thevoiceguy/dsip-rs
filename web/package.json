@@ -9,9 +9,11 @@
     "build": "./build.sh",
     "test:engine": "node test/engine.mjs",
     "test:call": "node test/call.mjs",
-    "test:first-contact": "node test/first-contact.mjs"
+    "test:first-contact": "node test/first-contact.mjs",
+    "types": "node test/types/emissions.mjs && tsc -p ."
   },
   "devDependencies": {
-    "playwright": "1.47.2"
+    "playwright": "1.47.2",
+    "typescript": "5.9.3"
   }
 }

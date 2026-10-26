@@ -146,7 +146,9 @@ pub struct ContactFile {
 }
 
 /// What the core hands back to its host.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // an event is built once and consumed at once; boxing the message would cost an allocation per event
 pub enum CoreEvent {
     /// Transmit this frame.
@@ -154,6 +156,7 @@ pub enum CoreEvent {
         /// The exact text frame (one `ws/1.0` message).
         frame: String,
         /// Message type.
+        #[serde(rename = "type")]
         msg_type: String,
         /// Session (or message id for session-less types).
         session: String,
@@ -169,8 +172,10 @@ pub enum CoreEvent {
         /// The signer's identity (subject of a presented, valid delegation; else the signer).
         identity: String,
         /// `identity.display_name` claim, if any.
+        #[cfg_attr(feature = "ts", tsify(type = "string | null"))]
         display_name: Option<String>,
         /// The full decoded payload (hosts read SDP / candidates from it).
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         payload: Value,
     },
     /// An inbound frame was rejected.
@@ -196,27 +201,36 @@ struct Held {
 }
 
 /// What a host adds to an invite it places.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(default)]
 pub struct Invite {
     /// The SDP offer, carried as the transport binding object (§16.3).
+    #[cfg_attr(feature = "ts", tsify(optional))]
     pub sdp: Option<String>,
     /// `identity.claims` (§18.1: claims, never badges; e.g. a gateway's PSTN caller claim, a `tel` binding N§4).
+    #[cfg_attr(feature = "ts", tsify(type = "unknown[]", optional))]
     pub claims: Vec<Value>,
     /// Changes to this invite's offer.
+    #[cfg_attr(feature = "ts", tsify(optional))]
     pub patch: InvitePatch,
 }
 
 /// Changes to one invite's offer.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 pub struct InvitePatch {
     /// Every media descriptor's `direction` (Recording Profile C§6: a recording session offers `sendonly`).
     #[serde(default)]
+    #[cfg_attr(feature = "ts", tsify(optional))]
     pub direction: Option<String>,
     /// `recording_session` metadata (Recording Profile C§6).
     #[serde(default)]
+    #[cfg_attr(feature = "ts", tsify(type = "unknown", optional))]
     pub recording_session: Option<Value>,
     /// The PSTN number asked of the gateway named by `to` (N§4.1).
     #[serde(default)]
+    #[cfg_attr(feature = "ts", tsify(type = "unknown", optional))]
     pub destination: Option<Value>,
 }
 

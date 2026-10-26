@@ -78,6 +78,8 @@ openssl-sys = "0.9"
 foreign-types = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = "0.2"
+# TypeScript declarations for the types that cross the browser boundary (dsip-rs B1); `Ts<T>`, never `into_wasm_abi`
+tsify = { version = "0.5.8", default-features = false, features = ["js"] }
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
 jsonschema = { version = "0.50", default-features = false }

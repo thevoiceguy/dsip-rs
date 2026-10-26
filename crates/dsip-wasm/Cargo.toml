@@ -14,9 +14,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 dsip-core = { workspace = true, features = ["wasm"] }
 dsip-schema.workspace = true
-dsip-session.workspace = true
+dsip-session = { workspace = true, features = ["ts"] }
 dsip-broadcast.workspace = true
-dsip-endpoint = { workspace = true, features = ["wasm"] }
+dsip-endpoint = { workspace = true, features = ["wasm", "ts"] }
 dsip-number.workspace = true
 dsip-dht = { workspace = true, default-features = false }
 dsip-messaging-device.workspace = true
@@ -27,7 +27,9 @@ dsip-recording.workspace = true
 # `js` gives it the browser's randomness and clock.
 openmls = { version = "0.9.0", features = ["js"] }
 openmls_traits = "0.6.0"
+serde.workspace = true
 serde_json.workspace = true
+tsify.workspace = true
 wasm-bindgen.workspace = true
 js-sys.workspace = true
 console_error_panic_hook.workspace = true

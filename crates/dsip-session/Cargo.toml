@@ -11,6 +11,12 @@ rust-version.workspace = true
 dsip-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tsify = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"
+
+[features]
+# TypeScript declarations of the types the browser host sees (dsip-wasm).
+ts = ["dep:tsify", "dep:wasm-bindgen"]

@@ -27,15 +27,14 @@ const sdp = (setup, direction = 'sendrecv') => ['v=0', `o=- ${++sdpN} 1 IN IP4 1
   'a=ice-pwd:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', `a=fingerprint:sha-256 ${FP}`,
   `a=setup:${setup}`, 'a=mid:0', `a=${direction}`, 'a=rtcp-mux', 'a=rtpmap:111 opus/48000/2'].join('\r\n') + '\r\n';
 const box = { A: [], B: [] };
-function drive(who, eventsJson) {
-  const ev = JSON.parse(eventsJson);
+function drive(who, ev) {
   const out = [];
   for (const e of ev) {
     out.push(e);
     if (e.send) box[who === 'A' ? 'B' : 'A'].push(e.send.frame);
     const m = e.media_request;
-    if (m?.kind === 'offer') out.push(...drive(who, eps()[who].media(JSON.stringify({ kind: 'offer', session: m.session, sdp: sdp('actpass') }), now())));
-    if (m?.kind === 'answer') out.push(...drive(who, eps()[who].media(JSON.stringify({ kind: 'answer', session: m.session, sdp: sdp('active', m.screening ? 'recvonly' : 'sendrecv') }), now())));
+    if (m?.kind === 'offer') out.push(...drive(who, eps()[who].media({ kind: 'offer', session: m.session, sdp: sdp('actpass') }, now())));
+    if (m?.kind === 'answer') out.push(...drive(who, eps()[who].media({ kind: 'answer', session: m.session, sdp: sdp('active', m.screening ? 'recvonly' : 'sendrecv') }, now())));
   }
   return out;
 }
@@ -60,17 +59,17 @@ const kinds = (evs) => evs.map((e) => e.send ? `send:${e.send.type}` : e.receive
 
 // 1. call: alice → bob through the call glue: the invite waits for the page's SDP offer; bob's client rings; the
 // user's accept asks for the SDP answer; the answer starts media on both sides (§14.1, §16.3)
-const placed = JSON.parse(A.place(bob.identity, JSON.stringify({}), now()));
+const placed = A.place(bob.identity, {}, now());
 const sid = placed.session;
 check('place asks the page for an SDP offer', placed.events.some((e) => e.media_request?.kind === 'offer' && e.media_request.session === sid), JSON.stringify(placed.events));
-const firstOut = placed.events.flatMap((e) => (e.media_request?.kind === 'offer' ? drive('A', A.media(JSON.stringify({ kind: 'offer', session: sid, sdp: sdp('actpass') }), now())) : []));
+const firstOut = placed.events.flatMap((e) => (e.media_request?.kind === 'offer' ? drive('A', A.media({ kind: 'offer', session: sid, sdp: sdp('actpass') }, now())) : []));
 const inviteFrame = firstOut.find((e) => e.send?.type === 'invite')?.send.frame;
 check('the invite goes out once the offer is handed back', !!inviteFrame);
 check('§10.4: the invite body is sealed to bob (no media in the clear)', inviteFrame && payloadOf(inviteFrame).media === undefined && payloadOf(inviteFrame).sealed !== undefined, inviteFrame && Object.keys(payloadOf(inviteFrame)).join(','));
 let r = pump();
 check('bob opens the sealed invite and rings', kinds(r.B).includes('recv:invite') && kinds(r.B).includes('call:ringing') && kinds(r.B).includes('send:progress'), JSON.stringify(kinds(r.B)));
 check('bob\'s invite carried the SDP after unsealing', r.B.find((e) => e.received?.message.type === 'invite')?.received.payload.transports?.[0]?.sdp?.startsWith('v=0'));
-const accepted = drive('B', B.call(JSON.stringify({ command: 'accept', session: sid }), now()));
+const accepted = drive('B', B.call({ command: 'accept', session: sid }, now()));
 check('accept asks the page for an SDP answer to the offer', kinds(accepted).includes('mreq:answer') && kinds(accepted).includes('send:answer'), JSON.stringify(kinds(accepted)));
 r = pump();
 const ka = kinds(r.A);
@@ -80,37 +79,37 @@ check('bob session ACTIVE', JSON.parse(B.session(sid))[sid].state === 'ACTIVE');
 
 // 2. ICE candidates ride in signed info (ACTIVE-only)
 const cand = { candidate: 'candidate:1 1 udp 1 127.0.0.1 5000 typ host', sdp_mid: '0', sdp_m_line_index: 0 };
-const sentInfo = drive('A', A.media(JSON.stringify({ kind: 'candidate', session: sid, candidate: cand }), now()));
+const sentInfo = drive('A', A.media({ kind: 'candidate', session: sid, candidate: cand }, now()));
 check('a local candidate in an ACTIVE call goes out in a signed info', kinds(sentInfo).includes('send:info'));
 r = pump();
 check('bob: the candidate is handed to the page', r.B.some((e) => e.media_request?.kind === 'remote_candidates' && e.media_request.candidates.length === 1));
 
 // 3. renegotiation: bob re-offers; alice answers it
-drive('B', B.call(JSON.stringify({ command: 'update', session: sid }), now()));
+drive('B', B.call({ command: 'update', session: sid }, now()));
 r = pump();
 check('alice: update offered', kinds(r.A).includes('call:update_offered'));
-drive('A', A.call(JSON.stringify({ command: 'answer_update', session: sid }), now()));
+drive('A', A.call({ command: 'answer_update', session: sid }, now()));
 r = pump();
 check('bob: update answered → answer applied', kinds(r.B).includes('media:apply_update') && kinds(r.B).includes('mreq:apply_answer'), JSON.stringify(kinds(r.B)));
 
 // 4. one call at a time: a second call to bob is declined busy and never put to the user
 const D = new Endpoint(JSON.stringify(JSON.parse(create_identity(null, null, 'Dan', now()))), JSON.stringify({}), now());
-const busyPlaced = JSON.parse(D.place(bob.identity, JSON.stringify({}), now()));
-const busyInvite = JSON.parse(D.media(JSON.stringify({ kind: 'offer', session: busyPlaced.session, sdp: sdp('actpass') }), now())).find((e) => e.send?.type === 'invite').send.frame;
-const busyOut = JSON.parse(B.inbound(busyInvite, now()));
+const busyPlaced = D.place(bob.identity, {}, now());
+const busyInvite = D.media({ kind: 'offer', session: busyPlaced.session, sdp: sdp('actpass') }, now()).find((e) => e.send?.type === 'invite').send.frame;
+const busyOut = B.inbound(busyInvite, now());
 const busyReject = busyOut.find((e) => e.send?.type === 'reject');
 check('bob declines a second call user.busy, without ringing', busyReject && payloadOf(busyReject.send.frame).reason === 'user.busy' && !kinds(busyOut).includes('call:ringing'), JSON.stringify(kinds(busyOut)));
 check('the first call is untouched', JSON.parse(B.session(sid))[sid].state === 'ACTIVE');
 
 // 5. hangup
-drive('A', A.call(JSON.stringify({ command: 'hangup', session: sid }), now()));
+drive('A', A.call({ command: 'hangup', session: sid }, now()));
 r = pump();
 check('bob: bye → ended, media closed', kinds(r.B).includes('ui:ended') && kinds(r.B).includes('mreq:close') && JSON.parse(B.session(sid))[sid].state === 'ENDED', JSON.stringify(kinds(r.B)));
-const probe = JSON.parse(A.local(JSON.stringify({ local: 'info', session: sid }), now()));
+const probe = A.local({ local: 'info', session: sid }, now());
 check('info on ended session refused', probe.some((e) => e.emission?.refused === 'invalid-state'));
 
 // 6. standalone verifier: fresh introduction accepted, tampered frame rejected
-const goodFrame = JSON.parse(B.local(JSON.stringify({ local: 'introduce', id: B.new_id(now()), to: alice.identity, purpose: 'hi' }), now())).find((e) => e.send).send.frame;
+const goodFrame = B.local({ local: 'introduce', id: B.new_id(now()), to: alice.identity, purpose: 'hi' }, now()).find((e) => e.send).send.frame;
 const v1 = JSON.parse(verify_frame(goodFrame, JSON.stringify({ now: Math.floor(now()) })));
 check('verify_frame accepts a fresh introduction', v1.verdict === 'accept' && v1.type === 'introduction', JSON.stringify(v1).slice(0, 100));
 const env = JSON.parse(goodFrame);
@@ -122,20 +121,20 @@ check('verify_frame rejects a tampered frame', v2.verdict === 'reject' && v2.cod
 const carol = JSON.parse(create_identity(null, null, 'Carol', now()));
 const C = new Endpoint(JSON.stringify(carol), JSON.stringify({ first_contact_required: true }), now());
 const sid2 = A.new_id(now());
-let evs = JSON.parse(A.local(JSON.stringify({ local: 'place_call', session: sid2, to: carol.identity }), now()));
-let cev = JSON.parse(C.inbound(evs.find((e) => e.send).send.frame, now()));
+let evs = A.local({ local: 'place_call', session: sid2, to: carol.identity }, now());
+let cev = C.inbound(evs.find((e) => e.send).send.frame, now());
 check('carol rejects ungranted invite with policy.first-contact-required', cev.some((e) => e.send?.type === 'reject' && payloadOf(e.send.frame).reason === 'policy.first-contact-required'));
-const intro = JSON.parse(A.local(JSON.stringify({ local: 'introduce', id: A.new_id(now()), to: carol.identity, purpose: 'meetup' }), now())).find((e) => e.send).send.frame;
-cev = JSON.parse(C.inbound(intro, now()));
+const intro = A.local({ local: 'introduce', id: A.new_id(now()), to: carol.identity, purpose: 'meetup' }, now()).find((e) => e.send).send.frame;
+cev = C.inbound(intro, now());
 check('carol: introduction lands in requests (no session)', cev.some((e) => e.emission?.ui === 'introduction_received') && JSON.parse(C.requests()).length === 1);
 const [[introId]] = JSON.parse(C.requests());
-const grantEv = JSON.parse(C.local(JSON.stringify({ local: 'grant', introduction: introId, id: C.new_id(now()), scope: ['dsip.invite'], valid_until: Math.floor(now()) + 3600 }), now()));
-const aev = JSON.parse(A.inbound(grantEv.find((e) => e.send).send.frame, now()));
+const grantEv = C.local({ local: 'grant', introduction: introId, id: C.new_id(now()), scope: ['dsip.invite'], valid_until: Math.floor(now()) + 3600 }, now());
+const aev = A.inbound(grantEv.find((e) => e.send).send.frame, now());
 check('alice holds the grant', aev.some((e) => e.emission?.ui === 'granted') && Object.keys(JSON.parse(A.contacts_json()).grants_held).length === 1);
 const sid3 = A.new_id(now());
-evs = JSON.parse(A.local(JSON.stringify({ local: 'place_call', session: sid3, to: carol.identity }), now()));
+evs = A.local({ local: 'place_call', session: sid3, to: carol.identity }, now());
 check('granted invite carries the grant id', payloadOf(evs.find((e) => e.send).send.frame).grant !== undefined);
-cev = JSON.parse(C.inbound(evs.find((e) => e.send).send.frame, now()));
+cev = C.inbound(evs.find((e) => e.send).send.frame, now());
 check('granted invite is offered (rings)', cev.some((e) => e.emission?.ui === 'offered'));
 
 console.log(`\n${failures} failure(s)`);

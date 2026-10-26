@@ -11,6 +11,7 @@ use crate::message::Message;
 
 /// A local (application) request to the endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 #[serde(tag = "local", rename_all = "snake_case")]
 pub enum LocalEvent {
     /// Send an `invite` with id `session` to `to`.
@@ -620,6 +621,14 @@ impl KeysAction {
             KeysAction::Rotated => "rotated",
             KeysAction::Seen => "seen",
         }
+    }
+}
+
+/// The README JSON shape ([`Emission::to_json`]). Its TypeScript declaration is written by hand beside the browser
+/// build (`dsip-wasm`), since the shape is flattened per kind, and is checked against the state vectors' emissions.
+impl Serialize for Emission {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
     }
 }
 

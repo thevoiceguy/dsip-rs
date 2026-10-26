@@ -201,6 +201,7 @@ host/store.js           IndexedDB (localStorage fallback) for identity, contacts
 host/identity-file.js   the identity export: PBKDF2 + AES-GCM under a passphrase, version 1
 ../crates/dsip-wasm/src/messaging.rs   the messaging device (stage 6): OpenMLS + the profile's client rules, driven by app.js
 test/engine.mjs         Node: two wasm endpoints run a call + first contact in memory (no browser)
+test/types/emissions.mjs  writes every engine emission the state vectors expect as a typed array, for `tsc` (tsconfig.json)
 test/lib.mjs            Playwright helpers: launch with fake media, a person (fresh context = fresh identity), waits
 test/call.mjs           stage 1: two headless browsers call each other through a local relay (audio, video), export/import
 test/first-contact.mjs  stage 2: refusal until introduced, requests, grants, screening + escalation, contact link, ignore
@@ -274,8 +275,16 @@ test/run.sh             makes the gateway fixture, starts two mailboxes (A is re
 ```bash
 node web/test/engine.mjs                 # the engine in Node
 (cd web && npm ci && npx playwright install firefox)   # once; `--with-deps` on a bare CI host
+(cd web && npm run types)                # tsc: the checked files against pkg/dsip_wasm.d.ts, Emission against the vectors
 web/test/run.sh firefox                  # or chromium, or all; starts a relay on 127.0.0.1:8443
 ```
+
+**Types** (dsip-rs B1, `impl/docs/dsip-stack-design.md` §6). The engine's call path takes and returns JavaScript
+objects, typed by the declarations `wasm-pack` writes into `pkg/dsip_wasm.d.ts` from the Rust types. The page stays
+plain JavaScript with no build step: a file that opens with `// @ts-check` (so far `host/engine.js`) is checked by
+`tsc` against those declarations. The engine's `Emission` keeps the vectors' shape and its declaration is written by
+hand (`crates/dsip-wasm/src/types.rs`), so `npm run types` also checks it against every emission an `endpoint` or
+`relay` state vector expects.
 
 The headless tests drive the DOM like a person. `call.mjs`: two identities are made, one adds the other as a contact
 and calls, the incoming screen shows the caller's basis and that the identity is unknown, the call is answered, both
