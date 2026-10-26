@@ -24,7 +24,7 @@ use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::calls::AcceptPolicy;
 use dsip_endpoint::{AnswerPolicy, CallCommand, CallEvent, CallOut, Calls, CallsConfig, Command, ContactFile, Core, CoreConfig, CoreEvent,
-                    IdentityKeys, Invite, InvitePatch, MediaRequest, MediaResult};
+                    IdentityKeys, Invite, InvitePatch, MediaRequest, MediaResult, PresenceSealing};
 use dsip_session::LocalEvent;
 
 fn hex(b: &[u8]) -> String {
@@ -421,11 +421,12 @@ pub fn downgrade_summary(losses_json: &str) -> String {
     dsip_core::trust::downgrade_summary(&losses.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
-/// A watched identity's presence, as the page shows it. Spec: P§4.
-fn presence_json(w: &dsip_broadcast::presence::Watch, now: i64) -> String {
-    let c = w.combined(now);
+/// A watched identity's presence, as the page shows it: sealed records opened with the keys `core` holds, and the
+/// devices whose records it cannot read listed as `unreadable`. Spec: P§4, P§12.4.
+fn presence_json(core: &Core, w: &dsip_broadcast::presence::Watch, now: i64) -> String {
+    let (c, unreadable) = w.view(now, |kid| core.presence_key(w.target(), kid));
     json!({"target": w.target(), "state": c.state, "token": c.token, "source": c.source, "records": w.records().len(),
-           "terminated": w.terminated()})
+           "unreadable": unreadable, "terminated": w.terminated()})
     .to_string()
 }
 
@@ -443,6 +444,8 @@ pub struct Endpoint {
     /// The states picked, by audience (`None`: no audience), kept for the publisher created at the first binding.
     presence_states: std::collections::BTreeMap<Option<String>, String>,
     watches: std::collections::BTreeMap<String, dsip_broadcast::presence::Watch>,
+    /// The labels of the audiences sealed, to their wire tags (P§12.1: a label never leaves this device).
+    audience_tags: std::collections::BTreeMap<String, String>,
 }
 
 #[wasm_bindgen]
@@ -451,7 +454,10 @@ impl Endpoint {
     /// "t_establish":…, "seal":bool, "answer": "ring"|"accept"|"screen"|"decline"|"silent", "recording":
     /// "ask"|"always"|"never", "one_call":bool}`. Sealed bodies addressed to this identity or device open with their
     /// keys (§10.4); `did:web` signers whose documents are not held are asked for (`resolve` events, answered with
-    /// [`Endpoint::resolved`]).
+    /// [`Endpoint::resolved`]). `"seal_presence": true` seals this device's presence records (P§12), those with no
+    /// audience and those of each label in `"presence_audiences"` (a label goes on the wire as its tag): it needs the
+    /// identity's key agreement secret, so a device without the identity's key publishes in clear
+    /// ([`Endpoint::presence_sealing`] says which).
     #[wasm_bindgen(constructor)]
     pub fn new(identity_json: &str, config_json: &str, now: f64) -> Result<Endpoint, JsValue> {
         let id: Value = serde_json::from_str(identity_json).map_err(js)?;
@@ -464,6 +470,22 @@ impl Endpoint {
             delegation,
             display_name: id["display_name"].as_str().unwrap_or("").to_string(),
         };
+        let unseal = unseal_keys(&id, &keys)?;
+        // P§12.1, P§12.6: sealing is per audience; here `main` and every audience the user named, or none
+        let secret = unseal.iter().find(|(did, _)| *did == keys.identity).map(|(_, sk)| *sk);
+        let mut audience_tags = std::collections::BTreeMap::new();
+        let presence = match (cfgv["seal_presence"].as_bool().unwrap_or(false), secret) {
+            (true, Some(sk)) => {
+                for l in cfgv["presence_audiences"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    audience_tags.insert(l.to_string(), dsip_core::presence_seal::audience_tag(&sk, &keys.identity, l));
+                }
+                Some(PresenceSealing {
+                    sealed: std::iter::once(dsip_core::presence_seal::MAIN.to_string()).chain(audience_tags.values().cloned()).collect(),
+                    t_rotate: cfgv["t_presence_rotate"].as_i64(),
+                })
+            }
+            _ => None,
+        };
         let cfg = CoreConfig {
             video: cfgv["video"].as_bool().unwrap_or(false),
             t_establish: cfgv["t_establish"].as_i64(),
@@ -472,8 +494,8 @@ impl Endpoint {
             first_contact_required: cfgv["first_contact_required"].as_bool().unwrap_or(false),
             seal: cfgv["seal"].as_bool().unwrap_or(false),
             resolve_on_demand: true,
-            unseal_keys: unseal_keys(&id, &keys)?,
-            presence: None,
+            unseal_keys: unseal,
+            presence,
         };
         let calls = CallsConfig {
             media: true,
@@ -502,20 +524,24 @@ impl Endpoint {
             presence: None,
             presence_states: Default::default(),
             watches: Default::default(),
+            audience_tags,
         })
     }
 
-    /// Bound to the relay `authority` (its DID, from its `hello`): our presence records go there. Returns the first
-    /// signed record to send now, or `null`; [`Endpoint::presence_tick`] returns the rest. Spec: P§3, P§6.
+    /// Bound to the relay `authority` (its DID, from its `hello`): our presence records go there, and ending or changing
+    /// a share sends its `grant-revocation`s there (they come back as `send` events of the `local` that ends it).
+    /// Returns the first signed record to send now, or `null`; [`Endpoint::presence_tick`] returns the rest.
+    /// Spec: P§3, P§6, P§7, P§12.5.
     pub fn presence_bound(&mut self, authority: &str, now: f64) -> Result<Option<String>, JsValue> {
         let now = now as i64;
+        self.core.set_authority(Some(authority.to_string()));
         let out = match self.presence.as_mut() {
             Some(p) => p.rebind(authority, now),
             None => {
                 let k = self.core.keys();
                 let mut p = dsip_broadcast::presence::Publisher::new(&k.identity, &k.device.did(), authority, 300);
                 for (audience, state) in &self.presence_states {
-                    p.set_for(audience.as_deref(), Some(state), now);
+                    p.set_for(self.wire_audience(audience.as_deref()).as_deref(), Some(state), now);
                 }
                 let out = p.rebind(authority, now);
                 self.presence = Some(p);
@@ -523,6 +549,38 @@ impl Endpoint {
             }
         };
         self.sign_presence(out, now)
+    }
+
+    /// The connection to our relay closed: a share ended now is ended here only (§19.4), as nothing reaches the
+    /// authority. Spec: P§7.
+    pub fn presence_unbound(&mut self) {
+        self.core.set_authority(None);
+    }
+
+    /// Whether this device seals its presence records: `{"sealed": bool, "audiences": {label: tag}}`, and when sealing
+    /// was asked for but cannot be done, `"reason"`. Spec: P§12.1, P§12.6.
+    pub fn presence_sealing(&self) -> String {
+        let sealed = self.core.presence_sealed(None);
+        let mut v = json!({"sealed": sealed, "audiences": self.audience_tags});
+        if !sealed && self.core.audience_tag("").is_none() {
+            v["reason"] = "this device does not hold the identity's key agreement secret (P§12.1)".into();
+        }
+        v.to_string()
+    }
+
+    /// The `audience` (or `presence_audience` of a grant) that goes on the wire for the audience labelled `label`: its
+    /// tag when the audience is sealed, else the label. Spec: P§12.1.
+    pub fn presence_wire_audience(&self, label: &str) -> String {
+        self.audience_tags.get(label).cloned().unwrap_or_else(|| label.to_string())
+    }
+
+    /// The label of a wire `audience`: the one whose tag it is, else the audience itself. Spec: P§12.1.
+    pub fn presence_audience_label(&self, audience: &str) -> String {
+        self.audience_tags.iter().find(|(_, t)| *t == audience).map_or_else(|| audience.to_string(), |(l, _)| l.clone())
+    }
+
+    fn wire_audience(&self, label: Option<&str>) -> Option<String> {
+        label.map(|l| self.presence_wire_audience(l))
     }
 
     /// The user picked a presence state with no audience (`null` stops publishing). See [`Endpoint::presence_set_for`].
@@ -541,12 +599,17 @@ impl Endpoint {
             if !dsip_broadcast::presence::is_audience(a) {
                 return Err(JsValue::from_str(&format!("not an audience token (P§6): {a}")));
             }
+            // P§12.6: a sealed subject never sends an audience it did not seal in clear (the label would leak)
+            if self.core.presence_sealed(None) && !self.audience_tags.contains_key(a) {
+                return Err(JsValue::from_str(&format!("audience {a} is not sealed yet: restart the engine with it in presence_audiences")));
+            }
         }
         match &state {
             Some(st) => self.presence_states.insert(audience.clone(), st.clone()),
             None => self.presence_states.remove(&audience),
         };
-        let out = self.presence.as_mut().and_then(|p| p.set_for(audience.as_deref(), state.as_deref(), now as i64));
+        let wire = self.wire_audience(audience.as_deref());
+        let out = self.presence.as_mut().and_then(|p| p.set_for(wire.as_deref(), state.as_deref(), now as i64));
         self.sign_presence(out, now as i64)
     }
 
@@ -561,7 +624,20 @@ impl Endpoint {
         self.sign_presence(out, now as i64)
     }
 
-    /// The authority refused our record for `audience` (`null`: no audience; the refused record's `audience`) with
+    /// The epoch of `scope` (`main`, or an audience tag) rose: a `keys` emission. Returns its record, sealed at the new
+    /// epoch, to send now, or `null` (none published for it, or P§8's interval holds it back: [`Endpoint::presence_tick`]
+    /// returns it then). Spec: P§12.5, P§8. Impl: sent at once, not at the next refresh, so the grantees re-granted the
+    /// new key read this device without waiting for it.
+    pub fn presence_rekeyed(&mut self, scope: &str, now: f64) -> Result<Option<String>, JsValue> {
+        let audience = (scope != dsip_core::presence_seal::MAIN).then(|| scope.to_string());
+        let out = self.presence.as_mut().and_then(|p| {
+            let state = p.state_for(audience.as_deref())?.to_string();
+            p.set_for(audience.as_deref(), Some(&state), now as i64)
+        });
+        self.sign_presence(out, now as i64)
+    }
+
+    /// The authority refused our record for `audience` (`null`: no audience; the refused record's wire `audience`) with
     /// `reason` (an `error` whose `in_reply_to` is the record). Spec: P§9.
     pub fn presence_refused(&mut self, reason: &str, retry_after: Option<f64>, now: f64, audience: Option<String>) {
         if let Some(p) = self.presence.as_mut() {
@@ -572,15 +648,19 @@ impl Endpoint {
     fn sign_presence(&mut self, out: Option<Value>, now: i64) -> Result<Option<String>, JsValue> {
         let Some(p) = out else { return Ok(None) };
         let lifetime = self.presence.as_ref().map_or(300, |p| p.lifetime());
-        self.core.sign_payload(p, now, lifetime).map(Some).map_err(js)
+        // P§12.2: a sealed scope's record is sealed at its current epoch
+        self.core.sign_presence(p, now, lifetime).map(Some).map_err(js)
     }
 
     /// A signed `subscribe` to `target`'s presence at its authority `authority` (the relay that answers for it,
     /// §9.3), for `expires_in` seconds (at most 3,600 for presence; a renewal replaces). Returns
-    /// `{"frame", "subscription"}`; the host sends the frame on its connection to that relay.
-    /// Spec: §9.3, P§3.
+    /// `{"frame", "subscription"}`; the host sends the frame on its connection to that relay. It lists `presence/0.2`,
+    /// so sealed records come too and are opened with the keys our grants carried. With `target` our own identity it
+    /// is our own watch (P§6 rule 1), from which a sibling's higher epoch is adopted ([`Endpoint::presence_notify`]).
+    /// Spec: §9.3, P§3, P§12.4, P§12.5.
     pub fn presence_subscribe(&mut self, target: &str, authority: &str, expires_in: f64, now: f64) -> Result<String, JsValue> {
-        let mut p = json!({"dsip": dsip_core::version::version_block(&self.supported, &[dsip_broadcast::PROFILE]),
+        let profiles = [dsip_broadcast::PROFILE, dsip_core::presence_seal::PROFILE];
+        let mut p = json!({"dsip": dsip_core::version::version_block(&self.supported, &profiles),
                            "type": "subscribe", "to": authority, "target": target, "events": ["presence"], "expires_in": expires_in as i64});
         // P§6: presence is private by default; the grants we hold from the target admit us
         let claims = self.core.presence_claims(target, now as i64);
@@ -601,42 +681,63 @@ impl Endpoint {
         Ok(json!({"frame": frame, "subscription": sub, "grants": presented}).to_string())
     }
 
-    /// Signed `grant-revocation`s, addressed to our authority, for every grant we issued to `identity` (P§7, §19.4):
-    /// sent before the grants are revoked locally, so the authority ends what they admitted. Returns a JSON array of
-    /// `{"grant", "frame"}`.
-    pub fn grant_revocations(&mut self, identity: &str, authority: &str, now: f64) -> Result<String, JsValue> {
-        let ids: Vec<String> = self.core.contacts().grants_issued.iter().filter(|(_, g)| g.identity == identity).map(|(id, _)| id.clone()).collect();
-        let mut out = vec![];
-        for id in ids {
-            if let Some(frame) = self.core.grant_revocation(&id, authority, now as i64).map_err(js)? {
-                out.push(json!({"grant": id, "frame": frame}));
-            }
-        }
-        Ok(Value::Array(out).to_string())
-    }
-
     /// A verified presence `notify` payload (from a `received` event). Each carried record is verified here, independently
-    /// of the authority. Returns `{"target", "state", "token", "source", "records", "terminated"}` (P§4: `source` is
-    /// `record`, `assertion` — the authority's claim — or `none`), or `null` when it is for no presence watch of ours
-    /// or out of order. Spec: §9.3, P§3, P§4.
-    pub fn presence_notify(&mut self, payload_json: &str, now: f64) -> Option<String> {
-        let payload: Value = serde_json::from_str(payload_json).ok()?;
-        let sub = payload["subscription"].as_str()?.to_string();
+    /// of the authority, and a sealed one opened with the keys our grants from the target carried. Returns `{"target",
+    /// "state", "token", "source", "records", "unreadable", "terminated"}` (P§4: `source` is `record`, `assertion` —
+    /// the authority's claim — or `none`; P§12.4: `unreadable` lists the devices whose records we hold no key for),
+    /// or `null` when it is for no presence watch of ours or out of order.
+    ///
+    /// On our own watch it returns `{"own": true, "events": […]}` instead: each record of a sibling device may carry
+    /// a higher epoch, which this device adopts, re-granting the grants that carry it; the events are driven like
+    /// [`Endpoint::local`]'s. Spec: §9.3, P§3, P§4, P§12.4, P§12.5.
+    pub fn presence_notify(&mut self, payload_json: &str, now: f64) -> Result<Option<String>, JsValue> {
+        let Ok(payload) = serde_json::from_str::<Value>(payload_json) else { return Ok(None) };
+        let Some(sub) = payload["subscription"].as_str().map(String::from) else { return Ok(None) };
         let core = &self.core;
-        let w = self.watches.get_mut(&sub)?;
+        let Some(w) = self.watches.get_mut(&sub) else { return Ok(None) };
         if !w.notify(&payload, |f| core.verify_record(f, now as i64)) {
-            return None;
+            return Ok(None);
         }
-        let out = presence_json(w, now as i64);
-        if w.terminated() {
+        let terminated = w.terminated();
+        let out = if w.target() == core.keys().identity {
+            let me = core.keys().identity.clone();
+            let mut events = vec![];
+            for f in payload["body"]["records"].as_array().into_iter().flatten().filter_map(|r| r["frame"].as_str()) {
+                if let Some((rec, identity)) = self.core.verify_record(f, now as i64) {
+                    if identity == me && rec["device"] == rec["from"] {
+                        events.extend(self.core.own_record(&rec, now as i64).map_err(js)?);
+                    }
+                }
+            }
+            let events: Value = serde_json::from_str(&self.observe(events, now)?).map_err(js)?;
+            json!({"own": true, "target": me, "events": events, "terminated": terminated}).to_string()
+        } else {
+            presence_json(&self.core, w, now as i64)
+        };
+        if terminated {
             self.watches.remove(&sub);
         }
-        Some(out)
+        Ok(Some(out))
     }
 
-    /// Every watched identity's presence at `now`, as [`Endpoint::presence_notify`] gives it (records expire, P§4).
+    /// The authority refused the subscription `subscription` (a `reject`, §9.3): its watch is dropped, so nothing is
+    /// shown for a target we may not watch.
+    pub fn presence_rejected(&mut self, subscription: &str) {
+        self.watches.remove(subscription);
+    }
+
+    /// Every watched identity's presence at `now`, as [`Endpoint::presence_notify`] gives it (records expire, P§4); our
+    /// own watch, and a watch the authority has not answered yet, are not listed.
     pub fn presence_all(&self, now: f64) -> String {
-        Value::Array(self.watches.values().map(|w| serde_json::from_str(&presence_json(w, now as i64)).unwrap_or(Value::Null)).collect()).to_string()
+        let me = &self.core.keys().identity;
+        Value::Array(
+            self.watches
+                .values()
+                .filter(|w| w.target() != me && w.notified())
+                .map(|w| serde_json::from_str(&presence_json(&self.core, w, now as i64)).unwrap_or(Value::Null))
+                .collect(),
+        )
+        .to_string()
     }
 
     /// The client `hello` frame to send first on a connection (§13.2).

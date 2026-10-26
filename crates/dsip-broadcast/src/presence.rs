@@ -349,6 +349,7 @@ pub struct Watch {
     asserted: Option<String>,
     records: Vec<Value>,
     terminated: bool,
+    notified: bool,
 }
 
 impl Watch {
@@ -367,6 +368,12 @@ impl Watch {
         self.terminated
     }
 
+    /// Whether a `notify` was applied: until then the authority has not admitted the subscription, and nothing is
+    /// known of the target's presence (§9.3).
+    pub fn notified(&self) -> bool {
+        self.notified
+    }
+
     /// Apply a verified `notify` payload. Each carried record's signed `frame` goes through `verify`, which returns the
     /// record's verified payload and the identity its signer acts for (§7.4), or `None`. A record is kept only when it
     /// verifies, is a `presence` record, names this target as `subject`, is signed by the identity it names, and names
@@ -379,6 +386,7 @@ impl Watch {
             }
         }
         self.seq = seq.or(self.seq);
+        self.notified = true;
         if payload["state"] == "terminated" {
             self.terminated = true;
         }

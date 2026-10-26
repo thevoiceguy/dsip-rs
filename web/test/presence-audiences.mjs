@@ -90,7 +90,7 @@ try {
   await change(false, '');
   check('Calls only: a grant follows Alice\'s, the old one revoked at Bob\'s relay; her watch ends (§19.4, P§7)',
     await alice.page.waitForFunction((did) => window.dsip.presence(did) === null, bob.did, { timeout: 20000 }).then(() => true, () => false)
-    && /grant-revocation of our grant to .* before the grant that follows it/.test(await bob.page.textContent('#log')), JSON.stringify(await shown(alice, bob)));
+    && /→ grant-revocation of our grant [^\n]*\n(?:[^\n]*\n)*?[^\n]*→ grant /.test(await bob.page.textContent('#log')), JSON.stringify(await shown(alice, bob)));
   check('Alice still holds a grant from Bob: she need not introduce herself again (spec-gap 150)',
     /granted you|mutual grant/.test(await alice.page.evaluate((d) => window.dsip.contactStatus(d), bob.did) || ''),
     await alice.page.evaluate((d) => window.dsip.contactStatus(d), bob.did));

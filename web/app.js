@@ -105,7 +105,8 @@ function renderContacts() {
     const issued = mine.length > 0;
     // P§6, P§7: what we share with them, and until when when it is a time-boxed share
     const shares = mine.map(([id, g]) => {
-      const audience = grantAudiences[id];
+      // a grant re-issued on rotation (P§12.5) is known by its wire audience: the label is ours (P§12.1)
+      const audience = grantAudiences[id] || (g.presence_audience ? engine.ep.presence_audience_label(g.presence_audience) : null);
       const until = g.valid_until - t < 31536000 - 86400   // a time-boxed share, not "until removed"
         ? new Date(g.valid_until * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
       return audience || until ? `${audience || 'presence'}${until ? ` until ${until}` : ''}` : null;
@@ -183,21 +184,16 @@ function liveGrantTo(did) {
     .filter(([, g]) => g.identity === did && g.valid_until > t).map(([id]) => id).sort().pop() || null;
 }
 
-/** §19.4 (spec-gap 150): a grant that follows the one we issued `did`, so they need not introduce again. The old one is
- *  revoked at our relay first, which ends what it admitted there (P§7); they watch again presenting the new one. */
+/** §19.4 (spec-gap 150): a grant that follows the one we issued `did`, so they need not introduce again. The engine
+ *  revokes the old one at our relay first, with every grant of its rotation chain (P§7, P§12.5), which ends what they
+ *  admitted there; they watch again presenting the new one. */
 async function changeGrant(did, { audience, secs, presence }) {
   const old = liveGrantTo(did);
   if (!old) return notify('no live grant to change: they need to introduce themselves again');
-  if (relay?.bound && relayInfo?.did) {
-    for (const { grant, frame } of JSON.parse(engine.ep.grant_revocations(did, relayInfo.did, now()))) {
-      if (grant !== old) continue;
-      relay.send(frame);
-      log(`→ grant-revocation of our grant to ${short(did)} to our relay, before the grant that follows it`, 'P§7 · §19.4');
-    }
-  }
   const ev = { local: 'regrant', grant: old, id: engine.newId(), valid_until: Math.floor(now()) + secs,
                scope: ['dsip.invite', 'dsip.message', ...(presence ? ['dsip.subscribe'] : [])] };
-  if (presence && audience) { ev.presence_audience = audience; noteGrantAudience(ev.id, audience); }
+  // P§12.1: a sealed audience goes on the wire as its tag
+  if (presence && audience) { ev.presence_audience = engine.ep.presence_wire_audience(audience); noteGrantAudience(ev.id, audience); }
   log(`changing our grant to ${nameOf(did) || short(did)}: ${presence ? `presence${audience ? ` (${audience})` : ''}` : 'calls and messages only'}${secs < 31536000 ? `, ending in ${secs} s` : ''}`, '§19.4 · P§7');
   await engine.local(ev);
   persist(); renderContacts();
@@ -228,7 +224,8 @@ function renderRequests() {
     g.onclick = () => {
       const ev = { local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message', 'dsip.subscribe'],
                    valid_until: Math.floor(now()) + Number(len.value) };   // §19.4; M§14.2: calls and messages; P§6: presence
-      if (aud.value) { ev.presence_audience = aud.value; noteGrantAudience(ev.id, aud.value); }   // P§6 (spec-gap 145)
+      // P§6 (spec-gap 145); P§12.1: a sealed audience goes on the wire as its tag
+      if (aud.value) { ev.presence_audience = engine.ep.presence_wire_audience(aud.value); noteGrantAudience(ev.id, aud.value); }
       const secs = Number(len.value);
       log(`granting ${nameOf(who) || short(who)}${aud.value ? ` the ${aud.value} audience` : ''}${secs < 31536000 ? `, a share ending in ${secs} s` : ''}`, 'P§6 · P§7');
       engine.local(ev);
@@ -270,12 +267,20 @@ function renderRecording() {
   $('btn-accept').disabled = blocked; $('btn-screen').disabled = blocked;
 }
 
+/** P§12: whether this device seals, as the engine says (it cannot without the identity's key agreement secret). */
+function renderSealing() {
+  $('seal-presence-status').textContent = !settings.seal_presence || !sealing ? '' : sealing.sealed ? 'sealed: your relay carries presence it cannot read'
+    : `not sealed: ${sealing.reason || 'reload to apply'}`;
+}
+
 function renderSettings() {
   $('set-name').value = identity.display_name || '';
   $('set-did').textContent = identity.identity;
   $('set-device').textContent = identity.device;
   $('set-first-contact').checked = !!settings.first_contact_required;
   $('set-seal').checked = !!settings.seal;
+  $('set-seal-presence').checked = !!settings.seal_presence;
+  renderSealing();
   $('set-recording-accept').value = settings.recording_accept || 'ask';
   $('presence-select').value = settings.presence || '';
   renderAudiences();
@@ -486,7 +491,7 @@ async function onReceived(r) {
   if (m.type === 'error' && m.reason === 'transport.replaced') { relayReplaced(r.identity); return; }
   if (m.type === 'error') log(`   error ${m.reason || ''}${p.detail ? ': ' + (typeof p.detail === 'string' ? p.detail : JSON.stringify(p.detail)) : ''}`, '§15');
   if (m.type === 'error' && presenceSent.has(m.in_reply_to)) { presenceRefused(m.reason, p.retry_after, presenceSent.get(m.in_reply_to)); return; }
-  if (m.type === 'reject' && presenceSubFor(m.session)) { presenceBlocked(m.session); return; }
+  if (m.type === 'reject' && (presenceSubFor(m.session) || m.session === ownWatch?.sub)) { presenceBlocked(m.session); return; }
   if (m.type === 'error' && m.reason === 'policy.rate-limited') {
     notify(`the relay limits introductions (§19.4): try again in ${p.retry_after ?? '?'} s`);
     return;
@@ -691,6 +696,13 @@ async function onEmission(e) {
     return;
   }
   if (e.info) { log(`ℹ info for ${e.info.about}`, '§12.12'); return; }
+  if (e.keys) {
+    // P§12.5: a scope's epoch rose, by our rotation or a sibling's record; the grants carrying it follow with the new key
+    const scope = e.scope === 'main' ? 'main' : engine.ep.presence_audience_label(e.scope);
+    log(`· presence key ${scope} ${e.keys} to epoch ${e.epoch}`, 'P§12.5');
+    presenceSend(engine.ep.presence_rekeyed(e.scope, now()));
+    return;
+  }
   if (e.drop) { log(`· dropped: ${e.drop}`); return; }
   if (e.refused) { log(`✗ refused: ${e.refused}`); notify(`Refused: ${e.refused}`); return; }
   if (e.queue) log(`queued ${e.queue.type} for ${short(e.queue.to)}`);
@@ -1309,15 +1321,11 @@ async function addContact(name, did, number = '') {
   await saveContacts();
 }
 
-/** Withdraws the grants we issued `did` (§19.4), at our relay too, so it stops showing them our presence at once
- *  (P§7). A grant is withdrawn whole: their calls need a new introduction too. */
+/** Withdraws the grants we issued `did` (§19.4); the engine revokes each at our relay too, with its rotation chain, so
+ *  it stops showing them our presence at once (P§7, P§12.5). A grant is withdrawn whole: their calls need a new
+ *  introduction too. */
 async function revokeGrants(did) {
-  const revocations = relay?.bound && relayInfo?.did ? JSON.parse(engine.ep.grant_revocations(did, relayInfo.did, now())) : [];
-  for (const { frame } of revocations) {
-    relay.send(frame);
-    log(`→ grant-revocation of our grant to ${short(did)} to our relay`, 'P§7 · §19.4');
-  }
-  if (!revocations.length && !relay?.bound) log(`our relay is not bound: the grant to ${short(did)} is withdrawn here only`, '§19.4');
+  if (!relay?.bound) log(`our relay is not bound: the grants to ${short(did)} are withdrawn here only`, '§19.4');
   // §19.4: the granting endpoint stops honouring the grant whether or not a revocation was sent
   const issued = Object.entries(JSON.parse(engine.contactsFile()).grants_issued || {}).filter(([, g]) => g.identity === did);
   for (const [grant] of issued) await engine.local({ local: 'revoke', grant });
@@ -1428,7 +1436,12 @@ function connect() {
       if (revokedHere) notify('This device was revoked by your identity. If that was a mistake, enrol it again from the identity file (a new delegation).');
     },
     frame: (text) => engine.inbound(text),
-    closed: () => { if (!relay.closedByUs && !relay.rejected) renderRelay('disconnected, reconnecting…', 'bad'); },
+    closed: () => {
+      // P§7: a share ended while we are not bound is ended here only (§19.4); a replaced connection's close, coming
+      // after the new one bound, leaves the authority the new one set
+      if (!relay?.bound) engine.ep.presence_unbound();
+      if (!relay.closedByUs && !relay.rejected) renderRelay('disconnected, reconnecting…', 'bad');
+    },
     dropped: (f) => log(`✗ not connected: a ${JSON.parse(f).type || 'frame'} was not sent`),
   }, now);
   relay.connect();
@@ -1441,6 +1454,8 @@ const presenceSent = new Map();    // ids of our records → their audience (or 
 const presenceSubs = new Map();    // contact DID → {sub, relay, renewAt, retryAt}: our watch on it (§9.3)
 const PRESENCE_SUB_S = 3600;       // §9.3: the presence event class's cap; renewed before it lapses
 let presenceTimer = null;
+let sealing = null;                // P§12: {sealed, audiences: {label: tag}, reason?} for this engine
+let ownWatch = null;               // P§12.5: {sub, renewAt}: our watch on our own identity, when sealing
 
 /** Send our signed presence record (or nothing) to our relay, the authority (P§3). */
 function presenceSend(frame) {
@@ -1449,7 +1464,9 @@ function presenceSend(frame) {
   presenceSent.set(p.id, p.audience ?? null);
   if (presenceSent.size > 32) presenceSent.delete(presenceSent.keys().next().value);
   relay.send(frame);
-  log(`→ presence     ${p.state}${p.audience ? ` for audience ${p.audience}` : ''} seq ${p.seq} for ${p.expires_at - p.issued_at} s to our relay`, p.audience ? 'P§3 · P§6' : 'P§3');
+  const audience = p.audience ? engine.ep.presence_audience_label(p.audience) : null;
+  const what = p.kid ? `sealed under ${p.kid}` : p.state;   // P§12.2: the relay cannot read a sealed one
+  log(`→ presence     ${what}${audience ? ` for audience ${audience}` : ''} seq ${p.seq} for ${p.expires_at - p.issued_at} s to our relay`, p.kid ? 'P§3 · P§12.2' : p.audience ? 'P§3 · P§6' : 'P§3');
 }
 
 /** Every record due now: one per audience at most (P§6, P§8). */
@@ -1461,6 +1478,7 @@ function presenceDrain() {
 function presenceBound(authority) {
   presenceSend(engine.ep.presence_bound(authority, now()));
   for (const s of presenceSubs.values()) if (s.relay === relay) s.renewAt = 0;
+  ownWatch = null;   // P§12.5: our own watch, at our relay, opened again
   clearInterval(presenceTimer);
   presenceTimer = setInterval(presenceTick, 1000);
   presenceTick();
@@ -1483,6 +1501,8 @@ async function audienceSet(name, state) {
   if (state) all[name] = state; else delete all[name];
   settings.presence_audiences = all;
   await saveSettings();
+  // P§12.6: sealing holds the audiences named when the engine started; a new one starts it again, sealed too
+  if (state && sealing?.sealed && !(name in (sealing.audiences || {}))) { location.reload(); return; }
   presenceSend(engine.ep.presence_set_for(name, state || null, now()));
   if (!state) log(`presence audience ${name} removed: no more records for it; the last lapses at its expires_at`, 'P§6');
   renderAudiences();
@@ -1512,6 +1532,7 @@ function renderAudiences() {
 function presenceTick() {
   presenceDrain();
   const t = now();
+  if (sealing?.sealed && relay?.bound && relayInfo?.did && (!ownWatch || t >= ownWatch.renewAt)) presenceWatchOwn();
   for (const c of contacts) {
     const s = presenceSubs.get(c.did);
     // a contact's relay that dropped us forgot the subscription: watched again once it binds us again
@@ -1541,11 +1562,21 @@ async function presenceWatch(did) {
   log(`→ subscribe    presence of ${short(did)} at ${r === relay ? 'our relay' : r.url} for ${PRESENCE_SUB_S} s${out.grants ? `, presenting ${out.grants} grant(s) of theirs` : ', no grant of theirs to present'}`, '§9.3 · P§6');
 }
 
+/** P§12.5: a sealing device watches its own identity at our relay (P§6 rule 1 admits it) to learn its siblings' epochs. */
+function presenceWatchOwn() {
+  const out = JSON.parse(engine.ep.presence_subscribe(identity.identity, relayInfo.did, PRESENCE_SUB_S, now()));
+  ownWatch = { sub: out.subscription, renewAt: now() + PRESENCE_SUB_S - 300 };
+  relay.send(out.frame);
+  log(`→ subscribe    our own identity at our relay, sealed records too: a sibling's epoch is ours`, '§9.3 · P§12.5');
+}
+
 function presenceSubFor(sub) { return [...presenceSubs.entries()].find(([, s]) => s.sub === sub)?.[0]; }
 
 /** The authority answered `reject policy.blocked`: uniform for a target it does not know or will not show (§9.3);
  *  tried again in a minute (the contact may bind there by then). */
 function presenceBlocked(sub) {
+  engine.ep.presence_rejected(sub);
+  if (sub === ownWatch?.sub) { ownWatch.renewAt = now() + 60; log('our own presence watch was refused; trying again later', 'P§6 · P§12.5'); return; }
   const did = presenceSubFor(sub);
   const s = presenceSubs.get(did);
   if (s) Object.assign(s, { renewAt: 0, retryAt: now() + 60 });
@@ -1561,11 +1592,19 @@ function presenceForget(did) {
 }
 
 /** A presence notify: the wasm verifies each record and combines them (P§3, P§4). */
-function presenceNotified(p) {
-  const out = engine.ep.presence_notify(JSON.stringify(p), now());
+async function presenceNotified(p) {
+  let out;
+  try { out = engine.ep.presence_notify(JSON.stringify(p), now()); } catch (e) { return log(`✗ presence notify: ${e.message || e}`, 'P§12'); }
   if (!out) return;
   const v = JSON.parse(out);
-  log(`◇ presence     ${short(v.target)}: ${v.state}${v.token !== v.state ? ` (${v.token})` : ''}, ${v.source === 'record' ? `from ${v.records} signed record(s)` : v.source === 'assertion' ? "the relay's claim" : 'nothing bound'}`, 'P§4');
+  if (v.own) {
+    // P§12.5: our own watch; a sibling's higher epoch becomes ours, and the grants carrying it follow
+    if (v.terminated) ownWatch = null;
+    await engine.drive(JSON.stringify(v.events));
+    return;
+  }
+  const unread = v.unreadable?.length ? `; ${v.unreadable.length} sealed record(s) not readable: no key for them (P§12.4)` : '';
+  log(`◇ presence     ${short(v.target)}: ${v.state}${v.token !== v.state ? ` (${v.token})` : ''}, ${v.source === 'record' ? `from ${v.records - (v.unreadable?.length || 0)} signed record(s)` : v.source === 'assertion' ? "the relay's claim" : 'nothing bound'}${unread}`, v.unreadable?.length ? 'P§4 · P§12.4' : 'P§4');
   if (v.terminated) {
     const s = presenceSubs.get(v.target);
     if (s) Object.assign(s, { renewAt: now() });
@@ -1578,7 +1617,7 @@ function presenceNotified(p) {
 function presenceRefresh(list) {
   for (const v of list) {
     if (!v?.target) continue;
-    const shown = { state: v.state, token: v.token, source: v.source };
+    const shown = { state: v.state, token: v.token, source: v.source, unreadable: v.unreadable?.length || 0 };
     if (JSON.stringify(presenceShown.get(v.target)) === JSON.stringify(shown)) continue;
     presenceShown.set(v.target, shown);
     const li = [...$('contact-list').children].find((x) => x.dataset.did === v.target);
@@ -1591,17 +1630,24 @@ function presenceRefresh(list) {
 function renderPresence(el, v) {
   if (!v) { el.textContent = ''; return; }
   const label = { available: 'available', busy: 'busy', away: 'away', dnd: 'do not disturb', offline: 'offline' }[v.state] || v.state;
-  el.textContent = v.source === 'assertion' ? `${label} (relay says)` : v.token !== v.state ? `${label} (${v.token})` : label;
-  el.className = `presence ${v.state}${v.source === 'assertion' ? ' claim' : ''}`;
-  el.title = v.source === 'record' ? 'from a record their device signed (P§4)' : v.source === 'assertion' ? 'their relay says they are bound; no device of theirs has said more (§9.3)' : 'no record and nothing bound';
+  const text = v.source === 'assertion' ? `${label} (relay says)` : v.token !== v.state ? `${label} (${v.token})` : label;
+  // P§12.4: a sealed record we hold no key for is neither shown nor guessed; we say that we hold one
+  el.textContent = v.unreadable && v.source !== 'record' ? `${v.source === 'none' ? '' : `${text} · `}presence not readable` : text;
+  el.className = `presence ${v.state}${v.source === 'assertion' ? ' claim' : ''}${v.unreadable ? ' unreadable' : ''}`;
+  el.title = (v.source === 'record' ? 'from a record their device signed (P§4)' : v.source === 'assertion' ? 'their relay says they are bound; no device of theirs has said more (§9.3)' : 'no record and nothing bound')
+    + (v.unreadable ? `; ${v.unreadable} sealed record(s) we hold no key for: a grant of theirs carrying keys opens them (P§12.3, P§12.4)` : '');
 }
 
 // ---------------------------------------------------------------- boot
 
 async function startEngine() {
   // Impl: one call at a time in this client; a second invite is declined user.busy (§15) by the call glue
+  // P§12: sealing presence is fixed for the engine's life: `main` and every audience named now (one added reloads)
   engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required, one_call: true,
-    seal: !!settings.seal, recording: settings.recording_accept || 'ask' }, now);
+    seal: !!settings.seal, recording: settings.recording_accept || 'ask',
+    seal_presence: !!settings.seal_presence, presence_audiences: Object.keys(settings.presence_audiences || {}) }, now);
+  sealing = JSON.parse(engine.ep.presence_sealing());
+  renderSealing();
   engine.loadContactsFile(await store.get(key('engine.contacts')));
   engine.ep.presence_set(settings.presence || null, now());   // P§3: sent once our relay binds us
   for (const [a, st] of Object.entries(settings.presence_audiences || {})) engine.ep.presence_set_for(a, st, now());   // P§6
@@ -1612,7 +1658,11 @@ async function startEngine() {
       // a session placed through the peer's own relay stays there, an introduction through the relay their hint
       // named (keyed by their DID); everything else goes through ours
       const via = callRelays.get(meta.session) || callRelays.get(meta.to);
-      (via || relay).send(frame); log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}${via ? ` via ${via.url}` : ''}${payloadOf(frame).sealed ? ' · sealed (§10.4)' : ''}`, '§12.4');
+      (via || relay).send(frame);
+      const p = payloadOf(frame);
+      // P§7, P§12.5: the engine revokes a share's grants at our relay, the authority, before what changes it
+      if (meta.type === 'grant-revocation') log(`→ grant-revocation of our grant …${p.grant.slice(-8)} to ${short(p.grantee)} to our relay`, 'P§7 · §19.4');
+      else log(`→ ${meta.type.padEnd(12)} to ${short(meta.to)}${via ? ` via ${via.url}` : ''}${p.sealed ? ' · sealed (§10.4)' : ''}${p.presence_keys ? ' · with presence keys (P§12.3)' : ''}`, '§12.4');
       if (meta.type === 'reject' && payloadOf(frame).reason === 'policy.first-contact-required') log(`refused a call from ${short(meta.to)} without ringing: first contact required`, '§19.4');
     },
     frame: legFrame,
@@ -2325,6 +2375,7 @@ function renderMessages() {
   $('set-name-save').onclick = async () => { identity.display_name = $('set-name').value.trim(); await store.set(key('identity'), identity); location.reload(); };
   $('set-first-contact').onchange = async (e) => { settings.first_contact_required = e.target.checked; await saveSettings(); location.reload(); };
   $('set-seal').onchange = async (e) => { settings.seal = e.target.checked; await saveSettings(); engine.setSeal(settings.seal); log(`call bodies ${settings.seal ? 'sealed to the callee when its key resolves' : 'sent in clear'}`, '§10.4'); };
+  $('set-seal-presence').onchange = async (e) => { settings.seal_presence = e.target.checked; await saveSettings(); location.reload(); };
   $('set-recording-accept').onchange = async (e) => { settings.recording_accept = e.target.value; await saveSettings(); location.reload(); };
   $('presence-select').onchange = async (e) => { settings.presence = e.target.value || null; await saveSettings(); presenceSet(settings.presence); };
   $('audience-form').onsubmit = async (e) => {
@@ -2418,6 +2469,8 @@ function renderMessages() {
     setPresence: async (state) => { settings.presence = state || null; $('presence-select').value = state || ''; await saveSettings(); presenceSet(settings.presence); },
     setAudience: (name, state) => audienceSet(name, state || null),
     audiences: () => ({ ...(settings.presence_audiences || {}) }),
+    sealing: () => sealing,                                   // P§12: {sealed, audiences: {label: tag}, reason?}
+    setSealPresence: async (on) => { settings.seal_presence = !!on; await saveSettings(); },   // applies at the next load
     contactStatus: (did) => [...document.querySelectorAll('#contact-list li')].find((li) => li.querySelector('.did').textContent === did)?.querySelector('.status').textContent || null,
     requests: () => engine.requests(),
     saved: () => lastPersist,   // resolves once the latest contact-file write is in storage

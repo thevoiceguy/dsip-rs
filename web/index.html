@@ -206,6 +206,9 @@
   audience is a second record, for the contacts you grant that audience: they see both, combined, and the stronger state shows
   (do not disturb &gt; busy &gt; available &gt; away &gt; invisible; Presence Profile P§4, P§6). Each is signed here; your relay
   never edits one. Choose an audience, and a share length, when you grant a request.</p>
+  <div class="row"><label class="small"><input type="checkbox" id="set-seal-presence"> seal my presence (P§12): your relay
+    carries a state it cannot read; only contacts whose grant carries the keys read it, so a grant made before sealing needs
+    Change grant to carry them</label> <span id="seal-presence-status" class="muted small"></span></div>
   <ul id="audience-list" class="list"></ul>
   <form id="audience-form" class="row">
     <input id="audience-name" size="16" placeholder="family" pattern="[a-z][a-z0-9\-]{0,63}" title="a-z, 0-9 and -, starting with a letter (P§6)" required>
