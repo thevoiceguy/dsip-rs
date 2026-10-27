@@ -13,7 +13,7 @@ use serde_json::Value;
 
 /// A mailbox, or a group's hub (M§4.2, M§6.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Hub {
     /// Its DID.
     pub did: String,
@@ -23,7 +23,7 @@ pub struct Hub {
 
 /// A group whose hub is unreachable (M§9.4).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Outage {
     /// When the hub was first found unreachable.
     pub down_since: Option<i64>,
@@ -37,7 +37,7 @@ pub struct Outage {
 
 /// An archive key this device holds (M§12.1); the key itself never leaves the `Messenger`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct ArchiveKey {
     /// Its id.
     pub akid: String,
@@ -47,7 +47,7 @@ pub struct ArchiveKey {
 
 /// A group this device can join by external commit (M§6.8), as its GroupInfo describes it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Available {
     /// The group id.
     pub group: String,
@@ -64,7 +64,7 @@ pub struct Available {
 
 /// How one inbound leg of this device ended, as the host saw it (M§13.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 #[serde(default)]
 pub struct CallLeg {
     /// The call's session id.
@@ -83,7 +83,7 @@ pub struct CallLeg {
 
 /// What [`crate::messenger::Messenger::call_ended_item`] did (M§13.3).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct CallEnded {
     /// The `call-event` sent, `None` when the decision is to send none.
     #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
@@ -98,7 +98,7 @@ pub struct CallEnded {
 
 /// What [`crate::messenger::Messenger::call_record`] built and sent (C§9).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct CallRecorded {
     /// The `call-record`.
     #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
@@ -109,7 +109,7 @@ pub struct CallRecorded {
 
 /// What [`crate::messenger::Messenger::accept_recording`] accepted (C§5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct RecordingAccepted {
     /// The recorder devices accepted.
     pub accepted: Vec<String>,
@@ -120,7 +120,7 @@ pub struct RecordingAccepted {
 /// An object sent (M§8): the outbox item it went out under (`None`: kept for a successor, M§9.4), whose `sent` event
 /// names it, and the frame (empty: queued behind an unreachable hub).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Sent {
     /// The outbox item.
     pub item: Option<String>,
@@ -130,7 +130,7 @@ pub struct Sent {
 
 /// One conversation as [`crate::messenger::Messenger::conversations`] lists it (M§6.2, M§7, C§5).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Conversation {
     /// The group id.
     pub group: String,
@@ -168,7 +168,7 @@ pub struct Conversation {
 
 /// A payload sealed for upload (M§8.4 rule 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct SealedBlob {
     /// `nonce ‖ ciphertext ‖ tag`, base64url: the bytes uploaded.
     pub sealed: String,
@@ -182,7 +182,7 @@ pub struct SealedBlob {
 
 /// A blob uploaded for an `audio` content (M§8.2, M§8.4).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 #[serde(default)]
 pub struct BlobRef {
     /// Where it was uploaded.
@@ -199,7 +199,7 @@ pub struct BlobRef {
 
 /// What a device does after its blob sources answered (M§8.4 rule 7, the pinned `blob_fetch`, spec-gap 106).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum FetchDecision {
     /// Play the bytes `source` served.
@@ -231,7 +231,7 @@ impl From<crate::blob::Fetch> for FetchDecision {
 
 /// What a device discloses to other identities (M§10.5, M§11); `delivered` defaults on, the rest off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 #[serde(default)]
 pub struct ReceiptPolicy {
     /// `delivered` receipts.
@@ -252,7 +252,7 @@ impl Default for ReceiptPolicy {
 
 /// A device a `key-packages` answer would add (M§5.5, M§6.2, C§5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct KeyPackageDevice {
     /// The device.
     pub device: String,
@@ -262,7 +262,7 @@ pub struct KeyPackageDevice {
 
 /// An introduction made (M§14.1, spec-gap 81).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Introduction {
     /// Its id.
     pub id: String,
@@ -274,7 +274,7 @@ pub struct Introduction {
 
 /// A request answered with a grant (M§14.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Granted {
     /// Who asked.
     pub requester: String,

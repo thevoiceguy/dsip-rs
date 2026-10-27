@@ -1,6 +1,7 @@
 //! The messaging device in the browser (client stage 6): `dsip_messaging_device::messenger::Messenger`, the device
-//! side of the Messaging Profile on OpenMLS, bound for JavaScript. It is driven with JSON strings and emits frames and
-//! events, as the §12 engine is driven; every method forwards to the library (dsip-rs stage 3j-2).
+//! side of the Messaging Profile on OpenMLS, bound for JavaScript. It takes and returns JavaScript objects typed from
+//! the library's types (dsip-rs B3c) and emits frames and events, as the §12 engine is driven; every method forwards
+//! to the library (dsip-rs stage 3j-2). Its save and the identity it is made from stay JSON text: storage formats.
 //!
 //! Spec: M§4–M§14 as the library implements them (`dsip_messaging_device::messenger`); §7.4 (a delegation re-issued
 //! with `dsip.messaging`, [`redelegate`]).
@@ -9,31 +10,58 @@
 //! the host writes as one record after each step — the atomic commit of spec-gap 44 in a browser.
 
 use serde_json::{json, Value};
+use tsify::{Ts, Tsify};
 use wasm_bindgen::prelude::*;
 
 use dsip_core::envelope::{self, Envelope};
 use dsip_core::keys::KeyPair;
+use dsip_messaging_device::blob::Tried;
 use dsip_messaging_device::messenger::{Error, Messenger as Inner};
+use dsip_messaging_device::{ArchiveKey, Available, BlobRef, CallLeg, CallRecorded, Conversation, FetchDecision, Hub,
+                            RecordingAccepted, SealedBlob};
 
+use crate::types::{ByIdentity, Events, Grants, Json, Outages, RelayHello};
 use crate::{js, unhex};
+
+// Errors stay the strings this binding has always thrown; only values became objects (dsip-rs B3c).
 
 fn js_err(e: Error) -> JsValue {
     JsValue::from_str(&e.0)
 }
 
-/// The library's typed result as the JSON text this binding still returns (dsip-rs B3c makes it an object).
-fn text<T: serde::Serialize>(v: T) -> String {
-    serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
+fn ts_err(e: tsify::Error) -> JsValue {
+    JsValue::from_str(&e.to_string())
 }
 
-/// A JSON parameter as the library's typed input, refused as the library refused unreadable JSON.
-fn parse<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, JsValue> {
-    serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))
+/// The library's typed result as a JavaScript object.
+fn obj<T: Tsify + serde::Serialize>(v: &T) -> Result<Ts<T>, JsValue> {
+    v.into_ts().map_err(ts_err)
 }
 
-/// A JSON parameter the library read leniently: what does not parse is `T::default()`.
-fn lenient<T: serde::de::DeserializeOwned + Default>(json: &str) -> T {
-    serde_json::from_str(json).unwrap_or_default()
+/// A list of the library's typed results.
+fn list<T: Tsify + serde::Serialize>(v: &[T]) -> Result<Vec<Ts<T>>, JsValue> {
+    v.iter().map(obj).collect()
+}
+
+/// JSON values the library keeps as it received or saved them, each as it is (`unknown`).
+fn values(v: impl IntoIterator<Item = Value>) -> Result<Vec<Ts<Json>>, JsValue> {
+    v.into_iter().map(|v| obj(&Json(v))).collect()
+}
+
+/// A parameter as the library's typed input, refused as the library refused unreadable JSON.
+fn parse<T: Tsify + serde::de::DeserializeOwned>(v: &Ts<T>) -> Result<T, JsValue>
+where
+    T::JsType: Clone,
+{
+    v.to_rust().map_err(ts_err)
+}
+
+/// A parameter the library read leniently: what does not read is `T::default()`.
+fn lenient<T: Tsify + serde::de::DeserializeOwned + Default>(v: &Ts<T>) -> T
+where
+    T::JsType: Clone,
+{
+    v.to_rust().unwrap_or_default()
 }
 
 /// A messaging device: this identity's device key under its delegation, its MLS groups, and the state the
@@ -63,14 +91,14 @@ impl Messenger {
     }
 
     /// The identity's mailbox `{did, uri}`.
-    pub fn mailbox(&self) -> String {
-        text(self.0.mailbox())
+    pub fn mailbox(&self) -> Result<Ts<Hub>, JsValue> {
+        obj(&self.0.mailbox())
     }
 
     /// Grants held from others, `{identity: compact}` (from the calling engine's contact file, §19.4): what is
     /// presented to the peer's mailbox (M§14.2), beside grants that arrive through this mailbox.
-    pub fn set_grants(&mut self, grants_json: &str) {
-        self.0.set_grants(&lenient(grants_json))
+    pub fn set_grants(&mut self, grants: Ts<Grants>) {
+        self.0.set_grants(&lenient(&grants).0)
     }
 
     /// M§10.5: disclose read watermarks to the conversation (`true`) or keep them in the personal group (`false`,
@@ -82,13 +110,13 @@ impl Messenger {
     /// The user has read a conversation through `content_id` (M§10.3): the receipts machine decides whether a
     /// watermark goes out, to the conversation or to the personal group (M§10.5), at most one per 5 s. Frames and
     /// events, as `inbound` returns them.
-    pub fn read_through(&mut self, gid: &str, content_id: &str, now: f64) -> String {
-        text(self.0.read_through(gid, content_id, now))
+    pub fn read_through(&mut self, gid: &str, content_id: &str, now: f64) -> Result<Ts<Events>, JsValue> {
+        obj(&Events(self.0.read_through(gid, content_id, now)))
     }
 
     /// Advance every conversation's clock (M§10.3: a read held back by the 5 s interval goes out when it passes).
-    pub fn tick(&mut self, now: f64) -> String {
-        text(self.0.tick(now))
+    pub fn tick(&mut self, now: f64) -> Result<Ts<Events>, JsValue> {
+        obj(&Events(self.0.tick(now)))
     }
 
     /// This device's hub-outage threshold, seconds (M§9.4: the client's own; 24 h RECOMMENDED).
@@ -103,17 +131,17 @@ impl Messenger {
     }
 
     /// Groups whose hub is unreachable: `{group: {down_since, pending, abandoned}}` (M§9.4).
-    pub fn outages(&self) -> String {
-        text(self.0.outages())
+    pub fn outages(&self) -> Result<Ts<Outages>, JsValue> {
+        obj(&Outages(self.0.outages()))
     }
 
     /// Create the successor of `dead` (M§7.5) once its hub has been unreachable past the threshold: a group for the
     /// same conversation hubbed at this identity's mailbox, `successor_of` naming the dead group, re-adding the dead
-    /// group's last roster from `key_packages_json` (`{identity: key-packages answer}`, fetched with `successor_of`,
+    /// group's last roster from `key_packages` (`{identity: key-packages answer}`, fetched with `successor_of`,
     /// M§7.5 spec-gap 61). When this device already converged on a successor, that one is used. The pending items
     /// follow once the successor holds its members (M§9.4). Frames.
-    pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
-        self.0.create_successor(dead, &lenient(key_packages_json), now).map_err(js_err).map(text)
+    pub fn create_successor(&mut self, dead: &str, key_packages: Ts<ByIdentity>, now: f64) -> Result<Vec<String>, JsValue> {
+        self.0.create_successor(dead, &lenient(&key_packages).0, now).map_err(js_err)
     }
 
     /// The hand-over to a successor could not be done (the peers' KeyPackages could not be fetched): retried with the
@@ -126,81 +154,80 @@ impl Messenger {
     /// package of `device` is used): the commit to deposit. After the personal group's add is accepted, every live
     /// archive key is re-sent there ([`Messenger::resend_archive_keys`]). The groups to add it to, in order, are
     /// [`Messenger::groups_for_new_device`].
-    pub fn add_device(&mut self, gid: &str, device: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
-        self.0.add_device(gid, device, &parse(key_packages_json)?, now).map_err(js_err)
+    pub fn add_device(&mut self, gid: &str, device: &str, key_packages: Ts<Json>, now: f64) -> Result<String, JsValue> {
+        self.0.add_device(gid, device, &parse(&key_packages)?.0, now).map_err(js_err)
     }
 
     /// The groups a new device of this identity joins, in order: the personal group first (M§12.3 step 3), then
     /// every conversation it is not in yet (M§6.7); `[]` when it is everywhere already.
-    pub fn groups_for_new_device(&self, device: &str, now: f64) -> String {
-        text(self.0.groups_for_new_device(device, now))
+    pub fn groups_for_new_device(&self, device: &str, now: f64) -> Vec<String> {
+        self.0.groups_for_new_device(device, now)
     }
 
     /// M§12.3 step 3: every live archive key, as `archive-key` objects to the personal group, so a device just added
     /// can read the archive. Frames to send.
-    pub fn resend_archive_keys(&mut self, now: f64) -> String {
-        text(self.0.resend_archive_keys(now))
+    pub fn resend_archive_keys(&mut self, now: f64) -> Vec<String> {
+        self.0.resend_archive_keys(now)
     }
 
     /// Archive keys this device holds, `[{akid, created_at}]`, newest current (M§12.1).
-    pub fn archive_keys(&self) -> String {
-        text(self.0.archive_keys())
+    pub fn archive_keys(&self) -> Result<Vec<Ts<ArchiveKey>>, JsValue> {
+        list(&self.0.archive_keys())
     }
 
     /// Groups this identity's mailbox delivered a GroupInfo for that this device is not in (M§6.8): what it can join by
-    /// external commit. `[{group, conversation, kind}]`, the personal group first.
-    pub fn available(&self) -> String {
-        text(self.0.available())
+    /// external commit, the personal group first.
+    pub fn available(&self) -> Result<Vec<Ts<Available>>, JsValue> {
+        list(&self.0.available())
     }
 
     /// Join `gid` by external commit (M§6.8): a device of an identity that has a leaf there, or the identity's own
     /// personal group, with no sibling online to add it. The commit goes to the hub; a `commit-conflict` or
     /// `stale-epoch` refusal discards the joined state, syncs and joins again from the newer GroupInfo (the pinned
     /// `CommitRetry`, spec-gap 58). No archive key comes with it: history waits for a sibling (M§12.3). Frames.
-    pub fn external_join(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        self.0.external_join(gid, now).map_err(js_err).map(text)
+    pub fn external_join(&mut self, gid: &str, now: f64) -> Result<Vec<String>, JsValue> {
+        self.0.external_join(gid, now).map_err(js_err)
     }
 
     /// A callee leg of this device ended (M§13.3): whether it sends a `call-event` to the personal group, by the
     /// vector-pinned decision (spec-gap 63) — alerted here and not answered here, never `session.answered-elsewhere`;
-    /// `declined` when this device ended it with `user.declined`, else `missed`. `leg_json` is `{session, peer, alerted,
-    /// answered_here, ended_by: "local"|"remote", reason}`. Frames to send (`[]` when none).
-    pub fn call_ended(&mut self, leg_json: &str, now: f64) -> Result<String, JsValue> {
-        self.0.call_ended(&parse(leg_json)?, now).map_err(js_err).map(text)
+    /// `declined` when this device ended it with `user.declined`, else `missed`. Frames to send (`[]` when none).
+    pub fn call_ended(&mut self, leg: Ts<CallLeg>, now: f64) -> Result<Vec<String>, JsValue> {
+        self.0.call_ended(&parse(&leg)?, now).map_err(js_err)
     }
 
     /// One leg's `call-record` for this identity's record-keeper `keeper` (C§9), built from what the host saw of the
-    /// leg: `leg_json` is `{session, direction, peer, relay?, invited_at, answered, answered_at?, ended_by, reason?,
+    /// leg: `leg` is `{session, direction, peer, relay?, invited_at, answered, answered_at?, ended_by, reason?,
     /// media?, evidence?}`. The outcome is the pinned order (`call-record-outcome`); `answered_at` goes in exactly when
     /// it is `answered`; `ended_at` is now. A record the record-keeper would drop (`check: "object"`) is never sent.
     /// The record is held, then everything held goes to the conversation with `keeper` if it exists
-    /// ([`Messenger::flush_records`]). Returns `{record, frames}`.
+    /// ([`Messenger::flush_records`]).
     ///
     /// Spec: C§9 (v0.13, spec-gaps 121 and 123).
-    pub fn call_record(&mut self, keeper: &str, leg_json: &str, now: f64) -> Result<String, JsValue> {
-        self.0.call_record(keeper, &parse(leg_json)?, now).map_err(js_err).map(text)
+    pub fn call_record(&mut self, keeper: &str, leg: Ts<Json>, now: f64) -> Result<Ts<CallRecorded>, JsValue> {
+        obj(&self.0.call_record(keeper, &parse(&leg)?.0, now).map_err(js_err)?)
     }
 
     /// The held call records, sent to the direct conversation with `keeper` when there is one (C§9: the record-keeper
     /// opens it, spec-gap 123); frames to send, `[]` while there is none.
-    pub fn flush_records(&mut self, keeper: &str, now: f64) -> Result<String, JsValue> {
-        self.0.flush_records(keeper, now).map_err(js_err).map(text)
+    pub fn flush_records(&mut self, keeper: &str, now: f64) -> Result<Vec<String>, JsValue> {
+        self.0.flush_records(keeper, now).map_err(js_err)
     }
 
     /// Leave the conversation `gid` for this identity (M§7.3 "Leaving", spec-gap 125): a Remove proposal for each of
     /// its leaves goes to the hub, another member commits them, and until then nothing is sent there and it is not
-    /// listed. The personal group is never left. Returns the frames to send.
-    pub fn leave(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        self.0.leave(gid, now).map_err(js_err).map(text)
+    /// listed. The personal group is never left. Frames and events, as `inbound` returns them.
+    pub fn leave(&mut self, gid: &str, now: f64) -> Result<Ts<Events>, JsValue> {
+        obj(&Events(self.0.leave(gid, now).map_err(js_err)?))
     }
 
     /// The user accepted the recording of `gid` (C§5): every recorder now in it is accepted for this conversation, and
-    /// a `recording-acceptance` goes to the personal group so this identity's other devices accept them too. Returns
-    /// `{accepted: [device], frames}`; content may then be sent there. A recorder that joins later asks again.
+    /// a `recording-acceptance` goes to the personal group so this identity's other devices accept them too; content
+    /// may then be sent there. A recorder that joins later asks again.
     ///
     /// Spec: C§5 "Acceptance is the person's, not one device's".
-    pub fn accept_recording(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        self.0.accept_recording(gid, now).map_err(js_err).map(text)
+    pub fn accept_recording(&mut self, gid: &str, now: f64) -> Result<Ts<RecordingAccepted>, JsValue> {
+        obj(&self.0.accept_recording(gid, now).map_err(js_err)?)
     }
 
     /// How many of this device's call records wait for the conversation with the record-keeper (C§9).
@@ -209,8 +236,8 @@ impl Messenger {
     }
 
     /// As a record-keeper: the records received (C§9), `[{group, from, device, received_at, record}]`.
-    pub fn records(&self) -> String {
-        text(self.0.records())
+    pub fn records(&self) -> Result<Vec<Ts<Json>>, JsValue> {
+        values(self.0.records().iter().cloned())
     }
 
     /// Whether this device is a recorder (its delegation carries `dsip.record`, C§5).
@@ -219,14 +246,14 @@ impl Messenger {
     }
 
     /// The call log, one entry per session (M§13.3).
-    pub fn calls(&self) -> String {
-        text(self.0.calls())
+    pub fn calls(&self) -> Result<Vec<Ts<Json>>, JsValue> {
+        values(serde_json::from_value::<Vec<Value>>(serde_json::to_value(self.0.calls()).map_err(js)?).map_err(js)?)
     }
 
     /// One conversation's timeline (M§13.3, the pinned `peer_timeline`): its messages with this identity's call events
     /// for the peer interleaved — `{"call": {…}}` or the message as [`Messenger::thread`] gives it.
-    pub fn timeline(&self, gid: &str) -> String {
-        text(self.0.timeline(gid))
+    pub fn timeline(&self, gid: &str) -> Result<Vec<Ts<Json>>, JsValue> {
+        values(self.0.timeline(gid))
     }
 
     /// Whether this device can send to `peer` (M§13.2 condition 2): a direct conversation exists, or a grant from them
@@ -236,9 +263,9 @@ impl Messenger {
     }
 
     /// Seal a payload for upload (M§8.4 rule 1): a fresh single-use 32-byte key, AES-256-GCM, no AAD, stored as
-    /// `nonce ‖ ciphertext ‖ tag`. Returns `{"sealed": b64url, "key": b64url, "sha256": hex, "size": n}`.
-    pub fn seal_blob(&self, plain_b64: &str) -> String {
-        text(self.0.seal_blob(plain_b64))
+    /// `nonce ‖ ciphertext ‖ tag`.
+    pub fn seal_blob(&self, plain_b64: &str) -> Result<Ts<SealedBlob>, JsValue> {
+        obj(&self.0.seal_blob(plain_b64))
     }
 
     /// The `blob-put` that authorizes one upload of `sha256`/`size` to this identity's mailbox (M§5.6), as the compact
@@ -247,30 +274,29 @@ impl Messenger {
         self.0.blob_put(sha256, size, now)
     }
 
-    /// An `audio` content object (M§8.2) for a blob already uploaded: `blob_json` is `{uri, sha256, size, key, content_type}`
-    /// from [`Messenger::seal_blob`] and the upload; `purpose` `voice-message` or `voicemail` (with `session`). The deposit
+    /// An `audio` content object (M§8.2) for a blob already uploaded: `blob` from [`Messenger::seal_blob`] and the upload; `purpose` `voice-message` or `voicemail` (with `session`). The deposit
     /// carries the manifest without the key (M§8.4 rule 4). The frame to send.
-    pub fn send_audio(&mut self, gid: &str, blob_json: &str, duration_ms: f64, purpose: &str, session: Option<String>, now: f64) -> Result<String, JsValue> {
-        self.0.send_audio(gid, &parse(blob_json)?, duration_ms, purpose, session, now).map_err(js_err)
+    pub fn send_audio(&mut self, gid: &str, blob: Ts<BlobRef>, duration_ms: f64, purpose: &str, session: Option<String>, now: f64) -> Result<String, JsValue> {
+        self.0.send_audio(gid, &parse(&blob)?, duration_ms, purpose, session, now).map_err(js_err)
     }
 
     /// Where to fetch a content's blob from, in order (M§8.4 rules 6–7, the pinned `blob_sources`): the manifest's copy
-    /// at another `uri` for the same `sha256` and `size`, then the content's own. `object_json` is the content object,
-    /// `manifest_json` the item's `blobs` (or null).
-    pub fn blob_sources(&self, object_json: &str, manifest_json: &str) -> String {
-        text(self.0.blob_sources(&lenient(object_json), &lenient(manifest_json)))
+    /// at another `uri` for the same `sha256` and `size`, then the content's own. `object` is the content object,
+    /// `manifest` the item's `blobs` (or null).
+    pub fn blob_sources(&self, object: Ts<Json>, manifest: Ts<Json>) -> Vec<String> {
+        self.0.blob_sources(&lenient(&object).0, &lenient(&manifest).0)
     }
 
     /// Open a fetched blob for a content object (M§8.4 rule 7): the size and SHA-256 must match the content's `blob`
     /// before it is decrypted under the key the content carries. The plaintext, base64url, or the refusal code.
-    pub fn open_blob(&self, object_json: &str, stored_b64: &str) -> Result<String, JsValue> {
-        self.0.open_blob(&parse(object_json)?, stored_b64).map_err(js_err)
+    pub fn open_blob(&self, object: Ts<Json>, stored_b64: &str) -> Result<String, JsValue> {
+        self.0.open_blob(&parse(&object)?.0, stored_b64).map_err(js_err)
     }
 
     /// One source's answer as the fetch decision takes it (`status` 0: not reached; `stored_b64`, bytes a 200 served
-    /// that did not open, or empty): `{uri, status, sha256?, size?}` (M§8.4 rule 7, spec-gap 106).
-    pub fn blob_tried(&self, uri: &str, status: u16, stored_b64: &str) -> String {
-        text(self.0.blob_tried(uri, status, stored_b64))
+    /// that did not open, or empty) (M§8.4 rule 7, spec-gap 106).
+    pub fn blob_tried(&self, uri: &str, status: u16, stored_b64: &str) -> Result<Ts<Tried>, JsValue> {
+        obj(&self.0.blob_tried(uri, status, stored_b64))
     }
 
     /// Seconds before fetch `attempt` is tried again (spec-gap 67's schedule: 4 s doubling, at most 60 s).
@@ -278,26 +304,27 @@ impl Messenger {
         self.0.blob_retry_delay_s(attempt)
     }
 
-    /// What a device does after its blob sources answered (`tried`: `[{uri, status, sha256?, size?}]`; the pinned
-    /// `blob_fetch`, spec-gap 106): `{"action": "retry"|"give-up", "reason"}`.
-    pub fn blob_fetch_decision(&self, object_json: &str, tried_json: &str, attempt: f64) -> String {
-        text(self.0.blob_fetch_decision(&lenient(object_json), &lenient::<Vec<_>>(tried_json), attempt))
+    /// What a device does after its blob sources answered (`tried`, from [`Messenger::blob_tried`]; the pinned
+    /// `blob_fetch`, spec-gap 106).
+    pub fn blob_fetch_decision(&self, object: Ts<Json>, tried: Vec<Ts<Tried>>, attempt: f64) -> Result<Ts<FetchDecision>, JsValue> {
+        let tried: Vec<Tried> = tried.iter().map(Ts::to_rust).collect::<Result<_, _>>().unwrap_or_default();
+        obj(&self.0.blob_fetch_decision(&lenient(&object).0, &tried, attempt))
     }
 
     /// The user played an `audio` or `video` content (M§10.4): a `played` receipt under the same opt-in as `read`
     /// (M§10.5). Frames and events, as `inbound` returns them.
-    pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> String {
-        text(self.0.played(gid, content_id, now))
+    pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> Result<Ts<Events>, JsValue> {
+        obj(&Events(self.0.played(gid, content_id, now)))
     }
 
-    /// A DID document to hold (§8.1), for `did:web` peers.
-    pub fn add_document(&mut self, doc_json: &str) -> bool {
-        match serde_json::from_str(doc_json) {
-            Ok(doc) => {
+    /// A DID document to hold (§8.1), for `did:web` peers; `false` when it is not one.
+    pub fn add_document(&mut self, doc: Ts<Json>) -> bool {
+        match doc.to_rust().ok().and_then(|d| serde_json::from_value(d.0).ok()) {
+            Some(doc) => {
                 self.0.add_document(doc);
                 true
             }
-            Err(_) => false,
+            None => false,
         }
     }
 
@@ -306,14 +333,13 @@ impl Messenger {
         self.0.hello_frame(now)
     }
 
-    /// Verify a service's `hello` (must echo one of ours, §20.5). Returns `{"ok":true,"did":…,"capabilities":…}` or
-    /// `{"ok":false,"code":…}`. Named as the relay host expects, so one connection class serves both.
-    pub fn relay_hello(&mut self, frame: &str, now: f64) -> String {
-        match self.0.relay_hello(frame, now) {
-            Ok(h) => json!({"ok": true, "did": h.did, "capabilities": h.capabilities}),
-            Err(code) => json!({"ok": false, "code": code}),
-        }
-        .to_string()
+    /// Verify a service's `hello` (must echo one of ours, §20.5): its DID and capabilities, or the code. Named and
+    /// shaped as [`crate::Endpoint::relay_hello`], so one connection class serves both.
+    pub fn relay_hello(&mut self, frame: &str, now: f64) -> Result<Ts<RelayHello>, JsValue> {
+        obj(&match self.0.relay_hello(frame, now) {
+            Ok(h) => RelayHello::Ok { ok: true, did: h.did, capabilities: h.capabilities },
+            Err(code) => RelayHello::Refused { ok: false, code: Value::String(code), detail: None },
+        })
     }
 
     /// A `sync` for this identity's mailbox (M§5.4): `since`/`ack_through` from the durable state, `live` once asked.
@@ -327,14 +353,14 @@ impl Messenger {
     }
 
     /// What to send on a fresh binding: pending application items again (M§9.3, the same bytes), then a sync.
-    pub fn on_bound(&mut self, now: f64) -> String {
-        text(self.0.on_bound(now))
+    pub fn on_bound(&mut self, now: f64) -> Vec<String> {
+        self.0.on_bound(now)
     }
 
     /// Create this identity's personal group at its mailbox (M§7.1): the `mailbox-config` that registers it and the
     /// GroupInfo deposit; the first archive key follows once the hub holds the group (M§12.1). Frames to send.
-    pub fn create_personal(&mut self, now: f64) -> Result<String, JsValue> {
-        self.0.create_personal(now).map_err(js_err).map(text)
+    pub fn create_personal(&mut self, now: f64) -> Result<Vec<String>, JsValue> {
+        self.0.create_personal(now).map_err(js_err)
     }
 
     /// A `key-package-fetch` for `target` to send on a connection to `to_mailbox` (M§5.5), presenting the grant
@@ -346,26 +372,26 @@ impl Messenger {
     }
 
     /// Create a direct conversation with `target` from its mailbox's `key-packages` answer (M§7.2): every device of
-    /// the target the vector-pinned rule picks (C§5), plus this identity's own other devices from `own_json` (the
+    /// the target the vector-pinned rule picks (C§5), plus this identity's own other devices from `own` (the
     /// same answer shape, or null), in one commit once the group is hubbed. Returns the frames to send, or the refusal.
-    pub fn create_direct(&mut self, target: &str, key_packages_json: &str, own_json: Option<String>, now: f64) -> Result<String, JsValue> {
-        let own: Option<Value> = own_json.and_then(|o| serde_json::from_str(&o).ok());
-        self.0.create_direct(target, &parse(key_packages_json)?, own.as_ref(), now).map_err(js_err).map(text)
+    pub fn create_direct(&mut self, target: &str, key_packages: Ts<Json>, own: Option<Ts<Json>>, now: f64) -> Result<Vec<String>, JsValue> {
+        let own = own.and_then(|o| o.to_rust().ok()).map(|o| o.0);
+        self.0.create_direct(target, &parse(&key_packages)?.0, own.as_ref(), now).map_err(js_err)
     }
 
-    /// Create a group conversation (M§7.3, `kind: group`) with the identities of `targets_json`, `{identity: its
-    /// mailbox's key-packages answer}`, plus this identity's own other devices from `own_json` (or null): every device
+    /// Create a group conversation (M§7.3, `kind: group`) with the identities of `targets`, `{identity: its
+    /// mailbox's key-packages answer}`, plus this identity's own other devices from `own` (or null): every device
     /// the vector-pinned rule picks, added in one commit once the group is hubbed at this identity's mailbox, with the
     /// grants held from them (M§14.2). Returns the frames to send.
-    pub fn create_group(&mut self, targets_json: &str, own_json: Option<String>, now: f64) -> Result<String, JsValue> {
-        let own: Option<Value> = own_json.and_then(|o| serde_json::from_str(&o).ok());
-        self.0.create_group(&parse(targets_json)?, own.as_ref(), now).map_err(js_err).map(text)
+    pub fn create_group(&mut self, targets: Ts<ByIdentity>, own: Option<Ts<Json>>, now: f64) -> Result<Vec<String>, JsValue> {
+        let own = own.and_then(|o| o.to_rust().ok()).map(|o| o.0);
+        self.0.create_group(&parse(&targets)?.0, own.as_ref(), now).map_err(js_err)
     }
 
     /// Add `target`'s devices to the group conversation `gid` from its mailbox's `key-packages` answer (M§7.3: any
     /// member identity MAY add another, holding its grant, M§14.2): the commit to deposit.
-    pub fn add_member(&mut self, gid: &str, target: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
-        self.0.add_member(gid, target, &parse(key_packages_json)?, now).map_err(js_err)
+    pub fn add_member(&mut self, gid: &str, target: &str, key_packages: Ts<Json>, now: f64) -> Result<String, JsValue> {
+        self.0.add_member(gid, target, &parse(&key_packages)?.0, now).map_err(js_err)
     }
 
     /// Remove the member identity `target` from the conversation `gid`, every leaf of it (M§7.3: any member identity
@@ -387,10 +413,10 @@ impl Messenger {
         self.0.rekey(gid, now).map_err(js_err)
     }
 
-    /// The roster changes of a conversation and its predecessors, oldest first: `[{group, seq, epoch, by, added,
-    /// removed, left}]` (M§7.3: rendered, attributed to the committing identity).
-    pub fn roster_log(&self, gid: &str) -> String {
-        text(self.0.roster_log(gid))
+    /// The roster changes of a conversation and its predecessors, oldest first: `{group, seq, epoch, by, added,
+    /// removed, left}` each (M§7.3: rendered, attributed to the committing identity).
+    pub fn roster_log(&self, gid: &str) -> Result<Vec<Ts<Json>>, JsValue> {
+        values(self.0.roster_log(gid))
     }
 
     /// A text message to a conversation (M§8.1 `content`, kind `text`): the deposit to send, pending until the hub's
@@ -399,29 +425,28 @@ impl Messenger {
         self.0.send_text(gid, text, now).map_err(js_err)
     }
 
-    /// Conversations: `[{group, conversation, kind, peer, members, epoch, hub, pending, recorded, recorders, may_send,
-    /// recorders_pending}]`; members are the leaves that authenticate at `now` (M§6.2); `pending` counts items not yet
+    /// Conversations: members are the leaves that authenticate at `now` (M§6.2); `pending` counts items not yet
     /// accepted by the hub; `recorders_pending` lists the recorders the user has still to accept (C§5).
-    pub fn conversations(&self, now: f64) -> String {
-        text(self.0.conversations(now))
+    pub fn conversations(&self, now: f64) -> Result<Vec<Ts<Conversation>>, JsValue> {
+        list(&self.0.conversations(now))
     }
 
-    /// The thread of one group in `seq` order (M§8.5): `[{key, sender, sender_device, object, seq, mine, delivered,
-    /// from_archive}]`; `read_through` of the whole thread is `{identity: content id}` (M§10.3), in
+    /// The thread of one group in `seq` order (M§8.5): `{key, sender, sender_device, object, seq, mine, delivered,
+    /// from_archive}` each; `read_through` of the whole thread is `{identity: content id}` (M§10.3), in
     /// [`Messenger::read_marks`].
-    pub fn thread(&self, gid: &str) -> String {
-        text(self.0.thread(gid))
+    pub fn thread(&self, gid: &str) -> Result<Vec<Ts<Json>>, JsValue> {
+        values(self.0.thread(gid))
     }
 
     /// Each identity's read watermark in a conversation, `{identity: content id}` (M§10.3; a sibling's undisclosed
     /// one reaches us through the personal group, M§10.5).
-    pub fn read_marks(&self, gid: &str) -> String {
-        text(self.0.read_marks(gid))
+    pub fn read_marks(&self, gid: &str) -> Result<Ts<Json>, JsValue> {
+        obj(&Json(self.0.read_marks(gid)))
     }
 
     /// Introductions delivered through the mailbox and not yet answered (M§14.1), `{id: payload}`.
-    pub fn requests(&self) -> String {
-        text(self.0.requests())
+    pub fn requests(&self) -> Result<Ts<ByIdentity>, JsValue> {
+        obj(&ByIdentity(self.0.requests().clone()))
     }
 
     /// The personal group's id, once created.
@@ -431,8 +456,8 @@ impl Messenger {
 
     /// Process one frame from the mailbox. Returns the emissions: `{send: frame}` (to the mailbox), `{ui: …}`
     /// events, `{sync: true}` when a refused commit asks for one (spec-gap 58), `{refused: …}`, `{error: …}`.
-    pub fn inbound(&mut self, frame: &str, now: f64) -> String {
-        text(self.0.inbound(frame, now))
+    pub fn inbound(&mut self, frame: &str, now: f64) -> Result<Ts<Events>, JsValue> {
+        obj(&Events(self.0.inbound(frame, now)))
     }
 
     /// A fresh ULID (§12.9: timestamp-consistent with `now`).

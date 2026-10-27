@@ -392,9 +392,16 @@ PoC better on their own terms: each removes duplicated glue from the reference c
        object, a manifest, a call record's leg) stay JSON values (`unknown`), as B2 left the libraries' JSON. `dsip-msg`
        reads the types; `dsip-wasm` still speaks JSON text, parsing each parameter at its edge as leniently as the
        library did and serializing each result. The declarations (`Event`, `Ui` and the above, `ts` on in
-       `dsip-wasm`) are in `pkg/dsip_wasm.d.ts` and pass `tsc`; an `Option` there is `T | undefined`, which is what
-       the objects of B3c carry where the JSON text has `null`.
+       `dsip-wasm`) are in `pkg/dsip_wasm.d.ts` and pass `tsc`.
      - **B3c:** `dsip-wasm` returns objects and the page reads them; dsip-msg matches on the types.
+       *Done:* the `Messenger`'s methods take and return objects (`Ts<T>`; a list of library values is `T[]`, frames
+       `string[]`, the JSON it keeps `unknown[]`), with four wrappers in `dsip-wasm` (`Events`, `Outages`, `Grants`,
+       `ByIdentity`); its save and the identity it is made from stay JSON text, and what it throws stays the string it
+       was. The library types carry tsify's `missing_as_null` and `hashmap_as_object`, as B2's do: an absent value
+       is `null`, as in the JSON text the page read, so its checks did not change, and a map is a plain object. The
+       page drops 41 `JSON.parse` and the `JSON.stringify` of every argument; `host/relay.js` reads one `relay_hello`
+       shape from the `Endpoint` and the `Messenger`. dsip-msg matches on `Event`, `Ui` (every one of the 64 kinds,
+       no fallback) and `OpInfo`, and reads `Conversation`s, printing the lines it printed.
    - **B4:** `app.js` under check, with the last parsing and stringifying of boundary values gone.
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a

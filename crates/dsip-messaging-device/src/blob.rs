@@ -97,7 +97,7 @@ pub fn tried(uri: &str, status: u16, stored: Option<&[u8]>) -> Tried {
 
 /// One source's answer, as [`fetch_decision`] takes it, serialized `{uri, status, sha256?, size?}` (M§8.4 rule 7, spec-gap 106).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Tried {
     /// The source.
     pub uri: String,
