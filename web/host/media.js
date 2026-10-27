@@ -1,3 +1,4 @@
+// @ts-check
 // WebRTC for one call: the browser's RTCPeerConnection and the local stream. Local candidates go to the call glue,
 // which holds them until the session is ACTIVE and sends them in signed `info`. Remote candidates that arrive before
 // the remote description is set wait here.
@@ -6,15 +7,28 @@
 // `info`, ACTIVE-only), §14.1 (no media before a signed answer), §14.4 (screening: receive only), C§4 (media held
 // while a recording waits on acceptance).
 
+/**
+ * What the call screen listens for. Every handler is optional.
+ * @typedef {object} MediaHandlers
+ * @property {(c: { candidate: string, sdp_mid: string, sdp_m_line_index: number } | null) => void} [candidate]
+ * @property {(stream: MediaStream) => void} [track]
+ * @property {(state: RTCPeerConnectionState) => void} [state]
+ */
+
 export class Media {
+  /** @param {RTCIceServer[]} iceServers @param {MediaHandlers} on */
   constructor(iceServers, on) {
     this.pc = new RTCPeerConnection({ iceServers });
-    this.on = on;                       // {candidate(entry|null), track(stream), state(str)}
+    this.on = on;
+    /** @type {MediaStream | null} */
     this.localStream = null;
     // every remote track joins one stream: a track added later by an update (video added to an audio call) arrives
     // with a stream of its own, and showing that stream instead would drop the audio
     this.remoteStream = new MediaStream();
+    /** @type {RTCIceCandidateInit[]} */
     this.pendingRemote = [];
+    /** @type {Map<RTCRtpSender, MediaStreamTrack> | null} */
+    this.held = null;
     this.pc.onicecandidate = ({ candidate }) => {
       // Firefox marks the end of each m-section with an empty candidate string; the binding carries real candidates
       // (`^candidate:`, B§ Appendix A) and one end_of_candidates, which the final null event supplies.
@@ -31,10 +45,12 @@ export class Media {
     this.pc.onconnectionstatechange = () => this.on.state?.(this.pc.connectionState);
   }
 
+  /** @param {boolean} video */
   async capture(video) {
-    this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video });
-    this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream));
-    return this.localStream;
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true, video });
+    this.localStream = s;
+    s.getTracks().forEach((t) => this.pc.addTrack(t, s));
+    return s;
   }
 
   /** An offer to send (§16.3). */
@@ -45,6 +61,7 @@ export class Media {
   }
 
   /** Answer a remote offer; with `screening`, receive only (§14.4). */
+  /** @param {string} offerSdp @param {boolean} screening */
   async answer(offerSdp, screening) {
     await this.pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
     if (screening) this.pc.getTransceivers().forEach((t) => { t.direction = 'recvonly'; });
@@ -54,11 +71,13 @@ export class Media {
     return a.sdp;
   }
 
+  /** @param {string} sdp */
   async acceptAnswer(sdp) {
     await this.pc.setRemoteDescription({ type: 'answer', sdp });
     await this.flushRemote();
   }
 
+  /** @param {{ candidate: string, sdp_mid?: string, sdp_m_line_index?: number }} c */
   async addRemoteCandidate(c) {
     const cand = { candidate: c.candidate, sdpMid: c.sdp_mid, sdpMLineIndex: c.sdp_m_line_index };
     if (this.pc.remoteDescription) await this.pc.addIceCandidate(cand).catch(() => {});
@@ -74,14 +93,16 @@ export class Media {
   async addVideo() {
     if (this.localStream?.getVideoTracks().length) return;
     const v = await navigator.mediaDevices.getUserMedia({ video: true });
-    if (!this.localStream) this.localStream = v;
+    const local = this.localStream ?? v;
+    this.localStream = local;
     // the camera joins the stream the audio is in, so the far side sees one stream with both
-    else v.getTracks().forEach((t) => this.localStream.addTrack(t));
-    v.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream));
+    if (local !== v) v.getTracks().forEach((t) => local.addTrack(t));
+    v.getTracks().forEach((t) => this.pc.addTrack(t, local));
   }
 
   /** Leave screening (§14.4 step 3): capture audio (and video if asked) and send on the transceivers that were
    *  receive-only; the caller then sees an `update` with `answered_by: "user"`. */
+  /** @param {boolean} video */
   async unscreen(video) {
     const s = await navigator.mediaDevices.getUserMedia({ audio: true, video });
     for (const track of s.getTracks()) {
@@ -120,7 +141,9 @@ export class Media {
   /** The candidate pair in use (`local`/`remote` candidate types, `protocol`, `relayed`, `rtt_ms`), or null. */
   async path() {
     const stats = await this.pc.getStats();
+    /** @type {Record<string, any>} */
     const by = {}; stats.forEach((s) => { by[s.id] = s; });
+    /** @type {any} */
     let pair = null;
     stats.forEach((s) => { if (s.type === 'candidate-pair' && (s.nominated || s.selected) && s.state === 'succeeded') pair = pair && !s.nominated ? pair : s; });
     if (!pair) stats.forEach((s) => { if (s.type === 'transport' && s.selectedCandidatePairId && by[s.selectedCandidatePairId]) pair = by[s.selectedCandidatePairId]; });

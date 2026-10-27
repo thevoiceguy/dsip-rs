@@ -279,11 +279,13 @@ node web/test/engine.mjs                 # the engine in Node
 web/test/run.sh firefox                  # or chromium, or all; starts a relay on 127.0.0.1:8443
 ```
 
-**Types** (dsip-rs B1, B2, `impl/docs/dsip-stack-design.md` §6). The engine (`Endpoint`) and the free functions take
-and return JavaScript objects, typed by the declarations `wasm-pack` writes into `pkg/dsip_wasm.d.ts` from the Rust
-types; saved records (the identity, the contact file) stay the JSON text that is stored, and the `Messenger` still
-speaks strings until B3. The page stays plain JavaScript with no build step: a file that opens with `// @ts-check` (so
-far `host/engine.js`) is checked by `tsc` against those declarations. The values that keep the vectors' shapes — the
+**Types** (dsip-rs B1–B4, `impl/docs/dsip-stack-design.md` §6). The engine (`Endpoint`), the `Messenger` and the
+free functions take and return JavaScript objects, typed by the declarations `wasm-pack` writes into
+`pkg/dsip_wasm.d.ts` from the Rust types; saved records (the identity, the contact file, the `Messenger`'s save) stay
+the JSON text that is stored. The page stays plain JavaScript with no build step, and every file of it opens with
+`// @ts-check`: `tsc` checks `host/` strictly (`tsconfig.json`) and `app.js` without implicit-`any` and null checks
+(`tsconfig.app.json`: its DOM code, not its boundary, is what those would flag). The JSON the `Messenger` keeps as it
+received it is `unknown`; `app.js` declares the shapes it reads of it beside their readers. The values that keep the vectors' shapes — the
 engine's `Emission`, the session and contacts snapshots, a frame's verdict — are declared by hand
 (`crates/dsip-wasm/src/types.rs`), so `npm run types` also checks those declarations against every such value the
 vectors expect.

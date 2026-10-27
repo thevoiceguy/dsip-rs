@@ -1169,7 +1169,7 @@ impl Client {
         if self.m.is_recorder() && !self.recorder_misbehave {
             bail!("a recorder device is receive-only (C§5)");
         }
-        if self.conv(gid)?.may_send == json!(false) {
+        if !self.conv(gid)?.may_send {
             bail!("recorded conversation: type accept-recording first (C§5)");
         }
         Ok(())
@@ -1648,8 +1648,8 @@ impl Client {
             }
             "available" => {
                 for a in self.m.available() {
-                    println!("AVAILABLE group={} conversation={} kind={}", a.group, a.conversation.as_str().unwrap_or("?"),
-                             a.kind.as_str().unwrap_or("?"));
+                    let or_unknown = |v: &str| if v.is_empty() { "?".to_string() } else { v.to_string() };
+                    println!("AVAILABLE group={} conversation={} kind={}", a.group, or_unknown(&a.conversation), or_unknown(&a.kind));
                 }
                 Ok(())
             }
@@ -1734,7 +1734,7 @@ impl Client {
                 // C§5: per conversation, every recorder device present now
                 let gid = self.active()?;
                 let c = self.conv(&gid)?;
-                if c.recorders.as_array().is_none_or(Vec::is_empty) {
+                if c.recorders.is_empty() {
                     println!("OK not recorded");
                     return Ok(());
                 }

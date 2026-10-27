@@ -746,7 +746,8 @@ impl<S: Store> Messenger<S> {
     pub fn available(&self) -> Vec<Available> {
         let mut out: Vec<Available> = self.group_info.iter().filter(|(g, _)| !self.convs.contains_key(*g)).filter_map(|(g, gi)| {
             let conv = dsip_mls::group_info_conversation(&unb64(&json!(gi)))?;
-            Some(Available { group: g.clone(), conversation: conv["conversation"].clone(), kind: conv["kind"].clone(), hub: conv["hub"].clone() })
+            Some(Available { group: g.clone(), conversation: s_of(&conv["conversation"]), kind: s_of(&conv["kind"]),
+                             hub: serde_json::from_value(conv["hub"].clone()).unwrap_or_default() })
         }).collect();
         out.sort_by_key(|c| c.kind != "personal");
         out
@@ -1375,8 +1376,10 @@ impl<S: Store> Messenger<S> {
             members.sort();
             members.dedup();
             Conversation { group: g.clone(), conversation: c.conversation.clone(), kind: c.kind.clone(), peer: c.peer.clone(), members,
-                epoch: c.group.epoch().as_u64(), recorded: recording["recorded"].clone(), recorders: recording["recorders"].clone(),
-                may_send: recording["may_send"].clone(), recorders_pending: recording["pending"].clone(),
+                epoch: c.group.epoch().as_u64(), recorded: recording["recorded"] == json!(true),
+                recorders: serde_json::from_value(recording["recorders"].clone()).unwrap_or_default(),
+                may_send: recording["may_send"] == json!(true),
+                recorders_pending: serde_json::from_value(recording["pending"].clone()).unwrap_or_default(),
                 hub: Hub { did: c.hub.0.clone(), uri: c.hub.1.clone() }, pending: self.outbox.pending(g) + self.handover.get(g).map_or(0, Vec::len),
                 hub_down: self.outbox.is_down(g), predecessors: self.lineage(g).into_iter().filter(|x| x != g).collect() }
         }).collect()

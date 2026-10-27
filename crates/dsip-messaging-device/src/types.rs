@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A mailbox, or a group's hub (M§4.2, M§6.6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Hub {
     /// Its DID.
@@ -52,14 +52,11 @@ pub struct Available {
     /// The group id.
     pub group: String,
     /// The conversation it carries.
-    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
-    pub conversation: Value,
+    pub conversation: String,
     /// Its kind (`personal`, `direct`, `group`).
-    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
-    pub kind: Value,
-    /// Its hub, `{did, uri}`.
-    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
-    pub hub: Value,
+    pub kind: String,
+    /// Its hub.
+    pub hub: Hub,
 }
 
 /// How one inbound leg of this device ended, as the host saw it (M§13.3).
@@ -145,17 +142,13 @@ pub struct Conversation {
     /// The MLS epoch.
     pub epoch: u64,
     /// Whether a recorder is in it (C§5).
-    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
-    pub recorded: Value,
-    /// The recorders in it, `[{device, subject}]`.
-    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
-    pub recorders: Value,
+    pub recorded: bool,
+    /// The recorders in it.
+    pub recorders: Vec<Recorder>,
     /// Whether content may be sent there (C§5: every recorder accepted).
-    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
-    pub may_send: Value,
+    pub may_send: bool,
     /// The recorders the user has still to accept.
-    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
-    pub recorders_pending: Value,
+    pub recorders_pending: Vec<Recorder>,
     /// Its hub.
     pub hub: Hub,
     /// The items not yet accepted by the hub, with those kept for a successor (M§9.4).
@@ -164,6 +157,16 @@ pub struct Conversation {
     pub hub_down: bool,
     /// The groups it succeeds, by lineage (M§7.5).
     pub predecessors: Vec<String>,
+}
+
+/// A recorder device in a conversation (C§5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
+pub struct Recorder {
+    /// The recorder device.
+    pub device: String,
+    /// The identity it records for.
+    pub subject: String,
 }
 
 /// A payload sealed for upload (M§8.4 rule 1).

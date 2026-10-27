@@ -1,3 +1,4 @@
+// @ts-check
 // The identity file: the person's identity key, encrypted with a passphrase. The export is the only copy of the
 // identity key outside the browser; importing it on another browser enrols that browser as a device of the same
 // identity: the app makes a fresh device key there and the identity key signs its delegation (§7.4), no server
@@ -11,15 +12,19 @@
 
 const ITERATIONS = 600_000;
 const enc = new TextEncoder(), dec = new TextDecoder();
+/** @param {ArrayBuffer | Uint8Array} bytes */
 const b64 = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)));
+/** @param {string} s */
 const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
+/** @param {string} passphrase @param {BufferSource} salt @param {number} iterations */
 async function deriveKey(passphrase, salt, iterations) {
   const base = await crypto.subtle.importKey('raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
 
-/** Encrypt an identity (the JSON object from `create_identity`) under `passphrase`; returns the file text. */
+/** Encrypt an identity (the JSON object from `create_identity`) under `passphrase`; returns the file text.
+ *  @param {{ identity: string }} identity @param {string} passphrase */
 export async function exportIdentity(identity, passphrase) {
   if (!passphrase || passphrase.length < 8) throw new Error('a passphrase of at least 8 characters is required');
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -33,7 +38,8 @@ export async function exportIdentity(identity, passphrase) {
   }, null, 1);
 }
 
-/** Decrypt an identity file; returns the identity JSON object, or throws (wrong passphrase, not a file). */
+/** Decrypt an identity file; returns the identity JSON object, or throws (wrong passphrase, not a file).
+ *  @param {string} text @param {string} passphrase @returns {Promise<any>} */
 export async function importIdentity(text, passphrase) {
   let f;
   try { f = JSON.parse(text); } catch { throw new Error('not an identity file'); }

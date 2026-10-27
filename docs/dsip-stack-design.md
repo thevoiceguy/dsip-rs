@@ -403,6 +403,18 @@ PoC better on their own terms: each removes duplicated glue from the reference c
        shape from the `Endpoint` and the `Messenger`. dsip-msg matches on `Event`, `Ui` (every one of the 64 kinds,
        no fallback) and `OpInfo`, and reads `Conversation`s, printing the lines it printed.
    - **B4:** `app.js` under check, with the last parsing and stringifying of boundary values gone.
+    *Done:* every file of the page is under `// @ts-check`: `host/` strict (`tsconfig.json`), `app.js` by
+    `tsconfig.app.json`, strict but for implicit `any` and null checks, which over 2,500 lines of DOM code are
+    noise (1,318 errors, none about the boundary) rather than drift; `npm run types` runs both and CI runs it. The
+    boundary's globals are typed (`Engine`, `Relay`, `Messenger`, the verified hellos), and `$` is `any` on
+    purpose: the check is for the values crossing the wasm boundary, not the DOM's element kinds. The JSON the
+    `Messenger` keeps (`unknown`) is read through shapes declared beside their readers (`CallRecord`,
+    `HeldRecord`, `TimelineEntry`, `RosterEntry`, `IntroductionRequest`). What is left of `JSON.parse` and
+    `JSON.stringify` is storage (the identity, the contact file, the `Messenger`'s save), the DID document text a
+    `did:web` identity hosts, frames decoded for log lines, and settings. The check found: hint verdicts never
+    carry `detail` (the page logged nothing where `reason` was), an `ignored` number claim rendered `undefined`, and
+    four `unknown` fields with fixed shapes, now Rust types (`Conversation`'s `recorded`, `may_send`, `recorders`,
+    `recorders_pending` as `Recorder`; `Available`'s `conversation`, `kind`, `hub`).
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.

@@ -3,11 +3,11 @@
     "target": "es2022",
     "module": "es2022",
     "moduleResolution": "bundler",
-    "lib": ["es2022", "esnext.disposable", "dom"],
+    "lib": ["es2022", "esnext.disposable", "dom", "dom.iterable"],
     "allowJs": true,
     "checkJs": false,
     "noEmit": true,
     "strict": true
   },
-  "include": ["app.js", "host/**/*.js", "test/types/*.ts"]
+  "include": ["host/**/*.js", "test/types/*.ts"]
 }
