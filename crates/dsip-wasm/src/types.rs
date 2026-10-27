@@ -131,7 +131,7 @@ export type VoicemailOffer = { offer: false } | { offer: true; max_duration_s?: 
 macro_rules! json_as {
     ($(#[$doc:meta])* $name:ident, $ts:literal) => {
         $(#[$doc])*
-        #[derive(Serialize, Deserialize, Tsify)]
+        #[derive(Serialize, Deserialize, Tsify, Default)]
         #[serde(transparent)]
         #[tsify(type = $ts, hashmap_as_object, missing_as_null)]
         pub struct $name(pub Value);
@@ -440,3 +440,27 @@ pub struct SelectedHint {
     /// The signing DID (device or subject).
     pub signer: String,
 }
+
+/// A [`crate::messaging::Messenger`] step's outputs, in order: frames to send and events (dsip-rs B3a).
+#[derive(Serialize, Tsify)]
+#[serde(transparent)]
+#[tsify(hashmap_as_object, missing_as_null)]
+pub struct Events(pub Vec<dsip_messaging_device::Event>);
+
+/// Groups whose hub is unreachable, by group (M§9.4).
+#[derive(Serialize, Tsify)]
+#[serde(transparent)]
+#[tsify(hashmap_as_object, missing_as_null)]
+pub struct Outages(pub BTreeMap<String, dsip_messaging_device::Outage>);
+
+/// Grants held from others, `{identity: compact envelope}` (§19.4).
+#[derive(Deserialize, Tsify, Default)]
+#[serde(transparent)]
+#[tsify(hashmap_as_object)]
+pub struct Grants(pub BTreeMap<String, String>);
+
+/// JSON values by identity or id: `key-packages` answers, introductions.
+#[derive(Serialize, Deserialize, Tsify, Default)]
+#[serde(transparent)]
+#[tsify(type = "Record<string, unknown>", hashmap_as_object, missing_as_null)]
+pub struct ByIdentity(pub BTreeMap<String, Value>);

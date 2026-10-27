@@ -19,9 +19,7 @@ export class Relay {
     ws.onopen = () => { ws.send(this.engine.hello_frame(this.now())); };
     ws.onmessage = async (ev) => {
       if (!this.bound) {
-        // the Endpoint returns an object; the Messenger (a mailbox connection) still returns JSON text until dsip-rs B3
-        const out = this.engine.relay_hello(ev.data, this.now());
-        const r = typeof out === 'string' ? JSON.parse(out) : out;
+        const r = this.engine.relay_hello(ev.data, this.now());   // the Endpoint's or the Messenger's: one shape
         if (!r.ok) { this.on.refused?.(r); ws.close(); return; }
         this.bound = true; this.backoff = 1000; this.rejected = null;
         this.on.bound?.(r);

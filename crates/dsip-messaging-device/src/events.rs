@@ -10,7 +10,7 @@ use serde_json::Value;
 
 /// One output of a step, in order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 #[serde(untagged)]
 // tsify does not follow `untagged`
 #[cfg_attr(feature = "ts", tsify(type = "{ send: string } | Ui | { sync: boolean } | { refused: string; group?: string; item?: string; pending?: boolean } | { error: string; group?: string; reason?: unknown; detail?: unknown } | { drop: string } | { rejected: Rejected } | { key_packages: unknown } | { successor_due: SuccessorDue }"))]
@@ -121,7 +121,7 @@ impl From<Ui> for Event {
 
 /// A frame's verdict (§10.2).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct Rejected {
     /// The reject code.
     pub code: String,
@@ -131,7 +131,7 @@ pub struct Rejected {
 
 /// What creating a successor needs (M§9.4, M§7.5).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct SuccessorDue {
     /// The dead group.
     pub group: String,
@@ -148,7 +148,7 @@ pub struct SuccessorDue {
 /// An object handed over to a successor: its outbox item there (`None`: kept until the successor exists), and the
 /// object's `id` (M§9.4).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct HandedOver {
     /// The outbox item.
     pub item: Option<String>,
@@ -159,7 +159,7 @@ pub struct HandedOver {
 
 /// What a membership commit does, for the host to say (no key material).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum OpInfo {
     /// Devices of `peer` added; `device` names one of this identity's own (M§12.3).
@@ -200,7 +200,7 @@ pub enum OpInfo {
 
 /// A recorder device newly in a conversation (C§5).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 pub struct NewRecorder {
     /// The recorder device.
     #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
@@ -214,7 +214,7 @@ pub struct NewRecorder {
 
 /// What the host shows, by kind.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify), tsify(hashmap_as_object, missing_as_null))]
 #[serde(tag = "ui", rename_all = "snake_case")]
 pub enum Ui {
     /// A member's activity (M§11.1).

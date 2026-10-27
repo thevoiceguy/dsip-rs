@@ -40,7 +40,8 @@ use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::client::select_mailbox;
 use dsip_messaging_device::messenger::Messenger;
-use dsip_messaging_device::{blob, CallLeg, CallLog, Event, ReceiptPolicy, Store, Ui};
+use dsip_messaging_device::events::{NewRecorder, SuccessorDue};
+use dsip_messaging_device::{blob, CallLeg, CallLog, Conversation, Event, OpInfo, ReceiptPolicy, Store, Ui};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{conversation_extension, digest, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
@@ -328,6 +329,11 @@ fn s(v: &Value) -> &str {
     v.as_str().unwrap_or("")
 }
 
+/// A value that may be absent, as dsip-msg always printed it: `null` when it is.
+fn opt<T: std::fmt::Display>(v: &Option<T>) -> String {
+    v.as_ref().map_or_else(|| "null".into(), T::to_string)
+}
+
 /// The device's SQLite database as the `Messenger`'s store, with the `crash-next` test hook (spec-gap 44's demo): armed,
 /// the next item the `Messenger` processes exits inside its transaction, before the commit.
 struct Db {
@@ -594,19 +600,19 @@ impl Client {
     }
 
     /// The conversations, as the `Messenger` lists them.
-    fn conversations(&self) -> Vec<Value> {
-        serde_json::to_value(self.m.conversations(self.now())).ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+    fn conversations(&self) -> Vec<Conversation> {
+        self.m.conversations(self.now())
     }
 
     /// One conversation as the `Messenger` lists it: `gid`, or the successor this device converged on (M§7.5).
-    fn conv(&self, gid: &str) -> Result<Value> {
+    fn conv(&self, gid: &str) -> Result<Conversation> {
         let live = self.m.successor(gid).unwrap_or_else(|| gid.to_string());
-        self.conversations().into_iter().find(|c| c["group"] == json!(live)).context("not a member of that group")
+        self.conversations().into_iter().find(|c| c.group == live).context("not a member of that group")
     }
 
     fn refresh_names(&mut self) {
         for c in self.conversations() {
-            self.names.insert(s(&c["group"]).to_string(), (s(&c["conversation"]).to_string(), s(&c["kind"]).to_string()));
+            self.names.insert(c.group, (c.conversation, c.kind));
         }
     }
 
@@ -621,7 +627,7 @@ impl Client {
     /// The conversation commands act on after `gone` went: the first other conversation, never the personal group.
     fn active_after(&mut self, gone: &str) {
         if self.active.as_deref() == Some(gone) {
-            self.active = self.conversations().into_iter().find(|c| c["kind"] != "personal" && c["group"] != json!(gone)).map(|c| s(&c["group"]).to_string());
+            self.active = self.conversations().into_iter().find(|c| c.kind != "personal" && c.group != gone).map(|c| c.group);
         }
     }
 
@@ -798,33 +804,28 @@ impl Client {
     /// Act on what the `Messenger` emitted: frames to the mailbox, events printed as lines, network work queued.
     async fn handle(&mut self, out: &[Event]) -> Result<()> {
         self.refresh_names();
-        let emissions: Vec<Value> = out.iter().map(|e| serde_json::to_value(e).unwrap_or_default()).collect();
-        for e in emissions {
-            if let Some(f) = e.get("send").and_then(Value::as_str) {
-                if let Err(err) = self.send_frame(f).await {
-                    println!("ERR {err}");
+        for e in out {
+            match e {
+                Event::Send { send } => {
+                    if let Err(err) = self.send_frame(send).await {
+                        println!("ERR {err}");
+                    }
                 }
-            } else if e.get("sync").is_some() {
-                // spec-gap 58: a refused commit syncs past the winning one before anything is re-proposed
-                if let Err(err) = self.sync(false).await {
-                    println!("ERR {err}");
+                Event::Sync { .. } => {
+                    // spec-gap 58: a refused commit syncs past the winning one before anything is re-proposed
+                    if let Err(err) = self.sync(false).await {
+                        println!("ERR {err}");
+                    }
                 }
-            } else if let Some(ui) = e["ui"].as_str() {
-                self.ui(ui, &e).await;
-            } else if e.get("refused").is_some() {
-                self.refused(&e).await;
-            } else if let Some(d) = e.get("successor_due") {
-                self.successor_due(d);
-            } else if let Some(reason) = e.get("reason") {
-                println!("ERR {reason} {}", e["detail"]); // the mailbox's own error, not an answer to a deposit
-            } else if let Some(x) = e.get("error") {
-                println!("ERR {}", s(x));
-            } else if let Some(x) = e.get("drop") {
-                println!("DROP {}", s(x));
-            } else if let Some(r) = e.get("rejected") {
-                println!("ERR frame rejected: {} {}", r["code"], s(&r["reason"]));
-            } else if e.get("key_packages").is_none() {
-                println!("?? {e}");
+                Event::Ui(ui) => self.ui(ui).await,
+                Event::Refused { refused, item, pending, .. } => self.refused(refused, item.as_deref(), *pending == Some(true)).await,
+                Event::SuccessorDue { successor_due } => self.successor_due(successor_due),
+                // the mailbox's own error, not an answer to a deposit
+                Event::Error { reason: Some(reason), detail, .. } => println!("ERR {reason} {}", detail.as_ref().unwrap_or(&Value::Null)),
+                Event::Error { error, .. } => println!("ERR {error}"),
+                Event::Drop { drop } => println!("DROP {drop}"),
+                Event::Rejected { rejected } => println!("ERR frame rejected: {} {}", json!(rejected.code), rejected.reason.as_deref().unwrap_or("")),
+                Event::KeyPackages { .. } => {}
             }
         }
         self.refresh_names();
@@ -832,212 +833,215 @@ impl Client {
     }
 
     /// The line a commit in `gid` is reported under: what the command that proposed it said, or what it does.
-    fn label(&self, gid: &str, op: &Value) -> String {
+    fn label(&self, gid: &str, op: Option<&OpInfo>) -> String {
         if let Some(l) = self.labels.get(gid) {
             return l.clone();
         }
         let kind = self.name(gid).1;
-        match s(&op["op"]) {
-            "add" if op["device"].is_string() => format!("added device {} to {kind}", s(&op["device"])),
-            "add" => format!("added {} ({} device(s))", s(&op["peer"]), op["devices"]),
-            "update" => "rekeyed".into(),
-            "move_hub" => format!("moved to {}", s(&op["hub"]["did"])),
-            "remove" => format!("removed {}", s(&op["identity"])),
-            "remove_device" => format!("removed device {} from {kind}", s(&op["device"])),
-            "leave" => format!("committed the leave of {}", s(&op["identity"])),
-            "rejoin" => "rejoin".into(),
-            other => other.to_string(),
+        match op {
+            Some(OpInfo::Add { device: Some(device), .. }) => format!("added device {device} to {kind}"),
+            Some(OpInfo::Add { peer, devices, .. }) => format!("added {peer} ({devices} device(s))"),
+            Some(OpInfo::Update) => "rekeyed".into(),
+            Some(OpInfo::MoveHub { hub }) => format!("moved to {}", s(&hub["did"])),
+            Some(OpInfo::Remove { identity }) => format!("removed {identity}"),
+            Some(OpInfo::RemoveDevice { device }) => format!("removed device {device} from {kind}"),
+            Some(OpInfo::Leave { identity }) => format!("committed the leave of {identity}"),
+            Some(OpInfo::Rejoin) => "rejoin".into(),
+            None => String::new(),
         }
     }
 
     /// One event of the `Messenger`, as the line dsip-msg prints.
-    async fn ui(&mut self, ui: &str, e: &Value) {
-        let g = s(&e["group"]).to_string();
+    async fn ui(&mut self, ui: &Ui) {
         match ui {
-            "joined" if e["external"] == json!(true) => {
-                println!("OK rejoined {} kind={} epoch={} seq={}", s(&e["conversation"]), s(&e["kind"]), e["epoch"], e["seq"]);
-                if e["kind"] != "personal" {
-                    self.active = Some(g);
+            Ui::Joined { group, conversation, kind, epoch, external: Some(true), seq, .. } => {
+                println!("OK rejoined {} kind={kind} epoch={epoch} seq={}", s(conversation), opt(&seq.flatten()));
+                if kind != "personal" {
+                    self.active = Some(group.clone());
                 }
             }
-            "joined" => {
-                println!("JOINED {} kind={} members={}", s(&e["conversation"]), s(&e["kind"]), list(&e["members"]));
-                if e["kind"] != "personal" {
-                    self.active = Some(g);
+            Ui::Joined { group, conversation, kind, members, .. } => {
+                println!("JOINED {} kind={kind} members={members:?}", s(conversation));
+                if kind != "personal" {
+                    self.active = Some(group.clone());
                 }
             }
-            "committed" => {
-                let label = self.label(&g, &e["op"]);
-                self.labels.remove(&g);
-                println!("OK {label} epoch={} seq={}", e["epoch"], e["seq"]);
+            Ui::Committed { group, epoch, seq, op, .. } => {
+                let label = self.label(group, op.as_ref());
+                self.labels.remove(group);
+                println!("OK {label} epoch={epoch} seq={}", opt(seq));
             }
-            "conflict" if e["reason"] == "mailbox.unknown-group" => {
+            Ui::Conflict { group, reason, op, .. } if reason == "mailbox.unknown-group" => {
                 // spec-gap 60: the hub may have handed the group on; the sync shows whether it did
-                let hub = self.conv(&g).map(|c| s(&c["hub"]["did"]).to_string()).unwrap_or_default();
-                println!("MOVED? {}: mailbox.unknown-group from {hub}; syncing", self.label(&g, &e["op"]));
+                let hub = self.conv(group).map(|c| c.hub.did).unwrap_or_default();
+                println!("MOVED? {}: mailbox.unknown-group from {hub}; syncing", self.label(group, op.as_ref()));
             }
-            "conflict" if e["op"]["op"] == "rejoin" => {
-                println!("CONFLICT rejoin: {} at epoch {}; syncing for a newer GroupInfo", s(&e["reason"]), e["epoch"]);
+            Ui::Conflict { reason, epoch, op: Some(OpInfo::Rejoin), .. } => {
+                println!("CONFLICT rejoin: {reason} at epoch {}; syncing for a newer GroupInfo", opt(epoch));
             }
-            "conflict" => {
-                println!("CONFLICT {}: {} at epoch {}; syncing past the winning commit", self.label(&g, &e["op"]), s(&e["reason"]), e["epoch"]);
+            Ui::Conflict { group, reason, epoch, op } => {
+                println!("CONFLICT {}: {reason} at epoch {}; syncing past the winning commit", self.label(group, op.as_ref()), opt(epoch));
             }
-            "repropose" => println!("REPROPOSE {} attempt={} epoch={}", self.label(&g, &e["op"]), e["attempt"], e["epoch"]),
-            "no_longer_needed" => {
-                println!("OK {} no longer needed after the winning commit", self.label(&g, &e["op"]));
-                self.labels.remove(&g);
+            Ui::Repropose { group, op, attempt, epoch } => println!("REPROPOSE {} attempt={attempt} epoch={}", self.label(group, Some(op)), opt(epoch)),
+            Ui::NoLongerNeeded { group, op } => {
+                println!("OK {} no longer needed after the winning commit", self.label(group, Some(op)));
+                self.labels.remove(group);
             }
-            "epoch" => {
-                println!("EPOCH {} kind={} by={} added={} removed={}", e["epoch"], self.name(&g).1, s(&e["by"]), list(&e["added"]), list(&e["removed"]));
+            Ui::Epoch { group, epoch, by, added, removed } => {
+                println!("EPOCH {epoch} kind={} by={by} added={added:?} removed={removed:?}", self.name(group).1);
             }
-            "hub_moved" => println!("HUB-MOVED {} to {} at seq={}", self.name(&g).0, s(&e["hub"]), e["seq"]),
-            "removed" => {
-                println!("REMOVED from {} kind={} by={}", s(&e["conversation"]), s(&e["kind"]), s(&e["by"]));
-                self.active_after(&g);
+            Ui::HubMoved { group, seq, hub, .. } => println!("HUB-MOVED {} to {hub} at seq={seq}", self.name(group).0),
+            Ui::Removed { group, by, conversation, kind, .. } => {
+                println!("REMOVED from {} kind={} by={by}", conversation.as_deref().unwrap_or(""), kind.as_deref().unwrap_or(""));
+                self.active_after(group);
             }
-            "message" => self.message_in(e),
-            "duplicate_content" => println!("DUP-HISTORY seq={}", e["seq"]),
-            "duplicate" => println!("DUP {} {}", s(&e["class"]), s(&e["cursor"])),
-            "self" => println!("SELF {} seq={}", s(&e["class"]), e["seq"]),
-            "prejoin" => println!("PREJOIN {} seq={}", s(&e["class"]), e["seq"]),
-            "hold" => println!("HOLD {} seq={} (waiting for the gap to fill)", s(&e["class"]), e["seq"]),
-            "released" => println!("RELEASED {} seq={}", s(&e["class"]), e["seq"]),
-            "unprocessable" => println!("?? unprocessable {} {}: {}", s(&e["class"]), s(&e["cursor"]), s(&e["why"])),
-            "dropped" => println!("DROP {}", s(&e["why"])),
-            "unauthenticated" => println!("UNAUTHENTICATED {}", s(&e["what"])),
+            Ui::Message { group, from, seq, from_device, object, blobs, .. } => self.message_in(group, from, *seq, from_device, object, blobs),
+            Ui::DuplicateContent { seq } => println!("DUP-HISTORY seq={seq}"),
+            Ui::Duplicate { class, cursor } => println!("DUP {class} {}", cursor.as_deref().unwrap_or("")),
+            Ui::Own { class, seq } => println!("SELF {class} seq={}", opt(seq)),
+            Ui::Prejoin { class, seq } => println!("PREJOIN {class} seq={}", opt(seq)),
+            Ui::Hold { class, seq } => println!("HOLD {class} seq={} (waiting for the gap to fill)", opt(seq)),
+            Ui::Released { class, seq } => println!("RELEASED {} seq={seq}", s(class)),
+            Ui::Unprocessable { class, cursor, why } => println!("?? unprocessable {class} {}: {why}", cursor.as_deref().unwrap_or("")),
+            Ui::Dropped { why } => println!("DROP {why}"),
+            Ui::Unauthenticated { what } => println!("UNAUTHENTICATED {what}"),
             // C§5: a recorder is receive-only — its content is treated as from an unauthenticated leaf
-            "recorder_content" => println!("DROP recorder content from {} (C§5: a recorder is receive-only)", s(&e["device"])),
-            "sibling_welcome" => println!("SIBLING welcome {}", s(&e["cursor"])),
-            "gap_timeout" => println!("GAP-TIMEOUT group={g} held={}: re-joining by external commit", e["held"]),
-            "resync" => println!("RESYNC from null"),
-            "archive_key" if e["fresh"] == json!(true) => println!("ARCHIVE-KEY {} from {}", s(&e["akid"]), s(&e["from"])),
-            "archive_key_created" => println!("OK archive-key {}", s(&e["akid"])),
-            "archive" => println!("ARCHIVED seq={} akid={}", e["seq"], s(&e["akid"])),
-            "archive_held" => println!("HELD archive {} akid={}", s(&e["cursor"]), s(&e["akid"])),
-            "history" => {
-                let what = if e["kind"] == "text" { s(&e["text"]).to_string() } else { format!("[{}]", s(&e["kind"])) };
-                println!("HISTORY seq={} {}: {what}", e["seq"], s(&e["from"]));
+            Ui::RecorderContent { device, .. } => println!("DROP recorder content from {device} (C§5: a recorder is receive-only)"),
+            Ui::SiblingWelcome { cursor } => println!("SIBLING welcome {}", cursor.as_deref().unwrap_or("")),
+            Ui::GapTimeout { group, held } => println!("GAP-TIMEOUT group={group} held={held}: re-joining by external commit"),
+            Ui::Resync => println!("RESYNC from null"),
+            Ui::ArchiveKey { akid, from, fresh: true } => println!("ARCHIVE-KEY {akid} from {from}"),
+            Ui::ArchiveKeyCreated { akid, .. } => println!("OK archive-key {akid}"),
+            Ui::Archive { seq, akid, .. } => println!("ARCHIVED seq={seq} akid={akid}"),
+            Ui::ArchiveHeld { cursor, akid } => println!("HELD archive {cursor} akid={akid}"),
+            Ui::History { seq, from, kind, text, .. } => {
+                let what = if kind == "text" { s(text).to_string() } else { format!("[{}]", s(kind)) };
+                println!("HISTORY seq={seq} {from}: {what}");
             }
-            "history_receipt" => {
-                let what = if e["kind"] == "read" { &e["through"] } else { &e["targets"] };
-                println!("HISTORY-RECEIPT seq={} {} {} {what}", e["seq"], s(&e["from"]), s(&e["kind"]));
+            Ui::HistoryReceipt { seq, from, kind, targets, through, .. } => {
+                let what = if kind == "read" { through } else { targets };
+                println!("HISTORY-RECEIPT seq={seq} {from} {} {what}", s(kind));
             }
-            "call_event" if e["from_archive"] == json!(true) => {
-                println!("HISTORY-CALL {} {} session={}", s(&e["outcome"]), s(&e["peer"]), s(&e["session"]));
+            Ui::CallEvent { session, peer, outcome, from_archive: Some(true), .. } => {
+                println!("HISTORY-CALL {} {} session={}", s(outcome), s(peer), s(session));
             }
-            "call_event" if e["collapsed"] == json!(true) => println!("DUP-CALL session={} from {}", s(&e["session"]), s(&e["from_device"])),
-            "call_event" => println!("CALL {} {} {} session={}", s(&e["outcome"]), s(&e["direction"]), s(&e["peer"]), s(&e["session"])),
-            "call_record" => println!("CALL-RECORD from {} session={} outcome={}", s(&e["from"]), s(&e["session"]), s(&e["outcome"])),
-            "receipt" => {
-                let what = if e["kind"] == "read" { &e["through"] } else { &e["targets"] };
-                let personal = self.m.personal().is_some_and(|p| p == g);
-                println!("RECEIPT {} {} {what}{}", s(&e["from"]), s(&e["kind"]), if personal { " (personal group)" } else { "" });
+            Ui::CallEvent { session, from_device, collapsed: Some(true), .. } => {
+                println!("DUP-CALL session={} from {}", s(session), from_device.as_deref().unwrap_or(""))
             }
-            "receipt_sent" => {
-                let what = if e["kind"] == "read" { &e["through"] } else { &e["targets"] };
-                let via = if e["via"] == "conversation" { "" } else { " (personal group)" };
-                println!("SENT-RECEIPT {} {what}{via}", s(&e["kind"]));
+            Ui::CallEvent { session, peer, outcome, direction, .. } => println!("CALL {} {} {} session={}", s(outcome), s(direction), s(peer), s(session)),
+            Ui::CallRecord { from, session, outcome, .. } => println!("CALL-RECORD from {from} session={} outcome={}", s(session), s(outcome)),
+            Ui::Receipt { group, from, kind, targets, through } => {
+                let what = if kind == "read" { through } else { targets };
+                let personal = self.m.personal().is_some_and(|p| p == *group);
+                println!("RECEIPT {from} {} {what}{}", s(kind), if personal { " (personal group)" } else { "" });
             }
-            "read_private_kept" => println!("READ-PRIVATE (no personal group: kept on this device)"),
-            "receipt_withheld" => println!("RECEIPT-WITHHELD {} group={g} (C§5: a recorder is not accepted yet)", s(&e["kind"])),
-            "activity" => println!("ACTIVITY {} {} {}", s(&e["from"]), s(&e["activity"]), s(&e["state"])),
-            "activity_cleared" => println!("ACTIVITY-CLEARED {} {}", s(&e["from"]), s(&e["activity"])),
-            "activity_sent" => println!("SENT-ACTIVITY {} {}", s(&e["activity"]), s(&e["state"])),
-            "request" => println!("REQUEST {} from {}: \"{}\" sealed={} purpose_on_wire={}", s(&e["id"]), s(&e["from"]), s(&e["purpose"]),
-                                  e["sealed"], e["purpose_on_wire"]),
-            "granted" => println!("GRANTED by {} scope={} request={}", s(&e["by"]), e["scope"], s(&e["request"])),
-            "recording" => self.recording(e),
-            "recording_accepted" => {
-                let target = self.names.iter().find(|(_, (c, _))| *c == s(&e["conversation"])).map(|(g, _)| g.clone()).unwrap_or_default();
-                println!("RECORDING-ACCEPTED group={target} recorders={} by sibling {}   C§5", list(&e["recorders"]), s(&e["from_device"]));
+            Ui::ReceiptSent { kind, targets, through, via, .. } => {
+                let what = if kind == "read" { through } else { targets };
+                let via = if via == "conversation" { "" } else { " (personal group)" };
+                println!("SENT-RECEIPT {kind} {}{via}", what.as_ref().unwrap_or(&Value::Null));
             }
-            "sent" => self.sent(e).await,
-            "hub_down" => println!("HUB-DOWN group={g} hub_timeout={}", e["hub_timeout"]),
-            "hub_back" => println!("HUB-BACK group={g}"),
-            "hub_retry" => println!("PENDING {} retry_in={}", s(&e["item"]), e["in"]),
-            "hub_arriving" => println!("ARRIVING {g}: the hub does not host the group yet; again in {}s", e["in"]),
-            "hub_arrival_expired" => println!("ARRIVAL-EXPIRED {g}: the new hub never hosted the group"),
-            "moved_check" => {
-                let hub = self.conv(&g).map(|c| s(&c["hub"]["did"]).to_string()).unwrap_or_default();
+            Ui::ReadPrivateKept { .. } => println!("READ-PRIVATE (no personal group: kept on this device)"),
+            Ui::ReceiptWithheld { group, kind } => println!("RECEIPT-WITHHELD {kind} group={group} (C§5: a recorder is not accepted yet)"),
+            Ui::Activity { from, activity, state, .. } => println!("ACTIVITY {} {} {}", s(from), s(activity), s(state)),
+            Ui::ActivityCleared { from, activity, .. } => println!("ACTIVITY-CLEARED {from} {activity}"),
+            Ui::ActivitySent { activity, state, .. } => println!("SENT-ACTIVITY {activity} {state}"),
+            Ui::Request { id, from, purpose, sealed, purpose_on_wire } => {
+                println!("REQUEST {id} from {from}: \"{purpose}\" sealed={sealed} purpose_on_wire={purpose_on_wire}")
+            }
+            Ui::Granted { by, scope, request } => println!("GRANTED by {by} scope={scope} request={request}"),
+            Ui::Recording { group, new, ended, .. } => self.recording(group, new, *ended),
+            Ui::RecordingAccepted { conversation, recorders, from_device } => {
+                let target = self.names.iter().find(|(_, (c, _))| c == conversation).map(|(g, _)| g.clone()).unwrap_or_default();
+                println!("RECORDING-ACCEPTED group={target} recorders={recorders:?} by sibling {from_device}   C§5");
+            }
+            Ui::Sent { group, item, seq, after_outage, .. } => self.sent(group, item, seq, *after_outage).await,
+            Ui::HubDown { group, hub_timeout } => println!("HUB-DOWN group={group} hub_timeout={hub_timeout}"),
+            Ui::HubBack { group } => println!("HUB-BACK group={group}"),
+            Ui::HubRetry { in_s, item, .. } => println!("PENDING {} retry_in={in_s}", item.as_deref().unwrap_or("")),
+            Ui::HubArriving { group, in_s } => println!("ARRIVING {group}: the hub does not host the group yet; again in {in_s}s"),
+            Ui::HubArrivalExpired { group } => println!("ARRIVAL-EXPIRED {group}: the new hub never hosted the group"),
+            Ui::MovedCheck { group, .. } => {
+                let hub = self.conv(group).map(|c| c.hub.did).unwrap_or_default();
                 println!("RETRY send: mailbox.unknown-group from {hub}; syncing");
             }
-            "handed_over" => {
-                for x in e["sent"].as_array().into_iter().flatten() {
-                    if let (Some(item), Some(old)) = (x["item"].as_str(), self.resent.remove(s(&x["id"]))) {
-                        self.items.insert(item.to_string(), Item::Resent(old));
+            Ui::HandedOver { sent, .. } => {
+                for x in sent {
+                    let old = self.resent.remove(s(&x.id));
+                    if let (Some(item), Some(old)) = (&x.item, old) {
+                        self.items.insert(item.clone(), Item::Resent(old));
                     }
                 }
             }
-            "successor" => {
-                println!("SUCCESSOR joined group={g} of={}", s(&e["of"]));
-                self.active = Some(g);
+            Ui::Successor { group, of, .. } => {
+                println!("SUCCESSOR joined group={group} of={of}");
+                self.active = Some(group.clone());
             }
-            "successor_declined" | "successor_left" => {
-                let why = if s(&e["why"]).contains("first contact") {
-                    "not a valid successor: first contact required".to_string()
-                } else {
-                    format!("successor of {} converged elsewhere", s(&e["of"]))
-                };
-                println!("LEFT group={g} conversation={} ({why})", self.name(&g).0);
-                self.active_after(&g);
-                if let Some(w) = self.m.successor(s(&e["of"])) {
-                    self.active = Some(w);
-                }
-            }
-            "key_packages_uploaded" => println!("OK uploaded {} key packages", e["count"].as_i64().unwrap_or(1) - 1),
-            "leave_proposed" => println!("LEAVE proposed group={g} seq={}", e["seq"]),
-            "leave_proposal_refused" => println!("LEAVE proposal refused group={g}: {}", s(&e["reason"])),
-            "leave_committing" => println!("LEAVE committing the leave of {} group={g}", s(&e["identity"])),
-            "left" => println!("LEFT group={g} conversation={} (a sibling device left for this identity)", self.name(&g).0),
-            "leave_proposals" => println!("LEAVE proposals from {} group={g}: {}", s(&e["identity"]), e["decision"]),
-            "activity_not_sent" => println!("OK {} {} (not sent: refresh bound or not disclosed)", s(&e["activity"]), s(&e["state"])),
+            Ui::SuccessorDeclined { group, of, why } => self.successor_gone(group, of, why),
+            Ui::SuccessorLeft { group, of } => self.successor_gone(group, of, ""),
+            Ui::KeyPackagesUploaded { count } => println!("OK uploaded {} key packages", *count as i64 - 1),
+            Ui::LeaveProposed { group, seq } => println!("LEAVE proposed group={group} seq={}", opt(seq)),
+            Ui::LeaveProposalRefused { group, reason } => println!("LEAVE proposal refused group={group}: {reason}"),
+            Ui::LeaveCommitting { group, identity } => println!("LEAVE committing the leave of {identity} group={group}"),
+            Ui::Left { group, .. } => println!("LEFT group={group} conversation={} (a sibling device left for this identity)", self.name(group).0),
+            Ui::LeaveProposals { group, identity, decision } => println!("LEAVE proposals from {identity} group={group}: {decision}"),
+            Ui::ActivityNotSent { activity, state, .. } => println!("OK {activity} {state} (not sent: refresh bound or not disclosed)"),
             // rendered by the lines above, or nothing to say
-            "roster" | "personal" | "archive_key" | "archived" | "history_applied" => {}
-            other => println!("?? event {other} {e}"),
+            Ui::Roster { .. } | Ui::Personal { .. } | Ui::ArchiveKey { .. } | Ui::Archived { .. } | Ui::HistoryApplied { .. } => {}
+        }
+    }
+
+    /// A successor this device was in is left: not valid (first contact required), or another converged (M§7.5).
+    fn successor_gone(&mut self, group: &str, of: &str, why: &str) {
+        let why = if why.contains("first contact") {
+            "not a valid successor: first contact required".to_string()
+        } else {
+            format!("successor of {of} converged elsewhere")
+        };
+        println!("LEFT group={group} conversation={} ({why})", self.name(group).0);
+        self.active_after(group);
+        if let Some(w) = self.m.successor(of) {
+            self.active = Some(w);
         }
     }
 
     /// A content message (M§8.1): a device event to the alarm list, a blob fetched, or text shown.
-    fn message_in(&mut self, e: &Value) {
-        let (gid, sender, object) = (s(&e["group"]).to_string(), s(&e["from"]).to_string(), e["object"].clone());
+    fn message_in(&mut self, gid: &str, sender: &str, seq: i64, sender_device: &str, object: &Value, blobs: &Value) {
         if self.recorder_mode {
             // C§5: the compliance archive
-            let line = json!({"group": gid, "seq": e["seq"], "sender": sender, "sender_device": e["from_device"], "object": object});
+            let line = json!({"group": gid, "seq": seq, "sender": sender, "sender_device": sender_device, "object": object});
             let written = std::fs::OpenOptions::new().create(true).append(true).open(self.state.join("recorder-archive.jsonl"))
                 .and_then(|mut f| writeln!(f, "{line}"));
             match written {
-                Ok(()) => println!("ARCHIVED {sender}: {}", display(&object)),
+                Ok(()) => println!("ARCHIVED {sender}: {}", display(object)),
                 Err(err) => println!("ERR recorder archive: {err}"),
             }
         }
-        if self.event_in(&gid, &sender, &object) {
+        if self.event_in(gid, sender, object) {
             // device events and alarm acknowledgements went to the alarm list (E§5)
         } else if object.get("blob").is_some() {
             // the item is committed; a fetch that finds nothing is tried again (spec-gap 106)
-            self.jobs.push(Job::Media { sender, object, blobs: e["blobs"].clone(), attempt: 1 });
+            self.jobs.push(Job::Media { sender: sender.to_string(), object: object.clone(), blobs: blobs.clone(), attempt: 1 });
         } else {
             println!("RECV {sender}: {}", s(&object["text"]));
         }
     }
 
     /// Recording Profile C§5: a conversation becoming recorded, or no longer recorded.
-    fn recording(&self, e: &Value) {
-        let g = s(&e["group"]);
-        for r in e["new"].as_array().into_iter().flatten() {
-            let own = r["own"] == json!(true);
-            println!("RECORDED group={g} by recorder device {} of {}{}   C§5", s(&r["device"]), s(&r["subject"]),
-                     if own { " (this identity's own recording)" } else { " — type accept-recording, or decline-recording to leave" });
+    fn recording(&self, g: &str, new: &[NewRecorder], ended: bool) {
+        for r in new {
+            println!("RECORDED group={g} by recorder device {} of {}{}   C§5", s(&r.device), s(&r.subject),
+                     if r.own { " (this identity's own recording)" } else { " — type accept-recording, or decline-recording to leave" });
         }
-        if e["ended"] == json!(true) {
+        if ended {
             println!("RECORDING ENDED group={g}   C§5");
         }
     }
 
     /// The hub accepted an outbox item of ours (M§9.2).
-    async fn sent(&mut self, e: &Value) {
-        let (item, seq) = (s(&e["item"]).to_string(), &e["seq"]);
-        let kind = self.items.remove(&item);
-        if e["after_outage"] == json!(true) && !matches!(kind, Some(Item::Resent(_))) {
+    async fn sent(&mut self, group: &str, item: &str, seq: &Option<i64>, after_outage: bool) {
+        let seq = opt(seq);
+        let kind = self.items.remove(item);
+        if after_outage && !matches!(kind, Some(Item::Resent(_))) {
             println!("SENT-AFTER-OUTAGE {item} seq={seq}");
         } else {
             match kind {
@@ -1050,41 +1054,39 @@ impl Client {
                 Some(Item::CallEvent { outcome, session, fresh }) => {
                     println!("SENT-CALL-EVENT {outcome} session={session}{}", if fresh { "" } else { " (already recorded)" })
                 }
-                Some(Item::Resent(old)) => println!("RESENT {old} in={} seq={seq}", s(&e["group"])),
+                Some(Item::Resent(old)) => println!("RESENT {old} in={group} seq={seq}"),
                 None => {}
             }
         }
-        self.inform_outcome(&item, true).await;
+        self.inform_outcome(item, true).await;
     }
 
-    /// The hub refused something of ours (M§16).
-    async fn refused(&mut self, e: &Value) {
-        let item = e["item"].as_str().map(String::from);
-        if e["pending"] == json!(true) {
+    /// The hub refused something of ours (M§16): `pending` when it stays in the outbox behind an outage (M§9.4).
+    async fn refused(&mut self, refused: &str, item: Option<&str>, pending: bool) {
+        if pending {
             // M§9.4: kept in the outbox; the outage's retries are announced as PENDING
             if let Some(i) = item {
-                self.inform_pending(&i);
+                self.inform_pending(i);
             }
             return;
         }
-        println!("ERR {}", s(&e["refused"]));
+        println!("ERR {refused}");
         if let Some(i) = item {
-            self.items.remove(&i);
-            self.inform_outcome(&i, false).await;
+            self.items.remove(i);
+            self.inform_outcome(i, false).await;
         }
     }
 
     /// M§9.4: the hub of `group` has been unreachable past this device's threshold: its pending items wait for the
     /// successor, which this device creates (M§7.5).
-    fn successor_due(&mut self, d: &Value) {
-        let dead = s(&d["group"]).to_string();
-        let pending = d["pending"].as_array().cloned().unwrap_or_default();
-        for p in &pending {
-            self.resent.insert(s(&p["id"]).to_string(), s(&p["item"]).to_string());
-            self.items.remove(s(&p["item"]));
+    fn successor_due(&mut self, d: &SuccessorDue) {
+        for p in &d.pending {
+            let item = p.item.clone().unwrap_or_default();
+            self.items.remove(&item);
+            self.resent.insert(s(&p.id).to_string(), item);
         }
-        println!("OUTAGE-SUCCESSOR group={dead} pending={}", pending.len());
-        self.jobs.push(Job::Successor(dead));
+        println!("OUTAGE-SUCCESSOR group={} pending={}", d.group, d.pending.len());
+        self.jobs.push(Job::Successor(d.group.clone()));
     }
 
     /// The network work events asked for, in order.
@@ -1120,8 +1122,7 @@ impl Client {
             return self.send_frames(&frames).await;
         }
         let me = self.identity.clone();
-        let members: Vec<String> = self.conversations().into_iter().find(|c| c["group"] == json!(dead))
-            .map(|c| c["members"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect()).unwrap_or_default();
+        let members: Vec<String> = self.conversations().into_iter().find(|c| c.group == dead).map(|c| c.members).unwrap_or_default();
         let mut answers = BTreeMap::new();
         for peer in members.into_iter().filter(|p| *p != me) {
             // M§7.5 (spec-gap 61): the peer's mailbox serves a successor's creator without a grant
@@ -1168,7 +1169,7 @@ impl Client {
         if self.m.is_recorder() && !self.recorder_misbehave {
             bail!("a recorder device is receive-only (C§5)");
         }
-        if self.conv(gid)?["may_send"] == json!(false) {
+        if self.conv(gid)?.may_send == json!(false) {
             bail!("recorded conversation: type accept-recording first (C§5)");
         }
         Ok(())
@@ -1177,7 +1178,7 @@ impl Client {
     /// A content object of this identity for `gid`'s conversation (M§8.1), with `fields`.
     fn content(&mut self, gid: &str, fields: Value) -> Result<Value> {
         let now = self.now();
-        let mut obj = json!({"object": "content", "id": self.m.new_id(now), "conversation": self.conv(gid)?["conversation"],
+        let mut obj = json!({"object": "content", "id": self.m.new_id(now), "conversation": self.conv(gid)?.conversation,
             "sender": self.identity, "sent_at": now as i64, "purpose": "message"});
         for (k, v) in fields.as_object().into_iter().flatten() {
             obj[k.as_str()] = v.clone();
@@ -1283,7 +1284,7 @@ impl Client {
         let gid = frames.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
             .and_then(|p| p["groups"][0]["group"].as_str().map(String::from)).context("no group created")?;
         self.active = Some(gid.clone());
-        println!("OK conversation {} kind={kind}", s(&self.conv(&gid)?["conversation"]));
+        println!("OK conversation {} kind={kind}", self.conv(&gid)?.conversation);
         self.save()?;
         self.send_frames(&frames).await
     }
@@ -1306,7 +1307,7 @@ impl Client {
     async fn create_personal(&mut self) -> Result<()> {
         let frames = self.m.create_personal(self.now()).map_err(messenger_err)?;
         let personal = self.m.personal().context("no personal group")?;
-        println!("OK conversation {} kind=personal", s(&self.conv(&personal)?["conversation"]));
+        println!("OK conversation {} kind=personal", self.conv(&personal)?.conversation);
         self.save()?;
         self.send_frames(&frames).await
     }
@@ -1335,7 +1336,7 @@ impl Client {
                 Some(a) => a,
                 None => self.fetch_key_packages(&me, None).await?,
             };
-            let label = format!("added device {device} to {}", s(&self.conv(&gid)?["kind"]));
+            let label = format!("added device {device} to {}", self.conv(&gid)?.kind);
             self.label_for(&gid, label);
             let frame = self.m.add_device(&gid, device, &answer, self.now()).map_err(messenger_err)?;
             self.send_frame(&frame).await?;
@@ -1441,7 +1442,7 @@ impl Client {
         let now = self.now();
         let key_b64 = dsip_core::b64::encode(&key);
         let uploaded = blob::Uploaded { uri: &uri, sha256: &sha, size: sealed.len() as u64, key: &key_b64, content_type: "audio/ogg; codecs=opus" };
-        let conversation = s(&self.conv(&group)?["conversation"]).to_string();
+        let conversation = self.conv(&group)?.conversation;
         let id = self.m.new_id(now);
         let obj = blob::audio_content(&id, &conversation, &self.identity, now as i64, purpose, duration_ms, &uploaded, session.as_deref());
         // M§8.4 rule 4: the deposit's manifest names the blob without its key (the Messenger writes it)
@@ -1454,8 +1455,7 @@ impl Client {
         let group = self.active()?;
         let me = self.identity.clone();
         let c = self.conv(&group)?;
-        let peer = c["peer"].as_str().map(String::from)
-            .or_else(|| c["members"].as_array().into_iter().flatten().filter_map(Value::as_str).find(|m| *m != me).map(String::from))
+        let peer = c.peer.or_else(|| c.members.into_iter().find(|m| *m != me))
             .context("no callee in the conversation")?;
         let r = resolver(&self.resolver_files);
         let doc = dsip_core::did::Resolver::resolve(&r, &peer).with_context(|| format!("no document for {peer}"))?;
@@ -1693,8 +1693,8 @@ impl Client {
             "timeline" => {
                 // M§13.3 (spec-gap 63): one peer's direct conversation with this identity's call events for that peer
                 let peer = rest.trim();
-                let gid = self.conversations().into_iter().find(|c| c["kind"] == "direct" && c["peer"] == json!(peer))
-                    .map(|c| s(&c["group"]).to_string()).with_context(|| format!("no direct conversation with {peer}"))?;
+                let gid = self.conversations().into_iter().find(|c| c.kind == "direct" && c.peer.as_deref() == Some(peer))
+                    .map(|c| c.group).with_context(|| format!("no direct conversation with {peer}"))?;
                 let entries = self.m.timeline(&gid);
                 println!("PEER-TIMELINE {peer} {}", entries.len());
                 for e in entries {
@@ -1734,7 +1734,7 @@ impl Client {
                 // C§5: per conversation, every recorder device present now
                 let gid = self.active()?;
                 let c = self.conv(&gid)?;
-                if c["recorders"].as_array().is_none_or(Vec::is_empty) {
+                if c.recorders.as_array().is_none_or(Vec::is_empty) {
                     println!("OK not recorded");
                     return Ok(());
                 }
@@ -1966,14 +1966,14 @@ async fn main() -> Result<()> {
     // Restart: everything below comes from the database, exactly as last committed.
     let since = client.m.state()["resume"]["cursor"].clone();
     for c in client.conversations() {
-        println!("RESTORED {} kind={} since={since}", s(&c["conversation"]), s(&c["kind"]));
-        if c["pending"].as_u64().unwrap_or(0) > 0 {
+        println!("RESTORED {} kind={} since={since}", c.conversation, c.kind);
+        if c.pending > 0 {
             // M§9.4 (spec-gap 72): pending items and the outage they wait out survive a restart
-            println!("PENDING restored {} item(s) for {}", c["pending"], s(&c["group"]));
+            println!("PENDING restored {} item(s) for {}", c.pending, c.group);
         }
     }
     if client.active.as_ref().is_none_or(|a| client.conv(a).is_err()) {
-        client.active = client.conversations().into_iter().rev().find(|c| c["kind"] != "personal").map(|c| s(&c["group"]).to_string());
+        client.active = client.conversations().into_iter().rev().find(|c| c.kind != "personal").map(|c| c.group);
     }
     client.refresh_names();
     client.connect().await?;

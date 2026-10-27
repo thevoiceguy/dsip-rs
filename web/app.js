@@ -1045,13 +1045,13 @@ async function callRecording(accept) {
  *  archive key comes with it: history waits for a sibling to re-send one (M§12.3). */
 async function joinAvailable() {
   if (!messenger || !mailboxInfo) return [];
-  const groups = JSON.parse(messenger.available());
+  const groups = messenger.available();
   if (!groups.length) { log('external join: the mailbox holds no GroupInfo for a group this device is not in', 'M§6.8'); return []; }
   const joined = [];
   for (const g of groups) {
     try {
       const p = awaitEmission((e) => (e.ui === 'joined' && e.group === g.group) || (e.refused && e.refused.includes(g.group)), 30000);
-      await driveMailbox(JSON.parse(messenger.external_join(g.group, now())).map((f) => ({ send: f })));
+      await driveMailbox(messenger.external_join(g.group, now()).map((f) => ({ send: f })));
       log(`external commit for the ${g.kind} group ${short(g.group)} sent to its hub ${short(g.hub?.did)}`, 'M§6.8');
       const r = await p;
       if (r.ui === 'joined') joined.push(g.group);
@@ -1114,7 +1114,7 @@ async function recordLeg(leg) {
     answered: leg.answered, answered_at: leg.answered_at, ended_by: end ? (end.dir === 'out' ? 'local' : 'remote') : 'local',
     reason: end ? end.reason : leg.uiReason, media: leg.answered ? leg.media : undefined, evidence };
   try {
-    const out = JSON.parse(messenger.call_record(keeper, JSON.stringify(input), now()));
+    const out = messenger.call_record(keeper, input, now());
     if (out.frames.length) await driveMailbox(out.frames.map((f) => ({ send: f })));
     else await store.set(key('messenger'), JSON.parse(messenger.save()));
     log(`call record for ${short(leg.session)}: ${out.record.outcome}, ended ${out.record.ended_by}${out.record.reason ? ` (${out.record.reason})` : ''}, ${evidence.length} frame hashes; ${out.frames.length ? 'sent to the record-keeper' : `held (${messenger.held_records()}): no conversation with the record-keeper yet`}`, 'C§9');
@@ -1125,7 +1125,7 @@ async function recordLeg(leg) {
 async function flushRecords() {
   if (!messenger || !settings.record_keeper || !messenger.held_records()) return;
   try {
-    const frames = JSON.parse(messenger.flush_records(settings.record_keeper, now()));
+    const frames = messenger.flush_records(settings.record_keeper, now());
     if (frames.length) { await driveMailbox(frames.map((f) => ({ send: f }))); log(`${frames.length} held call record${frames.length === 1 ? '' : 's'} sent to the record-keeper`, 'C§9'); }
   } catch (e) { log(`✗ held call records: ${e.message || e}`, 'C§9'); }
 }
@@ -1135,7 +1135,7 @@ async function flushRecords() {
 async function leaveConversation(gid) {
   if (!messenger) return;
   try {
-    const out = JSON.parse(messenger.leave(gid, now()));
+    const out = messenger.leave(gid, now());
     await driveMailbox(out);
     if (activeConv === gid) activeConv = null;
     log(`left ${short(gid)}: the removal of this identity's ${out.filter((e) => e.send).length} leaf(s) proposed; another member commits it`, 'M§7.3');
@@ -1149,7 +1149,7 @@ async function leaveConversation(gid) {
 async function acceptRecording(gid) {
   if (!messenger) return;
   try {
-    const out = JSON.parse(messenger.accept_recording(gid, now()));
+    const out = messenger.accept_recording(gid, now());
     await driveMailbox(out.frames.map((f) => ({ send: f })));
     log(`recording accepted: ${out.accepted.map(short).join(', ')}${out.frames.length ? '; your other devices are told through the personal group' : ''}`, 'C§5');
   } catch (e) { notify(`${e.message || e}`); }
@@ -1175,7 +1175,7 @@ function renderRecords() {
   const keeper = !!messenger?.is_recorder();
   $('records-pane').classList.toggle('hidden', !keeper);
   if (!keeper) return;
-  const recs = JSON.parse(messenger.records());
+  const recs = messenger.records();
   const key = JSON.stringify(recs.map((r) => [r.device, r.record.session]));
   if ($('record-list').dataset.shown === key) return;
   $('record-list').dataset.shown = key;
@@ -1194,7 +1194,7 @@ function renderRecords() {
 async function callEnded(leg, endedBy, reason) {
   if (!messenger || !leg) return;
   try {
-    const frames = JSON.parse(messenger.call_ended(JSON.stringify({ session: leg.sid, peer: leg.peer, alerted: !!leg.alerted, answered_here: !!leg.answered, ended_by: endedBy, reason: reason || '' }), now()));
+    const frames = messenger.call_ended({ session: leg.sid, peer: leg.peer, alerted: !!leg.alerted, answered_here: !!leg.answered, ended_by: endedBy, reason: reason || '' }, now());
     if (frames.length) { await driveMailbox(frames.map((f) => ({ send: f }))); log(`call event for ${short(leg.sid)} to the personal group: ${reason === 'user.declined' && endedBy === 'local' ? 'declined' : 'missed'}`, 'M§13.3'); }
     else log(`no call event for ${short(leg.sid)} (${reason || 'ended'})`, 'M§13.3');
   } catch (e) { log(`call event not sent: ${e.message || e}`, 'M§13.3'); }
@@ -1224,12 +1224,12 @@ async function leaveVoicemail() {
   const vm = pendingVoicemail;
   if (!vm) return;
   if (recorder) { await toggleVoice(); return; }
-  let conv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === vm.peer);
+  let conv = messenger.conversations(now()).find((c) => c.kind === 'direct' && c.peer === vm.peer);
   if (!conv) {
     await messagePeer(vm.peer);
-    try { await until(() => JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === vm.peer && c.members.length === 2), 30000); }
+    try { await until(() => messenger.conversations(now()).find((c) => c.kind === 'direct' && c.peer === vm.peer && c.members.length === 2), 30000); }
     catch { return notify('voicemail: no conversation with them could be opened'); }
-    conv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === vm.peer);
+    conv = messenger.conversations(now()).find((c) => c.kind === 'direct' && c.peer === vm.peer);
     show('call');
   }
   await toggleVoice({ gid: conv.group, purpose: 'voicemail', session: vm.session, max_s: vm.max_s });
@@ -1672,7 +1672,7 @@ async function startEngine() {
     mediaRequest: onMediaRequest,
     resolve: (did) => { resolveDid(did); },   // not awaited: the held frame waits, nothing else does
     rejected: (code, detail) => log(`✗ inbound rejected: ${code} ${detail || ''}`, '§10.2'),
-    changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); messenger?.set_grants(JSON.stringify(heldGrantFrames())); legsChanged(); },
+    changed: () => { persist(); renderContacts(); renderCall(); renderLinks(); messenger?.set_grants(heldGrantFrames()); legsChanged(); },
   };
   engine.startTimers();
   connect();
@@ -1720,10 +1720,10 @@ async function startMessagingNow() {
     if (settings.gap_timeout_s) m.set_gap_timeout(settings.gap_timeout_s);   // M§6.5: RECOMMENDED 300 s
     messenger = m;
   } catch (e) { log(`messaging not started: ${e.message || e}`, 'M§4'); renderMessages(); return; }
-  messenger.set_grants(JSON.stringify(heldGrantFrames()));
+  messenger.set_grants(heldGrantFrames());
   clearInterval(messagingTick);
   messagingTick = setInterval(() => { if (messenger === m && mailboxInfo) driveMailbox(m.tick(now())).catch(() => {}); }, 5000);
-  for (const d of Object.values(documents)) messenger.add_document(JSON.stringify(d));
+  for (const d of Object.values(documents)) messenger.add_document(d);
   // Every callback belongs to this connection: a restart replaces `mailboxConn`, and the old socket's late close or
   // frame must not touch the state of the new one.
   const m = messenger;
@@ -1768,10 +1768,9 @@ async function startMessagingNow() {
   log(`messaging: mailbox ${mb.uri} (${short(mb.did)})`, 'M§4.2');
 }
 
-/** Act on what the Messenger returned (a JSON array of emissions, or of frames): send frames to the mailbox, log
- *  and render events, then save its state (MLS and delivery state together, spec-gap 44). */
-async function driveMailbox(result) {
-  const list = typeof result === 'string' ? JSON.parse(result) : result;
+/** Act on what the Messenger returned (its emissions, or frames): send frames to the mailbox, log and render
+ *  events, then save its state (MLS and delivery state together, spec-gap 44). */
+async function driveMailbox(list) {
   const m = messenger;
   for (const e of list) {
     if (typeof e === 'string') { mailboxConn.send(e); log(`→ ${payloadOf(e).type?.padEnd(12)} to mailbox${payloadOf(e).class ? ` (${payloadOf(e).class})` : ''}`, 'M§5'); continue; }
@@ -1859,7 +1858,7 @@ function fetchFromMailbox(mb, target, successorOf) {
       refused: (x) => finish(() => reject(new Error(`their mailbox's hello rejected: ${x.code}`))),
       rejected: (code) => finish(() => reject(new Error(`their mailbox refused our hello: ${code}`))),
       frame: (text) => {
-        for (const e of JSON.parse(messenger.inbound(text, now()))) {
+        for (const e of messenger.inbound(text, now())) {
           if (e.key_packages) return finish(() => resolve(e.key_packages));
           if (e.error) return finish(() => reject(new Error(e.error)));
           if (e.rejected) return finish(() => reject(new Error(`frame rejected: ${e.rejected.code}`)));
@@ -1878,8 +1877,8 @@ function fetchFromMailbox(mb, target, successorOf) {
 async function messagePeer(did) {
   if (!messenger) return notify('messaging needs a mailbox in Settings → Network');
   show('messages');
-  messenger.set_grants(JSON.stringify(heldGrantFrames()));   // grants held since the messenger started (§19.4)
-  const existing = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === did);
+  messenger.set_grants(heldGrantFrames());   // grants held since the messenger started (§19.4)
+  const existing = messenger.conversations(now()).find((c) => c.kind === 'direct' && c.peer === did);
   if (existing) { activeConv = existing.group; renderMessages(); return; }
   if (!mailboxInfo) return notify('the mailbox is not bound yet');
   $('thread-title').textContent = `opening a conversation with ${nameOf(did) || short(did)}…`;
@@ -1897,10 +1896,10 @@ async function messagePeer(did) {
       if (got.error) throw new Error(got.error);
       own = got.key_packages;
     } catch (e) { log(`own devices: none added (${e.message})`, 'M§7.2'); }
-    const frames = messenger.create_direct(did, JSON.stringify(theirs), own ? JSON.stringify(own) : undefined, now());
+    const frames = messenger.create_direct(did, theirs, own || undefined, now());
     await driveMailbox(frames);
     log(`conversation with ${short(did)} created at our mailbox (hub); the add goes out once the hub holds the group`, 'M§7.2 · M§6.5');
-    activeConv = JSON.parse(messenger.conversations(now())).find((c) => c.kind === 'direct' && c.peer === did)?.group || activeConv;
+    activeConv = messenger.conversations(now()).find((c) => c.kind === 'direct' && c.peer === did)?.group || activeConv;
   } catch (e) { notify(`cannot message ${nameOf(did) || short(did)}: ${e.message || e}`); log(`✗ ${e.message || e}`, 'M§7.2'); }
   renderMessages();
 }
@@ -1914,7 +1913,7 @@ async function ownForNewGroup() {
  *  we hold (M§14.2), our own other devices' too, the group created at our mailbox and every add in one commit. */
 async function createGroup(dids) {
   if (!messenger || !mailboxInfo) return notify('messaging is not connected');
-  messenger.set_grants(JSON.stringify(heldGrantFrames()));
+  messenger.set_grants(heldGrantFrames());
   try {
     const targets = {};
     for (const did of dids) {
@@ -1924,9 +1923,9 @@ async function createGroup(dids) {
       log(`key packages of ${short(did)}: ${(targets[did].key_packages || []).length} one-time${targets[did].last_resort ? ' + last resort' : ''}`, 'M§5.5');
     }
     const own = await ownForNewGroup();
-    const before = new Set(JSON.parse(messenger.conversations(now())).map((c) => c.group));
-    await driveMailbox(messenger.create_group(JSON.stringify(targets), own ? JSON.stringify(own) : undefined, now()));
-    activeConv = JSON.parse(messenger.conversations(now())).find((c) => !before.has(c.group))?.group || activeConv;
+    const before = new Set(messenger.conversations(now()).map((c) => c.group));
+    await driveMailbox(messenger.create_group(targets, own || undefined, now()));
+    activeConv = messenger.conversations(now()).find((c) => !before.has(c.group))?.group || activeConv;
     log(`group with ${dids.map((d) => nameOf(d) || short(d)).join(', ')} created at our mailbox (hub); the adds go out once the hub holds it`, 'M§7.3 · M§6.5');
   } catch (e) { notify(`cannot create the group: ${e.message || e}`); log(`✗ ${e.message || e}`, 'M§7.3'); }
   show('messages');
@@ -1936,12 +1935,12 @@ async function createGroup(dids) {
 /** Add the identity `did` to the group conversation `gid` (M§7.3): its KeyPackages fetched with our grant, one commit. */
 async function addMember(gid, did) {
   if (!messenger || !mailboxInfo) return;
-  messenger.set_grants(JSON.stringify(heldGrantFrames()));
+  messenger.set_grants(heldGrantFrames());
   try {
     const mb = await peerMailbox(did);
     if (!mb) throw new Error(`no mailbox found for ${nameOf(did) || short(did)}`);
     const kps = await fetchFromMailbox(mb, did);
-    await driveMailbox([{ send: messenger.add_member(gid, did, JSON.stringify(kps), now()) }]);
+    await driveMailbox([{ send: messenger.add_member(gid, did, kps, now()) }]);
     log(`adding ${short(did)} to ${short(gid)}`, 'M§7.3');
   } catch (e) { notify(`cannot add ${nameOf(did) || short(did)}: ${e.message || e}`); }
   renderMessages();
@@ -2006,10 +2005,10 @@ async function successorDue(d) {
       kps[peer] = await fetchFromMailbox(mb, peer, d.group);
       log(`key packages of ${short(peer)} for the successor: ${(kps[peer].key_packages || []).length} one-time${kps[peer].last_resort ? ' + last resort' : ''}`, 'M§7.5');
     }
-    const frames = JSON.parse(messenger.create_successor(d.group, JSON.stringify(kps), now()));
+    const frames = messenger.create_successor(d.group, kps, now());
     await driveMailbox(frames.map((f) => ({ send: f })));
     log(`successor of ${short(d.group)} created at our mailbox; the members are added once the hub holds it`, 'M§7.5');
-    if (activeConv === d.group) activeConv = JSON.parse(messenger.conversations(now())).find((c) => c.predecessors.includes(d.group))?.group || activeConv;
+    if (activeConv === d.group) activeConv = messenger.conversations(now()).find((c) => c.predecessors.includes(d.group))?.group || activeConv;
   } catch (e) {
     messenger.successor_failed(d.group);
     log(`successor of ${short(d.group)} not created: ${e.message || e}; retried`, 'M§9.4');
@@ -2033,18 +2032,18 @@ async function reconcileDevices() {
   if (reconciling) return reconciling;
   reconciling = (async () => {
     for (const d of devices.map((d) => d.device).filter((d) => d !== identity.device)) {
-      const groups = JSON.parse(messenger.groups_for_new_device(d, now()));
+      const groups = messenger.groups_for_new_device(d, now());
       for (const gid of groups) {
         if (!messenger || !mailboxInfo) return;
         try {
           const kps = await fetchOwnKeyPackages();
           if (!(kps.key_packages || []).length && !kps.last_resort) { log(`device ${short(d)}: no KeyPackage at the mailbox yet (it uploads on its first bind, M§5.5)`, 'M§12.3'); return; }
           const done = awaitEmission((e) => (e.ui === 'committed' && e.device === d && e.group === gid) || (e.refused && /commit|add/.test(e.refused)), 30000);
-          await driveMailbox([{ send: messenger.add_device(gid, d, JSON.stringify(kps), now()) }]);
+          await driveMailbox([{ send: messenger.add_device(gid, d, kps, now()) }]);
           log(`adding device ${short(d)} to ${gid === messenger.personal() ? 'the personal group' : 'a conversation'}`, 'M§12.3 · M§6.7');
           const r = await done;
           if (r.refused) { log(`device ${short(d)}: ${r.refused}`, 'M§12.3'); return; }
-          if (r.personal) { await driveMailbox(messenger.resend_archive_keys(now())); log(`re-sent ${JSON.parse(messenger.archive_keys()).length} archive key(s) to the personal group for ${short(d)}`, 'M§12.3'); }
+          if (r.personal) { await driveMailbox(messenger.resend_archive_keys(now())); log(`re-sent ${messenger.archive_keys().length} archive key(s) to the personal group for ${short(d)}`, 'M§12.3'); }
         } catch (e) {
           log(`device ${short(d)}: ${e.message || e}`, 'M§12.3');
           if (/is a recorder device/.test(e.message || e)) continue;   // C§5: it still joins the conversations
@@ -2096,7 +2095,7 @@ async function toggleVoice(opts = {}) {
  *  send the audio content carrying the key; the deposit's manifest carries the blob without it. */
 async function sendVoice(gid, blob, durationMs, purpose = 'voice-message', session = undefined) {
   const plain = await blob.arrayBuffer();
-  const sealed = JSON.parse(messenger.seal_blob(b64u.encode(plain)));
+  const sealed = messenger.seal_blob(b64u.encode(plain));
   const uri = `${blobEndpoint().replace(/\/$/, '')}/${sealed.sha256}`;
   const auth = messenger.blob_put(sealed.sha256, sealed.size, now());
   const r = await fetch(uri, { method: 'PUT', headers: { Authorization: `DSIP ${auth}`, 'Content-Type': 'application/octet-stream' }, body: b64u.decode(sealed.sealed) });
@@ -2105,7 +2104,7 @@ async function sendVoice(gid, blob, durationMs, purpose = 'voice-message', sessi
   log(`blob ${sealed.sha256.slice(0, 12)}… (${sealed.size} B, ciphertext) uploaded to ${uri}: ${r.status}${answer.duplicate ? ' (already held)' : ''}`, 'M§5.6');
   const content_type = blob.type || 'audio/webm';
   lastVoice = { plain_size: plain.byteLength, sha256: sealed.sha256, size: sealed.size, content_type, duration_ms: durationMs };
-  const frame = messenger.send_audio(gid, JSON.stringify({ uri, sha256: sealed.sha256, size: sealed.size, key: sealed.key, content_type }), durationMs, purpose, session, now());
+  const frame = messenger.send_audio(gid, { uri, sha256: sealed.sha256, size: sealed.size, key: sealed.key, content_type }, durationMs, purpose, session, now());
   await driveMailbox([{ send: frame }]);
   log(`${purpose === 'voicemail' ? `voicemail for call ${short(session)}` : 'voice message'} sent: ${Math.round(durationMs / 1000)} s, ${content_type}, the key in the content and never on the mailbox`, 'M§8.2 · M§8.4');
 }
@@ -2117,24 +2116,24 @@ async function fetchBlob(gid, m, attempt = 1) {
   const id = m.object.id;
   if (media[id] && media[id].state !== 'retry') return;
   media[id] = { state: 'fetching', attempt };
-  const sources = JSON.parse(messenger.blob_sources(JSON.stringify(m.object), JSON.stringify(m.blobs || null)));
+  const sources = messenger.blob_sources(m.object, m.blobs || null);
   const tried = [];
   for (const uri of sources) {
     try {
       const r = await fetch(uri);
-      if (!r.ok) { tried.push(JSON.parse(messenger.blob_tried(uri, r.status, ''))); log(`blob source ${uri}: ${r.status}`, 'M§8.4'); continue; }
+      if (!r.ok) { tried.push(messenger.blob_tried(uri, r.status, '')); log(`blob source ${uri}: ${r.status}`, 'M§8.4'); continue; }
       const stored = await r.arrayBuffer();
       try {
-        const plain = messenger.open_blob(JSON.stringify(m.object), b64u.encode(stored));
+        const plain = messenger.open_blob(m.object, b64u.encode(stored));
         const url = URL.createObjectURL(new Blob([b64u.decode(plain)], { type: m.object.blob?.content_type || 'audio/webm' }));
         media[id] = { state: 'ready', url, from: uri, size: stored.byteLength };
         log(`blob for ${short(id)} fetched from ${uri}: size and SHA-256 verified, decrypted under the content's key`, 'M§8.4 rule 7');
         renderMessages();
         return;
-      } catch (why) { tried.push(JSON.parse(messenger.blob_tried(uri, 200, b64u.encode(stored)))); log(`blob source ${uri}: ${why}`, 'M§8.4 rule 7'); }
-    } catch (e) { tried.push(JSON.parse(messenger.blob_tried(uri, 0, ''))); log(`blob source ${uri}: ${e.message}`, 'M§8.4'); }
+      } catch (why) { tried.push(messenger.blob_tried(uri, 200, b64u.encode(stored))); log(`blob source ${uri}: ${why}`, 'M§8.4 rule 7'); }
+    } catch (e) { tried.push(messenger.blob_tried(uri, 0, '')); log(`blob source ${uri}: ${e.message}`, 'M§8.4'); }
   }
-  const d = JSON.parse(messenger.blob_fetch_decision(JSON.stringify(m.object), JSON.stringify(tried), attempt));
+  const d = messenger.blob_fetch_decision(m.object, tried, attempt);
   if (d.action === 'retry') {
     const delay = messenger.blob_retry_delay_s(attempt) * 1000;
     media[id] = { state: 'retry', attempt: attempt + 1 };
@@ -2161,7 +2160,7 @@ function renderMessages() {
     : !mailboxInfo ? `mailbox ${mb.uri} (${short(mb.did)}): connecting…`
     : `mailbox ${mb.uri} (${short(mb.did)}): bound · personal group ${messenger.personal() ? 'yes' : devices.length > 1 ? 'waiting to be added by another device (M§12.3)' : 'pending'} · this device's MLS state is kept in this browser's storage`;
   $('mailbox-status').textContent = status;
-  const convs = messenger ? JSON.parse(messenger.conversations(now())).filter((c) => c.kind !== 'personal') : [];
+  const convs = messenger ? messenger.conversations(now()).filter((c) => c.kind !== 'personal') : [];
   const ul = $('conv-list');
   ul.innerHTML = convs.length ? '' : '<li class="muted small">none yet: open a contact and choose Message</li>';
   for (const c of convs) {
@@ -2175,7 +2174,7 @@ function renderMessages() {
     ul.append(li);
   }
   const rl = $('msg-request-list');
-  const reqs = messenger ? Object.entries(JSON.parse(messenger.requests())) : [];
+  const reqs = messenger ? Object.entries(messenger.requests()) : [];
   rl.innerHTML = reqs.length ? '' : '<li class="muted small">none</li>';
   for (const [id, r] of reqs) { const li = document.createElement('li'); li.innerHTML = '<code class="did"></code> <span class="small purpose"></span>'; li.querySelector('.did').textContent = r.from; li.querySelector('.purpose').textContent = `“${r.purpose}” (${id})`; rl.append(li); }
   if (activeConv && !convs.some((c) => c.group === activeConv)) {
@@ -2223,14 +2222,14 @@ function renderMessages() {
   }
   const th = $('thread');
   th.innerHTML = '';
-  const timeline = conv ? JSON.parse(messenger.timeline(conv.group)) : [];
+  const timeline = conv ? messenger.timeline(conv.group) : [];
   const thread = timeline.filter((m) => !m.call);
   // M§10.3: each identity's watermark is a content id; the seq it names is the thread's
-  const marks = conv ? JSON.parse(messenger.read_marks(conv.group)) : {};
+  const marks = conv ? messenger.read_marks(conv.group) : {};
   const seqOf = (id) => thread.find((m) => m.object.id === id)?.seq ?? -1;
   const theirRead = Math.max(-1, ...Object.entries(marks).filter(([who]) => who !== identity.identity).map(([, id]) => seqOf(id)));
   // M§7.3: roster changes, each before the first message the hub ordered after it
-  const roster = conv ? JSON.parse(messenger.roster_log(conv.group)) : [];
+  const roster = conv ? messenger.roster_log(conv.group) : [];
   const rosterDiv = (r) => { const d = document.createElement('div'); d.className = 'msg roster muted small'; d.textContent = rosterLine(r); d.dataset.epoch = r.epoch; return d; };
   let ri = 0;
   for (const m of timeline) {
@@ -2481,8 +2480,8 @@ function renderMessages() {
     mailbox: () => mailboxInfo?.did || null,
     mailboxText: () => $('mailbox-status').textContent,
     setMailbox: async (m) => { settings.mailbox = m === null ? null : m || undefined; await saveSettings(); renderSettings(); startMessaging(); },
-    conversations: () => (messenger ? JSON.parse(messenger.conversations(now())) : []),
-    thread: (gid) => (messenger ? JSON.parse(messenger.thread(gid || activeConv)) : []),
+    conversations: () => (messenger ? messenger.conversations(now()) : []),
+    thread: (gid) => (messenger ? messenger.thread(gid || activeConv) : []),
     activeConversation: () => activeConv,
     openConversation: (gid) => { activeConv = gid; renderMessages(); },
     messagePeer,
@@ -2490,7 +2489,7 @@ function renderMessages() {
     setRecordKeeper,
     becomeRecordKeeper,
     isRecorder: () => !!messenger?.is_recorder(),
-    records: () => (messenger ? JSON.parse(messenger.records()) : []),
+    records: () => (messenger ? messenger.records() : []),
     heldRecords: () => (messenger ? messenger.held_records() : 0),
     acceptRecording,
     leaveConversation,
@@ -2498,14 +2497,14 @@ function renderMessages() {
     addMember,
     removeMember,
     moveHub,
-    rosterLog: (gid) => (messenger ? JSON.parse(messenger.roster_log(gid || activeConv)) : []),
+    rosterLog: (gid) => (messenger ? messenger.roster_log(gid || activeConv) : []),
     rosterLines: () => [...document.querySelectorAll('#thread .msg.roster')].map((d) => d.textContent),
     personalGroup: () => messenger?.personal() || null,
     messengerSaved: () => store.get(key('messenger')),
-    readMarks: (gid) => (messenger ? JSON.parse(messenger.read_marks(gid || activeConv)) : {}),
+    readMarks: (gid) => (messenger ? messenger.read_marks(gid || activeConv) : {}),
     setReadDisclosed: async (v) => { settings.read_disclosed = !!v; await saveSettings(); messenger?.set_read_disclosed(!!v, now()); renderSettings(); },
     reconcileDevices,
-    archiveKeys: () => (messenger ? JSON.parse(messenger.archive_keys()) : []),
+    archiveKeys: () => (messenger ? messenger.archive_keys() : []),
     addDevice: async (did) => { if (!devices.some((d) => d.device === did)) devices.push({ device: did }); await store.set(key('devices'), devices); renderDevices(); return reconcileDevices(); },
     // voice and blobs (round 2B)
     recordVoice: async (ms) => { await toggleVoice(); await new Promise((r) => setTimeout(r, ms)); const done = new Promise((r) => { const t = setInterval(() => { if (!recorder && lastVoice) { clearInterval(t); r(); } }, 100); }); await toggleVoice(); await done; return lastVoice; },
@@ -2513,16 +2512,16 @@ function renderMessages() {
     // voicemail and call history (round 2C)
     voicemailOffered: () => pendingVoicemail,
     leaveVoicemail: async (ms) => { await leaveVoicemail(); await new Promise((r) => setTimeout(r, ms)); lastVoice = null; await leaveVoicemail(); await until(() => lastVoice, 30000); return lastVoice; },
-    calls: () => JSON.parse(messenger.calls()),
+    calls: () => messenger.calls(),
     // external join (round 2C)
-    available: () => JSON.parse(messenger.available()),
+    available: () => messenger.available(),
     // successor groups (round 2D)
     setHubTimeout: async (s) => { settings.hub_timeout_s = s; await saveSettings(); messenger?.set_hub_timeout(s); },
     setGapTimeout: async (s) => { settings.gap_timeout_s = s; await saveSettings(); messenger?.set_gap_timeout(s); },
     rekey,
-    outages: () => JSON.parse(messenger.outages()),
+    outages: () => messenger.outages(),
     joinAvailable,
-    timeline: (gid) => JSON.parse(messenger.timeline(gid || activeConv)),
+    timeline: (gid) => messenger.timeline(gid || activeConv),
     media: (id) => (media[id] ? { state: media[id].state, from: media[id].from, size: media[id].size, why: media[id].why } : null),
     playAudio: async (id) => { const a = document.querySelector(`audio[data-id="${id}"]`); if (!a) return false; await a.play().catch(() => {}); return true; },
     blobEndpoint,
