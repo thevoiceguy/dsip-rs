@@ -344,6 +344,35 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    re-encrypted as new objects once the successor holds them; and dsip-msg's way for an unprocessable item, a seq gap
    that does not fill, and receipts received (the browser's shortfalls, closed after 3j).
 
+   **The typed browser boundary** (decision 4; started 2026-10-26 at poc-v0.17, before stage 4 because it does not
+   wait for core 1.0). *Today:* `dsip-wasm` passes JSON strings both ways in its hundred or so exported functions and
+   methods, the page parses and stringifies them (77 `JSON.parse` in `app.js` alone), and the generated `.d.ts` says
+   `string` everywhere. The library `Messenger` speaks strings too, so `dsip-msg` parses them as well. *Target:* values
+   cross as JavaScript objects, typed by declarations generated from the Rust types.
+   - **tsify 0.5**, with `Ts<T>` on parameters and returns (its `into_wasm_abi` is deprecated: a failed conversion
+     throws past the wasm frames and leaks), maps as plain objects. The serde derives sit on the library types; the
+     tsify derive is behind a `ts` feature, so native builds do not carry it. JSON payloads are `unknown`.
+     Registry-governed values are `string` in TypeScript, never a union (CLAUDE.md).
+   - **Saved records stay strings**: the identity file, the contact file and the `Messenger`'s save are storage
+     formats, unchanged.
+   - **The page stays plain JavaScript with no build step**: `// @ts-check` and JSDoc types imported from
+     `pkg/dsip_wasm.d.ts`, and `tsc --noEmit` in CI (TypeScript a web devDependency). A checked file cannot drift
+     from the Rust types unseen.
+   - **The engine's `Emission`** is the vectors' shape (README, kind `state`): flattened and irregular (`{"ui": …,
+     "reason"}`, `{"timer": …, "name", "seconds"}`, `{"send": {…}}`), which serde cannot derive without reshaping
+     `dsip-session`. Its TypeScript type is written by hand, and `tsc` checks it against every emission in the
+     state vectors: the contract types it, not the implementation.
+
+   Parts, each with no behaviour change, no vector change, and every web test and CI job green:
+   - **B1:** the tooling and the call path: `CallOut`, `CoreEvent`, `MediaRequest`, `MediaResult`, `CallEvent`,
+     `CallCommand`, `Invite` and `Emission` typed; `Endpoint`'s `place`, `call`, `media`, `local`, `inbound`, `tick`
+     and `resolved`; `host/engine.js` under check.
+   - **B2:** the rest of `Endpoint` (presence, contacts, requests, sessions, recording) and the free functions
+     (identity, hints, numbers, verification, the renderers).
+   - **B3:** the `Messenger` typed in the library: its inputs and outputs are Rust types, which `dsip-msg` reads
+     instead of JSON, and `dsip-wasm` exports them.
+   - **B4:** `app.js` under check, with the last parsing and stringifying of boundary values gone.
+
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.
 5. **Its own repository and release.** Move the stack crates (or the whole of `impl/`) out when core reaches 1.0,

@@ -8,6 +8,7 @@ use serde_json::Value;
 
 /// A verified session-layer message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 pub struct Message {
     /// Message type.
     #[serde(rename = "type")]

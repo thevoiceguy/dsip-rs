@@ -68,7 +68,9 @@ impl Default for CallsConfig {
 }
 
 /// Media work for the host. The ones that produce SDP are answered with [`Calls::media`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MediaRequest {
     /// Create an SDP offer on the session's media leg, making the leg if it has none, and answer
@@ -101,6 +103,7 @@ pub enum MediaRequest {
         /// Session id.
         session: String,
         /// The candidates (`{candidate, sdp_mid, sdp_m_line_index}`).
+        #[cfg_attr(feature = "ts", tsify(type = "unknown[]"))]
         candidates: Vec<Value>,
     },
     /// Start sending media (§14.1: only after the signed answer).
@@ -121,7 +124,9 @@ pub enum MediaRequest {
 }
 
 /// The host's answer to a [`MediaRequest`], or a media event.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MediaResult {
     /// The SDP offer asked for by [`MediaRequest::Offer`].
@@ -143,6 +148,8 @@ pub enum MediaResult {
         /// Session id.
         session: String,
         /// The candidate (`{candidate, sdp_mid, sdp_m_line_index}`), or `None` at the end.
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         candidate: Option<Value>,
     },
     /// Local ICE candidates gathered together: once ACTIVE they go in one signed `info` (§12.12).
@@ -150,12 +157,15 @@ pub enum MediaResult {
         /// Session id.
         session: String,
         /// The candidates (`{candidate, sdp_mid, sdp_m_line_index}`).
+        #[cfg_attr(feature = "ts", tsify(type = "unknown[]"))]
         candidates: Vec<Value>,
     },
 }
 
 /// Something about a call the application shows or acts on.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(tag = "event", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CallEvent {
     /// An incoming call rings and waits on the user.
@@ -185,6 +195,7 @@ pub enum CallEvent {
         /// Session id.
         session: String,
         /// The emission, as `dsip_recording::Consent` writes it.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         emission: Value,
     },
     /// Our media is held until the other side's recording is accepted (C§4).
@@ -215,19 +226,28 @@ pub enum CallEvent {
 }
 
 /// What [`Calls`] hands the host: the core's events (transmit the frames, show the rest), media work, and call events.
-#[derive(Debug)]
+/// Serialized as `{"media_request": …}`, `{"call": …}`, or the core event as it stands (`{"send": …}`, …).
+#[derive(Debug, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+// tsify does not follow a variant's `untagged`
+#[cfg_attr(feature = "ts", tsify(type = "{ media_request: MediaRequest } | { call: CallEvent } | CoreEvent"))]
 #[allow(clippy::large_enum_variant)] // an output is built once and consumed at once
 pub enum CallOut {
-    /// An event of the core, as [`Core`] returns it.
-    Core(CoreEvent),
     /// Media work for the host.
+    #[serde(rename = "media_request")]
     Media(MediaRequest),
     /// Something about a call.
+    #[serde(rename = "call")]
     Call(CallEvent),
+    /// An event of the core, as [`Core`] returns it.
+    #[serde(untagged)]
+    Core(CoreEvent),
 }
 
 /// What the application asks of a call.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(tag = "command", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CallCommand {
     /// Answer (`answered_by` `user`).
@@ -245,6 +265,8 @@ pub enum CallCommand {
         /// Session id.
         session: String,
         /// Seconds it rings before it is declined `user.no-answer` (T-Ring-Local); [`RING_TIMEOUT_S`] when `None`.
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         ring_timeout: Option<i64>,
     },
     /// Answer with this `answered_by` token (§14.3; a registry value, e.g. `gateway`). A call still OFFERED is

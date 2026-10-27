@@ -17,6 +17,8 @@ dsip-webrtc-binding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tsify = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"
@@ -24,3 +26,5 @@ proptest = "1"
 [features]
 default = []
 wasm = ["dsip-core/wasm"]
+# TypeScript declarations of the types the browser host sees (dsip-wasm).
+ts = ["dsip-session/ts", "dep:tsify", "dep:wasm-bindgen"]

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
 pub mod messaging;
+pub mod types;
 
 /// What this client's device delegation carries (§7.4): signaling and interactive media for calls, and
 /// `dsip.messaging` for the mailbox (M§4.3).
@@ -23,9 +24,10 @@ use dsip_core::keys::KeyPair;
 use dsip_endpoint::hello::{client_hello, verify_relay_hello};
 use dsip_endpoint::verify::SeenIds;
 use dsip_endpoint::calls::AcceptPolicy;
-use dsip_endpoint::{AnswerPolicy, CallCommand, CallEvent, CallOut, Calls, CallsConfig, Command, ContactFile, Core, CoreConfig, CoreEvent,
-                    IdentityKeys, Invite, InvitePatch, MediaRequest, MediaResult, PresenceSealing};
-use dsip_session::LocalEvent;
+use dsip_endpoint::{AnswerPolicy, CallCommand, Calls, CallsConfig, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite,
+                    MediaResult, PresenceSealing};
+use tsify::{Ts, Tsify as _};
+use types::{CallOuts, LocalCommand, Placed};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -45,117 +47,6 @@ pub(crate) fn unhex(s: &str) -> Result<[u8; 32], JsValue> {
 
 pub(crate) fn js<E: std::fmt::Display>(e: E) -> JsValue {
     JsValue::from_str(&e.to_string())
-}
-
-/// A `local` call's JSON as a [`Command`]: the engine event plus the host fields beside it.
-fn command_from_json(v: &Value) -> Result<Command, serde_json::Error> {
-    let ev: LocalEvent = serde_json::from_value(v.clone())?;
-    let sdp = v.get("sdp").and_then(Value::as_str).map(String::from);
-    Ok(match ev {
-        LocalEvent::PlaceCall { session, to } => {
-            let claims = v.get("claims").and_then(Value::as_array).cloned().unwrap_or_default();
-            let patch = match v.get("patch") {
-                Some(p) if p.is_object() => serde_json::from_value(p.clone())?,
-                _ => InvitePatch::default(),
-            };
-            Command::PlaceCall { session, to, invite: Invite { sdp, claims, patch } }
-        }
-        LocalEvent::Accept { session, answered_by } => Command::Accept { session, answered_by, sdp },
-        LocalEvent::Update { session, id, answered_by } => Command::Update { session, id, answered_by, sdp },
-        LocalEvent::AnswerUpdate { session, in_reply_to, answered_by } => Command::AnswerUpdate { session, in_reply_to, answered_by, sdp },
-        LocalEvent::Info { session } => match v.get("data") {
-            Some(data) => Command::Info { session, data: data.clone() },
-            None => Command::Engine(LocalEvent::Info { session }),
-        },
-        other => Command::Engine(other),
-    })
-}
-
-
-fn core_event_json(e: &CoreEvent) -> Value {
-    match e {
-        CoreEvent::Send { frame, msg_type, session, to } => json!({"send": {"frame": frame, "type": msg_type, "session": session, "to": to}}),
-        CoreEvent::Emission(em) => json!({"emission": em.to_json()}),
-        CoreEvent::Received { message, identity, display_name, payload } => {
-            json!({"received": {"message": message, "identity": identity, "display_name": display_name, "payload": payload}})
-        }
-        CoreEvent::Rejected { code, detail } => json!({"rejected": {"code": code, "detail": detail}}),
-        CoreEvent::Resolve { did } => json!({"resolve": {"did": did}}),
-    }
-}
-
-fn media_request_json(m: &MediaRequest) -> Value {
-    match m {
-        MediaRequest::Offer { session, add_source } => json!({"kind": "offer", "session": session, "add_source": add_source}),
-        MediaRequest::Answer { session, offer, screening } => json!({"kind": "answer", "session": session, "offer": offer, "screening": screening}),
-        MediaRequest::ApplyAnswer { session, sdp } => json!({"kind": "apply_answer", "session": session, "sdp": sdp}),
-        MediaRequest::RemoteCandidates { session, candidates } => json!({"kind": "remote_candidates", "session": session, "candidates": candidates}),
-        MediaRequest::StartSending { session } => json!({"kind": "start_sending", "session": session}),
-        MediaRequest::HoldSending { session } => json!({"kind": "hold_sending", "session": session}),
-        MediaRequest::Close { session } => json!({"kind": "close", "session": session}),
-        other => json!({"kind": "unknown", "debug": format!("{other:?}")}),
-    }
-}
-
-fn call_event_json(e: &CallEvent) -> Value {
-    match e {
-        CallEvent::Ringing { session } => json!({"event": "ringing", "session": session}),
-        CallEvent::Silent { session } => json!({"event": "silent", "session": session}),
-        CallEvent::NoOffer { session } => json!({"event": "no_offer", "session": session}),
-        CallEvent::UpdateOffered { session, id } => json!({"event": "update_offered", "session": session, "id": id}),
-        CallEvent::Recording { session, emission } => json!({"event": "recording", "session": session, "emission": emission}),
-        CallEvent::RecordingHeld { session } => json!({"event": "recording_held", "session": session}),
-        CallEvent::SendingResumed { session } => json!({"event": "sending_resumed", "session": session}),
-        CallEvent::NothingToAccept { session } => json!({"event": "nothing_to_accept", "session": session}),
-        CallEvent::ResentInClear { old, new, by } => json!({"event": "resent_in_clear", "old": old, "new": new, "by": by}),
-        other => json!({"event": "unknown", "debug": format!("{other:?}")}),
-    }
-}
-
-fn outs_json(out: &[CallOut]) -> String {
-    Value::Array(
-        out.iter()
-            .map(|o| match o {
-                CallOut::Core(e) => core_event_json(e),
-                CallOut::Media(m) => json!({"media_request": media_request_json(m)}),
-                CallOut::Call(e) => json!({"call": call_event_json(e)}),
-            })
-            .collect(),
-    )
-    .to_string()
-}
-
-/// A `call` command's JSON (`{"command": "accept"|"screen"|…, "session"}`) as a [`CallCommand`].
-fn call_command(v: &Value) -> Result<CallCommand, JsValue> {
-    let session = v["session"].as_str().ok_or_else(|| JsValue::from_str("no session"))?.to_string();
-    Ok(match v["command"].as_str().unwrap_or("") {
-        "accept" => CallCommand::Accept { session },
-        "screen" => CallCommand::Screen { session },
-        "decline" => CallCommand::Decline { session },
-        "cancel" => CallCommand::Cancel { session },
-        "hangup" => CallCommand::Hangup { session },
-        "update" => CallCommand::Update { session },
-        "escalate" => CallCommand::Escalate { session },
-        "answer_update" => CallCommand::AnswerUpdate { session },
-        "reject_update" => CallCommand::RejectUpdate { session },
-        "info" => CallCommand::Info { session },
-        "accept_recording" => CallCommand::AcceptRecording { session },
-        "decline_recording" => CallCommand::DeclineRecording { session },
-        other => return Err(JsValue::from_str(&format!("unknown call command {other:?}"))),
-    })
-}
-
-/// A `media` result's JSON (`{"kind": "offer"|"answer", "session", "sdp"}` or `{"kind": "candidate", "session",
-/// "candidate": {…}|null}`) as a [`MediaResult`].
-fn media_result(v: &Value) -> Result<MediaResult, JsValue> {
-    let session = v["session"].as_str().ok_or_else(|| JsValue::from_str("no session"))?.to_string();
-    let sdp = || v["sdp"].as_str().map(String::from).ok_or_else(|| JsValue::from_str("no sdp"));
-    Ok(match v["kind"].as_str().unwrap_or("") {
-        "offer" => MediaResult::Offer { session, sdp: sdp()? },
-        "answer" => MediaResult::Answer { session, sdp: sdp()? },
-        "candidate" => MediaResult::Candidate { session, candidate: Some(v["candidate"].clone()).filter(|c| !c.is_null()) },
-        other => return Err(JsValue::from_str(&format!("unknown media result {other:?}"))),
-    })
 }
 
 /// Install the panic hook (better errors in the browser console).
@@ -709,7 +600,7 @@ impl Endpoint {
                     }
                 }
             }
-            let events: Value = serde_json::from_str(&self.observe(events, now)?).map_err(js)?;
+            let events = serde_json::to_value(self.observe(events, now)?.0).map_err(js)?;
             json!({"own": true, "target": me, "events": events, "terminated": terminated}).to_string()
         } else {
             presence_json(&self.core, w, now as i64)
@@ -779,69 +670,61 @@ impl Endpoint {
         }
     }
 
-    /// A local event (README vocabulary JSON), with what the host supplies for its message beside it: `sdp` on
+    /// A local event (README vocabulary), with what the host supplies for its message beside it: `sdp` on
     /// `place_call`, `accept`, `update` and `answer_update`; `claims` (§18.1) and `patch` (`{direction?,
-    /// recording_session?, destination?}`, C§6, N§4.1) on `place_call`; `data` on `info` (B§4). Returns a JSON
-    /// array of events.
-    pub fn local(&mut self, event_json: &str, now: f64) -> Result<String, JsValue> {
-        let v: Value = serde_json::from_str(event_json).map_err(js)?;
-        let out = self.core.command(command_from_json(&v).map_err(js)?, now as i64).map_err(js)?;
-        self.observe(out, now)
+    /// recording_session?, destination?}`, C§6, N§4.1) on `place_call`; `data` on `info` (B§4).
+    pub fn local(&mut self, event: Ts<LocalCommand>, now: f64) -> Result<Ts<CallOuts>, JsError> {
+        let out = self.core.command(event.to_rust()?.into_command(), now as i64)?;
+        self.observe_ts(out, now)
     }
 
-    /// An inbound frame. Returns a JSON array of events.
-    pub fn inbound(&mut self, frame: &str, now: f64) -> Result<String, JsValue> {
-        let out = self.core.inbound(frame, now as i64).map_err(js)?;
-        self.observe(out, now)
+    /// An inbound frame.
+    pub fn inbound(&mut self, frame: &str, now: f64) -> Result<Ts<CallOuts>, JsError> {
+        let out = self.core.inbound(frame, now as i64)?;
+        self.observe_ts(out, now)
     }
 
-    /// Advance the clock; due timers fire. Returns a JSON array of events.
-    pub fn tick(&mut self, now: f64) -> Result<String, JsValue> {
-        let out = self.core.tick(now as i64).map_err(js)?;
-        self.observe(out, now)
+    /// Advance the clock; due timers fire.
+    pub fn tick(&mut self, now: f64) -> Result<Ts<CallOuts>, JsError> {
+        let out = self.core.tick(now as i64)?;
+        self.observe_ts(out, now)
     }
 
-    fn observe(&mut self, events: Vec<CoreEvent>, now: f64) -> Result<String, JsValue> {
-        let out = self.calls.observe(&mut self.core, events, now as i64).map_err(js)?;
-        Ok(outs_json(&out))
+    fn observe(&mut self, events: Vec<CoreEvent>, now: f64) -> Result<CallOuts, JsValue> {
+        Ok(CallOuts(self.calls.observe(&mut self.core, events, now as i64).map_err(js)?))
     }
 
-    /// Place a call to `to`: `invite_json` is `{claims?, patch?}` (as `place_call` takes them). Returns
-    /// `{"session", "events"}`; the events ask for the SDP offer (`media_request` `offer`), and the invite goes out
-    /// once [`Endpoint::media`] hands it back (§16.3).
-    pub fn place(&mut self, to: &str, invite_json: &str, now: f64) -> Result<String, JsValue> {
-        let v: Value = serde_json::from_str(invite_json).unwrap_or(json!({}));
-        let claims = v.get("claims").and_then(Value::as_array).cloned().unwrap_or_default();
-        let patch = match v.get("patch") {
-            Some(p) if p.is_object() => serde_json::from_value(p.clone()).map_err(js)?,
-            _ => InvitePatch::default(),
-        };
-        let (session, out) = self.calls.place(&mut self.core, to, Invite { sdp: None, claims, patch }, now as i64).map_err(js)?;
-        Ok(json!({"session": session, "events": serde_json::from_str::<Value>(&outs_json(&out)).map_err(js)?}).to_string())
+    fn observe_ts(&mut self, events: Vec<CoreEvent>, now: f64) -> Result<Ts<CallOuts>, JsError> {
+        let out = self.calls.observe(&mut self.core, events, now as i64)?;
+        Ok(CallOuts(out).into_ts()?)
     }
 
-    /// What the user asks of a call: `{"command": "accept"|"screen"|"decline"|"cancel"|"hangup"|"update"|"escalate"|
-    /// "answer_update"|"reject_update"|"info"|"accept_recording"|"decline_recording", "session"}`. Returns a JSON
-    /// array of events.
-    pub fn call(&mut self, command_json: &str, now: f64) -> Result<String, JsValue> {
-        let v: Value = serde_json::from_str(command_json).map_err(js)?;
-        let out = self.calls.command(&mut self.core, call_command(&v)?, now as i64).map_err(js)?;
-        Ok(outs_json(&out))
+    /// Place a call to `to` with what the invite carries beside its SDP (`{claims?, patch?}`, as `place_call` takes
+    /// them). The events ask for the SDP offer (`media_request` `offer`), and the invite goes out once
+    /// [`Endpoint::media`] hands it back (§16.3).
+    pub fn place(&mut self, to: &str, invite: Ts<Invite>, now: f64) -> Result<Ts<Placed>, JsError> {
+        let invite = Invite { sdp: None, ..invite.to_rust()? };
+        let (session, events) = self.calls.place(&mut self.core, to, invite, now as i64)?;
+        Ok(Placed { session, events }.into_ts()?)
     }
 
-    /// The page's answer to a `media_request` (`{"kind": "offer"|"answer", "session", "sdp"}`), or a local ICE
-    /// candidate (`{"kind": "candidate", "session", "candidate": {candidate, sdp_mid, sdp_m_line_index}|null}`, null at
-    /// the end). Returns a JSON array of events.
-    pub fn media(&mut self, result_json: &str, now: f64) -> Result<String, JsValue> {
-        let v: Value = serde_json::from_str(result_json).map_err(js)?;
-        let out = self.calls.media(&mut self.core, media_result(&v)?, now as i64).map_err(js)?;
-        Ok(outs_json(&out))
+    /// What the user asks of a call.
+    pub fn call(&mut self, command: Ts<CallCommand>, now: f64) -> Result<Ts<CallOuts>, JsError> {
+        let out = self.calls.command(&mut self.core, command.to_rust()?, now as i64)?;
+        Ok(CallOuts(out).into_ts()?)
+    }
+
+    /// The page's answer to a `media_request` (`offer`, `answer`), or a local ICE candidate (`candidate`: `null` at
+    /// the end).
+    pub fn media(&mut self, result: Ts<MediaResult>, now: f64) -> Result<Ts<CallOuts>, JsError> {
+        let out = self.calls.media(&mut self.core, result.to_rust()?, now as i64)?;
+        Ok(CallOuts(out).into_ts()?)
     }
 
     /// The outcome of a `resolve` event: the DID document fetched for `did` (JSON), or `""` when the fetch failed
     /// (`error` says why). A document is held from now on, for calls and for relay `hello`s alike (§8.1, §8.4); the
-    /// frames that waited for it are verified. Returns a JSON array of events.
-    pub fn resolved(&mut self, did: &str, doc_json: &str, error: &str, now: f64) -> Result<String, JsValue> {
+    /// frames that waited for it are verified.
+    pub fn resolved(&mut self, did: &str, doc_json: &str, error: &str, now: f64) -> Result<Ts<CallOuts>, JsError> {
         let result = match serde_json::from_str::<dsip_core::did::DidDocument>(doc_json) {
             Ok(d) if d.id == did => {
                 self.resolver.insert(d.clone());
@@ -850,8 +733,8 @@ impl Endpoint {
             Ok(d) => Err(dsip_core::did::ResolveError::Fetch { did: did.into(), detail: format!("the document is for {}", d.id) }),
             Err(e) => Err(dsip_core::did::ResolveError::Fetch { did: did.into(), detail: if error.is_empty() { e.to_string() } else { error.into() } }),
         };
-        let out = self.core.resolved(did, result, now as i64).map_err(js)?;
-        self.observe(out, now)
+        let out = self.core.resolved(did, result, now as i64)?;
+        self.observe_ts(out, now)
     }
 
     /// Whether outbound session bodies are sealed (§10.4); a sealed call refused as an unknown critical extension is

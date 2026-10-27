@@ -794,7 +794,7 @@ async function placeCall(to, video, destination) {
     // the call glue asks for the SDP offer (onMediaRequest); the invite carries it (B§: the transport binding object)
     const placed = engine.place(to, {
       claims: settings.binding ? [{ type: 'tel', number: bindingNumber(), binding: settings.binding }] : [],   // N§4
-      patch: destination ? { destination } : null });       // N§4.1
+      ...(destination ? { patch: { destination } } : {}) });   // N§4.1
     call.sid = placed.session;
     if (r) { callRelays.delete(route); callRelays.set(placed.session, r); }
     await placed.go();
@@ -1600,7 +1600,7 @@ async function presenceNotified(p) {
   if (v.own) {
     // P§12.5: our own watch; a sibling's higher epoch becomes ours, and the grants carrying it follow
     if (v.terminated) ownWatch = null;
-    await engine.drive(JSON.stringify(v.events));
+    await engine.drive(v.events);
     return;
   }
   const unread = v.unreadable?.length ? `; ${v.unreadable.length} sealed record(s) not readable: no key for them (P§12.4)` : '';
