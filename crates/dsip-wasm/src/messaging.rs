@@ -21,6 +21,11 @@ fn js_err(e: Error) -> JsValue {
     JsValue::from_str(&e.0)
 }
 
+/// The library's typed result as the JSON text this binding still returns (dsip-rs B3c makes it an object).
+fn text<T: serde::Serialize>(v: T) -> String {
+    serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
+}
+
 /// A messaging device: this identity's device key under its delegation, its MLS groups, and the state the
 /// Messaging Profile asks a device to keep (M§5.4, M§8.5). The host moves frames between it and the mailbox.
 #[wasm_bindgen]
@@ -68,12 +73,12 @@ impl Messenger {
     /// watermark goes out, to the conversation or to the personal group (M§10.5), at most one per 5 s. Frames and
     /// events, as `inbound` returns them.
     pub fn read_through(&mut self, gid: &str, content_id: &str, now: f64) -> String {
-        self.0.read_through(gid, content_id, now)
+        text(self.0.read_through(gid, content_id, now))
     }
 
     /// Advance every conversation's clock (M§10.3: a read held back by the 5 s interval goes out when it passes).
     pub fn tick(&mut self, now: f64) -> String {
-        self.0.tick(now)
+        text(self.0.tick(now))
     }
 
     /// This device's hub-outage threshold, seconds (M§9.4: the client's own; 24 h RECOMMENDED).
@@ -98,7 +103,7 @@ impl Messenger {
     /// M§7.5 spec-gap 61). When this device already converged on a successor, that one is used. The pending items
     /// follow once the successor holds its members (M§9.4). Frames.
     pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<String, JsValue> {
-        self.0.create_successor(dead, key_packages_json, now).map_err(js_err)
+        self.0.create_successor(dead, key_packages_json, now).map_err(js_err).map(text)
     }
 
     /// The hand-over to a successor could not be done (the peers' KeyPackages could not be fetched): retried with the
@@ -118,13 +123,13 @@ impl Messenger {
     /// The groups a new device of this identity joins, in order: the personal group first (M§12.3 step 3), then
     /// every conversation it is not in yet (M§6.7); `[]` when it is everywhere already.
     pub fn groups_for_new_device(&self, device: &str, now: f64) -> String {
-        self.0.groups_for_new_device(device, now)
+        text(self.0.groups_for_new_device(device, now))
     }
 
     /// M§12.3 step 3: every live archive key, as `archive-key` objects to the personal group, so a device just added
     /// can read the archive. Frames to send.
     pub fn resend_archive_keys(&mut self, now: f64) -> String {
-        self.0.resend_archive_keys(now)
+        text(self.0.resend_archive_keys(now))
     }
 
     /// Archive keys this device holds, `[{akid, created_at}]`, newest current (M§12.1).
@@ -143,7 +148,7 @@ impl Messenger {
     /// `stale-epoch` refusal discards the joined state, syncs and joins again from the newer GroupInfo (the pinned
     /// `CommitRetry`, spec-gap 58). No archive key comes with it: history waits for a sibling (M§12.3). Frames.
     pub fn external_join(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        self.0.external_join(gid, now).map_err(js_err)
+        self.0.external_join(gid, now).map_err(js_err).map(text)
     }
 
     /// A callee leg of this device ended (M§13.3): whether it sends a `call-event` to the personal group, by the
@@ -151,7 +156,7 @@ impl Messenger {
     /// `declined` when this device ended it with `user.declined`, else `missed`. `leg_json` is `{session, peer, alerted,
     /// answered_here, ended_by: "local"|"remote", reason}`. Frames to send (`[]` when none).
     pub fn call_ended(&mut self, leg_json: &str, now: f64) -> Result<String, JsValue> {
-        self.0.call_ended(leg_json, now).map_err(js_err)
+        self.0.call_ended(leg_json, now).map_err(js_err).map(text)
     }
 
     /// One leg's `call-record` for this identity's record-keeper `keeper` (C§9), built from what the host saw of the
@@ -169,14 +174,14 @@ impl Messenger {
     /// The held call records, sent to the direct conversation with `keeper` when there is one (C§9: the record-keeper
     /// opens it, spec-gap 123); frames to send, `[]` while there is none.
     pub fn flush_records(&mut self, keeper: &str, now: f64) -> Result<String, JsValue> {
-        self.0.flush_records(keeper, now).map_err(js_err)
+        self.0.flush_records(keeper, now).map_err(js_err).map(text)
     }
 
     /// Leave the conversation `gid` for this identity (M§7.3 "Leaving", spec-gap 125): a Remove proposal for each of
     /// its leaves goes to the hub, another member commits them, and until then nothing is sent there and it is not
     /// listed. The personal group is never left. Returns the frames to send.
     pub fn leave(&mut self, gid: &str, now: f64) -> Result<String, JsValue> {
-        self.0.leave(gid, now).map_err(js_err)
+        self.0.leave(gid, now).map_err(js_err).map(text)
     }
 
     /// The user accepted the recording of `gid` (C§5): every recorder now in it is accepted for this conversation, and
@@ -272,7 +277,7 @@ impl Messenger {
     /// The user played an `audio` or `video` content (M§10.4): a `played` receipt under the same opt-in as `read`
     /// (M§10.5). Frames and events, as `inbound` returns them.
     pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> String {
-        self.0.played(gid, content_id, now)
+        text(self.0.played(gid, content_id, now))
     }
 
     /// A DID document to hold (§8.1), for `did:web` peers.
@@ -303,13 +308,13 @@ impl Messenger {
 
     /// What to send on a fresh binding: pending application items again (M§9.3, the same bytes), then a sync.
     pub fn on_bound(&mut self, now: f64) -> String {
-        self.0.on_bound(now)
+        text(self.0.on_bound(now))
     }
 
     /// Create this identity's personal group at its mailbox (M§7.1): the `mailbox-config` that registers it and the
     /// GroupInfo deposit; the first archive key follows once the hub holds the group (M§12.1). Frames to send.
     pub fn create_personal(&mut self, now: f64) -> Result<String, JsValue> {
-        self.0.create_personal(now).map_err(js_err)
+        self.0.create_personal(now).map_err(js_err).map(text)
     }
 
     /// A `key-package-fetch` for `target` to send on a connection to `to_mailbox` (M§5.5), presenting the grant
@@ -324,7 +329,7 @@ impl Messenger {
     /// the target the vector-pinned rule picks (C§5), plus this identity's own other devices from `own_json` (the
     /// same answer shape, or null), in one commit once the group is hubbed. Returns the frames to send, or the refusal.
     pub fn create_direct(&mut self, target: &str, key_packages_json: &str, own_json: Option<String>, now: f64) -> Result<String, JsValue> {
-        self.0.create_direct(target, key_packages_json, own_json, now).map_err(js_err)
+        self.0.create_direct(target, key_packages_json, own_json, now).map_err(js_err).map(text)
     }
 
     /// Create a group conversation (M§7.3, `kind: group`) with the identities of `targets_json`, `{identity: its
@@ -332,7 +337,7 @@ impl Messenger {
     /// the vector-pinned rule picks, added in one commit once the group is hubbed at this identity's mailbox, with the
     /// grants held from them (M§14.2). Returns the frames to send.
     pub fn create_group(&mut self, targets_json: &str, own_json: Option<String>, now: f64) -> Result<String, JsValue> {
-        self.0.create_group(targets_json, own_json, now).map_err(js_err)
+        self.0.create_group(targets_json, own_json, now).map_err(js_err).map(text)
     }
 
     /// Add `target`'s devices to the group conversation `gid` from its mailbox's `key-packages` answer (M§7.3: any
@@ -405,7 +410,7 @@ impl Messenger {
     /// Process one frame from the mailbox. Returns the emissions: `{send: frame}` (to the mailbox), `{ui: …}`
     /// events, `{sync: true}` when a refused commit asks for one (spec-gap 58), `{refused: …}`, `{error: …}`.
     pub fn inbound(&mut self, frame: &str, now: f64) -> String {
-        self.0.inbound(frame, now)
+        text(self.0.inbound(frame, now))
     }
 
     /// A fresh ULID (§12.9: timestamp-consistent with `now`).

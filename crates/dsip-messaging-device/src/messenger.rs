@@ -1,6 +1,6 @@
 //! The messaging device, sans-I/O: this identity's device key under its delegation, its MLS groups and the state
-//! the Messaging Profile asks a device to keep, driven with JSON strings and emitting frames and events. The host
-//! moves frames between it and the mailbox and keeps the clock. The browser (`dsip-wasm`) and dsip-msg are its hosts,
+//! the Messaging Profile asks a device to keep, emitting frames and typed [`Event`]s (dsip-rs B3a; its other inputs
+//! and results are still JSON text until B3b). The host moves frames between it and the mailbox and keeps the clock. The browser (`dsip-wasm`) and dsip-msg are its hosts,
 //! which set its timeouts and nothing else of its behaviour.
 //!
 //! Spec: M§4.2 (the mailbox a `did:key` identity names in its reachability hint; the peer's found the same way),
@@ -49,6 +49,7 @@ use crate::successors::{self, Converge, Create, Successors};
 use crate::{archive, blob, calls, first_contact, key_packages, CallLog, process, recording, Deposit, Deposits, History, Inbound, MemoryStore, Outbox, Outcome,
     Receipts, Retry, Route};
 use crate::Store;
+use crate::events::{Event, HandedOver, NewRecorder, OpInfo, Rejected, SuccessorDue, Ui};
 use dsip_messaging::client::{registration_on_removal, GapTracker, MoveArrival, Resume};
 use dsip_messaging::verify::verify_frame;
 use dsip_messaging::mls_wire::{open, seal, SealUse};
@@ -138,16 +139,16 @@ enum Pending {
 }
 
 impl Op {
-    /// What the commit does, for the host to say: `{op, peer?, device?, identity?, hub?}` (no key material).
-    fn describe(&self) -> Value {
+    /// What the commit does, for the host to say (no key material).
+    fn describe(&self) -> OpInfo {
         match self {
-            Op::Add { peer, device, kps, .. } => json!({"op": "add", "peer": peer, "device": device, "devices": kps.len()}),
-            Op::Rejoin => json!({"op": "rejoin"}),
-            Op::Leave { identity } => json!({"op": "leave", "identity": identity}),
-            Op::Remove { identity } => json!({"op": "remove", "identity": identity}),
-            Op::MoveHub { hub } => json!({"op": "move_hub", "hub": hub}),
-            Op::Update => json!({"op": "update"}),
-            Op::RemoveDevice { device, .. } => json!({"op": "remove_device", "device": device}),
+            Op::Add { peer, device, kps, .. } => OpInfo::Add { peer: peer.clone(), device: device.clone(), devices: kps.len() },
+            Op::Rejoin => OpInfo::Rejoin,
+            Op::Leave { identity } => OpInfo::Leave { identity: identity.clone() },
+            Op::Remove { identity } => OpInfo::Remove { identity: identity.clone() },
+            Op::MoveHub { hub } => OpInfo::MoveHub { hub: hub.clone() },
+            Op::Update => OpInfo::Update,
+            Op::RemoveDevice { device, .. } => OpInfo::RemoveDevice { device: device.clone() },
         }
     }
 
@@ -557,15 +558,15 @@ impl<S: Store> Messenger<S> {
     /// The user has read a conversation through `content_id` (M§10.3): the receipts machine decides whether a
     /// watermark goes out, to the conversation or to the personal group (M§10.5), at most one per 5 s. Frames and
     /// events, as `inbound` returns them.
-    pub fn read_through(&mut self, gid: &str, content_id: &str, now: f64) -> String {
+    pub fn read_through(&mut self, gid: &str, content_id: &str, now: f64) -> Vec<Event> {
         let now_i = now as i64;
-        let Some(c) = self.convs.get_mut(gid) else { return "[]".into() };
+        let Some(c) = self.convs.get_mut(gid) else { return vec![] };
         let emissions = c.receipts.read(now_i, &json!(content_id));
-        json!(self.receipt_sends(gid, emissions, now_i)).to_string()
+        self.receipt_sends(gid, emissions, now_i)
     }
 
     /// Advance every conversation's clock (M§10.3: a read held back by the 5 s interval goes out when it passes).
-    pub fn tick(&mut self, now: f64) -> String {
+    pub fn tick(&mut self, now: f64) -> Vec<Event> {
         let now_i = now as i64;
         let mut out = self.advance_receipts(now_i);
         // M§9.4: a deposit with no answer at all counts as the hub unreachable
@@ -583,17 +584,17 @@ impl<S: Store> Messenger<S> {
         }
         // M§6.5 (spec-gap 69): a gap that has not filled in time makes this device re-join (M§6.8)
         for (gid, held) in self.delivery().gap_timeouts(now_i) {
-            out.push(json!({"ui": "gap_timeout", "group": gid, "held": held}));
+            out.push(Ui::GapTimeout { group: gid.clone(), held }.into());
             match self.external_commit(&gid, now_i) {
                 Ok(frame) => {
                     self.retries.insert(gid, (Retry::default(), Op::Rejoin));
-                    out.push(json!({"send": frame}));
+                    out.push(Event::send(frame));
                 }
-                Err(e) => out.push(json!({"error": e.0, "group": gid})),
+                Err(e) => out.push(Event::Error { error: e.0, group: Some(gid), reason: None, detail: None }),
             }
         }
         out.extend(self.recording_changes(now_i));
-        json!(out).to_string()
+        out
     }
 
     /// This device's hub-outage threshold, seconds (M§9.4: the client's own; 24 h RECOMMENDED).
@@ -613,7 +614,7 @@ impl<S: Store> Messenger<S> {
     /// group's last roster from `key_packages_json` (`{identity: key-packages answer}`, fetched with `successor_of`,
     /// M§7.5 spec-gap 61). When this device already converged on a successor, that one is used. The pending items
     /// follow once the successor holds its members (M§9.4). Frames.
-    pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<String, Error> {
+    pub fn create_successor(&mut self, dead: &str, key_packages_json: &str, now: f64) -> Result<Vec<String>, Error> {
         let now_i = now as i64;
         self.track_rosters();
         let me = self.keys.identity.clone();
@@ -622,7 +623,7 @@ impl<S: Store> Messenger<S> {
                 let moved = self.handover.remove(dead).unwrap_or_default();
                 self.handover.entry(w.clone()).or_default().extend(moved);
                 let out = self.flush_handover(&w, now_i);
-                return Ok(json!(out.into_iter().filter_map(|e| e.get("send").cloned()).collect::<Vec<_>>()).to_string());
+                return Ok(out.iter().filter_map(|e| e.frame().map(String::from)).collect());
             }
             Create::Refuse(why) => return Err(Error::from(format!("successor refused: {}", json!(why)))),
             Create::Create { peers } => peers,
@@ -661,7 +662,7 @@ impl<S: Store> Messenger<S> {
                 out.extend(self.leave_group(&g, now_i));
             }
         }
-        Ok(json!(out).to_string())
+        Ok(out)
     }
 
     /// The hand-over to a successor could not be done (the peers' KeyPackages could not be fetched): retried with the
@@ -709,7 +710,7 @@ impl<S: Store> Messenger<S> {
 
     /// The groups a new device of this identity joins, in order: the personal group first (M§12.3 step 3), then
     /// every conversation it is not in yet (M§6.7); `[]` when it is everywhere already.
-    pub fn groups_for_new_device(&self, device: &str, now: f64) -> String {
+    pub fn groups_for_new_device(&self, device: &str, now: f64) -> Vec<String> {
         let ctx = Context::new(now as i64, &self.resolver);
         let in_group = |c: &Conv| c.group.members().any(|m| member_identity(&c.group, m.index, &ctx).ok().is_some_and(|w| w.device == device));
         let mut order: Vec<String> = vec![];
@@ -723,14 +724,14 @@ impl<S: Store> Messenger<S> {
                 order.push(g.clone());
             }
         }
-        json!(order).to_string()
+        order
     }
 
     /// M§12.3 step 3: every live archive key, as `archive-key` objects to the personal group, so a device just added
     /// can read the archive. Frames to send.
-    pub fn resend_archive_keys(&mut self, now: f64) -> String {
+    pub fn resend_archive_keys(&mut self, now: f64) -> Vec<String> {
         let now_i = now as i64;
-        let Some(personal) = self.personal.clone() else { return "[]".into() };
+        let Some(personal) = self.personal.clone() else { return vec![] };
         let keys: Vec<(String, Vec<u8>, i64)> = self.archive_keys.iter().map(|(a, (k, t))| (a.clone(), k.clone(), *t)).collect();
         let mut frames = vec![];
         for (akid, key, at) in keys {
@@ -739,7 +740,7 @@ impl<S: Store> Messenger<S> {
                 frames.push(f);
             }
         }
-        json!(frames).to_string()
+        frames
     }
 
     /// Archive keys this device holds, `[{akid, created_at}]`, newest current (M§12.1).
@@ -762,22 +763,22 @@ impl<S: Store> Messenger<S> {
     /// personal group, with no sibling online to add it. The commit goes to the hub; a `commit-conflict` or
     /// `stale-epoch` refusal discards the joined state, syncs and joins again from the newer GroupInfo (the pinned
     /// `CommitRetry`, spec-gap 58). No archive key comes with it: history waits for a sibling (M§12.3). Frames.
-    pub fn external_join(&mut self, gid: &str, now: f64) -> Result<String, Error> {
+    pub fn external_join(&mut self, gid: &str, now: f64) -> Result<Vec<String>, Error> {
         if self.convs.contains_key(gid) {
             return Err(Error::from("this device is in that group already"));
         }
         let frame = self.external_commit(gid, now as i64)?;
         self.retries.insert(gid.to_string(), (Retry::default(), Op::Rejoin));
-        Ok(json!([frame]).to_string())
+        Ok(vec![frame])
     }
 
     /// A callee leg of this device ended (M§13.3): whether it sends a `call-event` to the personal group, by the
     /// vector-pinned decision (spec-gap 63) — alerted here and not answered here, never `session.answered-elsewhere`;
     /// `declined` when this device ended it with `user.declined`, else `missed`. `leg_json` is `{session, peer, alerted,
     /// answered_here, ended_by: "local"|"remote", reason}`. Frames to send (`[]` when none).
-    pub fn call_ended(&mut self, leg_json: &str, now: f64) -> Result<String, Error> {
+    pub fn call_ended(&mut self, leg_json: &str, now: f64) -> Result<Vec<String>, Error> {
         let r: Value = serde_json::from_str(&self.call_ended_item(leg_json, now)?).map_err(err)?;
-        Ok(if r["event"].is_null() { "[]".into() } else { json!([r["send"]]).to_string() })
+        Ok(if r["event"].is_null() { vec![] } else { vec![s_of(&r["send"])] })
     }
 
     /// [`Messenger::call_ended`] for a host that says what it did: `{event, item, send, fresh}`: the `call-event` sent
@@ -813,15 +814,15 @@ impl<S: Store> Messenger<S> {
         let rec = calls::call_record(&leg, &self.keys.device.did(), now as i64)
             .map_err(|code| Error::from(format!("call record not sent: {code}")))?;
         self.records_held.push(rec.clone());
-        let frames: Value = serde_json::from_str(&self.flush_records(keeper, now)?).map_err(err)?;
+        let frames = self.flush_records(keeper, now)?;
         Ok(json!({"record": rec, "frames": frames}).to_string())
     }
 
     /// The held call records, sent to the direct conversation with `keeper` when there is one (C§9: the record-keeper
     /// opens it, spec-gap 123); frames to send, `[]` while there is none.
-    pub fn flush_records(&mut self, keeper: &str, now: f64) -> Result<String, Error> {
+    pub fn flush_records(&mut self, keeper: &str, now: f64) -> Result<Vec<String>, Error> {
         let Some(gid) = self.convs.iter().find(|(_, c)| c.kind == "direct" && c.peer.as_deref() == Some(keeper)).map(|(g, _)| g.clone()) else {
-            return Ok("[]".into());
+            return Ok(vec![]);
         };
         let gid = self.live(&gid);
         let mut frames = vec![];
@@ -832,13 +833,13 @@ impl<S: Store> Messenger<S> {
                 frames.push(f);
             }
         }
-        Ok(json!(frames).to_string())
+        Ok(frames)
     }
 
     /// Leave the conversation `gid` for this identity (M§7.3 "Leaving", spec-gap 125): a Remove proposal for each of
     /// its leaves goes to the hub, another member commits them, and until then nothing is sent there and it is not
     /// listed. The personal group is never left. Returns the frames to send.
-    pub fn leave(&mut self, gid: &str, now: f64) -> Result<String, Error> {
+    pub fn leave(&mut self, gid: &str, now: f64) -> Result<Vec<Event>, Error> {
         let gid = self.live(gid);
         if !self.convs.contains_key(&gid) {
             return Err(Error::from("not a member of that group"));
@@ -847,12 +848,12 @@ impl<S: Store> Messenger<S> {
             return Err(Error::from("the personal group is not left (M§7.1)"));
         }
         self.leaving.insert(gid.clone());
-        Ok(json!(self.propose_leave(&gid, now as i64)).to_string())
+        Ok(self.propose_leave(&gid, now as i64))
     }
 
     /// The Remove proposals for every leaf of this identity in `gid`, deposited: this device's own by `leave_group`
     /// (MLS lets a member propose, never commit, its own removal), a sibling's by `propose_remove_member`.
-    fn propose_leave(&mut self, gid: &str, now: i64) -> Vec<Value> {
+    fn propose_leave(&mut self, gid: &str, now: i64) -> Vec<Event> {
         let ctx = Context::new(now, &self.resolver);
         let (provider, signer) = (self.mls.provider(), self.mls.signer());
         let me = self.keys.identity.clone();
@@ -873,12 +874,12 @@ impl<S: Store> Messenger<S> {
                 }
             }
         }
-        let mut out: Vec<Value> = errors.into_iter().map(|e| json!({"error": format!("leave proposal in {gid}: {e}")})).collect();
+        let mut out: Vec<Event> = errors.into_iter().map(|e| Event::error(format!("leave proposal in {gid}: {e}"))).collect();
         for b in bytes {
             let frame = self.hub_deposit(gid, "handshake", json!({"mls": b64(&b)}), now);
             let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
             self.pending.insert(id, Pending::Proposal { gid: gid.to_string() });
-            out.push(json!({"send": frame}));
+            out.push(Event::send(frame));
         }
         out
     }
@@ -1036,11 +1037,11 @@ impl<S: Store> Messenger<S> {
 
     /// The user played an `audio` or `video` content (M§10.4): a `played` receipt under the same opt-in as `read`
     /// (M§10.5). Frames and events, as `inbound` returns them.
-    pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> String {
+    pub fn played(&mut self, gid: &str, content_id: &str, now: f64) -> Vec<Event> {
         let now_i = now as i64;
-        let Some(c) = self.convs.get_mut(gid) else { return "[]".into() };
+        let Some(c) = self.convs.get_mut(gid) else { return vec![] };
         let emissions = c.receipts.play(now_i, content_id);
-        json!(self.receipt_sends(gid, emissions, now_i)).to_string()
+        self.receipt_sends(gid, emissions, now_i)
     }
 
     /// A DID document to hold (§8.1), for `did:web` peers.
@@ -1096,15 +1097,15 @@ impl<S: Store> Messenger<S> {
     }
 
     /// What to send on a fresh binding: pending application items again (M§9.3, the same bytes), then a sync.
-    pub fn on_bound(&mut self, now: f64) -> String {
-        let mut frames: Vec<String> = serde_json::from_str(&self.rebind(now)).unwrap_or_default();
+    pub fn on_bound(&mut self, now: f64) -> Vec<String> {
+        let mut frames = self.rebind(now);
         frames.push(self.sync_frame(true, now));
-        json!(frames).to_string()
+        frames
     }
 
     /// [`Messenger::on_bound`] without the sync, for a host that syncs when its user asks: deposits whose answer the
     /// ended binding took with it, and the outbox's pending items, again (M§9.3: the same bytes).
-    pub fn rebind(&mut self, now: f64) -> String {
+    pub fn rebind(&mut self, now: f64) -> Vec<String> {
         let mut frames = vec![];
         let moved = self.moved_from.is_some();
         if let Some(old) = self.moved_from.take() {
@@ -1125,7 +1126,7 @@ impl<S: Store> Messenger<S> {
                 frames.push(self.deposit_item(&gid, &it, now as i64));
             }
         }
-        json!(frames).to_string()
+        frames
     }
 
     /// Deposits whose answer a binding that ended took with it, sent again under fresh envelopes: a GroupInfo as a new
@@ -1170,7 +1171,7 @@ impl<S: Store> Messenger<S> {
 
     /// Create this identity's personal group at its mailbox (M§7.1): the `mailbox-config` that registers it and the
     /// GroupInfo deposit; the first archive key follows once the hub holds the group (M§12.1). Frames to send.
-    pub fn create_personal(&mut self, now: f64) -> Result<String, Error> {
+    pub fn create_personal(&mut self, now: f64) -> Result<Vec<String>, Error> {
         if self.personal.is_some() {
             return Err(Error::from("this identity already has a personal group here"));
         }
@@ -1181,7 +1182,7 @@ impl<S: Store> Messenger<S> {
             self.pending.insert(id, Pending::GroupInfo { gid: gid.clone(), then: None });
             self.pending.insert(format!("personal:{gid}"), Pending::PersonalReady { gid });
         }
-        Ok(json!(frames).to_string())
+        Ok(frames)
     }
 
     /// A `key-package-fetch` for `target` to send on a connection to `to_mailbox` (M§5.5), presenting the grant
@@ -1202,7 +1203,7 @@ impl<S: Store> Messenger<S> {
     /// Create a direct conversation with `target` from its mailbox's `key-packages` answer (M§7.2): every device of
     /// the target the vector-pinned rule picks (C§5), plus this identity's own other devices from `own_json` (the
     /// same answer shape, or null), in one commit once the group is hubbed. Returns the frames to send, or the refusal.
-    pub fn create_direct(&mut self, target: &str, key_packages_json: &str, own_json: Option<String>, now: f64) -> Result<String, Error> {
+    pub fn create_direct(&mut self, target: &str, key_packages_json: &str, own_json: Option<String>, now: f64) -> Result<Vec<String>, Error> {
         if let Some(gid) = self.convs.iter().find(|(_, c)| c.kind == "direct" && c.peer.as_deref() == Some(target)).map(|(g, _)| g.clone()) {
             return Err(Error::from(format!("a conversation with {target} exists: {gid}")));
         }
@@ -1221,14 +1222,14 @@ impl<S: Store> Messenger<S> {
         if let Some(id) = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])) {
             self.pending.insert(id, Pending::GroupInfo { gid, then: Some(op) });
         }
-        Ok(json!(frames).to_string())
+        Ok(frames)
     }
 
     /// Create a group conversation (M§7.3, `kind: group`) with the identities of `targets_json`, `{identity: its
     /// mailbox's key-packages answer}`, plus this identity's own other devices from `own_json` (or null): every device
     /// the vector-pinned rule picks, added in one commit once the group is hubbed at this identity's mailbox, with the
     /// grants held from them (M§14.2). Returns the frames to send.
-    pub fn create_group(&mut self, targets_json: &str, own_json: Option<String>, now: f64) -> Result<String, Error> {
+    pub fn create_group(&mut self, targets_json: &str, own_json: Option<String>, now: f64) -> Result<Vec<String>, Error> {
         let now_i = now as i64;
         let targets: serde_json::Map<String, Value> = serde_json::from_str(targets_json).map_err(err)?;
         if targets.is_empty() {
@@ -1249,7 +1250,7 @@ impl<S: Store> Messenger<S> {
         if let Some(id) = frames.last().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])) {
             self.pending.insert(id, Pending::GroupInfo { gid, then: Some(op) });
         }
-        Ok(json!(frames).to_string())
+        Ok(frames)
     }
 
     /// Add `target`'s devices to the group conversation `gid` from its mailbox's `key-packages` answer (M§7.3: any
@@ -1327,7 +1328,7 @@ impl<S: Store> Messenger<S> {
     /// Remove a device of this identity from every group it is in, by credential (a revoked device's leaf no longer
     /// authenticates, spec-gap 57), and rotate the archive key once the personal group no longer holds it (M§12.4).
     /// Frames to send: one commit per group (and the new archive key at once when the personal group never held it).
-    pub fn remove_device(&mut self, device: &str, now: f64) -> Result<String, Error> {
+    pub fn remove_device(&mut self, device: &str, now: f64) -> Result<Vec<Event>, Error> {
         let now = now as i64;
         let personal = self.personal.clone().ok_or_else(|| Error::from("no personal group yet"))?;
         let groups: Vec<String> = self.convs.iter().filter(|(_, c)| !commits::device_leaves(&c.group, device).is_empty()).map(|(g, _)| g.clone()).collect();
@@ -1338,28 +1339,28 @@ impl<S: Store> Messenger<S> {
         for gid in &groups {
             let op = Op::RemoveDevice { device: device.to_string(), rotate: *gid == personal };
             out.push(match self.propose(gid, &op, now) {
-                Ok(f) => json!({"send": f}),
-                Err(e) => json!({"refused": format!("remove {device} from {gid}: {}", e.0)}),
+                Ok(f) => Event::send(f),
+                Err(e) => Event::refused(format!("remove {device} from {gid}: {}", e.0)),
             });
         }
         if !groups.contains(&personal) {
             out.extend(self.new_archive_key(&personal, now));
         }
-        Ok(json!(out).to_string())
+        Ok(out)
     }
 
     /// A fresh archive key, current from now on, sent to the personal group `personal` as an object (M§12.1).
-    fn new_archive_key(&mut self, personal: &str, now: i64) -> Vec<Value> {
+    fn new_archive_key(&mut self, personal: &str, now: i64) -> Vec<Event> {
         let akid = self.fresh_id(now);
         let key = KeyPair::generate().seed(); // 32 random bytes (M§12.1)
         self.archive_keys.insert(akid.clone(), (key.to_vec(), now));
         self.history.archive_key(&akid, now); // the current key, from now on
         let obj = json!({"object": "archive-key", "akid": akid, "key": b64(&key), "created_at": now});
         let mut out = vec![match self.send_object(personal, &obj, now) {
-            Ok(f) => json!({"send": f}),
-            Err(e) => json!({"error": e.0}),
+            Ok(f) => Event::send(f),
+            Err(e) => Event::error(e.0),
         }];
-        out.push(json!({"ui": "archive_key_created", "group": personal, "akid": akid}));
+        out.push(Ui::ArchiveKeyCreated { group: personal.to_string(), akid }.into());
         out
     }
 
@@ -1506,7 +1507,7 @@ impl<S: Store> Messenger<S> {
 
     /// Process one frame from the mailbox. Returns the emissions: `{send: frame}` (to the mailbox), `{ui: …}`
     /// events, `{sync: true}` when a refused commit asks for one (spec-gap 58), `{refused: …}`, `{error: …}`.
-    pub fn inbound(&mut self, frame: &str, now: f64) -> String {
+    pub fn inbound(&mut self, frame: &str, now: f64) -> Vec<Event> {
         let now_i = now as i64;
         let mut out = vec![];
         self.seen.sweep(now_i);
@@ -1516,7 +1517,7 @@ impl<S: Store> Messenger<S> {
             ctx.supported = self.supported.clone();
             match verify_frame(frame, &ctx) {
                 Ok(i) => i,
-                Err(r) => return json!([{"rejected": {"code": r.code, "reason": r.reason}}]).to_string(),
+                Err(r) => return vec![Event::Rejected { rejected: Rejected { code: r.code, reason: r.reason } }],
             }
         };
         let p = inb.payload().clone();
@@ -1525,21 +1526,21 @@ impl<S: Store> Messenger<S> {
         if inb.device() != self.mailbox.0 && !(matches!(inb.msg_type(), "key-packages" | "error") || (inb.msg_type() == "accepted" && answers_ours)) {
             // Everything on this binding is the mailbox's (M§4.1), except what it relays unchanged: a hub's `accepted`
             // or `error` to a deposit it forwarded (M§5.2), and a peer mailbox's answer to a key-package-fetch (M§5.5).
-            out.push(json!({"drop": format!("frame from {}, not the mailbox", inb.device())}));
-            return json!(out).to_string();
+            out.push(Event::Drop { drop: format!("frame from {}, not the mailbox", inb.device()) });
+            return out;
         }
         match inb.msg_type() {
             "items" => {
                 for item in p["items"].as_array().into_iter().flatten() {
                     match self.item(item, now_i) {
                         Ok(more) => out.extend(more),
-                        Err(e) => out.push(json!({"error": format!("item {}: {}", item["cursor"], e.0)})),
+                        Err(e) => out.push(Event::error(format!("item {}: {}", item["cursor"], e.0))),
                     }
                 }
                 out.extend(self.receipts_batch(now_i));
                 out.extend(self.apply_restored(now_i));
                 if p["next"].is_string() {
-                    out.push(json!({"send": self.sync_frame(false, now)}));
+                    out.push(Event::send(self.sync_frame(false, now)));
                 } else if p["in_reply_to"].is_string() {
                     // caught up: membership changes refused for a conflict are re-proposed while still needed, and what a
                     // moved group's old hub refused goes to the new one (M§7.4). Only the answer to a sync says so: a live
@@ -1551,15 +1552,15 @@ impl<S: Store> Messenger<S> {
             "error" if p["reason"] == "mailbox.cursor-invalid" => {
                 // M§5.4: re-sync from null; seq positions make the redelivery collapse (M§8.5)
                 self.resume.cursor_invalid();
-                out.push(json!({"ui": "resync"}));
-                out.push(json!({"send": self.sync_frame(false, now)}));
+                out.push(Ui::Resync.into());
+                out.push(Event::send(self.sync_frame(false, now)));
             }
             "error" => out.extend(self.refused(&p, now_i)),
-            "key-packages" => out.push(json!({"key_packages": p})),
-            other => out.push(json!({"drop": format!("no handler for {other}")})),
+            "key-packages" => out.push(Event::KeyPackages { key_packages: p }),
+            other => out.push(Event::Drop { drop: format!("no handler for {other}") }),
         }
         out.extend(self.recording_changes(now_i));
-        json!(out).to_string()
+        out
     }
 
     /// A fresh ULID (§12.9: timestamp-consistent with `now`).
@@ -1639,7 +1640,7 @@ impl<S: Store> Messenger<S> {
     /// The group moved to `hub` (`{did, uri}`) by the commit at `seq`: deposits go there from now on, and this
     /// identity's mailbox is told, so it admits the new hub's fan-out and forwards to it (M§7.4 "Member mailboxes follow
     /// their owner's devices"). The same `did` at a new `uri` is not a move: no `handover_seq`, nothing logged.
-    fn hub_moved(&mut self, gid: &str, hub: &Value, (seq, epoch): (i64, u64), by: &str, now: i64) -> Vec<Value> {
+    fn hub_moved(&mut self, gid: &str, hub: &Value, (seq, epoch): (i64, u64), by: &str, now: i64) -> Vec<Event> {
         let (did, uri) = (s_of(&hub["did"]), s_of(&hub["uri"]));
         let Some(c) = self.convs.get_mut(gid) else { return vec![] };
         let moved = c.hub.0 != did;
@@ -1657,14 +1658,11 @@ impl<S: Store> Messenger<S> {
             g["handover_seq"] = json!(seq);
             // rendered in the thread like a roster change, attributed to the committing identity
             let entry = json!({"seq": seq, "epoch": epoch, "by": by, "added": [], "removed": [], "left": [], "hub": did});
-            self.roster_log.entry(gid.to_string()).or_default().push(entry.clone());
-            let mut ui = entry;
-            ui["ui"] = json!("hub_moved");
-            ui["group"] = json!(gid);
-            out.push(ui);
+            self.roster_log.entry(gid.to_string()).or_default().push(entry);
+            out.push(Ui::HubMoved { group: gid.to_string(), seq, epoch, by: by.to_string(), added: vec![], removed: vec![], left: vec![], hub: did }.into());
         }
         let env = self.config_env(json!({"subject": self.keys.identity, "groups": [g]}), now);
-        out.insert(0, json!({"send": env.frame()}));
+        out.insert(0, Event::send(env.frame()));
         out
     }
 
@@ -1733,7 +1731,7 @@ impl<S: Store> Messenger<S> {
     /// C§5: a conversation that became recorded by a new recorder device, or is no longer recorded, since it was last
     /// shown: `{ui: "recording", group, conversation, new: [{device, subject, own}], ended, may_send}`. A recorder
     /// device itself renders nothing; nor does the personal group, which a recorder never joins.
-    fn recording_changes(&mut self, now: i64) -> Vec<Value> {
+    fn recording_changes(&mut self, now: i64) -> Vec<Event> {
         let mut out = vec![];
         if self.recorder {
             return out;
@@ -1749,10 +1747,9 @@ impl<S: Store> Messenger<S> {
             if devices == before {
                 continue;
             }
-            let new: Vec<Value> = recorders.iter().filter(|r| r["device"].as_str().is_some_and(|d| !before.contains(d)))
-                .map(|r| json!({"device": r["device"], "subject": r["subject"], "own": r["subject"] == json!(self.keys.identity)})).collect();
-            out.push(json!({"ui": "recording", "group": gid, "conversation": conversation, "new": new, "ended": devices.is_empty(),
-                "may_send": st["may_send"]}));
+            let new: Vec<NewRecorder> = recorders.iter().filter(|r| r["device"].as_str().is_some_and(|d| !before.contains(d)))
+                .map(|r| NewRecorder { device: r["device"].clone(), subject: r["subject"].clone(), own: r["subject"] == json!(self.keys.identity) }).collect();
+            out.push(Ui::Recording { group: gid.clone(), conversation, new, ended: devices.is_empty(), may_send: st["may_send"].clone() }.into());
             self.recording_seen.insert(gid, devices);
         }
         out
@@ -1834,7 +1831,7 @@ impl<S: Store> Messenger<S> {
     }
 
     /// The hub or mailbox accepted a deposit of ours (M§5.3).
-    fn accepted(&mut self, p: &Value, now: i64) -> Vec<Value> {
+    fn accepted(&mut self, p: &Value, now: i64) -> Vec<Event> {
         let mut out = vec![];
         let id = s_of(&p["in_reply_to"]);
         let Some((pending, hub)) = self.pending.answer(&id) else { return out };
@@ -1850,7 +1847,7 @@ impl<S: Store> Messenger<S> {
                     self.resume.sent(&gid, seq);
                     self.gap_of_from(&gid, seq, now).step(&json!({"item": {"seq": seq, "class": "handshake"}}));
                 }
-                out.push(json!({"ui": "leave_proposed", "group": gid, "seq": p["seq"]}));
+                out.push(Ui::LeaveProposed { group: gid, seq: p["seq"].as_i64() }.into());
             }
             Pending::Commit { gid, op: Some(Op::Rejoin), .. } => {
                 // M§6.8: the external commit is already applied locally (OpenMLS stores it merged)
@@ -1867,14 +1864,14 @@ impl<S: Store> Messenger<S> {
                 }
                 self.retries.remove(&gid);
                 let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "joined"}]}), now);
-                out.push(json!({"send": env.frame()}));
-                out.push(json!({"ui": "joined", "group": gid, "conversation": conversation, "kind": kind, "members": members, "epoch": epoch,
-                    "external": true, "seq": p["seq"]}));
+                out.push(Event::send(env.frame()));
+                out.push(Ui::Joined { group: gid.clone(), conversation: json!(conversation), kind, members, epoch, external: Some(true),
+                    seq: Some(p["seq"].as_i64()), successor_of: None }.into());
                 // M§6.5 rule 6: the hub gets the GroupInfo of the new epoch
                 if let Ok(f) = self.group_info_frame(&gid, now) {
                     let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
                     self.pending.insert(id, Pending::GroupInfo { gid, then: None });
-                    out.push(json!({"send": f}));
+                    out.push(Event::send(f));
                 }
             }
             Pending::Commit { gid, op, .. } => {
@@ -1885,17 +1882,17 @@ impl<S: Store> Messenger<S> {
                 };
                 if let Some(c) = self.convs.get_mut(&gid) {
                     if let Err(e) = c.group.merge_pending_commit(self.mls.provider()) {
-                        out.push(json!({"error": format!("merge commit: {e:?}")}));
+                        out.push(Event::error(format!("merge commit: {e:?}")));
                         return out;
                     }
                     let epoch = c.group.epoch().as_u64();
                     let (added, device) = match &op { Some(Op::Add { peer, device, .. }) => (Some(peer.clone()), device.clone()), _ => (None, None) };
-                    out.push(json!({"ui": "committed", "group": gid, "epoch": epoch, "seq": p["seq"], "added": added, "device": device,
-                        "personal": self.personal.as_deref() == Some(gid.as_str()), "op": op.as_ref().map(Op::describe)}));
+                    out.push(Ui::Committed { group: gid.clone(), epoch, seq: p["seq"].as_i64(), added, device,
+                        personal: self.personal.as_deref() == Some(gid.as_str()), op: op.as_ref().map(Op::describe) }.into());
                 }
                 if let Some(epoch) = self.convs.get(&gid).map(|c| c.group.epoch().as_u64()) {
                     let me = self.keys.identity.clone();
-                    out.extend(self.log_roster(&gid, (p["seq"].clone(), epoch), &me, &before_ids, &left, now));
+                    out.extend(self.log_roster(&gid, (p["seq"].as_i64(), epoch), &me, &before_ids, &left, now));
                 }
                 if let Some(seq) = p["seq"].as_i64() {
                     self.resume.sent(&gid, seq);
@@ -1920,9 +1917,9 @@ impl<S: Store> Messenger<S> {
                     Ok(f) => {
                         let id = Envelope::from_frame(&f).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
                         self.pending.insert(id, Pending::GroupInfo { gid, then: None });
-                        out.push(json!({"send": f}));
+                        out.push(Event::send(f));
                     }
-                    Err(e) => out.push(json!({"error": e.0})),
+                    Err(e) => out.push(Event::error(e.0)),
                 }
             }
             Pending::GroupInfo { gid, then } => {
@@ -1931,14 +1928,14 @@ impl<S: Store> Messenger<S> {
                 }
                 if let Some(op) = then {
                     match self.propose(&gid, &op, now) {
-                        Ok(f) => out.push(json!({"send": f})),
-                        Err(e) => out.push(json!({"refused": format!("add: {}", e.0)})),
+                        Ok(f) => out.push(Event::send(f)),
+                        Err(e) => out.push(Event::refused(format!("add: {}", e.0))),
                     }
                 }
                 if let Some(Pending::PersonalReady { gid: g }) = self.pending.remove(&format!("personal:{gid}")) {
                     // M§7.1, M§12.1: the first archive key
                     out.extend(self.new_archive_key(&g, now));
-                    out.push(json!({"ui": "personal", "group": g}));
+                    out.push(Ui::Personal { group: g }.into());
                 }
             }
             Pending::Application { gid, item } => {
@@ -1963,30 +1960,30 @@ impl<S: Store> Messenger<S> {
                         m["seq"] = json!(seq);
                     }
                 }
-                out.push(json!({"ui": "sent", "group": gid, "item": item, "seq": p["seq"], "duplicate": p["duplicate"], "after_outage": after_outage}));
+                out.push(Ui::Sent { group: gid.clone(), item: item.clone(), seq: p["seq"].as_i64(), duplicate: p["duplicate"].as_bool(), after_outage }.into());
                 // M§9.4: an accepted ends an outage and flushes the queue in order
                 let ems = self.outbox.answered(&gid, &item, None);
                 if ems.iter().any(|e| e.get("forward").is_some()) {
-                    out.push(json!({"ui": "hub_back", "group": gid}));
+                    out.push(Ui::HubBack { group: gid.clone() }.into());
                 }
                 out.extend(self.outage_emissions(&gid, ems, now));
             }
             Pending::PersonalReady { .. } => {}
-            Pending::KeyPackages { count } => out.push(json!({"ui": "key_packages_uploaded", "count": count})),
+            Pending::KeyPackages { count } => out.push(Ui::KeyPackagesUploaded { count }.into()),
             Pending::Config { .. } => {}
-            Pending::Archive { .. } => out.push(json!({"ui": "archived", "duplicate": p["duplicate"]})),
+            Pending::Archive { .. } => out.push(Ui::Archived { duplicate: p["duplicate"].as_bool() }.into()),
         }
         out
     }
 
     /// The hub or mailbox refused a deposit of ours (M§16): a commit as `CommitRetry` decides (spec-gap 58).
-    fn refused(&mut self, p: &Value, now: i64) -> Vec<Value> {
+    fn refused(&mut self, p: &Value, now: i64) -> Vec<Event> {
         let mut out = vec![];
         let reason = s_of(&p["reason"]);
         let id = s_of(&p["in_reply_to"]);
         let Some((pending, hub)) = self.pending.answer(&id) else {
             // not an answer to a deposit of ours (a sync's, or none): the mailbox's reason and detail as they came
-            out.push(json!({"error": format!("{reason} {}", p["detail"]), "reason": p["reason"], "detail": p["detail"]}));
+            out.push(Event::Error { error: format!("{reason} {}", p["detail"]), group: None, reason: Some(p["reason"].clone()), detail: Some(p["detail"].clone()) });
             return out;
         };
         if matches!(pending, Pending::Commit { .. } | Pending::Application { .. }) {
@@ -2001,11 +1998,11 @@ impl<S: Store> Messenger<S> {
             if let Some(d) = ems.iter().find_map(|e| e["retry_in"].as_i64()) {
                 // M§7.4 (spec-gap 129): the hub the group moved to is not set up yet: the same deposit again later
                 self.pending.defer(pending, now + d);
-                out.push(json!({"ui": "hub_arriving", "group": gid, "in": d}));
+                out.push(Ui::HubArriving { group: gid, in_s: d }.into());
                 return out;
             }
             if ems.iter().any(|e| e.get("expired").is_some()) {
-                out.push(json!({"ui": "hub_arrival_expired", "group": gid}));
+                out.push(Ui::HubArrivalExpired { group: gid }.into());
             }
         }
         match pending {
@@ -2021,7 +2018,7 @@ impl<S: Store> Messenger<S> {
                         let _ = c.group.clear_pending_commit(self.mls.provider().storage());
                     }
                     if let Some(r) = surface {
-                        out.push(json!({"refused": format!("commit in {gid}: {r}")}));
+                        out.push(Event::refused(format!("commit in {gid}: {r}")));
                     } else {
                         if reason == "mailbox.unknown-group" {
                             // M§7.4: the group may have moved; the sync shows whether it did
@@ -2030,24 +2027,24 @@ impl<S: Store> Messenger<S> {
                             }
                         }
                         let epoch = self.convs.get(&gid).map(|c| c.group.epoch().as_u64());
-                        out.push(json!({"ui": "conflict", "group": gid, "reason": reason, "epoch": epoch, "op": op.as_ref().map(Op::describe)}));
+                        out.push(Ui::Conflict { group: gid.clone(), reason: reason.clone(), epoch, op: op.as_ref().map(Op::describe) }.into());
                         if let Some(op) = op.clone() {
                             self.retries.insert(gid.clone(), (retry.clone(), op));
                         }
-                        out.push(json!({"sync": true}));
+                        out.push(Event::Sync { sync: true });
                     }
                 }
             }
-            Pending::GroupInfo { gid, .. } => out.push(json!({"refused": format!("group-info for {gid}: {reason}")})),
+            Pending::GroupInfo { gid, .. } => out.push(Event::refused(format!("group-info for {gid}: {reason}"))),
             // M§7.3: a refused proposal (a stale epoch) is proposed again at the next epoch
-            Pending::Proposal { gid } => out.push(json!({"ui": "leave_proposal_refused", "group": gid, "reason": reason})),
+            Pending::Proposal { gid } => out.push(Ui::LeaveProposalRefused { group: gid, reason }.into()),
             Pending::Application { gid, item } if reason == "mailbox.unknown-group" && self.convs.contains_key(&gid) => {
                 // M§7.4 "A member that missed the move": sync; re-encrypted and re-sent to the new hub if the group moved
                 let hub = self.convs.get(&gid).map(|c| c.hub.0.clone()).unwrap_or_default();
                 self.unknown_at.insert(gid.clone(), hub);
                 self.moved_items.entry(gid.clone()).or_default().push(item.clone());
-                out.push(json!({"ui": "moved_check", "group": gid, "item": item}));
-                out.push(json!({"sync": true}));
+                out.push(Ui::MovedCheck { group: gid, item }.into());
+                out.push(Event::Sync { sync: true });
             }
             Pending::Application { gid, item } => {
                 let down = is_outage(&reason);
@@ -2059,18 +2056,18 @@ impl<S: Store> Messenger<S> {
                 } else {
                     out.extend(self.hub_unreachable(&gid, &item, false, now));
                 }
-                out.push(json!({"refused": format!("message {item}: {reason}"), "group": gid, "item": item, "pending": down}));
+                out.push(Event::Refused { refused: format!("message {item}: {reason}"), group: Some(gid), item: Some(item), pending: Some(down) });
             }
             Pending::PersonalReady { .. } => {}
-            Pending::KeyPackages { .. } => out.push(json!({"refused": format!("key packages: {reason}")})),
-            Pending::Config { .. } => out.push(json!({"refused": format!("mailbox-config: {reason}")})),
-            Pending::Archive { .. } => out.push(json!({"refused": format!("archive record: {reason}")})),
+            Pending::KeyPackages { .. } => out.push(Event::refused(format!("key packages: {reason}"))),
+            Pending::Config { .. } => out.push(Event::refused(format!("mailbox-config: {reason}"))),
+            Pending::Archive { .. } => out.push(Event::refused(format!("archive record: {reason}"))),
         }
         out
     }
 
     /// After a sync caught up: re-propose membership changes that lost a conflict and are still needed (M§6.5).
-    fn after_sync(&mut self, now: i64) -> Vec<Value> {
+    fn after_sync(&mut self, now: i64) -> Vec<Event> {
         let mut out = vec![];
         for gid in self.retries.keys().cloned().collect::<Vec<_>>() {
             let (mut retry, op) = self.retries.remove(&gid).expect("present");
@@ -2094,16 +2091,16 @@ impl<S: Store> Messenger<S> {
             };
             let moved = self.hub_moved_since(&gid);
             match retry.synced(needed, moved) {
-                Synced::Done => out.push(json!({"ui": "no_longer_needed", "group": gid, "op": op.describe()})),
-                Synced::Surface(r) => out.push(json!({"refused": format!("commit in {gid}: {r}")})),
+                Synced::Done => out.push(Ui::NoLongerNeeded { group: gid.clone(), op: op.describe() }.into()),
+                Synced::Surface(r) => out.push(Event::refused(format!("commit in {gid}: {r}"))),
                 Synced::Repropose(attempt) => match self.propose(&gid, &op, now) {
                     Ok(f) => {
                         self.retries.insert(gid.clone(), (retry.clone(), op.clone()));
                         let epoch = self.convs.get(&gid).map(|c| c.group.epoch().as_u64());
-                        out.push(json!({"ui": "repropose", "group": gid, "op": op.describe(), "attempt": attempt, "epoch": epoch}));
-                        out.push(json!({"send": f}));
+                        out.push(Ui::Repropose { group: gid.clone(), op: op.describe(), attempt, epoch }.into());
+                        out.push(Event::send(f));
                     }
-                    Err(e) => out.push(json!({"refused": e.0})),
+                    Err(e) => out.push(Event::refused(e.0)),
                 },
             }
         }
@@ -2113,14 +2110,14 @@ impl<S: Store> Messenger<S> {
                 if moved {
                     // M§7.4: re-encrypted at the current epoch and re-sent to the new hub
                     match self.reencrypt_item(&gid, &item, now) {
-                        Some(f) => out.push(json!({"send": f})),
-                        None => out.push(json!({"refused": format!("message {item}: no longer in the outbox"), "group": gid, "item": item})),
+                        Some(f) => out.push(Event::send(f)),
+                        None => out.push(Event::Refused { refused: format!("message {item}: no longer in the outbox"), group: Some(gid.clone()), item: Some(item), pending: None }),
                     }
                 } else {
                     // spec-gap 60: no move, so mailbox.unknown-group is final
                     self.outbox.remove(&gid, &item);
                     self.messages.retain(|m| m["item"] != item);
-                    out.push(json!({"refused": format!("message {item}: mailbox.unknown-group"), "group": gid, "item": item, "pending": false}));
+                    out.push(Event::Refused { refused: format!("message {item}: mailbox.unknown-group"), group: Some(gid.clone()), item: Some(item), pending: Some(false) });
                 }
             }
         }
@@ -2159,7 +2156,7 @@ impl<S: Store> Messenger<S> {
     }
 
     /// One `items[]` element (M§5.4): committed with the MLS change it caused (spec-gap 44).
-    fn item(&mut self, item: &Value, now: i64) -> Result<Vec<Value>, MlsError> {
+    fn item(&mut self, item: &Value, now: i64) -> Result<Vec<Event>, MlsError> {
         let mut out = vec![];
         let class = s_of(&item["class"]);
         let gid = s_of(&item["group"]);
@@ -2173,7 +2170,7 @@ impl<S: Store> Messenger<S> {
             }
             Route::Other => return Ok(out),
             Route::Duplicate => {
-                out.push(json!({"ui": "duplicate", "class": class, "cursor": item["cursor"]}));
+                out.push(Ui::Duplicate { class, cursor: item["cursor"].as_str().map(String::from) }.into());
                 return Ok(out);
             }
             Route::FirstContact => {
@@ -2192,17 +2189,17 @@ impl<S: Store> Messenger<S> {
             }
             Route::Own { released } => {
                 // our own deposit fanned back (M§6.5 rule 5), arriving before its accepted (spec-gap 47) or instead of it
-                out.push(json!({"ui": "self", "class": class, "seq": item["seq"]}));
+                out.push(Ui::Own { class, seq: item["seq"].as_i64() }.into());
                 out.extend(self.released(released, now)?);
                 return Ok(out);
             }
             Route::PreJoin => {
-                out.push(json!({"ui": "prejoin", "class": class, "seq": item["seq"]}));
+                out.push(Ui::Prejoin { class, seq: item["seq"].as_i64() }.into());
                 return Ok(out);
             }
             Route::Held => {
                 // M§6.5 (spec-gap 69): a handshake beyond a seq gap, and anything after a held item, waits for the gap
-                out.push(json!({"ui": "hold", "class": class, "seq": item["seq"]}));
+                out.push(Ui::Hold { class, seq: item["seq"].as_i64() }.into());
                 return Ok(out);
             }
             Route::Process { bytes, released, .. } => (bytes, released),
@@ -2227,7 +2224,7 @@ impl<S: Store> Messenger<S> {
                         c.group = g;
                     }
                 }
-                out.push(json!({"ui": "unprocessable", "class": class, "cursor": item["cursor"], "why": e.0}));
+                out.push(Ui::Unprocessable { class, cursor: item["cursor"].as_str().map(String::from), why: e.0 }.into());
                 out.extend(self.released(released, now)?);
                 return Ok(out);
             }
@@ -2248,34 +2245,30 @@ impl<S: Store> Messenger<S> {
                 self.history.joined(&group, epoch);
                 // M§6.6: confirm the pending registration
                 let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": group, "state": "joined"}]}), now);
-                out.push(json!({"send": env.frame()}));
-                out.push(json!({"ui": "joined", "group": group, "conversation": conv["conversation"], "kind": kind, "members": members, "epoch": epoch,
-                    "successor_of": conv["successor_of"]}));
+                out.push(Event::send(env.frame()));
+                out.push(Ui::Joined { group: group.clone(), conversation: conv["conversation"].clone(), kind: kind.clone(), members, epoch,
+                    external: None, seq: None, successor_of: Some(conv["successor_of"].clone()) }.into());
                 if kind != "personal" && by != self.keys.identity {
                     // M§7.3: the joiner renders its own add, attributed to the identity whose commit added it
-                    let entry = json!({"seq": item["seq"], "epoch": epoch, "by": by, "added": [self.keys.identity], "removed": [], "left": []});
-                    self.roster_log.entry(group.clone()).or_default().push(entry.clone());
-                    let mut ui = entry;
-                    ui["ui"] = json!("roster");
-                    ui["group"] = json!(group);
-                    out.push(ui);
+                    let me = self.keys.identity.clone();
+                    out.push(self.roster_entry(&group, (item["seq"].as_i64(), epoch), &by, vec![me], vec![], vec![]));
                 }
                 if let Some(pred) = conv["successor_of"].as_str().map(String::from) {
                     out.extend(self.successor_welcome(&group, &pred, now));
                 }
             }
             Outcome::Object { sender, sender_device, object } => out.extend(self.object_in(&gid, item, &sender, &sender_device, object, now)),
-            Outcome::Dropped(why) => out.push(json!({"ui": "dropped", "why": why})),
-            Outcome::Unauthenticated(what) => out.push(json!({"ui": "unauthenticated", "what": what})),
-            Outcome::RecorderContent { device, id } => out.push(json!({"ui": "recorder_content", "device": device, "id": id})),
-            Outcome::NotForDevice => out.push(json!({"ui": "sibling_welcome", "cursor": item["cursor"]})),
+            Outcome::Dropped(why) => out.push(Ui::Dropped { why }.into()),
+            Outcome::Unauthenticated(what) => out.push(Ui::Unauthenticated { what }.into()),
+            Outcome::RecorderContent { device, id } => out.push(Ui::RecorderContent { device, id }.into()),
+            Outcome::NotForDevice => out.push(Ui::SiblingWelcome { cursor: item["cursor"].as_str().map(String::from) }.into()),
             Outcome::Epoch { epoch, by, added, removed, left, hub } => {
                 if let Some(h) = hub {
                     // M§7.4: a device that processes the moving commit tells its mailbox
                     out.extend(self.hub_moved(&gid, &h, (item["seq"].as_i64().unwrap_or(0), epoch), &by, now));
                 }
-                out.extend(self.log_roster(&gid, (item["seq"].clone(), epoch), &by, &before_ids, &left, now));
-                out.push(json!({"ui": "epoch", "group": gid, "epoch": epoch, "by": by, "added": added, "removed": removed}));
+                out.extend(self.log_roster(&gid, (item["seq"].as_i64(), epoch), &by, &before_ids, &left, now));
+                out.push(Ui::Epoch { group: gid.clone(), epoch, by, added, removed }.into());
                 if self.leaving.contains(&gid) {
                     // M§7.3: a proposal lapses with its epoch; still a member, the leave is proposed again
                     out.extend(self.propose_leave(&gid, now));
@@ -2294,11 +2287,11 @@ impl<S: Store> Messenger<S> {
                     self.personal = None;
                 }
                 let kind = c.as_ref().map(|c| c.kind.clone());
-                out.push(json!({"ui": "removed", "group": gid, "by": by, "conversation": c.map(|c| c.conversation), "kind": kind, "left": was_leaving}));
+                out.push(Ui::Removed { group: gid.clone(), by, conversation: c.map(|c| c.conversation), kind, left: was_leaving }.into());
                 let decision = registration_on_removal(&json!({"me": self.keys.identity, "remaining_identities": remaining}));
                 if decision["left"] == json!(true) {
                     let env = self.config_env(json!({"subject": self.keys.identity, "groups": [{"group": gid, "state": "left"}]}), now);
-                    out.push(json!({"send": env.frame()}));
+                    out.push(Event::send(env.frame()));
                 }
             }
             Outcome::Proposal { proposer, removes, others, roster } => {
@@ -2308,17 +2301,17 @@ impl<S: Store> Messenger<S> {
                 match d["action"].as_str() {
                     Some("commit") => match self.propose(&gid, &Op::Leave { identity: who.clone() }, now) {
                         Ok(f) => {
-                            out.push(json!({"send": f}));
-                            out.push(json!({"ui": "leave_committing", "group": gid, "identity": who}));
+                            out.push(Event::send(f));
+                            out.push(Ui::LeaveCommitting { group: gid.clone(), identity: who }.into());
                         }
-                        Err(e) => out.push(json!({"error": format!("committing the leave of {who}: {}", e.0)})),
+                        Err(e) => out.push(Event::error(format!("committing the leave of {who}: {}", e.0))),
                     },
                     Some("left") => {
                         // a sibling device left for this identity: nothing more is sent; the commit removing us follows
                         self.leaving.insert(gid.clone());
-                        out.push(json!({"ui": "left", "group": gid, "by_device": proposer["device"]}));
+                        out.push(Ui::Left { group: gid.clone(), by_device: proposer["device"].clone() }.into());
                     }
-                    _ => out.push(json!({"ui": "leave_proposals", "group": gid, "identity": who, "decision": d})),
+                    _ => out.push(Ui::LeaveProposals { group: gid.clone(), identity: who, decision: d }.into()),
                 }
             }
             Outcome::Nothing => {}
@@ -2328,17 +2321,17 @@ impl<S: Store> Messenger<S> {
     }
 
     /// The gap filled: what was held behind it is processed now, in seq order (M§6.5, spec-gap 69).
-    fn released(&mut self, released: Vec<Value>, now: i64) -> Result<Vec<Value>, MlsError> {
+    fn released(&mut self, released: Vec<Value>, now: i64) -> Result<Vec<Event>, MlsError> {
         let mut out = vec![];
         for held in released {
-            out.push(json!({"ui": "released", "class": held["class"], "seq": held["seq"]}));
+            out.push(Ui::Released { class: held["class"].clone(), seq: held["seq"].clone() }.into());
             out.extend(self.item(&held, now)?);
         }
         Ok(out)
     }
 
     /// A decrypted application object, already committed (M§8.1).
-    fn object_in(&mut self, gid: &str, item: &Value, sender: &str, sender_device: &str, object: Value, now: i64) -> Vec<Value> {
+    fn object_in(&mut self, gid: &str, item: &Value, sender: &str, sender_device: &str, object: Value, now: i64) -> Vec<Event> {
         let mut out = vec![];
         let seq = item["seq"].as_i64().unwrap_or(0);
         match object["object"].as_str() {
@@ -2348,7 +2341,7 @@ impl<S: Store> Messenger<S> {
                 let arrival = archive::take_key(&mut self.archive_keys, &akid, unb64(&object["key"]), created);
                 let fresh = arrival == archive::KeyArrival::Fresh;
                 if arrival == archive::KeyArrival::Conflict {
-                    out.push(json!({"ui": "dropped", "why": format!("archive-key {akid} from {sender_device}: another key under an akid already held; the first is kept (spec-gap 140)")}));
+                    out.push(Ui::Dropped { why: format!("archive-key {akid} from {sender_device}: another key under an akid already held; the first is kept (spec-gap 140)") }.into());
                 }
                 // M§12.3 step 5 (spec-gap 51): records kept for this key open now
                 // what the machine held for this key is released from held_archive below
@@ -2359,7 +2352,7 @@ impl<S: Store> Messenger<S> {
                         out.extend(self.open_archive(&h, now));
                     }
                 }
-                out.push(json!({"ui": "archive_key", "akid": akid, "from": sender, "fresh": fresh}));
+                out.push(Ui::ArchiveKey { akid, from: sender.to_string(), fresh }.into());
             }
             Some("call-event") => {
                 // M§13.3: every device of the identity shows one entry per call, whichever device sent it
@@ -2368,15 +2361,15 @@ impl<S: Store> Messenger<S> {
                 let decisions = self.history.mls(gid, seq, epoch, &key, &object);
                 out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
                 let fresh = self.calls.record(&object);
-                out.push(json!({"ui": "call_event", "session": object["session"], "peer": object["peer"], "outcome": object["outcome"],
-                    "direction": object["direction"], "from_device": sender_device, "collapsed": !fresh}));
+                out.push(Ui::CallEvent { session: object["session"].clone(), peer: object["peer"].clone(), outcome: object["outcome"].clone(),
+                    direction: object["direction"].clone(), from_device: Some(sender_device.to_string()), collapsed: Some(!fresh), from_archive: None }.into());
             }
             Some("recording-acceptance") => {
                 // C§5: each device accepts the union of its own acceptances and those in its personal group
                 let conv = s_of(&object["conversation"]);
                 let devices: Vec<String> = object["recorders"].as_array().into_iter().flatten().filter_map(|d| d.as_str().map(String::from)).collect();
                 self.recording_accepted.entry(conv.clone()).or_default().extend(devices.iter().cloned());
-                out.push(json!({"ui": "recording_accepted", "conversation": conv, "recorders": devices, "from_device": sender_device}));
+                out.push(Ui::RecordingAccepted { conversation: conv, recorders: devices, from_device: sender_device.to_string() }.into());
             }
             Some("call-record") if self.recorder => {
                 // C§9: a record-keeper keeps one record per session leg (the sending device's)
@@ -2384,7 +2377,7 @@ impl<S: Store> Messenger<S> {
                 if fresh {
                     self.records.push(json!({"group": gid, "from": sender, "device": sender_device, "received_at": now, "record": object}));
                 }
-                out.push(json!({"ui": "call_record", "from": sender, "session": object["session"], "outcome": object["outcome"], "fresh": fresh}));
+                out.push(Ui::CallRecord { from: sender.to_string(), session: object["session"].clone(), outcome: object["outcome"].clone(), fresh }.into());
             }
             Some("receipt") => {
                 // a sibling's undisclosed watermark describes another conversation (spec-gap 52)
@@ -2393,12 +2386,13 @@ impl<S: Store> Messenger<S> {
                 if let Some(t) = target {
                     self.batch.receipt(gid, &t, seq, &object, sender_device);
                 }
-                out.push(json!({"ui": "receipt", "group": gid, "from": sender, "kind": object["kind"], "targets": object["targets"], "through": object["through"]}));
+                out.push(Ui::Receipt { group: gid.to_string(), from: sender.to_string(), kind: object["kind"].clone(), targets: object["targets"].clone(),
+                    through: object["through"].clone() }.into());
             }
             Some("content") => {
                 let key = history::object_key(&object);
                 if !self.shown.insert(key.clone()) {
-                    out.push(json!({"ui": "duplicate_content", "seq": seq}));
+                    out.push(Ui::DuplicateContent { seq }.into());
                     return out;
                 }
                 // a sibling device's content is this identity's own (M§12.3: sent messages reach every device)
@@ -2409,8 +2403,8 @@ impl<S: Store> Messenger<S> {
                 let epoch = self.convs.get(gid).map(|c| c.group.epoch().as_u64()).unwrap_or(0);
                 let decisions = self.history.mls(gid, seq, epoch, &key, &object);
                 out.extend(self.archive_requests(gid, &decisions, &object, sender, sender_device, seq, now));
-                out.push(json!({"ui": "message", "group": gid, "from": sender, "seq": seq, "kind": object["kind"], "text": object["text"], "sent_at": object["sent_at"],
-                    "id": object["id"], "blobs": item["blobs"], "from_device": sender_device, "object": object}));
+                out.push(Ui::Message { group: gid.to_string(), from: sender.to_string(), seq, kind: object["kind"].clone(), text: object["text"].clone(),
+                    sent_at: object["sent_at"].clone(), id: object["id"].clone(), blobs: item["blobs"].clone(), from_device: sender_device.to_string(), object }.into());
             }
             _ => {}
         }
@@ -2450,20 +2444,22 @@ impl<S: Store> Messenger<S> {
     /// Record a merged commit's roster change by identity, from the member identities before it, and say so to the UI
     /// (M§7.3: every roster change rendered, attributed to the committing identity). Nothing when no identity came or
     /// went (a device of a member added or removed, a path update).
-    fn log_roster(&mut self, gid: &str, (seq, epoch): (Value, u64), by: &str, before: &[String], left: &[String], now: i64) -> Vec<Value> {
+    fn log_roster(&mut self, gid: &str, (seq, epoch): (Option<i64>, u64), by: &str, before: &[String], left: &[String], now: i64) -> Vec<Event> {
         let after = self.member_identities(gid, now);
-        let added: Vec<&String> = after.iter().filter(|i| !before.contains(i)).collect();
-        let gone: Vec<&String> = before.iter().filter(|i| !after.contains(i)).collect();
+        let added: Vec<String> = after.iter().filter(|i| !before.contains(i)).cloned().collect();
+        let gone: Vec<String> = before.iter().filter(|i| !after.contains(i)).cloned().collect();
         if added.is_empty() && gone.is_empty() {
             return vec![];
         }
-        let (left, removed): (Vec<&String>, Vec<&String>) = gone.into_iter().partition(|i| left.contains(i));
+        let (left, removed): (Vec<String>, Vec<String>) = gone.into_iter().partition(|i| left.contains(i));
+        vec![self.roster_entry(gid, (seq, epoch), by, added, removed, left)]
+    }
+
+    /// One roster change, kept in the group's log and said to the host (M§7.3).
+    fn roster_entry(&mut self, gid: &str, (seq, epoch): (Option<i64>, u64), by: &str, added: Vec<String>, removed: Vec<String>, left: Vec<String>) -> Event {
         let entry = json!({"seq": seq, "epoch": epoch, "by": by, "added": added, "removed": removed, "left": left});
-        self.roster_log.entry(gid.to_string()).or_default().push(entry.clone());
-        let mut ui = entry;
-        ui["ui"] = json!("roster");
-        ui["group"] = json!(gid);
-        vec![ui]
+        self.roster_log.entry(gid.to_string()).or_default().push(entry);
+        Ui::Roster { group: gid.to_string(), seq, epoch, by: by.to_string(), added, removed, left }.into()
     }
 
     fn member_identities(&self, gid: &str, now: i64) -> Vec<String> {
@@ -2477,11 +2473,11 @@ impl<S: Store> Messenger<S> {
 
     /// A deposit the group's new hub refused before it hosted the group, made again to the group's hub: an application
     /// item's same bytes under a fresh envelope (M§9.3), a commit's same MLS bytes (M§7.4, spec-gap 129).
-    fn redeposit(&mut self, pending: Pending, now: i64) -> Vec<Value> {
+    fn redeposit(&mut self, pending: Pending, now: i64) -> Vec<Event> {
         match pending {
             Pending::Application { gid, item } => {
                 match self.outbox.item(&gid, &item).cloned() {
-                    Some(item) => vec![json!({"send": self.deposit_item(&gid, &item, now)})],
+                    Some(item) => vec![Event::send(self.deposit_item(&gid, &item, now))],
                     None => vec![],
                 }
             }
@@ -2489,42 +2485,42 @@ impl<S: Store> Messenger<S> {
                 let frame = self.hub_deposit(&gid, "handshake", fields.clone(), now);
                 let id = Envelope::from_frame(&frame).ok().and_then(|e| wire::payload_of(&e)).map(|p| s_of(&p["id"])).unwrap_or_default();
                 self.pending.insert(id, Pending::Commit { gid, op, fields });
-                vec![json!({"send": frame})]
+                vec![Event::send(frame)]
             }
             _ => vec![],
         }
     }
 
     /// A deposit for `gid` met an unreachable hub (or no answer): the outage starts or continues (M§9.4).
-    fn hub_unreachable(&mut self, gid: &str, item: &str, silent: bool, now: i64) -> Vec<Value> {
+    fn hub_unreachable(&mut self, gid: &str, item: &str, silent: bool, now: i64) -> Vec<Event> {
         let (started, ems) = self.outbox.unreachable(gid, item, silent, now);
         let mut out = vec![];
         if started {
-            out.push(json!({"ui": "hub_down", "group": gid, "hub_timeout": self.outbox.hub_timeout}));
+            out.push(Ui::HubDown { group: gid.to_string(), hub_timeout: self.outbox.hub_timeout }.into());
         }
         out.extend(self.outage_emissions(gid, ems, now));
         out
     }
 
     /// Act on the outbox's emissions (M§9.4): re-deposit the head, or hand the group to its successor at the threshold.
-    fn outage_emissions(&mut self, gid: &str, ems: Vec<Value>, now: i64) -> Vec<Value> {
+    fn outage_emissions(&mut self, gid: &str, ems: Vec<Value>, now: i64) -> Vec<Event> {
         let mut out = vec![];
         for e in ems {
             if let Some(id) = e["forward"].as_str() {
                 if let Some(item) = self.outbox.item_mut(gid, id) {
                     item["forwarded"] = json!(true); // its accepted ends the outage for it (M§9.4)
                     let item = item.clone();
-                    out.push(json!({"send": self.deposit_item(gid, &item, now)}));
+                    out.push(Event::send(self.deposit_item(gid, &item, now)));
                 }
             } else if let Some(d) = e["retry_in"].as_i64() {
                 let head = self.outbox.outages.get(gid).and_then(|o| o.pending().first().cloned());
-                out.push(json!({"ui": "hub_retry", "group": gid, "in": d, "item": head}));
+                out.push(Ui::HubRetry { group: gid.to_string(), in_s: d, item: head }.into());
             } else if e.get("successor").is_some() || e.get("handover").is_some() {
                 // M§9.4: the threshold passed: the dead group takes no more content; its pending items are re-encrypted
                 // for the successor, which the host creates once it has the members' KeyPackages (M§7.5)
                 let items = self.outbox.take(gid);
                 let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
-                let pending: Vec<Value> = items.iter().map(|i| json!({"item": i["id"], "id": i["obj"]["id"]})).collect();
+                let pending: Vec<HandedOver> = items.iter().map(|i| HandedOver { item: i["id"].as_str().map(String::from), id: i["obj"]["id"].clone() }).collect();
                 self.messages.retain(|m| !ids.contains(&m["item"]));
                 for i in &items {
                     self.shown.remove(&history::object_key(&i["obj"]));
@@ -2535,8 +2531,8 @@ impl<S: Store> Messenger<S> {
                 // M§7.5: the roster the members check it against (spec-gap 139), so it adds nobody they would refuse
                 let roster: Vec<String> = self.convs.get(gid).and_then(|c| commits::roster(&c.group)).unwrap_or_default()
                     .into_iter().filter(|i| *i != me).collect();
-                out.push(json!({"successor_due": {"group": gid, "peers": roster, "kind": self.convs.get(gid).map(|c| c.kind.clone()),
-                    "existing": self.successors.successor(gid), "pending": pending}}));
+                out.push(Event::SuccessorDue { successor_due: SuccessorDue { group: gid.to_string(), peers: roster, kind: self.convs.get(gid).map(|c| c.kind.clone()),
+                    existing: self.successors.successor(gid).map(String::from), pending } });
             }
         }
         out
@@ -2544,7 +2540,7 @@ impl<S: Store> Messenger<S> {
 
     /// A welcome to a successor group (M§7.5): the pinned check (its creator, leaf 0, was in the predecessor's last
     /// roster this device processed, and it adds nobody who was not) and convergence on the lowest `group_id`.
-    fn successor_welcome(&mut self, group: &str, pred: &str, now: i64) -> Vec<Value> {
+    fn successor_welcome(&mut self, group: &str, pred: &str, now: i64) -> Vec<Event> {
         let mut out = vec![];
         let roster = self.member_identities(group, now);
         let creator = {
@@ -2555,7 +2551,7 @@ impl<S: Store> Messenger<S> {
         self.track_rosters_but(Some(group));
         for d in self.successors.welcome(group, pred, &creator, &roster) {
             if let Converge::Join(_) = d {
-                out.push(json!({"ui": "successor", "group": group, "of": pred, "creator": creator}));
+                out.push(Ui::Successor { group: group.to_string(), of: pred.to_string(), creator: creator.clone() }.into());
                 // M§9.4: what this device still had pending for the dead group goes to the successor, re-encrypted
                 let items = self.outbox.take(pred);
                 let ids: Vec<Value> = items.iter().map(|i| i["id"].clone()).collect();
@@ -2570,11 +2566,11 @@ impl<S: Store> Messenger<S> {
                 out.extend(self.flush_handover(group, now));
             } else if let Converge::Decline(g) | Converge::FirstContact(g) = &d {
                 let why = if matches!(d, Converge::FirstContact(_)) { "not a valid successor: first contact (M§7.5)" } else { "a lower successor exists (M§7.5)" };
-                out.push(json!({"ui": "successor_declined", "group": g, "of": pred, "why": why}));
-                out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
+                out.push(Ui::SuccessorDeclined { group: g.clone(), of: pred.to_string(), why: why.to_string() }.into());
+                out.extend(self.leave_group(g, now).into_iter().map(Event::send));
             } else if let Converge::Leave(g) = &d {
-                out.push(json!({"ui": "successor_left", "group": g, "of": pred}));
-                out.extend(self.leave_group(g, now).into_iter().map(|f| json!({"send": f})));
+                out.push(Ui::SuccessorLeft { group: g.clone(), of: pred.to_string() }.into());
+                out.extend(self.leave_group(g, now).into_iter().map(Event::send));
             }
         }
         out
@@ -2586,7 +2582,7 @@ impl<S: Store> Messenger<S> {
     }
 
     /// Send what waits for `gid` (a successor) as new objects (M§9.4: re-encrypted, never the dead group's bytes).
-    fn flush_handover(&mut self, gid: &str, now: i64) -> Vec<Value> {
+    fn flush_handover(&mut self, gid: &str, now: i64) -> Vec<Event> {
         let objs = self.handover.remove(gid).unwrap_or_default();
         let mut out = vec![];
         let mut sent = vec![];
@@ -2594,16 +2590,16 @@ impl<S: Store> Messenger<S> {
             match self.send_item(gid, &obj, now) {
                 Ok((item, f)) => {
                     if !f.is_empty() {
-                        out.push(json!({"send": f}));
+                        out.push(Event::send(f));
                     }
                     // the object's new outbox item: its `sent` names it (queued behind an outage of this hub too)
-                    sent.push(json!({"item": item, "id": obj["id"]}));
+                    sent.push(HandedOver { item, id: obj["id"].clone() });
                 }
-                Err(e) => out.push(json!({"error": e.0})),
+                Err(e) => out.push(Event::error(e.0)),
             }
         }
         if !sent.is_empty() {
-            out.push(json!({"ui": "handed_over", "group": gid, "items": sent.len(), "sent": sent}));
+            out.push(Ui::HandedOver { group: gid.to_string(), items: sent.len(), sent }.into());
         }
         out
     }
@@ -2639,7 +2635,7 @@ impl<S: Store> Messenger<S> {
     }
 
     /// M§10.2: delivered receipts are decided once per sync batch, per conversation; each is sent as an object.
-    fn receipts_batch(&mut self, now: i64) -> Vec<Value> {
+    fn receipts_batch(&mut self, now: i64) -> Vec<Event> {
         let mut out = vec![];
         for (gid, items) in self.batch.take() {
             let Some(c) = self.convs.get_mut(&gid) else { continue };
@@ -2667,57 +2663,57 @@ impl<S: Store> Messenger<S> {
     /// undisclosed read watermark — to the personal group (M§10.5, spec-gap 52).
     /// Seal and deposit one activity (M§11.1): signed by the device key, AES-256-GCM under the epoch's exporter key,
     /// AAD `group_id ‖ epoch`, an ephemeral deposit no `accepted` answers.
-    fn activity_out(&mut self, gid: &str, activity: &str, state: &str, now: i64) -> Vec<Value> {
+    fn activity_out(&mut self, gid: &str, activity: &str, state: &str, now: i64) -> Vec<Event> {
         let Some(c) = self.convs.get(gid) else { return vec![] };
         let obj = json!({"object": "activity", "conversation": c.conversation, "sender": self.keys.identity, "activity": activity, "state": state});
         let signed = dsip_core::envelope::sign(&obj, &self.keys.device, &self.keys.device.kid());
         let key = match dsip_mls::activity_key(&c.group, self.mls.provider()) {
             Ok(k) => k,
-            Err(e) => return vec![json!({"error": format!("activity key: {e}")})],
+            Err(e) => return vec![Event::error(format!("activity key: {e}"))],
         };
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&KeyPair::generate().seed()[..12]);
         let use_ = SealUse::Activity { group: c.group.group_id().as_slice(), epoch: c.group.epoch().as_u64() };
         let sealed = seal(&key, &nonce, compact(&signed).as_bytes(), use_);
         let frame = self.hub_deposit(gid, "ephemeral", json!({"sealed": b64(&sealed)}), now);
-        vec![json!({"send": frame}), json!({"ui": "activity_sent", "group": gid, "activity": activity, "state": state})]
+        vec![Event::send(frame), Ui::ActivitySent { group: gid.to_string(), activity: activity.to_string(), state: state.to_string() }.into()]
     }
 
     /// A pushed activity (M§11.1): opened with the epoch's exporter key, its device signature verified, and kept only
     /// from a device that is a member's leaf; shown until the deposit's `expires_at` (M§11.2).
-    fn activity_in(&mut self, item: &Value, now: i64) -> Vec<Value> {
+    fn activity_in(&mut self, item: &Value, now: i64) -> Vec<Event> {
         let gid = s_of(&item["group"]);
         let ctx = Context::new(now, &self.resolver);
         let Some(c) = self.convs.get(&gid) else { return vec![] };
         let Ok(key) = dsip_mls::activity_key(&c.group, self.mls.provider()) else { return vec![] };
         let use_ = SealUse::Activity { group: c.group.group_id().as_slice(), epoch: c.group.epoch().as_u64() };
         let Ok(plain) = open(&key, &unb64(&item["sealed"]), use_) else {
-            return vec![json!({"ui": "dropped", "why": "activity: not sealed for this epoch"})];
+            return vec![Ui::Dropped { why: "activity: not sealed for this epoch".into() }.into()];
         };
         let mut parts = std::str::from_utf8(&plain).unwrap_or("").split('.');
         let mut next = || parts.next().unwrap_or("").to_string();
         let env = Envelope { protected: next(), payload: next(), signature: next() };
         let Ok(ver) = dsip_core::envelope::verify_raw(&env, &ctx, false) else {
-            return vec![json!({"ui": "dropped", "why": "activity: bad signature"})];
+            return vec![Ui::Dropped { why: "activity: bad signature".into() }.into()];
         };
         // M§11.1: the signature attributes it; the signing device must be a leaf of the group
         let leaf = c.group.members().filter_map(|m| member_identity(&c.group, m.index, &ctx).ok()).find(|w| w.device == ver.signer_did).map(|w| w.identity);
         let octx = json!({"conversation": c.conversation, "conversation_kind": c.kind, "leaf_identity": leaf});
         let obj = ver.payload;
         if dsip_messaging::checks::check_object(&obj, &octx)["verdict"] != "accept" {
-            return vec![json!({"ui": "dropped", "why": format!("activity from {}: not a member's device", ver.signer_did)})];
+            return vec![Ui::Dropped { why: format!("activity from {}: not a member's device", ver.signer_did) }.into()];
         }
         let mut out = self.advance_receipts(now);
         let emissions = self.convs.get_mut(&gid).map(|c| c.receipts.activity_in(now, &obj["sender"], &obj["activity"], &obj["state"], &item["expires_at"]))
             .unwrap_or_default();
         out.extend(self.receipt_sends(&gid, emissions, now));
-        out.push(json!({"ui": "activity", "group": gid, "from": obj["sender"], "activity": obj["activity"], "state": obj["state"]}));
+        out.push(Ui::Activity { group: gid, from: obj["sender"].clone(), activity: obj["activity"].clone(), state: obj["state"].clone() }.into());
         out
     }
 
     /// Advance every conversation's receipts machine to `now` (M§10.3, M§11.2): what it emits, and the activity that
     /// expired (`activity_cleared`).
-    fn advance_receipts(&mut self, now: i64) -> Vec<Value> {
+    fn advance_receipts(&mut self, now: i64) -> Vec<Event> {
         let mut out = vec![];
         for gid in self.convs.keys().cloned().collect::<Vec<_>>() {
             let c = self.convs.get_mut(&gid).expect("group");
@@ -2727,7 +2723,7 @@ impl<S: Store> Messenger<S> {
             for (who, acts) in before.as_object().into_iter().flatten() {
                 for a in acts.as_object().into_iter().flatten().map(|(a, _)| a) {
                     if after[who.as_str()].get(a).is_none() {
-                        out.push(json!({"ui": "activity_cleared", "group": gid, "from": who, "activity": a}));
+                        out.push(Ui::ActivityCleared { group: gid.clone(), from: who.clone(), activity: a.clone() }.into());
                     }
                 }
             }
@@ -2807,19 +2803,19 @@ impl<S: Store> Messenger<S> {
 
     /// The user's own activity in `gid` (M§11.1: typing, uploading, recording), `state` `active` or `stopped`: sent
     /// when the policy discloses activity, at the pace the receipts machine keeps. Frames and events.
-    pub fn activity(&mut self, gid: &str, activity: &str, state: &str, now: f64) -> String {
+    pub fn activity(&mut self, gid: &str, activity: &str, state: &str, now: f64) -> Vec<Event> {
         let now = now as i64;
         let gid = self.live(gid);
-        let Some(c) = self.convs.get_mut(&gid) else { return "[]".into() };
+        let Some(c) = self.convs.get_mut(&gid) else { return vec![] };
         let emissions = c.receipts.activity(now, activity, state);
         let mut out = self.receipt_sends(&gid, emissions, now);
         if out.is_empty() {
-            out.push(json!({"ui": "activity_not_sent", "group": gid, "activity": activity, "state": state}));
+            out.push(Ui::ActivityNotSent { group: gid, activity: activity.to_string(), state: state.to_string() }.into());
         }
-        json!(out).to_string()
+        out
     }
 
-    fn receipt_sends(&mut self, gid: &str, emissions: Vec<Emission>, now: i64) -> Vec<Value> {
+    fn receipt_sends(&mut self, gid: &str, emissions: Vec<Emission>, now: i64) -> Vec<Event> {
         let mut out = vec![];
         for e in emissions {
             // an archive decision is the batch's (receipts_batch)
@@ -2835,14 +2831,14 @@ impl<S: Store> Messenger<S> {
             let target = if receipt.personal {
                 match self.personal.clone() {
                     Some(p) => p,
-                    None => { out.push(json!({"ui": "read_private_kept", "group": gid})); continue; }
+                    None => { out.push(Ui::ReadPrivateKept { group: gid.to_string() }.into()); continue; }
                 }
             } else {
                 gid.to_string()
             };
             if target == gid && self.may_send_content(gid, now).is_err() {
                 // C§5: no receipts into a recorded conversation until its recorders are accepted (nor ever from a recorder)
-                out.push(json!({"ui": "receipt_withheld", "group": gid, "kind": kind}));
+                out.push(Ui::ReceiptWithheld { group: gid.to_string(), kind: kind.to_string() }.into());
                 continue;
             }
             let conversation = self.convs.get(gid).map(|c| c.conversation.clone()).unwrap_or_default();
@@ -2850,11 +2846,11 @@ impl<S: Store> Messenger<S> {
             let obj = receipt.object(&conversation, &self.keys.identity, &id, now);
             match self.send_object(&target, &obj, now) {
                 Ok(f) => {
-                    out.push(json!({"send": f}));
-                    out.push(json!({"ui": "receipt_sent", "group": gid, "kind": kind, "targets": receipt.targets, "through": receipt.through,
-                        "via": if target == gid { "conversation" } else { "personal group" }}));
+                    out.push(Event::send(f));
+                    out.push(Ui::ReceiptSent { group: gid.to_string(), kind: kind.to_string(), targets: receipt.targets.clone(), through: receipt.through.clone(),
+                        via: if target == gid { "conversation" } else { "personal group" }.to_string() }.into());
                 }
-                Err(e) => out.push(json!({"error": e.0})),
+                Err(e) => out.push(Event::error(e.0)),
             }
         }
         out
@@ -2863,7 +2859,7 @@ impl<S: Store> Messenger<S> {
     /// Archive records the history machine asked for (M§12.2): each sealed under its key, AAD `group_id ‖ seq`, and
     /// deposited to this identity's mailbox as `class: archive`.
     #[allow(clippy::too_many_arguments)] // the record's fields, named as M§12.2 names them
-    fn archive_requests(&mut self, gid: &str, decisions: &[Decision], obj: &Value, sender: &str, sender_device: &str, seq: i64, now: i64) -> Vec<Value> {
+    fn archive_requests(&mut self, gid: &str, decisions: &[Decision], obj: &Value, sender: &str, sender_device: &str, seq: i64, now: i64) -> Vec<Event> {
         let mut out = vec![];
         let Some(conversation) = self.convs.get(gid).map(|c| c.conversation.clone()) else { return out };
         let at = archive::Received { conversation: &conversation, group: gid, seq, sender, sender_device, received_at: now };
@@ -2874,27 +2870,27 @@ impl<S: Store> Messenger<S> {
             let Some(fields) = archive::seal_record(&key, &nonce, &akid, &record) else { continue };
             let env = wire::deposit_delegated(&self.keys.device, vec![self.keys.delegation.clone()], &self.mailbox.0, now, gid, "archive", fields.clone());
             self.pending.insert(wire::payload_of(&env).map(|p| s_of(&p["id"])).unwrap_or_default(), Pending::Archive { fields });
-            out.push(json!({"send": env.frame()}));
-            out.push(json!({"ui": "archive", "group": gid, "seq": seq, "akid": akid, "object": obj["object"]}));
+            out.push(Event::send(env.frame()));
+            out.push(Ui::Archive { group: gid.to_string(), seq, akid, object: obj["object"].clone() }.into());
         }
         out
     }
 
     /// An archive item (M§12.2, M§12.3 step 5): opened and shown as history, or kept sealed until its key arrives.
-    fn archive_in(&mut self, item: &Value, now: i64) -> Vec<Value> {
+    fn archive_in(&mut self, item: &Value, now: i64) -> Vec<Event> {
         let akid = s_of(&item["akid"]);
         if !self.archive_keys.contains_key(&akid) {
             let cursor = s_of(&item["cursor"]);
             self.held_archive.insert(cursor.clone(), item.clone());
             self.history.held(item);
-            return vec![json!({"ui": "archive_held", "cursor": cursor, "akid": akid})];
+            return vec![Ui::ArchiveHeld { cursor, akid }.into()];
         }
         self.open_archive(item, now)
     }
 
     /// Open one archive record under a held key; content becomes a timeline entry once, a receipt is applied as
     /// history (nothing sent, nothing archived again — spec-gap 64).
-    fn open_archive(&mut self, item: &Value, now: i64) -> Vec<Value> {
+    fn open_archive(&mut self, item: &Value, now: i64) -> Vec<Event> {
         let mut out = vec![];
         let akid = s_of(&item["akid"]);
         let Some((key, _)) = self.archive_keys.get(&akid).cloned() else { return out };
@@ -2902,7 +2898,7 @@ impl<S: Store> Messenger<S> {
         let opened = match archive::open_item(&key, item) {
             Ok(o) => o,
             Err(archive::OpenError::DoesNotOpen) => {
-                out.push(json!({"ui": "dropped", "why": format!("archive {}: does not open for its group and seq", item["cursor"])}));
+                out.push(Ui::Dropped { why: format!("archive {}: does not open for its group and seq", item["cursor"]) }.into());
                 return out;
             }
             Err(archive::OpenError::NotJson) => return out,
@@ -2916,18 +2912,18 @@ impl<S: Store> Messenger<S> {
             self.messages.push(json!({"group": gid, "key": key_id, "sender": sender, "sender_device": record["sender_device"], "object": obj,
                 "seq": seq, "mine": sender == self.keys.identity, "item": null, "from_archive": true}));
             self.restored.push(seq, &obj);
-            out.push(json!({"ui": "history", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"], "text": obj["text"]}));
+            out.push(Ui::History { group: gid, seq, from: sender, kind: obj["kind"].clone(), text: obj["text"].clone() }.into());
         } else if decisions.iter().any(Decision::is_apply) {
             if obj["object"] == "call-event" {
                 // spec-gap 63: an archived call event goes to the call log, not the timeline's content
                 if self.calls.record(&obj) {
-                    out.push(json!({"ui": "call_event", "session": obj["session"], "peer": obj["peer"], "outcome": obj["outcome"],
-                        "direction": obj["direction"], "from_archive": true}));
+                    out.push(Ui::CallEvent { session: obj["session"].clone(), peer: obj["peer"].clone(), outcome: obj["outcome"].clone(),
+                        direction: obj["direction"].clone(), from_device: None, collapsed: None, from_archive: Some(true) }.into());
                 }
             } else {
                 self.restored.push(seq, &obj);
-                out.push(json!({"ui": "history_receipt", "group": gid, "seq": seq, "from": sender, "kind": obj["kind"],
-                    "targets": obj["targets"], "through": obj["through"]}));
+                out.push(Ui::HistoryReceipt { group: gid, seq, from: sender, kind: obj["kind"].clone(), targets: obj["targets"].clone(),
+                    through: obj["through"].clone() }.into());
             }
         }
         out.extend(self.apply_restored(now));
@@ -2936,7 +2932,7 @@ impl<S: Store> Messenger<S> {
 
     /// Restored content and receipts are applied to their conversation's receipt state as history once this device
     /// is in that conversation (spec-gap 64); the rest wait.
-    fn apply_restored(&mut self, now: i64) -> Vec<Value> {
+    fn apply_restored(&mut self, now: i64) -> Vec<Event> {
         let groups = self.convs.iter().map(|(g, c)| (g.as_str(), c.conversation.as_str(), c.kind == "personal"));
         let mut out = vec![];
         for (g, items) in self.restored.ready(groups) {
@@ -2944,13 +2940,13 @@ impl<S: Store> Messenger<S> {
             let n = items.len();
             let emissions = c.receipts.restore(now, items);
             out.extend(self.receipt_sends(&g, emissions, now));
-            out.push(json!({"ui": "history_applied", "group": g, "items": n}));
+            out.push(Ui::HistoryApplied { group: g, items: n }.into());
         }
         out
     }
 
     /// A signed introduction or grant delivered through the mailbox (M§14.1, spec-gap 54), verified as a credential.
-    fn first_contact_in(&mut self, item: &Value, now: i64) -> Vec<Value> {
+    fn first_contact_in(&mut self, item: &Value, now: i64) -> Vec<Event> {
         let ctx = self.ctx(now);
         // sealed purposes (M§6.9) open with the identity's key agreement key, derived from the identity key (spec-gap 55)
         let why = match first_contact::received(item, &self.keys.identity, &ctx, now, self.controller_seed.as_ref()) {
@@ -2960,17 +2956,17 @@ impl<S: Store> Messenger<S> {
                     "expires_at": req.payload["expires_at"]}));
                 // M§6.9: a sealed purpose never travels in the clear
                 let on_wire = req.payload.get("purpose").is_some();
-                return vec![json!({"ui": "request", "id": req.id, "from": req.from, "purpose": purpose, "sealed": req.sealed, "purpose_on_wire": on_wire})];
+                return vec![Ui::Request { id: req.id, from: req.from, purpose, sealed: req.sealed, purpose_on_wire: on_wire }.into()];
             }
             first_contact::Received::Grant(g) => {
                 self.grants_held.insert(g.from.clone(), g.envelope);
-                return vec![json!({"ui": "granted", "by": g.from, "scope": g.scope, "request": g.request})];
+                return vec![Ui::Granted { by: g.from, scope: g.scope, request: g.request }.into()];
             }
             first_contact::Received::DoesNotVerify => format!("{} {}: does not verify", s_of(&item["class"]), item["cursor"]),
             first_contact::Received::BadIntroduction { id, code, .. } => format!("introduction {id}: {code}"),
             first_contact::Received::NoMessageScope { id, from } => format!("grant {id} from {from}: no dsip.message scope"),
         };
-        vec![json!({"ui": "dropped", "why": why})]
+        vec![Ui::Dropped { why }.into()]
     }
 }
 

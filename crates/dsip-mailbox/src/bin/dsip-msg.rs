@@ -40,7 +40,7 @@ use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::client::select_mailbox;
 use dsip_messaging_device::messenger::Messenger;
-use dsip_messaging_device::{blob, CallLog, Store};
+use dsip_messaging_device::{blob, CallLog, Event, Store, Ui};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{conversation_extension, digest, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
@@ -647,7 +647,7 @@ impl Client {
         self.reconnect_at = None;
         self.reconnect_ceiling = 1;
         // M§9.3: what the binding that ended took with it goes again, the same bytes; no sync until asked for
-        let frames: Vec<String> = serde_json::from_str(&self.m.rebind(self.now())).unwrap_or_default();
+        let frames = self.m.rebind(self.now());
         for f in frames {
             let env = Envelope::from_frame(&f).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
             self.conn.as_mut().context("offline")?.send(&env).await?;
@@ -698,11 +698,10 @@ impl Client {
         Ok(self.conn.as_mut().context("offline")?.send(&env).await?)
     }
 
-    /// Send each frame of a JSON array.
-    async fn send_frames(&mut self, frames: &str) -> Result<()> {
-        let frames: Vec<String> = serde_json::from_str(frames).unwrap_or_default();
+    /// Send each frame.
+    async fn send_frames(&mut self, frames: &[String]) -> Result<()> {
         for f in frames {
-            self.send_frame(&f).await?;
+            self.send_frame(f).await?;
         }
         Ok(())
     }
@@ -795,9 +794,9 @@ impl Client {
     }
 
     /// Act on what the `Messenger` emitted: frames to the mailbox, events printed as lines, network work queued.
-    async fn handle(&mut self, out: &str) -> Result<()> {
+    async fn handle(&mut self, out: &[Event]) -> Result<()> {
         self.refresh_names();
-        let emissions: Vec<Value> = serde_json::from_str(out).unwrap_or_default();
+        let emissions: Vec<Value> = out.iter().map(|e| serde_json::to_value(e).unwrap_or_default()).collect();
         for e in emissions {
             if let Some(f) = e.get("send").and_then(Value::as_str) {
                 if let Err(err) = self.send_frame(f).await {
@@ -1132,8 +1131,7 @@ impl Client {
             }
         }
         let frames = self.m.create_successor(dead, &Value::Object(answers).to_string(), self.now()).map_err(messenger_err)?;
-        let list: Vec<String> = serde_json::from_str(&frames).unwrap_or_default();
-        let gid = list.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
+        let gid = frames.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
             .and_then(|p| p["groups"][0]["group"].as_str().map(String::from)).unwrap_or_default();
         println!("SUCCESSOR created group={gid} of={dead}");
         self.active = Some(gid);
@@ -1281,8 +1279,7 @@ impl Client {
             self.m.create_group(&answers.to_string(), own, now)
         }
         .map_err(messenger_err)?;
-        let list: Vec<String> = serde_json::from_str(&frames).unwrap_or_default();
-        let gid = list.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
+        let gid = frames.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
             .and_then(|p| p["groups"][0]["group"].as_str().map(String::from)).context("no group created")?;
         self.active = Some(gid.clone());
         println!("OK conversation {} kind={kind}", s(&self.conv(&gid)?["conversation"]));
@@ -1327,7 +1324,7 @@ impl Client {
         if recorder {
             println!("RECORDER {device}: conversations only, never the personal group or the archive key   C§5");
         }
-        let order: Vec<String> = serde_json::from_str(&self.m.groups_for_new_device(device, self.now())).unwrap_or_default();
+        let order = self.m.groups_for_new_device(device, self.now());
         let mut first = Some(probe);
         for gid in order {
             if recorder && gid == personal {
@@ -1571,9 +1568,8 @@ impl Client {
     }
 
     /// How many receipts or activities an answer of the `Messenger`'s decided to send (or to keep, or withhold).
-    fn decided(out: &str) -> usize {
-        let list: Vec<Value> = serde_json::from_str(out).unwrap_or_default();
-        list.iter().filter(|e| matches!(e["ui"].as_str(), Some("receipt_sent" | "read_private_kept" | "receipt_withheld" | "activity_sent"))).count()
+    fn decided(out: &[Event]) -> usize {
+        out.iter().filter(|e| matches!(e, Event::Ui(Ui::ReceiptSent { .. } | Ui::ReadPrivateKept { .. } | Ui::ReceiptWithheld { .. } | Ui::ActivitySent { .. }))).count()
     }
 
     async fn command(&mut self, cmd: &str, rest: &str) -> Result<()> {
@@ -1747,7 +1743,7 @@ impl Client {
                 let r: Value = serde_json::from_str(&self.m.accept_recording(&gid, now).map_err(messenger_err)?)?;
                 println!("OK recording accepted group={gid} recorders={}", list(&r["accepted"]));
                 self.save()?;
-                let frames = r["frames"].to_string();
+                let frames: Vec<String> = serde_json::from_value(r["frames"].clone()).unwrap_or_default();
                 self.send_frames(&frames).await?;
                 // C§5 (v0.10): the acceptance is the person's — this identity's other devices are told
                 if r["frames"].as_array().is_some_and(|f| !f.is_empty()) {
