@@ -1551,7 +1551,10 @@ dependencies = [
  "base64 0.22.1",
  "dsip-core",
  "p256",
+ "serde",
  "serde_json",
+ "tsify",
+ "wasm-bindgen",
  "x509-parser 0.17.0",
 ]
 

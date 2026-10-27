@@ -15,6 +15,7 @@
 /** @typedef {import('../pkg/dsip_wasm.js').CallCommand} CallCommand */
 /** @typedef {import('../pkg/dsip_wasm.js').LocalCommand} LocalCommand */
 /** @typedef {import('../pkg/dsip_wasm.js').Invite} Invite */
+/** @typedef {import('../pkg/dsip_wasm.js').EndpointConfig} EndpointConfig */
 /** @typedef {Extract<CoreEvent, {send: unknown}>['send']} Sent */
 /** @typedef {Extract<CoreEvent, {received: unknown}>['received']} Received */
 
@@ -36,23 +37,23 @@ export class Engine {
   /**
    * @param {typeof import('../pkg/dsip_wasm.js').Endpoint} Endpoint the class from the wasm package
    * @param {object} identity the identity record
-   * @param {object} config `{first_contact_required, video, …}`
+   * @param {EndpointConfig} config `{first_contact_required, video, …}`
    * @param {() => number} now the clock, seconds
    */
   constructor(Endpoint, identity, config, now) {
     this.now = now;
-    this.ep = new Endpoint(JSON.stringify(identity), JSON.stringify(config), now());
+    this.ep = new Endpoint(JSON.stringify(identity), config, now());
     /** @type {Handlers} */
     this.on = {};
     /** @type {ReturnType<typeof setInterval> | null} */
     this.timer = null;
   }
 
-  whoami() { return JSON.parse(this.ep.whoami()); }
+  whoami() { return this.ep.whoami(); }
   /** @param {string | null | undefined} sid */
-  state(sid) { if (!sid) return null; const s = JSON.parse(this.ep.session(sid))[sid]; return s ? s.state : null; }
-  contacts() { return JSON.parse(this.ep.contacts_snapshot()); }
-  requests() { return JSON.parse(this.ep.requests()); }
+  state(sid) { if (!sid) return null; const s = this.ep.session(sid)[sid]; return s ? s.state : null; }
+  contacts() { return this.ep.contacts_snapshot(); }
+  requests() { return this.ep.requests(); }
   contactsFile() { return this.ep.contacts_json(); }
   /** @param {string | null | undefined} text */
   loadContactsFile(text) { if (text) this.ep.load_contacts(text); }
@@ -67,9 +68,9 @@ export class Engine {
   async inbound(frame) { return this.drive(this.ep.inbound(frame, this.now()), frame); }
   async tick() { return this.drive(this.ep.tick(this.now())); }
 
-  /** The other side's recording in `sid` (C§4): `{disclosure, pending, hold_media, …}`, or null.
+  /** The other side's recording in `sid` (C§4): `{disclosure, pending, hold_media, …}`, or undefined.
    *  @param {string} sid */
-  recording(sid) { return JSON.parse(this.ep.recording(sid)); }
+  recording(sid) { return this.ep.recording(sid); }
 
   /** Place a call through the call glue. Returns `{session, go}`: the session id at once (so the page can route it
    *  before anything is sent), and `go()`, which drives the first events (the request for the SDP offer; the invite
@@ -109,7 +110,7 @@ export class Engine {
     /** @type {string[]} */
     const ids = [];
     for (const m of (section || '').matchAll(/a=rtpmap:\d+ ([A-Za-z0-9]+)\//g)) { const id = names[m[1].toUpperCase()]; if (id && !ids.includes(id)) ids.push(id); }
-    this.ep.set_video_codecs(JSON.stringify(ids));
+    this.ep.set_video_codecs(ids);
   }
 
   startTimers() { this.timer ??= setInterval(() => this.tick(), 1000); }   // §12.9

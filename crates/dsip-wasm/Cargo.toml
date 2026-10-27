@@ -17,7 +17,7 @@ dsip-schema.workspace = true
 dsip-session = { workspace = true, features = ["ts"] }
 dsip-broadcast.workspace = true
 dsip-endpoint = { workspace = true, features = ["wasm", "ts"] }
-dsip-number.workspace = true
+dsip-number = { workspace = true, features = ["ts"] }
 dsip-dht = { workspace = true, default-features = false }
 dsip-messaging-device.workspace = true
 dsip-mls.workspace = true

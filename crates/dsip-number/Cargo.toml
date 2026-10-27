@@ -9,7 +9,14 @@ rust-version.workspace = true
 
 [dependencies]
 dsip-core.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
 x509-parser.workspace = true
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "pem"] }
+tsify = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+
+[features]
+# TypeScript declarations of the types the browser host sees (dsip-wasm).
+ts = ["dep:tsify", "dep:wasm-bindgen"]

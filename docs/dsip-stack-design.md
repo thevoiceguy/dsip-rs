@@ -361,14 +361,19 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    - **The engine's `Emission`** is the vectors' shape (README, kind `state`): flattened and irregular (`{"ui": …,
      "reason"}`, `{"timer": …, "name", "seconds"}`, `{"send": {…}}`), which serde cannot derive without reshaping
      `dsip-session`. Its TypeScript type is written by hand, and `tsc` checks it against every emission in the
-     state vectors: the contract types it, not the implementation.
+     state vectors: the contract types it, not the implementation. B2 does the same for the session and contacts
+     snapshots (kind `state`) and a frame's verdict (kinds `envelope`, `payload`, `semantic`); the check found the
+     first hand-written `SessionSnapshot` wrong (`outstanding_update` is `{id, direction}`, not an id).
 
    Parts, each with no behaviour change, no vector change, and every web test and CI job green:
-   - **B1:** the tooling and the call path: `CallOut`, `CoreEvent`, `MediaRequest`, `MediaResult`, `CallEvent`,
+   - **B1** (done, #256)**:** the tooling and the call path: `CallOut`, `CoreEvent`, `MediaRequest`, `MediaResult`, `CallEvent`,
      `CallCommand`, `Invite` and `Emission` typed; `Endpoint`'s `place`, `call`, `media`, `local`, `inbound`, `tick`
      and `resolved`; `host/engine.js` under check.
    - **B2:** the rest of `Endpoint` (presence, contacts, requests, sessions, recording) and the free functions
-     (identity, hints, numbers, verification, the renderers).
+     (identity, hints, numbers, verification, the renderers). `dsip-number`'s `ClaimOutcome`, `Selected` and
+     `Contact` carry the derives (behind its `ts` feature); the values the libraries build as JSON cross as JSON
+     with a declared type (`Json` is `unknown`; `Sessions`, `Contacts`, `Verdict`, `Consent`, `Mailbox`,
+     `Voicemail` are declared by hand). A result that may be absent is `T | undefined` (it was the string `null`).
    - **B3:** the `Messenger` typed in the library: its inputs and outputs are Rust types, which `dsip-msg` reads
      instead of JSON, and `dsip-wasm` exports them.
    - **B4:** `app.js` under check, with the last parsing and stringifying of boundary values gone.

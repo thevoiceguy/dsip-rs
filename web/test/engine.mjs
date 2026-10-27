@@ -11,8 +11,8 @@ const payloadOf = (frame) => JSON.parse(Buffer.from(JSON.parse(frame).payload, '
 
 const alice = JSON.parse(create_identity(null, null, 'Alice', now()));
 const bob = JSON.parse(create_identity(null, null, 'Bob', now()));
-const A = new Endpoint(JSON.stringify(alice), JSON.stringify({ video: false, seal: true }), now());
-const B = new Endpoint(JSON.stringify(bob), JSON.stringify({ one_call: true }), now());
+const A = new Endpoint(JSON.stringify(alice), { video: false, seal: true }, now());
+const B = new Endpoint(JSON.stringify(bob), { one_call: true }, now());
 const eps = () => ({ A, B });
 
 // in-memory "relay": frames from A go to B and vice versa. The page is the media host: what the call glue asks for
@@ -74,8 +74,8 @@ check('accept asks the page for an SDP answer to the offer', kinds(accepted).inc
 r = pump();
 const ka = kinds(r.A);
 check('alice: answer applied, media starts', ka.includes('recv:answer') && ka.includes('mreq:apply_answer') && ka.includes('mreq:start_sending'), JSON.stringify(ka));
-check('alice session ACTIVE', JSON.parse(A.session(sid))[sid].state === 'ACTIVE');
-check('bob session ACTIVE', JSON.parse(B.session(sid))[sid].state === 'ACTIVE');
+check('alice session ACTIVE', A.session(sid)[sid].state === 'ACTIVE');
+check('bob session ACTIVE', B.session(sid)[sid].state === 'ACTIVE');
 
 // 2. ICE candidates ride in signed info (ACTIVE-only)
 const cand = { candidate: 'candidate:1 1 udp 1 127.0.0.1 5000 typ host', sdp_mid: '0', sdp_m_line_index: 0 };
@@ -93,41 +93,41 @@ r = pump();
 check('bob: update answered → answer applied', kinds(r.B).includes('media:apply_update') && kinds(r.B).includes('mreq:apply_answer'), JSON.stringify(kinds(r.B)));
 
 // 4. one call at a time: a second call to bob is declined busy and never put to the user
-const D = new Endpoint(JSON.stringify(JSON.parse(create_identity(null, null, 'Dan', now()))), JSON.stringify({}), now());
+const D = new Endpoint(create_identity(null, null, 'Dan', now()), {}, now());
 const busyPlaced = D.place(bob.identity, {}, now());
 const busyInvite = D.media({ kind: 'offer', session: busyPlaced.session, sdp: sdp('actpass') }, now()).find((e) => e.send?.type === 'invite').send.frame;
 const busyOut = B.inbound(busyInvite, now());
 const busyReject = busyOut.find((e) => e.send?.type === 'reject');
 check('bob declines a second call user.busy, without ringing', busyReject && payloadOf(busyReject.send.frame).reason === 'user.busy' && !kinds(busyOut).includes('call:ringing'), JSON.stringify(kinds(busyOut)));
-check('the first call is untouched', JSON.parse(B.session(sid))[sid].state === 'ACTIVE');
+check('the first call is untouched', B.session(sid)[sid].state === 'ACTIVE');
 
 // 5. hangup
 drive('A', A.call({ command: 'hangup', session: sid }, now()));
 r = pump();
-check('bob: bye → ended, media closed', kinds(r.B).includes('ui:ended') && kinds(r.B).includes('mreq:close') && JSON.parse(B.session(sid))[sid].state === 'ENDED', JSON.stringify(kinds(r.B)));
+check('bob: bye → ended, media closed', kinds(r.B).includes('ui:ended') && kinds(r.B).includes('mreq:close') && B.session(sid)[sid].state === 'ENDED', JSON.stringify(kinds(r.B)));
 const probe = A.local({ local: 'info', session: sid }, now());
 check('info on ended session refused', probe.some((e) => e.emission?.refused === 'invalid-state'));
 
 // 6. standalone verifier: fresh introduction accepted, tampered frame rejected
 const goodFrame = B.local({ local: 'introduce', id: B.new_id(now()), to: alice.identity, purpose: 'hi' }, now()).find((e) => e.send).send.frame;
-const v1 = JSON.parse(verify_frame(goodFrame, JSON.stringify({ now: Math.floor(now()) })));
+const v1 = verify_frame(goodFrame, { now: Math.floor(now()) });
 check('verify_frame accepts a fresh introduction', v1.verdict === 'accept' && v1.type === 'introduction', JSON.stringify(v1).slice(0, 100));
 const env = JSON.parse(goodFrame);
 env.payload = env.payload.slice(0, 20) + (env.payload[20] === 'A' ? 'B' : 'A') + env.payload.slice(21);
-const v2 = JSON.parse(verify_frame(JSON.stringify(env), JSON.stringify({ now: Math.floor(now()) })));
+const v2 = verify_frame(JSON.stringify(env), { now: Math.floor(now()) });
 check('verify_frame rejects a tampered frame', v2.verdict === 'reject' && v2.code === 'signature-invalid', JSON.stringify(v2));
 
 // 7. first contact in wasm (the engine's own vocabulary, beside the call glue)
 const carol = JSON.parse(create_identity(null, null, 'Carol', now()));
-const C = new Endpoint(JSON.stringify(carol), JSON.stringify({ first_contact_required: true }), now());
+const C = new Endpoint(JSON.stringify(carol), { first_contact_required: true }, now());
 const sid2 = A.new_id(now());
 let evs = A.local({ local: 'place_call', session: sid2, to: carol.identity }, now());
 let cev = C.inbound(evs.find((e) => e.send).send.frame, now());
 check('carol rejects ungranted invite with policy.first-contact-required', cev.some((e) => e.send?.type === 'reject' && payloadOf(e.send.frame).reason === 'policy.first-contact-required'));
 const intro = A.local({ local: 'introduce', id: A.new_id(now()), to: carol.identity, purpose: 'meetup' }, now()).find((e) => e.send).send.frame;
 cev = C.inbound(intro, now());
-check('carol: introduction lands in requests (no session)', cev.some((e) => e.emission?.ui === 'introduction_received') && JSON.parse(C.requests()).length === 1);
-const [[introId]] = JSON.parse(C.requests());
+check('carol: introduction lands in requests (no session)', cev.some((e) => e.emission?.ui === 'introduction_received') && C.requests().length === 1);
+const [[introId]] = C.requests();
 const grantEv = C.local({ local: 'grant', introduction: introId, id: C.new_id(now()), scope: ['dsip.invite'], valid_until: Math.floor(now()) + 3600 }, now());
 const aev = A.inbound(grantEv.find((e) => e.send).send.frame, now());
 check('alice holds the grant', aev.some((e) => e.emission?.ui === 'granted') && Object.keys(JSON.parse(A.contacts_json()).grants_held).length === 1);
