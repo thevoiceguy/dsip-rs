@@ -1,3 +1,4 @@
+// @ts-check
 // Browser storage for the client: a key/value store on IndexedDB, with localStorage as the fallback where
 // IndexedDB is unavailable (private windows in some browsers). The identity, the contact list, the engine's
 // first-contact state and the settings live here. Nothing in this file is normative.
@@ -6,6 +7,7 @@
 
 const DB = 'dsip', STORE = 'kv';
 
+/** @returns {Promise<IDBDatabase | null>} */
 function openDb() {
   return new Promise((resolve, reject) => {
     if (!('indexedDB' in globalThis)) return resolve(null);
@@ -17,9 +19,11 @@ function openDb() {
   });
 }
 
+/** @type {Promise<IDBDatabase | null> | null} */
 let dbPromise = null;
 const db = () => (dbPromise ??= openDb());
 
+/** @param {IDBTransactionMode} mode @param {(s: IDBObjectStore) => IDBRequest} fn @returns {Promise<any>} */
 function tx(mode, fn) {
   return db().then((d) => {
     if (!d) return null;
@@ -33,6 +37,7 @@ function tx(mode, fn) {
 }
 
 export const store = {
+  /** @param {string} key @returns {Promise<any>} */
   async get(key) {
     try {
       const v = await tx('readonly', (s) => s.get(key));
@@ -40,10 +45,12 @@ export const store = {
     } catch { /* fall through */ }
     try { const raw = localStorage.getItem(`dsip.${key}`); return raw === null ? undefined : JSON.parse(raw); } catch { return undefined; }
   },
+  /** @param {string} key @param {unknown} value */
   async set(key, value) {
     try { const ok = await tx('readwrite', (s) => s.put(value, key)); if (ok !== null) return; } catch { /* fall through */ }
     try { localStorage.setItem(`dsip.${key}`, JSON.stringify(value)); } catch { /* storage unavailable: the session is ephemeral */ }
   },
+  /** @param {string} key */
   async del(key) {
     try { await tx('readwrite', (s) => s.delete(key)); } catch { /* ignore */ }
     try { localStorage.removeItem(`dsip.${key}`); } catch { /* ignore */ }

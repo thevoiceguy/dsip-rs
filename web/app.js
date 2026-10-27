@@ -1,3 +1,4 @@
+// @ts-check
 // DSIP reference client — the screens. Everything normative (verification, the §12 engine, payload building,
 // first-contact state, and the call glue: candidates, SDP, media gating, answering, the sealed-body fallback,
 // recording consent) runs inside dsip_wasm; this file owns the views and the one current call, and is the host layer
@@ -24,6 +25,30 @@ import { Relay } from './host/relay.js';
 import { Media } from './host/media.js';
 import { exportIdentity, importIdentity } from './host/identity-file.js';
 
+/** @typedef {import('./pkg/dsip_wasm.js').RelayHello} RelayHello */
+/** @typedef {import('./pkg/dsip_wasm.js').LocalCommand} LocalCommand */
+
+// What the Messenger keeps as it received or saved it crosses as `unknown` (dsip-rs B3b): the shapes below are what
+// this page reads of it, declared here beside their readers.
+/** A call record (C§9).
+ *  @typedef {{ session: string, direction: string, peer: string, outcome: string, ended_by: string, reason?: string,
+ *              invited_at: number, answered_at?: number, ended_at: number, evidence?: string[] }} CallRecord */
+/** A call record a record-keeper received (C§9).
+ *  @typedef {{ group: string, from: string, device: string, received_at: number, record: CallRecord }} HeldRecord */
+/** An introduction not yet answered (M§14.1).
+ *  @typedef {{ from: string, purpose?: string }} IntroductionRequest */
+/** A thread message (M§8.5), or this identity's call event for the peer (M§13.3, `call`); `object` is the content
+ *  object as it came off the wire.
+ *  @typedef {{ key: string, group: string, sender: string, sender_device: string, object: any, seq: number | null,
+ *              mine: boolean, delivered?: object, played?: object, from_archive?: boolean,
+ *              call?: { outcome: string, at: number, session: string } }} TimelineEntry */
+/** A roster change (M§7.3).
+ *  @typedef {{ group: string, seq: number | null, epoch: number, by: string, added: string[], removed: string[],
+ *              left: string[] }} RosterEntry */
+
+/** An element of the page by id. `any`: the check is for the values crossing the wasm boundary, not the DOM's
+ *  element kinds (dsip-rs B4).
+ *  @param {string} id @returns {any} */
 const $ = (id) => document.getElementById(id);
 const now = () => Date.now() / 1000;
 // `?as=` namespaces storage so two tabs on one origin can be two people (a convenience for trying it alone).
@@ -31,11 +56,16 @@ const slot = new URLSearchParams(location.search).get('as') || '';
 const key = (k) => (slot ? `${slot}.${k}` : k);
 const short = (d) => (d && d.length > 32 ? d.slice(0, 20) + '…' + d.slice(-8) : d || '');
 
-let identity = null, engine = null, relay = null, settings = {}, contacts = [];
+let identity = null, settings = {}, contacts = [];
+/** @type {Engine | null} */
+let engine = null;
+/** @type {Relay | null} */
+let relay = null;
 // {sid, role, peer, media, offer, pendingUpdate, screening, video, placing}: the call on screen. The call glue in the
 // wasm decides; this keeps what the screens show and the media leg (`placing`: our invite waits on its SDP offer)
 let call = null;
 const invites = new Map();   // session → the verified invite (`received`), until the call glue rings it
+/** @type {Extract<RelayHello, {ok: true}> | null} */
 let relayInfo = null;
 let purposes = {};    // introduction id → {purpose, basis}: what a request shows (the engine keeps only the ids)
 let grantAudiences = {};   // grant id we issued → its presence audience (P§6): the engine keeps scope and valid_until only
@@ -50,8 +80,12 @@ let ice = null;       // {servers, until}: ICE servers in effect, from Settings,
 let hintTimer = null; // re-signs the published reachability hint at ⅔ of its life
 let hintBusy = false, hintAgain = false; // a publish is in flight; another was asked for meanwhile
 let hintSeq = 0;      // the last `seq` this browser published (§8.3: newer wins; a re-sign within the same second must still be newer)
+/** @type {Messenger | null} */
 let messenger = null; // the wasm messaging device (stage 6), when a mailbox is configured
-let mailboxConn = null, mailboxInfo = null;   // the Relay to this identity's mailbox, and its verified hello
+/** @type {Relay | null} */
+let mailboxConn = null;                       // the Relay to this identity's mailbox
+/** @type {Extract<RelayHello, {ok: true}> | null} */
+let mailboxInfo = null;                       // its verified hello
 let activeConv = null;                        // the group id open on the Messages screen
 const waiters = [];                           // {pred, resolve}: one-shot waits for a Messenger emission on the mailbox connection
 let messagingTick = null;                     // advances the receipts machines (M§10.3: a held read goes out when 5 s pass)
@@ -172,7 +206,7 @@ function editGrant(li, did) {
   const share = document.createElement('label');
   share.innerHTML = '<input type="checkbox" class="grant-presence" checked> share presence';
   const apply = document.createElement('button'); apply.textContent = 'Apply'; apply.className = 'primary';
-  apply.onclick = () => box.remove() || changeGrant(did, { audience: aud.value, secs: Number(len.value), presence: share.querySelector('input').checked });
+  apply.onclick = () => { box.remove(); changeGrant(did, { audience: aud.value, secs: Number(len.value), presence: share.querySelector('input').checked }); };
   box.append(aud, len, share, apply);
   li.append(box);
 }
@@ -190,6 +224,7 @@ function liveGrantTo(did) {
 async function changeGrant(did, { audience, secs, presence }) {
   const old = liveGrantTo(did);
   if (!old) return notify('no live grant to change: they need to introduce themselves again');
+  /** @type {LocalCommand} */
   const ev = { local: 'regrant', grant: old, id: engine.newId(), valid_until: Math.floor(now()) + secs,
                scope: ['dsip.invite', 'dsip.message', ...(presence ? ['dsip.subscribe'] : [])] };
   // P§12.1: a sealed audience goes on the wire as its tag
@@ -202,6 +237,7 @@ async function changeGrant(did, { audience, secs, presence }) {
 function noteGrantAudience(id, audience) { grantAudiences[id] = audience; store.set(key('grant-audiences'), grantAudiences); }
 
 /** How long a grant lasts (P§7: a share ends at the grant's valid_until; calls and messages end with it). */
+/** @type {[string, number][]} */
 const SHARE_LENGTHS = [['until removed', 31536000], ['for 1 hour', 3600], ['for 1 day', 86400], ['for 1 week', 604800]];
 
 function renderRequests() {
@@ -222,6 +258,7 @@ function renderRequests() {
     const [aud, len] = grantPickers();
     const g = document.createElement('button'); g.textContent = 'Grant'; g.className = 'primary';
     g.onclick = () => {
+      /** @type {LocalCommand} */
       const ev = { local: 'grant', introduction: id, id: engine.newId(), scope: ['dsip.invite', 'dsip.message', 'dsip.subscribe'],
                    valid_until: Math.floor(now()) + Number(len.value) };   // §19.4; M§14.2: calls and messages; P§6: presence
       // P§6 (spec-gap 145); P§12.1: a sealed audience goes on the wire as its tag
@@ -254,7 +291,7 @@ function renderCall() {
  *  waits on acceptance, accepting or declining it are the choices, and the call is not answered before it. */
 function renderRecording() {
   const rec = call?.sid ? engine.recording(call.sid) : null;
-  const d = rec?.disclosure;
+  const d = /** @type {{ state?: string, recorder?: string, purpose?: string } | undefined} */ (rec?.disclosure);
   const on = d && d.state !== 'off';
   const text = on ? `⏺ RECORDED: the other side declares recording ${d.state} by ${nameOf(d.recorder) || short(d.recorder)}${d.purpose ? `, purpose ${d.purpose}` : ''}`
     + (rec.pending ? (call.role === 'responder' && !call.answered ? ': accept it to answer (C§4)' : ': nothing of yours is sent until you accept (C§4)') : ' (accepted)') : '';
@@ -354,6 +391,7 @@ function bindingStatus() {
   const claim = { type: 'tel', number: bindingNumber(), binding: settings.binding };
   const out = check_claim(claim, identity.identity, ownDocument(), now(), settings.tn_policy || {});
   if (out.outcome === 'attested') return `${out.line} — verifies, as a callee holding your document and this policy sees it (N§3.4)`;
+  if (out.outcome === 'ignored') return 'the binding — would be refused: it is not a claim the check reads';
   const hint = out.reason === 'not-claimed-by-did'
     ? (identity.identity.startsWith('did:web:') ? ' (your document must list the number: host the one above)' : ' (a bound number needs a did:web identity whose document lists it, N§3.3)')
     : out.reason === 'untrusted-certificate' ? ' (no anchor in the number policy covers the issuer)' : '';
@@ -848,7 +886,7 @@ async function discover(did) {
     } catch (e) { log(`hints for ${short(did)}: ${n} did not answer (${e.message})`, '§8.5'); }
   }
   const out = hint_select(did, frames, documents, now());
-  for (const v of out.report) if (v.verdict !== 'accept') log(`   a hint record was refused: ${v.code}${v.detail ? ' ' + v.detail : ''}`, '§8.3');
+  for (const v of out.report) if (v.verdict !== 'accept') log(`   a hint record was refused: ${v.code}${v.reason ? ' ' + v.reason : ''}`, '§8.3');
   if (out.hint) log(`hint for ${short(did)}: ${out.hint.uri} seq ${out.hint.seq}, signed by ${out.hint.signer === did ? 'the subject' : 'delegated device ' + short(out.hint.signer)} — HINT-SOURCED, NOT AUTHORITATIVE (§8.1 rule 6)`, '§8.3');
   else if (frames.length) log(`hint for ${short(did)}: none of ${frames.length} verified`, '§8.3');
   return out.hint;
@@ -1117,7 +1155,8 @@ async function recordLeg(leg) {
     const out = messenger.call_record(keeper, input, now());
     if (out.frames.length) await driveMailbox(out.frames.map((f) => ({ send: f })));
     else await store.set(key('messenger'), JSON.parse(messenger.save()));
-    log(`call record for ${short(leg.session)}: ${out.record.outcome}, ended ${out.record.ended_by}${out.record.reason ? ` (${out.record.reason})` : ''}, ${evidence.length} frame hashes; ${out.frames.length ? 'sent to the record-keeper' : `held (${messenger.held_records()}): no conversation with the record-keeper yet`}`, 'C§9');
+    const record = /** @type {CallRecord} */ (out.record);
+    log(`call record for ${short(leg.session)}: ${record.outcome}, ended ${record.ended_by}${record.reason ? ` (${record.reason})` : ''}, ${evidence.length} frame hashes; ${out.frames.length ? 'sent to the record-keeper' : `held (${messenger.held_records()}): no conversation with the record-keeper yet`}`, 'C§9');
   } catch (e) { log(`✗ call record for ${short(leg.session)}: ${e.message || e}`, 'C§9'); }
 }
 
@@ -1138,7 +1177,7 @@ async function leaveConversation(gid) {
     const out = messenger.leave(gid, now());
     await driveMailbox(out);
     if (activeConv === gid) activeConv = null;
-    log(`left ${short(gid)}: the removal of this identity's ${out.filter((e) => e.send).length} leaf(s) proposed; another member commits it`, 'M§7.3');
+    log(`left ${short(gid)}: the removal of this identity's ${out.filter((e) => 'send' in e && e.send).length} leaf(s) proposed; another member commits it`, 'M§7.3');
     notify('You left the conversation');
   } catch (e) { notify(`cannot leave: ${e.message || e}`); }
   renderMessages();
@@ -1175,7 +1214,7 @@ function renderRecords() {
   const keeper = !!messenger?.is_recorder();
   $('records-pane').classList.toggle('hidden', !keeper);
   if (!keeper) return;
-  const recs = messenger.records();
+  const recs = /** @type {HeldRecord[]} */ (messenger.records());
   const key = JSON.stringify(recs.map((r) => [r.device, r.record.session]));
   if ($('record-list').dataset.shown === key) return;
   $('record-list').dataset.shown = key;
@@ -1273,6 +1312,7 @@ function introduce(to) {
 }
 
 async function sendIntroduction(to, purpose, token) {
+  /** @type {LocalCommand} */
   const ev = { local: 'introduce', id: engine.newId(), to, purpose };
   if (token) ev.contact_token = token;
   // §8.1: as before a call, the hints tier may say they are bound to another relay; the introduction goes through
@@ -1684,6 +1724,7 @@ async function startEngine() {
 /** Grants held from others as `{identity: compact}` (§19.4: the grantee holds the signed grant; presented at M§14.2). */
 function heldGrantFrames() {
   const file = JSON.parse(engine.contactsFile());
+  /** @type {Record<string, string>} */
   const out = {};
   for (const [id, g] of Object.entries(file.grants_held || {})) if (file.grant_frames?.[id]) out[g.identity] = file.grant_frames[id];
   return out;
@@ -1737,7 +1778,8 @@ async function startMessagingNow() {
         conn.close(); renderMessages(); return;
       }
       mailboxInfo = r;
-      log(`← hello        mailbox ${short(r.did)} bound us (in_reply_to matched); ${r.capabilities?.mailbox?.hub ? 'a hub' : 'no hub'}, modes ${(r.capabilities?.mailbox?.modes || []).join('/')}`, 'M§4.3 · §20.5');
+      const caps = /** @type {{ mailbox?: { hub?: boolean, modes?: string[] } } | undefined} */ (r.capabilities);
+      log(`← hello        mailbox ${short(r.did)} bound us (in_reply_to matched); ${caps?.mailbox?.hub ? 'a hub' : 'no hub'}, modes ${(caps?.mailbox?.modes || []).join('/')}`, 'M§4.3 · §20.5');
       await driveMailbox(messenger.on_bound(now()));                      // pending items again, then sync live (M§9.3, M§5.4)
       await driveMailbox([messenger.key_packages_frame(2, now())]);        // M§5.5: fresh KeyPackages on every bind
       if (messenger.is_recorder()) log('this device is a recorder: it never joins its identity\'s personal group (C§5)', 'C§5');
@@ -1859,9 +1901,9 @@ function fetchFromMailbox(mb, target, successorOf) {
       rejected: (code) => finish(() => reject(new Error(`their mailbox refused our hello: ${code}`))),
       frame: (text) => {
         for (const e of messenger.inbound(text, now())) {
-          if (e.key_packages) return finish(() => resolve(e.key_packages));
-          if (e.error) return finish(() => reject(new Error(e.error)));
-          if (e.rejected) return finish(() => reject(new Error(`frame rejected: ${e.rejected.code}`)));
+          if ('key_packages' in e) return finish(() => resolve(e.key_packages));
+          if ('error' in e) return finish(() => reject(new Error(e.error)));
+          if ('rejected' in e) return finish(() => reject(new Error(`frame rejected: ${e.rejected.code}`)));
         }
       },
       closed: () => { if (!done) finish(() => reject(new Error('their mailbox closed the connection'))); },
@@ -1915,6 +1957,7 @@ async function createGroup(dids) {
   if (!messenger || !mailboxInfo) return notify('messaging is not connected');
   messenger.set_grants(heldGrantFrames());
   try {
+    /** @type {Record<string, any>} */
     const targets = {};
     for (const did of dids) {
       const mb = await peerMailbox(did);
@@ -1998,6 +2041,7 @@ async function successorDue(d) {
   successorBusy.add(d.group);
   try {
     log(`hub of ${short(d.group)} unreachable past the threshold: creating its successor${d.peers.length ? ` with ${d.peers.map((p) => nameOf(p) || short(p)).join(', ')}` : ''}`, 'M§9.4 · M§7.5');
+    /** @type {Record<string, any>} */
     const kps = {};
     for (const peer of d.peers) {
       const mb = await peerMailbox(peer);
@@ -2063,7 +2107,10 @@ const b64u = {
 };
 
 /** The mailbox's blob endpoint, from its hello capabilities (M§4.3). */
-function blobEndpoint() { return mailboxInfo?.capabilities?.mailbox?.blob_endpoint || null; }
+function blobEndpoint() {
+  const caps = /** @type {{ mailbox?: { blob_endpoint?: string } } | undefined} */ (mailboxInfo?.capabilities);
+  return caps?.mailbox?.blob_endpoint || null;
+}
 
 /** Start or stop recording a voice message for the open conversation; on stop it is sealed, uploaded and sent. */
 async function toggleVoice(opts = {}) {
@@ -2139,7 +2186,7 @@ async function fetchBlob(gid, m, attempt = 1) {
     media[id] = { state: 'retry', attempt: attempt + 1 };
     log(`blob for ${short(id)}: nothing served yet, trying again in ${delay / 1000} s (attempt ${attempt})`, 'spec-gap 106');
     setTimeout(() => fetchBlob(gid, m, attempt + 1), delay);
-  } else { media[id] = { state: 'failed', why: d.reason }; log(`blob for ${short(id)} given up: ${d.reason}`, 'M§8.4'); renderMessages(); }
+  } else { const why = 'reason' in d ? d.reason : d.action; media[id] = { state: 'failed', why }; log(`blob for ${short(id)} given up: ${why}`, 'M§8.4'); renderMessages(); }
 }
 
 async function sendText(text) {
@@ -2174,7 +2221,7 @@ function renderMessages() {
     ul.append(li);
   }
   const rl = $('msg-request-list');
-  const reqs = messenger ? Object.entries(messenger.requests()) : [];
+  const reqs = messenger ? Object.entries(/** @type {Record<string, IntroductionRequest>} */ (messenger.requests())) : [];
   rl.innerHTML = reqs.length ? '' : '<li class="muted small">none</li>';
   for (const [id, r] of reqs) { const li = document.createElement('li'); li.innerHTML = '<code class="did"></code> <span class="small purpose"></span>'; li.querySelector('.did').textContent = r.from; li.querySelector('.purpose').textContent = `“${r.purpose}” (${id})`; rl.append(li); }
   if (activeConv && !convs.some((c) => c.group === activeConv)) {
@@ -2222,14 +2269,14 @@ function renderMessages() {
   }
   const th = $('thread');
   th.innerHTML = '';
-  const timeline = conv ? messenger.timeline(conv.group) : [];
+  const timeline = conv ? /** @type {TimelineEntry[]} */ (messenger.timeline(conv.group)) : [];
   const thread = timeline.filter((m) => !m.call);
   // M§10.3: each identity's watermark is a content id; the seq it names is the thread's
-  const marks = conv ? messenger.read_marks(conv.group) : {};
+  const marks = conv ? /** @type {Record<string, string>} */ (messenger.read_marks(conv.group)) : {};
   const seqOf = (id) => thread.find((m) => m.object.id === id)?.seq ?? -1;
   const theirRead = Math.max(-1, ...Object.entries(marks).filter(([who]) => who !== identity.identity).map(([, id]) => seqOf(id)));
   // M§7.3: roster changes, each before the first message the hub ordered after it
-  const roster = conv ? messenger.roster_log(conv.group) : [];
+  const roster = conv ? /** @type {RosterEntry[]} */ (messenger.roster_log(conv.group)) : [];
   const rosterDiv = (r) => { const d = document.createElement('div'); d.className = 'msg roster muted small'; d.textContent = rosterLine(r); d.dataset.epoch = r.epoch; return d; };
   let ri = 0;
   for (const m of timeline) {
@@ -2330,7 +2377,7 @@ function renderMessages() {
   log(`identity ${identity.identity}`, '§7.3');
   log(`device   ${identity.device} (delegated, §7.4)`);
 
-  for (const b of document.querySelectorAll('nav button[data-view]')) b.onclick = () => { if (!call) { show(b.dataset.view); if (b.dataset.view === 'messages') renderMessages(); } else notify('finish the call first'); };
+  for (const b of /** @type {NodeListOf<HTMLButtonElement>} */ (document.querySelectorAll('nav button[data-view]'))) b.onclick = () => { if (!call) { show(b.dataset.view); if (b.dataset.view === 'messages') renderMessages(); } else notify('finish the call first'); };
   $('btn-log-toggle').onclick = () => $('log-panel').classList.toggle('hidden');
   $('me-did').onclick = () => navigator.clipboard?.writeText(identity.identity).then(() => notify('your DID is on the clipboard'));
   // the form is read and cleared before the save is awaited: clearing after it wiped whatever was typed meanwhile
@@ -2357,7 +2404,7 @@ function renderMessages() {
   };
   $('btn-cancel-group').onclick = () => $('group-picker').classList.add('hidden');
   $('btn-create-group').onclick = () => {
-    const dids = [...document.querySelectorAll('#group-picker-list input:checked')].map((i) => i.value);
+    const dids = [.../** @type {NodeListOf<HTMLInputElement>} */ (document.querySelectorAll('#group-picker-list input:checked'))].map((i) => i.value);
     $('group-picker').classList.add('hidden');
     if (dids.length) createGroup(dids);
   };
@@ -2416,7 +2463,7 @@ function renderMessages() {
   $('import-file').onchange = async (e) => { const f = e.target.files[0]; if (f) await importFromText(await f.text()); };
 
   // Test and automation surface (the headless test drives the screens through the DOM; this exposes state only).
-  window.dsip = {
+  /** @type {any} */ (window).dsip = {
     identity: () => identity.identity,
     state: () => (call ? engine.state(call.sid) || 'PREPARING' : null),   // null = no call; PREPARING = media being set up, no session yet
     session: () => call?.sid || null,
@@ -2523,7 +2570,7 @@ function renderMessages() {
     joinAvailable,
     timeline: (gid) => messenger.timeline(gid || activeConv),
     media: (id) => (media[id] ? { state: media[id].state, from: media[id].from, size: media[id].size, why: media[id].why } : null),
-    playAudio: async (id) => { const a = document.querySelector(`audio[data-id="${id}"]`); if (!a) return false; await a.play().catch(() => {}); return true; },
+    playAudio: async (id) => { const a = /** @type {HTMLAudioElement | null} */ (document.querySelector(`audio[data-id="${id}"]`)); if (!a) return false; await a.play().catch(() => {}); return true; },
     blobEndpoint,
   };
 })();
