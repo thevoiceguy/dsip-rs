@@ -424,7 +424,7 @@ PoC better on their own terms: each removes duplicated glue from the reference c
 
 **When to start:** stages 1 and 2 are worth doing once the next spec version shows no core churn. The endpoint
 state machine and envelope rules have not changed after v0.12. v0.13–v0.16 changed the profiles, added one core
-message (`alias-monitor`, v0.14) and changed relay behaviour (§12.7, §13.3 in v0.16; Appendix A.10–A.13). Stage 4 waits for the core spec's 1.0.
+message (`alias-monitor`, v0.14) and changed relay behaviour (§12.7, §13.3 in v0.16; Appendix A.10–A.13). Stage 4 waits for the core spec's 1.0, assembled 2026-10-27 as `v1.0/` (the v0.17 text declared normative, with §11.4's rule for 1.x).
 
 ## 7. Risks
 
