@@ -1499,6 +1499,8 @@ dependencies = [
  "openmls_traits",
  "serde",
  "serde_json",
+ "tsify",
+ "wasm-bindgen",
 ]
 
 [[package]]

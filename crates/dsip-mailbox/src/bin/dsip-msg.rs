@@ -23,7 +23,7 @@
 //! committing it. Device events (E§3–E§6: the gateway and the alarm lists) are in the `events` module.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -40,7 +40,7 @@ use dsip_core::version::Supported;
 use dsip_mailbox::wire;
 use dsip_messaging::client::select_mailbox;
 use dsip_messaging_device::messenger::Messenger;
-use dsip_messaging_device::{blob, CallLog, Event, Store, Ui};
+use dsip_messaging_device::{blob, CallLeg, CallLog, Event, ReceiptPolicy, Store, Ui};
 use dsip_mls::sqlite::SqliteProvider;
 use dsip_mls::{conversation_extension, digest, MlsError};
 use dsip_transport::conn::{ConnectParams, Connection};
@@ -546,7 +546,7 @@ struct Client {
     /// Answers awaited by request id, taken off the connection before the `Messenger` sees them.
     replies: HashMap<String, Option<Value>>,
     /// KeyPackages fetched ahead of an add, by identity: the mailbox's answer (M§5.5: single use, held until used).
-    prefetched: HashMap<String, String>,
+    prefetched: HashMap<String, Value>,
     /// A dead group's pending items by content id: the item id each had there (M§9.4).
     resent: HashMap<String, String>,
     jobs: Vec<Job>,
@@ -572,7 +572,9 @@ impl Client {
     fn refresh_docs(&mut self) {
         for f in &self.resolver_files {
             if let Ok(text) = std::fs::read_to_string(f) {
-                self.m.add_document(&text);
+                if let Ok(doc) = serde_json::from_str(&text) {
+                    self.m.add_document(doc);
+                }
             }
         }
     }
@@ -593,7 +595,7 @@ impl Client {
 
     /// The conversations, as the `Messenger` lists them.
     fn conversations(&self) -> Vec<Value> {
-        serde_json::from_str(&self.m.conversations(self.now())).unwrap_or_default()
+        serde_json::to_value(self.m.conversations(self.now())).ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
     }
 
     /// One conversation as the `Messenger` lists it: `gid`, or the successor this device converged on (M§7.5).
@@ -1114,23 +1116,23 @@ impl Client {
         if let Some(w) = self.m.successor(dead) {
             println!("SUCCESSOR exists group={w} of={dead}");
             self.active = Some(w);
-            let frames = self.m.create_successor(dead, "{}", now).map_err(messenger_err)?;
+            let frames = self.m.create_successor(dead, &BTreeMap::new(), now).map_err(messenger_err)?;
             return self.send_frames(&frames).await;
         }
         let me = self.identity.clone();
         let members: Vec<String> = self.conversations().into_iter().find(|c| c["group"] == json!(dead))
             .map(|c| c["members"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect()).unwrap_or_default();
-        let mut answers = serde_json::Map::new();
+        let mut answers = BTreeMap::new();
         for peer in members.into_iter().filter(|p| *p != me) {
             // M§7.5 (spec-gap 61): the peer's mailbox serves a successor's creator without a grant
             match self.fetch_key_packages(&peer, Some(dead)).await {
                 Ok(a) => {
-                    answers.insert(peer, serde_json::from_str(&a)?);
+                    answers.insert(peer, a);
                 }
                 Err(e) => bail!("{peer}'s KeyPackages: {e}"),
             }
         }
-        let frames = self.m.create_successor(dead, &Value::Object(answers).to_string(), self.now()).map_err(messenger_err)?;
+        let frames = self.m.create_successor(dead, &answers, self.now()).map_err(messenger_err)?;
         let gid = frames.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
             .and_then(|p| p["groups"][0]["group"].as_str().map(String::from)).unwrap_or_default();
         println!("SUCCESSOR created group={gid} of={dead}");
@@ -1141,8 +1143,8 @@ impl Client {
 
     /// Deposit content to `gid` (M§9.2): `kind` says what its `sent` prints.
     async fn send_content(&mut self, gid: &str, obj: Value, kind: Item) -> Result<Sent> {
-        let r: Value = serde_json::from_str(&self.m.send(gid, &obj.to_string(), self.now()).map_err(messenger_err)?)?;
-        let Some(item) = r["item"].as_str().map(String::from) else {
+        let r = self.m.send(gid, &obj, self.now()).map_err(messenger_err)?;
+        let Some(item) = r.item else {
             println!("PENDING kept for the successor of {gid}");
             self.save()?;
             return Ok(Sent::Successor);
@@ -1150,7 +1152,7 @@ impl Client {
         self.items.insert(item.clone(), kind);
         // M§9.2: pending, durably, before it goes out
         self.save()?;
-        let frame = s(&r["send"]).to_string();
+        let frame = r.send;
         if frame.is_empty() {
             // M§9.4: the hub is down; the item waits behind the pending ones and goes out with them
             println!("PENDING {item} queued");
@@ -1211,7 +1213,7 @@ impl Client {
     /// The `key-packages` answer for `target` (M§5.5): from its mailbox, or this identity's own over the bound
     /// connection, so no second binding displaces it. `successor_of` names the dead group a successor is created for
     /// (M§7.5, spec-gap 61). A grant held from `target` is presented (M§14.2).
-    async fn fetch_key_packages(&mut self, target: &str, successor_of: Option<&str>) -> Result<String> {
+    async fn fetch_key_packages(&mut self, target: &str, successor_of: Option<&str>) -> Result<Value> {
         let so = successor_of.map(String::from);
         let payload = if target == self.identity {
             let mailbox = self.mailbox.0.clone();
@@ -1226,7 +1228,7 @@ impl Client {
         if payload["type"] != "key-packages" {
             bail!("key-package-fetch refused: {} {}", payload["type"], payload["reason"]);
         }
-        Ok(payload.to_string())
+        Ok(payload)
     }
 }
 
@@ -1248,7 +1250,7 @@ impl Client {
     /// peer's devices and this identity's own others, added in one commit once the group is hubbed here.
     async fn create(&mut self, kind: &str, peer: &str, grant: Option<String>) -> Result<()> {
         if let Some(g) = grant {
-            self.m.set_grants(&json!({peer: g}).to_string());
+            self.m.set_grants(&BTreeMap::from([(peer.to_string(), g)]));
         }
         let answer = self.fetch_key_packages(peer, None).await?;
         self.m.key_package_devices(peer, &answer, self.now()).map_err(messenger_err)?;
@@ -1258,7 +1260,7 @@ impl Client {
         let own = match self.fetch_key_packages(&me, None).await {
             Ok(a) => match self.m.key_package_devices(&me, &a, self.now()) {
                 Ok(d) => {
-                    println!("OWN-DEVICES {} added with the peer's", serde_json::from_str::<Vec<Value>>(&d).unwrap_or_default().len());
+                    println!("OWN-DEVICES {} added with the peer's", d.len());
                     Some(a)
                 }
                 Err(e) => {
@@ -1273,10 +1275,9 @@ impl Client {
         };
         let now = self.now();
         let frames = if kind == "direct" {
-            self.m.create_direct(peer, &answer, own, now)
+            self.m.create_direct(peer, &answer, own.as_ref(), now)
         } else {
-            let answers: Value = json!({peer: serde_json::from_str::<Value>(&answer)?});
-            self.m.create_group(&answers.to_string(), own, now)
+            self.m.create_group(&BTreeMap::from([(peer.to_string(), answer)]), own.as_ref(), now)
         }
         .map_err(messenger_err)?;
         let gid = frames.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
@@ -1291,7 +1292,7 @@ impl Client {
     async fn add(&mut self, peer: &str, grant: Option<String>) -> Result<()> {
         let group = self.active()?;
         if let Some(g) = grant {
-            self.m.set_grants(&json!({peer: g}).to_string());
+            self.m.set_grants(&BTreeMap::from([(peer.to_string(), g)]));
         }
         let answer = match self.prefetched.remove(peer) {
             Some(a) => a,
@@ -1316,11 +1317,11 @@ impl Client {
         let personal = self.m.personal().context("no personal group: create it first (M§7.1)")?;
         let me = self.identity.clone();
         let probe = self.fetch_key_packages(&me, None).await?;
-        let devices: Vec<Value> = serde_json::from_str(&self.m.key_package_devices(&me, &probe, self.now()).map_err(messenger_err)?)?;
-        let found = devices.iter().find(|d| d["device"] == json!(device)).with_context(|| format!("no KeyPackage of {device} at the mailbox"))?;
+        let devices = self.m.key_package_devices(&me, &probe, self.now()).map_err(messenger_err)?;
+        let found = devices.iter().find(|d| d.device == device).with_context(|| format!("no KeyPackage of {device} at the mailbox"))?;
         // Recording Profile C§5: a recorder device joins conversations only — never the personal group, so it holds no
         // archive key and records only what is sent while it is a visible member
-        let recorder = found["recorder"] == json!(true);
+        let recorder = found.recorder;
         if recorder {
             println!("RECORDER {device}: conversations only, never the personal group or the archive key   C§5");
         }
@@ -1342,7 +1343,7 @@ impl Client {
             if gid == personal {
                 // M§12.3 step 3: a new member cannot read earlier epochs, so every live archive key is re-sent
                 let frames = self.m.resend_archive_keys(self.now());
-                let n = serde_json::from_str::<Vec<Value>>(&self.m.archive_keys()).map_or(0, |k| k.len());
+                let n = self.m.archive_keys().len();
                 self.save()?;
                 self.send_frames(&frames).await?;
                 println!("OK re-sent {n} archive key(s)");
@@ -1379,17 +1380,17 @@ impl Client {
 
     /// M§14.1: ask `target` for permission to message, the purpose sealed to its key agreement key unless `plain`.
     async fn introduce(&mut self, target: &str, purpose: &str, plain: bool) -> Result<()> {
-        let r: Value = serde_json::from_str(&self.m.introduce(target, purpose, plain, self.now()).map_err(messenger_err)?)?;
-        let id = s(&r["id"]).to_string();
+        let r = self.m.introduce(target, purpose, plain, self.now()).map_err(messenger_err)?;
+        let id = r.id.clone();
         // M§14.1 (spec-gap 81): tell our own mailbox first, so the grant that answers this is not rate-limited there.
         // Best-effort: it only spares the answer a rate limit. A device that cannot reach its own mailbox still introduces.
-        if let Err(e) = self.send_frame(s(&r["send"])).await {
+        if let Err(e) = self.send_frame(&r.send).await {
             println!("WARN introduction {id} not announced to our own mailbox: {e}");
         }
         self.save()?;
         let mut conn = self.peer_connect(target).await?;
         let did = conn.relay.did.clone();
-        let frame = self.m.first_contact_frame(&did, "introduction", target, s(&r["envelope"]), self.now());
+        let frame = self.m.first_contact_frame(&did, "introduction", target, &r.envelope, self.now());
         let answer = peer_exchange(&mut conn, &frame).await?;
         match answer["type"].as_str() {
             Some("accepted") => println!("OK introduction {id} to {target} accepted sealed={}", !plain),
@@ -1400,11 +1401,11 @@ impl Client {
 
     /// M§14.1: answer a request with a `dsip.message` grant, deposited at the requester's mailbox.
     async fn accept_request(&mut self, id: &str) -> Result<()> {
-        let r: Value = serde_json::from_str(&self.m.accept_request(id, self.now()).map_err(messenger_err)?)?;
-        let requester = s(&r["requester"]).to_string();
+        let r = self.m.accept_request(id, self.now()).map_err(messenger_err)?;
+        let requester = r.requester.clone();
         let mut conn = self.peer_connect(&requester).await?;
         let did = conn.relay.did.clone();
-        let frame = self.m.first_contact_frame(&did, "grant", &requester, s(&r["envelope"]), self.now());
+        let frame = self.m.first_contact_frame(&did, "grant", &requester, &r.envelope, self.now());
         let answer = peer_exchange(&mut conn, &frame).await?;
         anyhow::ensure!(answer["type"] == "accepted", "grant refused: {}", answer["reason"]);
         self.m.forget_request(id);
@@ -1517,7 +1518,7 @@ impl Client {
             }
         }
         // M§8.4 "Fetching" (spec-gap 106): try again when a source had nothing to serve; never when all served other bytes
-        Ok(match blob::fetch_decision(object, &json!(tried), attempt) {
+        Ok(match blob::fetch_decision(object, &tried, attempt) {
             blob::Fetch::Retry => Fetched::Retry,
             blob::Fetch::GiveUp(reason) => Fetched::GaveUp(reason),
             // a source served the content's size and hash but it did not decrypt: nothing to play
@@ -1563,7 +1564,7 @@ impl Client {
 
     /// The latest content of the active conversation's thread, `pred` choosing among them.
     fn latest(&self, gid: &str, pred: impl Fn(&Value) -> bool) -> Option<String> {
-        let thread: Vec<Value> = serde_json::from_str(&self.m.thread(gid)).unwrap_or_default();
+        let thread = self.m.thread(gid);
         thread.iter().rev().find(|m| pred(m)).and_then(|m| m["object"]["id"].as_str().map(String::from))
     }
 
@@ -1595,8 +1596,7 @@ impl Client {
                 self.introduce(target, purpose.trim(), cmd == "introduce-plain").await
             }
             "requests" => {
-                let r: Value = serde_json::from_str(&self.m.requests()).unwrap_or_default();
-                for (id, p) in r.as_object().into_iter().flatten() {
+                for (id, p) in self.m.requests() {
                     println!("PENDING {id} from {}", s(&p["from"]));
                 }
                 Ok(())
@@ -1647,10 +1647,9 @@ impl Client {
                 self.successor(&dead).await
             }
             "available" => {
-                let list: Vec<Value> = serde_json::from_str(&self.m.available()).unwrap_or_default();
-                for a in list {
-                    println!("AVAILABLE group={} conversation={} kind={}", s(&a["group"]), a["conversation"].as_str().unwrap_or("?"),
-                             a["kind"].as_str().unwrap_or("?"));
+                for a in self.m.available() {
+                    println!("AVAILABLE group={} conversation={} kind={}", a.group, a.conversation.as_str().unwrap_or("?"),
+                             a.kind.as_str().unwrap_or("?"));
                 }
                 Ok(())
             }
@@ -1659,7 +1658,7 @@ impl Client {
                 let w: Vec<&str> = rest.split_whitespace().collect();
                 let peer = w.first().context("usage: prefetch <peer> [grant file]")?.to_string();
                 if let Some(f) = w.get(1) {
-                    self.m.set_grants(&json!({&peer: std::fs::read_to_string(f)?.trim()}).to_string());
+                    self.m.set_grants(&BTreeMap::from([(peer.clone(), std::fs::read_to_string(f)?.trim().to_string())]));
                 }
                 let answer = self.fetch_key_packages(&peer, None).await?;
                 self.m.key_package_devices(&peer, &answer, now).map_err(messenger_err)?;
@@ -1673,21 +1672,20 @@ impl Client {
                 let [session, peer, alerted, answered, by, reason] = w.as_slice() else {
                     bail!("usage: call-ended <session> <peer> <alerted 0|1> <answered 0|1> <local|remote> <reason>");
                 };
-                let leg = json!({"session": session, "peer": peer, "alerted": *alerted == "1", "answered_here": *answered == "1",
-                                 "ended_by": by, "reason": reason});
-                let r: Value = serde_json::from_str(&self.m.call_ended_item(&leg.to_string(), now).map_err(messenger_err)?)?;
-                if r["event"].is_null() {
+                let leg = CallLeg { session: session.to_string(), peer: peer.to_string(), alerted: *alerted == "1", answered_here: *answered == "1",
+                                    ended_by: by.to_string(), reason: reason.to_string() };
+                let r = self.m.call_ended_item(&leg, now).map_err(messenger_err)?;
+                if r.event.is_none() {
                     println!("NO-CALL-EVENT session={session} reason={reason}");
                     return Ok(());
                 }
                 // M§13.3 (spec-gap 63): every alerted device may report the call; one entry per session
-                if let Some(item) = r["item"].as_str() {
-                    let kind = Item::CallEvent { outcome: s(&r["event"]["outcome"]).to_string(), session: session.to_string(),
-                                                 fresh: r["fresh"] == json!(true) };
-                    self.items.insert(item.to_string(), kind);
+                if let Some(item) = r.item {
+                    let outcome = r.event.as_ref().map(|e| s(&e["outcome"]).to_string()).unwrap_or_default();
+                    self.items.insert(item, Item::CallEvent { outcome, session: session.to_string(), fresh: r.fresh });
                 }
                 self.save()?;
-                match s(&r["send"]) {
+                match r.send.as_str() {
                     "" => Ok(()),
                     f => self.send_frame(f).await,
                 }
@@ -1697,7 +1695,7 @@ impl Client {
                 let peer = rest.trim();
                 let gid = self.conversations().into_iter().find(|c| c["kind"] == "direct" && c["peer"] == json!(peer))
                     .map(|c| s(&c["group"]).to_string()).with_context(|| format!("no direct conversation with {peer}"))?;
-                let entries: Vec<Value> = serde_json::from_str(&self.m.timeline(&gid)).unwrap_or_default();
+                let entries = self.m.timeline(&gid);
                 println!("PEER-TIMELINE {peer} {}", entries.len());
                 for e in entries {
                     match e.get("call") {
@@ -1740,13 +1738,12 @@ impl Client {
                     println!("OK not recorded");
                     return Ok(());
                 }
-                let r: Value = serde_json::from_str(&self.m.accept_recording(&gid, now).map_err(messenger_err)?)?;
-                println!("OK recording accepted group={gid} recorders={}", list(&r["accepted"]));
+                let r = self.m.accept_recording(&gid, now).map_err(messenger_err)?;
+                println!("OK recording accepted group={gid} recorders={}", list(&json!(r.accepted)));
                 self.save()?;
-                let frames: Vec<String> = serde_json::from_value(r["frames"].clone()).unwrap_or_default();
-                self.send_frames(&frames).await?;
+                self.send_frames(&r.frames).await?;
                 // C§5 (v0.10): the acceptance is the person's — this identity's other devices are told
-                if r["frames"].as_array().is_some_and(|f| !f.is_empty()) {
+                if !r.frames.is_empty() {
                     println!("OK recording acceptance shared with this identity's devices");
                 }
                 Ok(())
@@ -1827,12 +1824,12 @@ impl Client {
             "history" => {
                 // M§8.5: the conversation's timeline in hub seq order, from MLS and archive alike
                 let group = self.active()?;
-                let thread: Vec<Value> = serde_json::from_str(&self.m.thread(&group)).unwrap_or_default();
+                let thread = self.m.thread(&group);
                 for (i, m) in thread.iter().enumerate() {
                     println!("TIMELINE {i} {}: {}", s(&m["sender"]), display(&m["object"]));
                 }
-                let keys: Vec<Value> = serde_json::from_str(&self.m.archive_keys()).unwrap_or_default();
-                let current = keys.iter().max_by_key(|k| k["created_at"].as_i64()).map(|k| k["akid"].clone()).unwrap_or(Value::Null);
+                let keys = self.m.archive_keys();
+                let current = keys.iter().max_by_key(|k| k.created_at).map(|k| json!(k.akid)).unwrap_or(Value::Null);
                 println!("OK history {} item(s), current key {current}", thread.len());
                 Ok(())
             }
@@ -1924,9 +1921,9 @@ async fn main() -> Result<()> {
                                "controller_seed_hex": hex(&keys.controller.seed()), "display_name": args.identity}).to_string();
     let mut m = Messenger::open(&identity_json, &mailbox.0, &mailbox.1, db, &state, now as f64).map_err(messenger_err)?;
     // C§5: a recorder discloses nothing (it sends no receipts)
-    let policy = json!({"delivered": !args.no_delivered && !args.recorder, "read": !args.recorder && args.disclose.iter().any(|d| d == "read"),
-        "played": args.disclose.iter().any(|d| d == "played"), "activity": args.disclose.iter().any(|d| d == "activity")});
-    m.set_receipt_policy(&policy.to_string(), now as f64).map_err(messenger_err)?;
+    let policy = ReceiptPolicy { delivered: !args.no_delivered && !args.recorder, read: !args.recorder && args.disclose.iter().any(|d| d == "read"),
+        played: args.disclose.iter().any(|d| d == "played"), activity: args.disclose.iter().any(|d| d == "activity") };
+    m.set_receipt_policy(policy, now as f64);
     m.set_gap_timeout(args.gap_timeout);
     m.set_hub_timeout(args.hub_timeout as f64);
     m.set_no_answer_timeout(args.no_answer_timeout);

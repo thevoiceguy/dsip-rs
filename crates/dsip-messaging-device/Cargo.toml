@@ -19,10 +19,14 @@ serde_json.workspace = true
 openmls = "0.9.0"
 openmls_traits = "0.6.0"
 openmls_rust_crypto = "0.6.0"
+tsify = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
 
 [features]
 # `sqlite`: the native store, dsip-mls's SQLite provider (never on wasm32).
 sqlite = ["dsip-mls/sqlite"]
+# TypeScript declarations of the types the browser host sees (dsip-wasm).
+ts = ["dep:tsify", "dep:wasm-bindgen"]
 
 [[test]]
 name = "store"

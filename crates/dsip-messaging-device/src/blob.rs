@@ -6,6 +6,7 @@
 //! spec-gap 106: try again or give up).
 
 use dsip_messaging::mls_wire::{open_blob, seal, SealUse};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// A blob sealed for upload.
@@ -76,8 +77,8 @@ pub enum Fetch {
     GiveUp(String),
 }
 
-/// The pinned `blob_fetch` (spec-gap 106) over what the sources answered: `tried` is `[{uri, status, sha256?, size?}]`.
-pub fn fetch_decision(object: &Value, tried: &Value, attempt: i64) -> Fetch {
+/// The pinned `blob_fetch` (spec-gap 106) over what the sources answered.
+pub fn fetch_decision(object: &Value, tried: &[Tried], attempt: i64) -> Fetch {
     let b = &object["blob"];
     let d = dsip_messaging::client::blob_fetch(&json!({"blob": {"sha256": b["sha256"], "size": b["size"]}, "tried": tried, "attempt": attempt}));
     match d["action"].as_str() {
@@ -90,11 +91,26 @@ pub fn fetch_decision(object: &Value, tried: &Value, attempt: i64) -> Fetch {
 /// What one source answered, as [`fetch_decision`] takes it: `status` 0 when it could not be reached; `stored`, the
 /// bytes a 200 served that did not open, entered with their size and SHA-256 (rule 7: other bytes, or bytes that are
 /// the content's but do not decrypt under its key).
-pub fn tried(uri: &str, status: u16, stored: Option<&[u8]>) -> Value {
-    match stored {
-        Some(b) => json!({"uri": uri, "status": status, "sha256": dsip_mls::digest(b), "size": b.len()}),
-        None => json!({"uri": uri, "status": status}),
-    }
+pub fn tried(uri: &str, status: u16, stored: Option<&[u8]>) -> Tried {
+    Tried { uri: uri.to_string(), status, sha256: stored.map(dsip_mls::digest), size: stored.map(<[u8]>::len) }
+}
+
+/// One source's answer, as [`fetch_decision`] takes it, serialized `{uri, status, sha256?, size?}` (M§8.4 rule 7, spec-gap 106).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+pub struct Tried {
+    /// The source.
+    pub uri: String,
+    /// Its HTTP status; 0 when it was not reached.
+    pub status: u16,
+    /// Hex SHA-256 of bytes a 200 served that did not open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub sha256: Option<String>,
+    /// Their size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", tsify(optional))]
+    pub size: Option<usize>,
 }
 
 /// Seconds before fetch `attempt` is tried again after a [`Fetch::Retry`]: the mailbox replication schedule

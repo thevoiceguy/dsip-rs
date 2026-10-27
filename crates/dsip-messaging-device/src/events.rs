@@ -10,7 +10,10 @@ use serde_json::Value;
 
 /// One output of a step, in order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 #[serde(untagged)]
+// tsify does not follow `untagged`
+#[cfg_attr(feature = "ts", tsify(type = "{ send: string } | Ui | { sync: boolean } | { refused: string; group?: string; item?: string; pending?: boolean } | { error: string; group?: string; reason?: unknown; detail?: unknown } | { drop: string } | { rejected: Rejected } | { key_packages: unknown } | { successor_due: SuccessorDue }"))]
 // made and consumed within one step, a few at a time: boxing the large `Ui` would only complicate matching
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
@@ -33,12 +36,15 @@ pub enum Event {
         refused: String,
         /// The group, for an application message.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         group: Option<String>,
         /// The outbox item, for an application message.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         item: Option<String>,
         /// Whether it stays pending (M§9.4: the hub is unreachable).
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         pending: Option<bool>,
     },
     /// Something went wrong here, or the mailbox said so outside an answer to a deposit of ours.
@@ -47,12 +53,15 @@ pub enum Event {
         error: String,
         /// The group it concerns.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         group: Option<String>,
         /// The mailbox's reason, as it came.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(type = "unknown", optional))]
         reason: Option<Value>,
         /// The mailbox's detail, as it came.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(type = "unknown", optional))]
         detail: Option<Value>,
     },
     /// A frame passed over: not the mailbox's, or of a type with no handler (M§4.1).
@@ -68,6 +77,7 @@ pub enum Event {
     /// A `key-packages` answer arrived on this binding (M§5.5): the host passes it to the call that asked.
     KeyPackages {
         /// The payload.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         key_packages: Value,
     },
     /// A group's hub has been unreachable past the threshold: the host fetches the roster's KeyPackages and creates
@@ -111,6 +121,7 @@ impl From<Ui> for Event {
 
 /// A frame's verdict (§10.2).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 pub struct Rejected {
     /// The reject code.
     pub code: String,
@@ -120,6 +131,7 @@ pub struct Rejected {
 
 /// What creating a successor needs (M§9.4, M§7.5).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 pub struct SuccessorDue {
     /// The dead group.
     pub group: String,
@@ -136,15 +148,18 @@ pub struct SuccessorDue {
 /// An object handed over to a successor: its outbox item there (`None`: kept until the successor exists), and the
 /// object's `id` (M§9.4).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 pub struct HandedOver {
     /// The outbox item.
     pub item: Option<String>,
     /// The object's `id`.
+    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
     pub id: Value,
 }
 
 /// What a membership commit does, for the host to say (no key material).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum OpInfo {
     /// Devices of `peer` added; `device` names one of this identity's own (M§12.3).
@@ -171,6 +186,7 @@ pub enum OpInfo {
     /// The group moved to `hub` (M§7.4).
     MoveHub {
         /// `{did, uri}`.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         hub: Value,
     },
     /// This device's own leaf refreshed.
@@ -184,10 +200,13 @@ pub enum OpInfo {
 
 /// A recorder device newly in a conversation (C§5).
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 pub struct NewRecorder {
     /// The recorder device.
+    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
     pub device: Value,
     /// The identity it records for.
+    #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
     pub subject: Value,
     /// Whether it is this identity's own.
     pub own: bool,
@@ -195,6 +214,7 @@ pub struct NewRecorder {
 
 /// What the host shows, by kind.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 #[serde(tag = "ui", rename_all = "snake_case")]
 pub enum Ui {
     /// A member's activity (M§11.1).
@@ -202,10 +222,13 @@ pub enum Ui {
         /// The group.
         group: String,
         /// Who.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         from: Value,
         /// Typing, uploading, recording.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         activity: Value,
         /// `active` or `stopped`.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         state: Value,
     },
     /// A member's activity expired (M§11.2).
@@ -244,6 +267,7 @@ pub enum Ui {
         /// The archive key.
         akid: String,
         /// The object's type.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         object: Value,
     },
     /// An archive record kept sealed until its key arrives (M§12.3 step 5).
@@ -277,21 +301,28 @@ pub enum Ui {
     /// A call event of this identity, from a device or from the archive (M§13.3).
     CallEvent {
         /// The session.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         session: Value,
         /// The other party.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         peer: Value,
         /// `missed`, `declined`, …
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         outcome: Value,
         /// `inbound` or `outbound`.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         direction: Value,
         /// The device that sent it.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         from_device: Option<String>,
         /// An entry for its session was there already (spec-gap 63).
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         collapsed: Option<bool>,
         /// Read back from the archive.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         from_archive: Option<bool>,
     },
     /// As a record-keeper, a call record received (C§9).
@@ -299,8 +330,10 @@ pub enum Ui {
         /// Who sent it.
         from: String,
         /// The session.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         session: Value,
         /// The leg's outcome.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         outcome: Value,
         /// The first for its leg.
         fresh: bool,
@@ -368,6 +401,7 @@ pub enum Ui {
         /// The group.
         group: String,
         /// What was held behind the gap.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         held: Value,
     },
     /// A grant arrived through the mailbox (M§14.1).
@@ -375,6 +409,7 @@ pub enum Ui {
         /// Who granted.
         by: String,
         /// Its scope.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         scope: Value,
         /// The introduction it answers.
         request: String,
@@ -397,8 +432,10 @@ pub enum Ui {
         /// The sender.
         from: String,
         /// The content kind.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         kind: Value,
         /// The text.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         text: Value,
     },
     /// Restored content and receipts applied to a conversation joined since (spec-gap 64).
@@ -417,10 +454,13 @@ pub enum Ui {
         /// The sender.
         from: String,
         /// The receipt kind.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         kind: Value,
         /// The content ids.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         targets: Value,
         /// The read watermark.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         through: Value,
     },
     /// A handshake beyond a seq gap waits for it (M§6.5, spec-gap 69).
@@ -489,6 +529,7 @@ pub enum Ui {
         /// The group.
         group: String,
         /// The conversation.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         conversation: Value,
         /// Its kind.
         kind: String,
@@ -498,12 +539,15 @@ pub enum Ui {
         epoch: u64,
         /// Joined by external commit.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         external: Option<bool>,
         /// The external commit's seq.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(optional))]
         seq: Option<Option<i64>>,
         /// The dead group a successor's welcome names (M§7.5).
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", tsify(type = "unknown", optional))]
         successor_of: Option<Value>,
     },
     /// KeyPackages uploaded (M§5.5).
@@ -532,6 +576,7 @@ pub enum Ui {
         /// Who leaves.
         identity: String,
         /// The pinned decision.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         decision: Value,
     },
     /// The hub sequenced a leave proposal of ours (M§7.3).
@@ -546,6 +591,7 @@ pub enum Ui {
         /// The group.
         group: String,
         /// The device.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         by_device: Value,
     },
     /// A content message (M§8.1).
@@ -557,18 +603,24 @@ pub enum Ui {
         /// Its seq.
         seq: i64,
         /// The content kind.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         kind: Value,
         /// The text.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         text: Value,
         /// When it was sent.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         sent_at: Value,
         /// The content id.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         id: Value,
         /// The deposit's blob manifest (M§8.4).
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         blobs: Value,
         /// The sending device.
         from_device: String,
         /// The content object.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         object: Value,
     },
     /// An item refused `mailbox.unknown-group`: a sync shows whether the group moved (M§7.4).
@@ -609,10 +661,13 @@ pub enum Ui {
         /// The sender.
         from: String,
         /// The receipt kind.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         kind: Value,
         /// The content ids.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         targets: Value,
         /// The read watermark.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         through: Value,
     },
     /// A receipt of ours sent (M§10.2, M§10.5).
@@ -622,8 +677,10 @@ pub enum Ui {
         /// The receipt kind.
         kind: String,
         /// The content ids.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         targets: Option<Value>,
         /// The read watermark.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         through: Option<Value>,
         /// `conversation` or `personal group`.
         via: String,
@@ -640,6 +697,7 @@ pub enum Ui {
         /// The recorder device.
         device: String,
         /// The content id.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         id: Value,
     },
     /// A conversation became recorded by a new recorder, or is no longer recorded (C§5).
@@ -653,6 +711,7 @@ pub enum Ui {
         /// No recorder is left.
         ended: bool,
         /// Whether content may be sent.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         may_send: Value,
     },
     /// This identity accepted recorders, on this device or another (C§5).
@@ -667,8 +726,10 @@ pub enum Ui {
     /// What was held behind a gap is processed now (M§6.5, spec-gap 69).
     Released {
         /// Its class.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         class: Value,
         /// Its seq.
+        #[cfg_attr(feature = "ts", tsify(type = "unknown"))]
         seq: Value,
     },
     /// This device was removed from a group (M§7.3).

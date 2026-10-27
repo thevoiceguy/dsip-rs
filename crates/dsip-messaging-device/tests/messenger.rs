@@ -14,7 +14,7 @@ use dsip_core::envelope::{sign, Envelope};
 use dsip_core::keys::KeyPair;
 use dsip_messaging::wire;
 use dsip_messaging_device::messenger::Messenger;
-use dsip_messaging_device::MemoryStore;
+use dsip_messaging_device::{MemoryStore, ReceiptPolicy};
 use dsip_mls::Device;
 
 const NOW: i64 = 1_790_000_000;
@@ -42,8 +42,8 @@ fn kp(identity: &KeyPair, device: &KeyPair, caps: &[&str]) -> String {
 }
 
 /// A `key-packages` answer holding one KeyPackage of `device`, a device of `identity` with `caps`.
-fn key_packages(identity: &KeyPair, device: &KeyPair, caps: &[&str]) -> String {
-    json!({"type": "key-packages", "key_packages": [kp(identity, device, caps)]}).to_string()
+fn key_packages(identity: &KeyPair, device: &KeyPair, caps: &[&str]) -> Value {
+    json!({"type": "key-packages", "key_packages": [kp(identity, device, caps)]})
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn activity_sealed_opened_and_attributed() {
     assert_eq!(ev[0]["ui"], "activity_not_sent", "{ev:?}");
 
     // disclosed: a sealed ephemeral deposit (M§11.1)
-    m.set_receipt_policy(r#"{"activity": true}"#, NOW as f64).unwrap();
+    m.set_receipt_policy(ReceiptPolicy { activity: true, ..ReceiptPolicy::default() }, NOW as f64);
     let ev = events(m.activity(&gid, "typing", "active", NOW as f64 + 6.0));
     let frame = ev.iter().find_map(|e| e["send"].as_str()).expect("a deposit");
     let dep = wire::payload_of(&Envelope::from_frame(frame).unwrap()).unwrap();
@@ -226,7 +226,7 @@ fn first_contact_and_any_object_sent() {
                                 NOW as f64).unwrap();
 
     // an introduction sealed to bob's key agreement key (a did:key's, M§6.9), announced to our own mailbox first
-    let intro: Value = serde_json::from_str(&m.introduce(&bob.did(), "lunch?", false, NOW as f64).unwrap()).unwrap();
+    let intro: Value = serde_json::to_value(m.introduce(&bob.did(), "lunch?", false, NOW as f64).unwrap()).unwrap();
     let notice = wire::payload_of(&Envelope::from_frame(intro["send"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(notice["introductions_sent"], json!([intro["id"]]));
     let deposit = m.first_contact_frame("did:key:bobs-mailbox", "introduction", &bob.did(), intro["envelope"].as_str().unwrap(), NOW as f64);
@@ -250,7 +250,7 @@ fn first_contact_and_any_object_sent() {
     let conversation = m.state()["convs"][&gid]["conversation"].clone();
     let obj = json!({"object": "content", "id": "01J0000000000000000000EVNT", "conversation": conversation, "sender": alice.did(),
                      "sent_at": NOW, "kind": "event", "event": {"source": "ups-1"}});
-    let sent: Value = serde_json::from_str(&m.send(&gid, &obj.to_string(), NOW as f64).unwrap()).unwrap();
+    let sent: Value = serde_json::to_value(m.send(&gid, &obj, NOW as f64).unwrap()).unwrap();
     let item = sent["item"].as_str().unwrap().to_string();
     let ev = hub.drive(&mut m, json!([{"send": sent["send"]}]));
     assert_eq!(ui(&ev, "sent")[0]["item"], json!(item));
@@ -278,7 +278,7 @@ fn events_carry_what_a_host_prints() {
 
     // the commit says what it did; the conversation is recorded by Bob's recorder, which Alice has to accept (C§5)
     let kps = json!({"type": "key-packages", "key_packages": [kp(&bob, &bob_phone, PLAIN), kp(&bob, &bob_rec, RECORDER)]});
-    let out = m.create_direct(&bob.did(), &kps.to_string(), None, NOW as f64).unwrap();
+    let out = m.create_direct(&bob.did(), &kps, None, NOW as f64).unwrap();
     let ev = hub.drive(&mut m, &out);
     let committed = ui(&ev, "committed")[0].clone();
     assert_eq!((committed["op"]["op"].as_str(), committed["op"]["peer"].as_str()), (Some("add"), Some(bob.did().as_str())));
@@ -288,7 +288,7 @@ fn events_carry_what_a_host_prints() {
     assert_eq!(rec[0]["new"], json!([{"device": bob_rec.did(), "subject": bob.did(), "own": false}]));
     assert_eq!((rec[0]["ended"].as_bool(), rec[0]["may_send"].as_bool()), (Some(false), Some(false)));
     assert!(m.send_text(&gid, "hi", NOW as f64).is_err());
-    let accepted: Value = serde_json::from_str(&m.accept_recording(&gid, NOW as f64).unwrap()).unwrap();
+    let accepted: Value = serde_json::to_value(m.accept_recording(&gid, NOW as f64).unwrap()).unwrap();
     let ev = hub.drive(&mut m, &accepted["frames"]);
     assert!(ui(&ev, "recording").is_empty(), "the same recorders: nothing new to render {ev:?}");
 
@@ -308,20 +308,20 @@ fn events_carry_what_a_host_prints() {
 
     // a missed call: the event sent, its item, and whether this identity had it already (M§13.3, spec-gap 63)
     let leg = json!({"session": "01K742SG00XZRF7H1Z8WN9CGAD", "peer": bob.did(), "alerted": true, "answered_here": false, "ended_by": "remote", "reason": ""});
-    let r: Value = serde_json::from_str(&m.call_ended_item(&leg.to_string(), NOW as f64).unwrap()).unwrap();
+    let r: Value = serde_json::to_value(m.call_ended_item(&serde_json::from_value(leg.clone()).unwrap(), NOW as f64).unwrap()).unwrap();
     assert_eq!((r["event"]["outcome"].as_str(), r["event"]["direction"].as_str(), r["fresh"].as_bool()), (Some("missed"), Some("inbound"), Some(true)));
     let ev = hub.drive(&mut m, json!([{"send": r["send"]}]));
     assert_eq!(ui(&ev, "sent")[0]["item"], r["item"]);
-    let r: Value = serde_json::from_str(&m.call_ended_item(&leg.to_string(), NOW as f64).unwrap()).unwrap();
+    let r: Value = serde_json::to_value(m.call_ended_item(&serde_json::from_value(leg.clone()).unwrap(), NOW as f64).unwrap()).unwrap();
     assert_eq!(r["fresh"], false, "already recorded");
     let unalerted = json!({"session": "01K742SG00XZRF7H1Z8WN9CGAE", "peer": bob.did(), "alerted": false, "ended_by": "remote"});
-    let r: Value = serde_json::from_str(&m.call_ended_item(&unalerted.to_string(), NOW as f64).unwrap()).unwrap();
+    let r: Value = serde_json::to_value(m.call_ended_item(&serde_json::from_value(unalerted.clone()).unwrap(), NOW as f64).unwrap()).unwrap();
     assert!(r["event"].is_null() && r["send"] == "");
-    assert!(m.call_ended(&unalerted.to_string(), NOW as f64).unwrap().is_empty());
+    assert!(m.call_ended(&serde_json::from_value(unalerted.clone()).unwrap(), NOW as f64).unwrap().is_empty());
 
     // the hub is down: the retry names the item waiting, and its accepted says it went out after the outage (M§9.4)
-    let sent: Value = serde_json::from_str(&m.send(&gid, &json!({"object": "content", "id": "01J0000000000000000000DOWN",
-        "conversation": m.state()["convs"][&gid]["conversation"], "sender": alice.did(), "sent_at": NOW, "kind": "text", "text": "down?"}).to_string(),
+    let sent: Value = serde_json::to_value(m.send(&gid, &json!({"object": "content", "id": "01J0000000000000000000DOWN",
+        "conversation": m.state()["convs"][&gid]["conversation"], "sender": alice.did(), "sent_at": NOW, "kind": "text", "text": "down?"}),
         NOW as f64).unwrap()).unwrap();
     let down = wire::error(&hub.key, &phone.did(), NOW, Some(&deposit_id(sent["send"].as_str().unwrap())), "mailbox.hub-unreachable", None);
     let ev = events(m.inbound(&down.frame(), NOW as f64));
@@ -348,19 +348,19 @@ fn a_host_that_waits_for_its_commands_and_syncs_when_asked() {
     assert!(m.settled(), "answered, and the archive key that followed too");
 
     // the devices an answer would add, as the pinned rule picks them (C§5); the commit counts them
-    let kps = json!({"type": "key-packages", "key_packages": [kp(&bob, &bob_phone, PLAIN), kp(&bob, &bob_rec, RECORDER)]}).to_string();
-    let devices: Value = serde_json::from_str(&m.key_package_devices(&bob.did(), &kps, NOW as f64).unwrap()).unwrap();
+    let kps = json!({"type": "key-packages", "key_packages": [kp(&bob, &bob_phone, PLAIN), kp(&bob, &bob_rec, RECORDER)]});
+    let devices: Value = serde_json::to_value(m.key_package_devices(&bob.did(), &kps, NOW as f64).unwrap()).unwrap();
     assert_eq!(devices, json!([{"device": bob_phone.did(), "recorder": false}, {"device": bob_rec.did(), "recorder": true}]));
-    let refused = json!({"type": "error", "reason": "mailbox.first-contact-required"}).to_string();
+    let refused = json!({"type": "error", "reason": "mailbox.first-contact-required"});
     assert!(m.key_package_devices(&bob.did(), &refused, NOW as f64).unwrap_err().0.contains("first-contact-required"));
     let out = m.create_direct(&bob.did(), &kps, None, NOW as f64).unwrap();
     let ev = hub.drive(&mut m, &out);
     let committed = ui(&ev, "committed")[0].clone();
     assert_eq!(committed["op"]["devices"], 2, "{committed}");
     let gid = committed["group"].as_str().unwrap().to_string();
-    let receipts: Value = serde_json::from_str(&m.receipt_state(&gid)).unwrap();
+    let receipts: Value = m.receipt_state(&gid);
     assert!(receipts["read_through"].is_object(), "{receipts}");
-    assert_eq!(m.receipt_state("no-such-group"), "null");
+    assert_eq!(m.receipt_state("no-such-group"), Value::Null);
     assert_eq!(m.successor(&gid), None);
 
     // a commit in flight is unsettled; a new binding deposits it again without a sync, unless the host asks for one

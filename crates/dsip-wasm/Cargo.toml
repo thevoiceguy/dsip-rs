@@ -19,7 +19,7 @@ dsip-broadcast.workspace = true
 dsip-endpoint = { workspace = true, features = ["wasm", "ts"] }
 dsip-number = { workspace = true, features = ["ts"] }
 dsip-dht = { workspace = true, default-features = false }
-dsip-messaging-device.workspace = true
+dsip-messaging-device = { workspace = true, features = ["ts"] }
 dsip-mls.workspace = true
 dsip-messaging.workspace = true
 dsip-recording.workspace = true
