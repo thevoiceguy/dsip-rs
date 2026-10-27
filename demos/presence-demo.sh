@@ -58,12 +58,14 @@ wait $PHONE $LAPTOP
 ! grep -q "^← error" "$D/phone.log" "$D/laptop.log" || fail "the authority refused a record"
 
 echo "=== Bob's phone revokes the grant at his relay; Alice's watch ends at once (P§7, §19.4)"
-$B/dsip presence watch --identity "$D/alice" --relay $R --ca "$CA" --target "$BOB" --wait 15 >"$D/revoked.log" 2>&1 & W=$!
-sleep 2
+$B/dsip presence watch --identity "$D/alice" --relay $R --ca "$CA" --target "$BOB" --wait 30 >"$D/revoked.log" 2>&1 & W=$!
+# the revocation must reach a live subscription: wait for the watch's first notify, not a fixed delay
+for _ in $(seq 100); do grep -q "presence:" "$D/revoked.log" && break; sleep 0.2; done
+grep -q "presence:" "$D/revoked.log" || fail "Alice's watch was not admitted before the revocation"
 $B/dsip answer --identity "$D/bob-phone" --relay $R --ca "$CA" --script "sleep 2; revoke; sleep 2; quit" >"$D/revoke.log" 2>&1
 wait $W || true
-grep -E "grant-revocation" "$D/revoke.log" | sed 's/^ */  /'
-grep -E "terminated|reason" "$D/revoked.log" | sed 's/^ */  /'
+grep -E "grant-revocation" "$D/revoke.log" | sed 's/^ */  /' || true
+grep -E "terminated|reason" "$D/revoked.log" | sed 's/^ */  /' || true
 grep -q "reason policy.terminated" "$D/revoked.log" || fail "the revocation did not end Alice's watch with policy.terminated"
 $B/dsip presence watch --identity "$D/alice" --relay $R --ca "$CA" --target "$BOB" --wait 3 >"$D/after.log" 2>&1 || true
 grep -q 'reject   "policy.blocked"' "$D/after.log" || fail "a revoked grant still admitted Alice"
