@@ -383,6 +383,17 @@ PoC better on their own terms: each removes duplicated glue from the reference c
      - **B3b:** the structured results and inputs (`call_ended_item`, `call_record`, `accept_recording`,
        `conversations`, `thread`, blobs, `introduce`, the `*_json` parameters), and the tsify derives behind a `ts`
        feature.
+       *Done:* `types.rs` holds what a call builds for its answer (`Hub`, `Outage`, `ArchiveKey`, `Available`,
+       `CallEnded`, `CallRecorded`, `RecordingAccepted`, `Sent`, `Conversation`, `SealedBlob`, `FetchDecision`,
+       `KeyPackageDevice`, `Introduction`, `Granted`) and the host's inputs that are not wire payloads (`CallLeg`,
+       `BlobRef`, `ReceiptPolicy`; `blob::Tried` both ways); `relay_hello` is the endpoint's `RelayHello` or the
+       reject code. What the `Messenger` keeps as it was received or saved (the thread's messages, the call log,
+       records, the roster log, requests, a receipts snapshot) and wire payloads (a `key-packages` answer, a content
+       object, a manifest, a call record's leg) stay JSON values (`unknown`), as B2 left the libraries' JSON. `dsip-msg`
+       reads the types; `dsip-wasm` still speaks JSON text, parsing each parameter at its edge as leniently as the
+       library did and serializing each result. The declarations (`Event`, `Ui` and the above, `ts` on in
+       `dsip-wasm`) are in `pkg/dsip_wasm.d.ts` and pass `tsc`; an `Option` there is `T | undefined`, which is what
+       the objects of B3c carry where the JSON text has `null`.
      - **B3c:** `dsip-wasm` returns objects and the page reads them; dsip-msg matches on the types.
    - **B4:** `app.js` under check, with the last parsing and stringifying of boundary values gone.
 

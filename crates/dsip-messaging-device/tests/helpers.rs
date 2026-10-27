@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use dsip_core::delegation::delegation_payload;
 use dsip_core::did::StaticResolver;
@@ -85,6 +85,7 @@ fn recording_state_pending_until_accepted() {
 
 #[test]
 fn blob_sealed_opened_and_fetch_decided() {
+    let tried = |v: Value| -> Vec<blob::Tried> { serde_json::from_value(v).unwrap() };
     let (key, nonce) = ([7u8; 32], [9u8; 12]);
     let sealed = blob::seal_blob(&key, &nonce, b"OggS opus");
     assert_eq!(sealed.sha256, dsip_mls::digest(&sealed.bytes));
@@ -108,17 +109,17 @@ fn blob_sealed_opened_and_fetch_decided() {
     assert_eq!(blob::sources(&obj, &manifest), vec!["https://other.example/b".to_string(), "https://mbx.example/blob/x".to_string()]);
 
     // spec-gap 106: nothing served yet → retry; only other bytes → give up
-    assert_eq!(blob::fetch_decision(&obj, &json!([{"uri": "u", "status": 404}]), 1), blob::Fetch::Retry);
-    assert_eq!(blob::fetch_decision(&obj, &json!([{"uri": "u", "status": 200, "sha256": "00", "size": 1}]), 1),
+    assert_eq!(blob::fetch_decision(&obj, &tried(json!([{"uri": "u", "status": 404}])), 1), blob::Fetch::Retry);
+    assert_eq!(blob::fetch_decision(&obj, &tried(json!([{"uri": "u", "status": 200, "sha256": "00", "size": 1}])), 1),
                blob::Fetch::GiveUp("mismatch".into()));
-    let served = json!([{"uri": "u", "status": 200, "sha256": sealed.sha256, "size": sealed.bytes.len()}]);
+    let served = tried(json!([{"uri": "u", "status": 200, "sha256": sealed.sha256, "size": sealed.bytes.len()}]));
     assert_eq!(blob::fetch_decision(&obj, &served, 1), blob::Fetch::Play("u".into()));
 
     // what each source answered, as both clients enter it: other bytes with their size and hash, so they are a mismatch
-    assert_eq!(blob::tried("u", 404, None), json!({"uri": "u", "status": 404}));
-    let tried = json!([blob::tried("u", 200, Some(&other))]);
-    assert_eq!(tried[0]["sha256"], dsip_mls::digest(&other));
-    assert_eq!(blob::fetch_decision(&obj, &tried, 1), blob::Fetch::GiveUp("mismatch".into()));
+    assert_eq!(json!(blob::tried("u", 404, None)), json!({"uri": "u", "status": 404}));
+    let answered = [blob::tried("u", 200, Some(&other))];
+    assert_eq!(answered[0].sha256.as_deref(), Some(dsip_mls::digest(&other).as_str()));
+    assert_eq!(blob::fetch_decision(&obj, &answered, 1), blob::Fetch::GiveUp("mismatch".into()));
     // spec-gap 67's schedule
     assert_eq!([1, 2, 3, 4, 5, 9].map(blob::retry_delay_s), [4, 8, 16, 32, 60, 60]);
 }

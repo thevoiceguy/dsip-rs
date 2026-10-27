@@ -31,6 +31,7 @@ pub mod receipts;
 pub mod recording;
 pub mod store;
 pub mod successors;
+pub mod types;
 
 pub use calls::CallLog;
 pub use commits::Retry;
@@ -43,3 +44,4 @@ pub use process::{process, Outcome};
 pub use receipts::Receipts;
 pub use store::{MemoryStore, Store};
 pub use successors::Successors;
+pub use types::*;
