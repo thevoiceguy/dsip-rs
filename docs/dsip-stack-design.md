@@ -375,7 +375,15 @@ PoC better on their own terms: each removes duplicated glue from the reference c
      with a declared type (`Json` is `unknown`; `Sessions`, `Contacts`, `Verdict`, `Consent`, `Mailbox`,
      `Voicemail` are declared by hand). A result that may be absent is `T | undefined` (it was the string `null`).
    - **B3:** the `Messenger` typed in the library: its inputs and outputs are Rust types, which `dsip-msg` reads
-     instead of JSON, and `dsip-wasm` exports them.
+     instead of JSON, and `dsip-wasm` exports them. In three parts, as it is a 3,000-line JSON-native machine:
+     - **B3a:** the step outputs: `Event` (`{send}`, `{ui}`, `{sync}`, `{refused}`, `{error}`, …) with `Ui`, one
+       variant per kind the hosts render (64), built where they were built as `json!`. The step methods return
+       `Vec<Event>` and the frames-only ones `Vec<String>`; they serialize as before, so the hosts change only at
+       their edge (dsip-msg converts once in `handle`, `dsip-wasm` returns the same JSON text).
+     - **B3b:** the structured results and inputs (`call_ended_item`, `call_record`, `accept_recording`,
+       `conversations`, `thread`, blobs, `introduce`, the `*_json` parameters), and the tsify derives behind a `ts`
+       feature.
+     - **B3c:** `dsip-wasm` returns objects and the page reads them; dsip-msg matches on the types.
    - **B4:** `app.js` under check, with the last parsing and stringifying of boundary values gone.
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a

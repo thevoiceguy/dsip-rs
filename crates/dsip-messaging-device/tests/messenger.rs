@@ -110,9 +110,9 @@ impl Hub {
     }
 
     /// Send what the device returned, answer it, and feed the answers back until nothing more is sent: the events.
-    fn drive(&mut self, m: &mut Messenger, out: &str) -> Vec<Value> {
+    fn drive(&mut self, m: &mut Messenger, out: impl serde::Serialize) -> Vec<Value> {
         let mut events = vec![];
-        let mut queue: Vec<Value> = serde_json::from_str(out).unwrap();
+        let mut queue: Vec<Value> = self::events(out);
         while let Some(e) = (!queue.is_empty()).then(|| queue.remove(0)) {
             let frame = match (&e, e.get("send")) {
                 (Value::String(f), _) => f.clone(),
@@ -131,7 +131,7 @@ impl Hub {
                 json!({})
             };
             let reply = wire::accepted(&self.key, p["from"].as_str().unwrap(), NOW, p["id"].as_str().unwrap(), extra);
-            queue.extend(serde_json::from_str::<Vec<Value>>(&m.inbound(&reply.frame(), NOW as f64)).unwrap());
+            queue.extend(self::events(m.inbound(&reply.frame(), NOW as f64)));
         }
         events
     }
@@ -155,7 +155,7 @@ fn rekey_remove_device_and_rotate_the_archive_key() {
 
     // a sibling joins the personal group (M§12.3)
     let out = json!([{"send": m.add_device(&personal, &laptop.did(), &key_packages(&alice, &laptop, PLAIN), NOW as f64).unwrap()}]);
-    let ev = hub.drive(&mut m, &out.to_string());
+    let ev = hub.drive(&mut m, &out);
     assert_eq!(ui(&ev, "committed")[0]["device"], json!(laptop.did()));
     let epoch = ui(&ev, "committed")[0]["epoch"].as_u64().unwrap();
 
@@ -164,7 +164,7 @@ fn rekey_remove_device_and_rotate_the_archive_key() {
 
     // a rekey moves the epoch
     let out = json!([{"send": m.rekey(&personal, NOW as f64).unwrap()}]);
-    let ev = hub.drive(&mut m, &out.to_string());
+    let ev = hub.drive(&mut m, &out);
     assert_eq!(ui(&ev, "committed")[0]["epoch"], json!(epoch + 1));
 
     // removed by credential, then a new archive key, sent after the merge: in the epoch the laptop is not in (M§12.4)
@@ -189,12 +189,12 @@ fn activity_sealed_opened_and_attributed() {
     let gid = ui(&ev, "committed")[0]["group"].as_str().unwrap().to_string();
 
     // not disclosed: nothing goes out (M§10.5)
-    let ev: Vec<Value> = serde_json::from_str(&m.activity(&gid, "typing", "active", NOW as f64)).unwrap();
+    let ev = events(m.activity(&gid, "typing", "active", NOW as f64));
     assert_eq!(ev[0]["ui"], "activity_not_sent", "{ev:?}");
 
     // disclosed: a sealed ephemeral deposit (M§11.1)
     m.set_receipt_policy(r#"{"activity": true}"#, NOW as f64).unwrap();
-    let ev: Vec<Value> = serde_json::from_str(&m.activity(&gid, "typing", "active", NOW as f64 + 6.0)).unwrap();
+    let ev = events(m.activity(&gid, "typing", "active", NOW as f64 + 6.0));
     let frame = ev.iter().find_map(|e| e["send"].as_str()).expect("a deposit");
     let dep = wire::payload_of(&Envelope::from_frame(frame).unwrap()).unwrap();
     assert_eq!((dep["class"].as_str(), dep["group"].as_str()), (Some("ephemeral"), Some(gid.as_str())));
@@ -204,7 +204,7 @@ fn activity_sealed_opened_and_attributed() {
     // a pushed ephemeral item: never stored, so no cursor (M§11.2, spec-gap 49)
     let item = json!({"class": "ephemeral", "group": gid, "sealed": dep["sealed"], "expires_at": NOW + 16});
     let push = wire::items(&hub.key, &phone.did(), NOW, None, vec![item.clone()], Value::Null);
-    let ev: Vec<Value> = serde_json::from_str(&m.inbound(&push.frame(), NOW as f64 + 6.0)).unwrap();
+    let ev = events(m.inbound(&push.frame(), NOW as f64 + 6.0));
     let shown = ui(&ev, "activity");
     assert!(!shown.is_empty(), "{ev:?}");
     assert_eq!((shown[0]["from"].as_str(), shown[0]["activity"].as_str()), (Some(alice.did().as_str()), Some("typing")), "{ev:?}");
@@ -213,7 +213,7 @@ fn activity_sealed_opened_and_attributed() {
     let mut bad = item;
     bad["sealed"] = json!(dsip_core::b64::encode(b"not sealed for this epoch at all"));
     let push = wire::items(&hub.key, &phone.did(), NOW, None, vec![bad], Value::Null);
-    let ev: Vec<Value> = serde_json::from_str(&m.inbound(&push.frame(), NOW as f64 + 7.0)).unwrap();
+    let ev = events(m.inbound(&push.frame(), NOW as f64 + 7.0));
     assert_eq!(ui(&ev, "dropped").len(), 1, "{ev:?}");
 }
 
@@ -252,7 +252,7 @@ fn first_contact_and_any_object_sent() {
                      "sent_at": NOW, "kind": "event", "event": {"source": "ups-1"}});
     let sent: Value = serde_json::from_str(&m.send(&gid, &obj.to_string(), NOW as f64).unwrap()).unwrap();
     let item = sent["item"].as_str().unwrap().to_string();
-    let ev = hub.drive(&mut m, &json!([{"send": sent["send"]}]).to_string());
+    let ev = hub.drive(&mut m, json!([{"send": sent["send"]}]));
     assert_eq!(ui(&ev, "sent")[0]["item"], json!(item));
 }
 
@@ -261,8 +261,9 @@ fn deposit_id(send: &str) -> String {
     wire::payload_of(&Envelope::from_frame(send).unwrap()).unwrap()["id"].as_str().unwrap().to_string()
 }
 
-fn events(out: &str) -> Vec<Value> {
-    serde_json::from_str(out).unwrap()
+/// What a step returned, as the JSON a host reads.
+fn events(out: impl serde::Serialize) -> Vec<Value> {
+    serde_json::from_value(serde_json::to_value(out).unwrap()).unwrap()
 }
 
 #[test]
@@ -288,42 +289,42 @@ fn events_carry_what_a_host_prints() {
     assert_eq!((rec[0]["ended"].as_bool(), rec[0]["may_send"].as_bool()), (Some(false), Some(false)));
     assert!(m.send_text(&gid, "hi", NOW as f64).is_err());
     let accepted: Value = serde_json::from_str(&m.accept_recording(&gid, NOW as f64).unwrap()).unwrap();
-    let ev = hub.drive(&mut m, &accepted["frames"].to_string());
+    let ev = hub.drive(&mut m, &accepted["frames"]);
     assert!(ui(&ev, "recording").is_empty(), "the same recorders: nothing new to render {ev:?}");
 
     // a rekey that lost a conflict: which commit, at which epoch; re-proposed after the sync while still needed (M§6.5)
     let frame = m.rekey(&gid, NOW as f64).unwrap();
     let refusal = wire::error(&hub.key, &phone.did(), NOW, Some(&deposit_id(&frame)), "mailbox.commit-conflict", None);
-    let ev = events(&m.inbound(&refusal.frame(), NOW as f64));
+    let ev = events(m.inbound(&refusal.frame(), NOW as f64));
     let conflict = ui(&ev, "conflict")[0].clone();
     assert_eq!((conflict["op"]["op"].as_str(), conflict["epoch"].as_u64()), (Some("update"), committed["epoch"].as_u64()), "{ev:?}");
     let caught_up = wire::items(&hub.key, &phone.did(), NOW, Some("01J0000000000000000000SYNC"), vec![], Value::Null);
-    let ev = events(&m.inbound(&caught_up.frame(), NOW as f64));
+    let ev = events(m.inbound(&caught_up.frame(), NOW as f64));
     let again = ui(&ev, "repropose")[0].clone();
     assert_eq!((again["op"]["op"].as_str(), again["epoch"].as_u64()), (Some("update"), committed["epoch"].as_u64()), "{ev:?}");
     assert!(again["attempt"].as_u64().is_some());
-    let ev = hub.drive(&mut m, &json!(ev).to_string());
+    let ev = hub.drive(&mut m, &ev);
     assert_eq!(ui(&ev, "committed")[0]["op"]["op"], "update");
 
     // a missed call: the event sent, its item, and whether this identity had it already (M§13.3, spec-gap 63)
     let leg = json!({"session": "01K742SG00XZRF7H1Z8WN9CGAD", "peer": bob.did(), "alerted": true, "answered_here": false, "ended_by": "remote", "reason": ""});
     let r: Value = serde_json::from_str(&m.call_ended_item(&leg.to_string(), NOW as f64).unwrap()).unwrap();
     assert_eq!((r["event"]["outcome"].as_str(), r["event"]["direction"].as_str(), r["fresh"].as_bool()), (Some("missed"), Some("inbound"), Some(true)));
-    let ev = hub.drive(&mut m, &json!([{"send": r["send"]}]).to_string());
+    let ev = hub.drive(&mut m, json!([{"send": r["send"]}]));
     assert_eq!(ui(&ev, "sent")[0]["item"], r["item"]);
     let r: Value = serde_json::from_str(&m.call_ended_item(&leg.to_string(), NOW as f64).unwrap()).unwrap();
     assert_eq!(r["fresh"], false, "already recorded");
     let unalerted = json!({"session": "01K742SG00XZRF7H1Z8WN9CGAE", "peer": bob.did(), "alerted": false, "ended_by": "remote"});
     let r: Value = serde_json::from_str(&m.call_ended_item(&unalerted.to_string(), NOW as f64).unwrap()).unwrap();
     assert!(r["event"].is_null() && r["send"] == "");
-    assert_eq!(m.call_ended(&unalerted.to_string(), NOW as f64).unwrap(), "[]");
+    assert!(m.call_ended(&unalerted.to_string(), NOW as f64).unwrap().is_empty());
 
     // the hub is down: the retry names the item waiting, and its accepted says it went out after the outage (M§9.4)
     let sent: Value = serde_json::from_str(&m.send(&gid, &json!({"object": "content", "id": "01J0000000000000000000DOWN",
         "conversation": m.state()["convs"][&gid]["conversation"], "sender": alice.did(), "sent_at": NOW, "kind": "text", "text": "down?"}).to_string(),
         NOW as f64).unwrap()).unwrap();
     let down = wire::error(&hub.key, &phone.did(), NOW, Some(&deposit_id(sent["send"].as_str().unwrap())), "mailbox.hub-unreachable", None);
-    let ev = events(&m.inbound(&down.frame(), NOW as f64));
+    let ev = events(m.inbound(&down.frame(), NOW as f64));
     let retry = ui(&ev, "hub_retry")[0].clone();
     assert_eq!(retry["item"], sent["item"], "{ev:?}");
     let later = NOW as f64 + retry["in"].as_f64().unwrap();
@@ -365,22 +366,22 @@ fn a_host_that_waits_for_its_commands_and_syncs_when_asked() {
     // a commit in flight is unsettled; a new binding deposits it again without a sync, unless the host asks for one
     m.rekey(&gid, NOW as f64).unwrap();
     assert!(!m.settled());
-    let types = |frames: &str| -> Vec<String> {
-        serde_json::from_str::<Vec<String>>(frames).unwrap().iter()
+    let types = |frames: Vec<String>| -> Vec<String> {
+        frames.iter()
             .map(|f| wire::payload_of(&Envelope::from_frame(f).unwrap()).unwrap()["type"].as_str().unwrap().to_string()).collect()
     };
-    assert_eq!(types(&m.rebind(NOW as f64)), ["deposit"], "the same commit again (M§9.3), no sync");
-    assert_eq!(types(&m.on_bound(NOW as f64)), ["deposit", "sync"]);
+    assert_eq!(types(m.rebind(NOW as f64)), ["deposit"], "the same commit again (M§9.3), no sync");
+    assert_eq!(types(m.on_bound(NOW as f64)), ["deposit", "sync"]);
 
     // refused for a conflict: unsettled until the sync shows the commit is still needed and it is proposed again
-    let pending: Vec<String> = serde_json::from_str(&m.rebind(NOW as f64)).unwrap();
+    let pending = m.rebind(NOW as f64);
     let refusal = wire::error(&hub.key, &phone.did(), NOW, Some(&deposit_id(&pending[0])), "mailbox.commit-conflict", None);
-    let ev = events(&m.inbound(&refusal.frame(), NOW as f64));
+    let ev = events(m.inbound(&refusal.frame(), NOW as f64));
     assert!(!ui(&ev, "conflict").is_empty() && !m.settled(), "{ev:?}");
     let caught_up = wire::items(&hub.key, &phone.did(), NOW, Some("01J0000000000000000000SYNC"), vec![], Value::Null);
-    let ev = events(&m.inbound(&caught_up.frame(), NOW as f64));
+    let ev = events(m.inbound(&caught_up.frame(), NOW as f64));
     assert!(!ui(&ev, "repropose").is_empty(), "{ev:?}");
-    let ev = hub.drive(&mut m, &json!(ev).to_string());
+    let ev = hub.drive(&mut m, &ev);
     assert_eq!(ui(&ev, "committed")[0]["op"]["op"], "update");
     assert!(m.settled(), "{ev:?}");
 }
