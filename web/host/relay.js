@@ -5,7 +5,7 @@
 // is the engine's (`relay_hello`); this file only moves bytes and keeps the socket alive.
 
 export class Relay {
-  /** `engine` is the wasm Endpoint; `on` = {bound(relayInfo), frame(text), closed(wasBound), refused(r), rejected(code), dropped(frame)}. */
+  /** `engine` is the wasm Endpoint or Messenger; `on` = {bound(relayInfo), frame(text), closed(wasBound), refused(r), rejected(code), dropped(frame)}. */
   constructor(url, engine, on, now) {
     this.url = url; this.engine = engine; this.on = on; this.now = now;
     this.ws = null; this.bound = false; this.backoff = 1000; this.closedByUs = false;
@@ -19,7 +19,9 @@ export class Relay {
     ws.onopen = () => { ws.send(this.engine.hello_frame(this.now())); };
     ws.onmessage = async (ev) => {
       if (!this.bound) {
-        const r = JSON.parse(this.engine.relay_hello(ev.data, this.now()));
+        // the Endpoint returns an object; the Messenger (a mailbox connection) still returns JSON text until dsip-rs B3
+        const out = this.engine.relay_hello(ev.data, this.now());
+        const r = typeof out === 'string' ? JSON.parse(out) : out;
         if (!r.ok) { this.on.refused?.(r); ws.close(); return; }
         this.bound = true; this.backoff = 1000; this.rejected = null;
         this.on.bound?.(r);

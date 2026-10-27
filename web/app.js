@@ -345,14 +345,14 @@ function bindingNumber() { return bindingPayload(settings.binding || '').tn || '
 /** Our own did:web document (§7.2): the identity key, and `tel:` for the bound number (N§3.3). `null` for did:key. */
 function ownDocument() {
   if (!identity.identity.startsWith('did:web:')) return null;
-  return JSON.parse(did_document(JSON.stringify(identity), JSON.stringify(bindingNumber() ? [`tel:${bindingNumber()}`] : [])));
+  return JSON.parse(did_document(JSON.stringify(identity), bindingNumber() ? [`tel:${bindingNumber()}`] : []));
 }
 
 /** What a callee holding our document and this policy would make of our binding (N§3.4), said before any call. */
 function bindingStatus() {
   if (!settings.binding) return 'no binding: your calls present no number';
   const claim = { type: 'tel', number: bindingNumber(), binding: settings.binding };
-  const out = JSON.parse(check_claim(JSON.stringify(claim), identity.identity, JSON.stringify(ownDocument()), now(), JSON.stringify(settings.tn_policy || {})));
+  const out = check_claim(claim, identity.identity, ownDocument(), now(), settings.tn_policy || {});
   if (out.outcome === 'attested') return `${out.line} — verifies, as a callee holding your document and this policy sees it (N§3.4)`;
   const hint = out.reason === 'not-claimed-by-did'
     ? (identity.identity.startsWith('did:web:') ? ' (your document must list the number: host the one above)' : ' (a bound number needs a did:web identity whose document lists it, N§3.3)')
@@ -372,7 +372,7 @@ async function addDocument(text) {
   let doc;
   try { doc = JSON.parse(text); } catch { return notify('a DID document is JSON'); }
   if (!doc || typeof doc.id !== 'string' || !doc.id.startsWith('did:web:')) return notify('a DID document names its did:web id');
-  if (!engine.ep.add_document(JSON.stringify(doc))) return notify('that document could not be read');
+  if (!engine.ep.add_document(doc)) return notify('that document could not be read');
   documents[doc.id] = doc;
   await store.set(key('documents'), documents);
   renderDocuments();
@@ -482,7 +482,7 @@ async function onReceived(r) {
   log(`← ${m.type.padEnd(12)} from ${short(r.identity)}${r.display_name ? ` "${r.display_name}"` : ''}  ✓ signature · delegation · replay · schema`, '§10.2');
   if (m.type === 'introduction') {
     // what the request will show: the stated purpose (a claim) and the introducer's §18.1 basis
-    purposes[m.id] = { purpose: p.purpose || '', basis: verification_basis(r.identity, JSON.stringify((p.identity && p.identity.claims) || [])) };
+    purposes[m.id] = { purpose: p.purpose || '', basis: verification_basis(r.identity, (p.identity && p.identity.claims) || []) };
     await store.set(key('purposes'), purposes);
     renderContacts();   // the request is listed now, with its purpose and basis
     return;
@@ -503,7 +503,7 @@ async function onReceived(r) {
   }
   if (!call || ![m.id, m.session, m.in_reply_to].includes(call.sid)) return;   // not this call: the engine has already acted
   if (m.type === 'error' && m.reason === 'gateway.downgraded') {
-    const text = '⚠ ' + downgrade_summary(JSON.stringify((p.detail && p.detail.losses) || []));
+    const text = '⚠ ' + downgrade_summary((p.detail && p.detail.losses) || []);
     for (const id of ['call-downgrade', 'in-downgrade']) { $(id).textContent = text; $(id).classList.remove('hidden'); }
     log(text, 'G§7');
   }
@@ -522,17 +522,17 @@ function ringing(sid) {
   const tel = claims.find((c) => c.type === 'tel');
   $('in-name').textContent = nameOf(r.identity) || r.display_name || '(no name)';
   $('in-did').textContent = r.identity;
-  $('in-caller').textContent = tel ? '☎ ' + tel_caller_line(JSON.stringify(tel)) + ' (via gateway)' : '';
+  $('in-caller').textContent = tel ? '☎ ' + tel_caller_line(tel) + ' (via gateway)' : '';
   $('in-caller').classList.toggle('hidden', !tel);
-  $('in-basis').textContent = verification_basis(r.identity, JSON.stringify(claims));
+  $('in-basis').textContent = verification_basis(r.identity, claims);
   // N§4: the caller's own bound numbers, verified against the identity that signed this invite and its document;
   // N§5: a number that a stored contact lists but that now belongs to another identity is said out loud
   const numberLines = [], warnings = [];
   for (const c of claims) {
-    const out = JSON.parse(check_claim(JSON.stringify(c), r.identity, JSON.stringify(documents[r.identity] ?? null), now(), JSON.stringify(setting('tn_policy') || {})));
+    const out = check_claim(c, r.identity, documents[r.identity] ?? null, now(), setting('tn_policy') || {});
     if (out.outcome === 'attested') {
       numberLines.push(`☎ ${out.line} (N§4)`);
-      const w = identity_change(JSON.stringify(contacts), c.number, r.identity, out.attested_by ?? undefined, out.issued);
+      const w = identity_change(contacts, c.number, r.identity, out.attested_by ?? undefined, out.issued);
       if (w) warnings.push(`⚠ ${w} (N§5)`);
     } else if (out.outcome === 'dropped') numberLines.push(`☎ ${out.line || 'a number'} — number binding refused: ${out.reason} (N§4, §18.2)`);
   }
@@ -764,7 +764,7 @@ async function placeCall(to, video, destination) {
   const me = call;
   $('call-peer-name').textContent = nameOf(to) || '';
   $('call-peer-did').textContent = to;
-  $('call-basis').textContent = verification_basis(to, '[]');
+  $('call-basis').textContent = verification_basis(to, []);
   const lines = [];
   if (destination) lines.push(`to ${destination} through the gateway ${short(to)}: the number is the invite's destination (N§4.1)`);
   if (settings.binding) lines.push(`presenting ${bindingNumber()} with its binding (N§4)`);
@@ -818,7 +818,7 @@ async function callNumber(input) {
         log(`number ${tn}: ${r.ok ? `${bindings.length} binding(s)` : `${r.status}`} from ${n} (hints tier)`, 'N§6');
       } catch (e) { log(`number ${tn}: ${n} did not answer (${e.message})`, 'N§6'); }
     }
-    const sel = JSON.parse(tn_select(tn, JSON.stringify(bindings), JSON.stringify(documents), now(), JSON.stringify(setting('tn_policy') || {})));
+    const sel = tn_select(tn, bindings, documents, now(), setting('tn_policy') || {});
     if (sel) {
       log(`number ${tn} → ${sel.did}${sel.attested_by ? ` (attested by ${sel.attested_by})` : ''}${sel.others.length ? `; also claimed by ${sel.others.join(', ')}` : ''}`, 'N§6 · N§7');
       return placeCall(sel.did, false);
@@ -847,7 +847,7 @@ async function discover(did) {
       log(`hints for ${short(did)}: ${r.ok ? `${got.length} record(s)` : r.status === 404 ? 'none (no overlay at that node)' : r.status} from ${n} in ${Math.round(performance.now() - t0)} ms (hints tier)`, '§8.5 · profile §10');
     } catch (e) { log(`hints for ${short(did)}: ${n} did not answer (${e.message})`, '§8.5'); }
   }
-  const out = JSON.parse(hint_select(did, JSON.stringify(frames), JSON.stringify(documents), now()));
+  const out = hint_select(did, frames, documents, now());
   for (const v of out.report) if (v.verdict !== 'accept') log(`   a hint record was refused: ${v.code}${v.detail ? ' ' + v.detail : ''}`, '§8.3');
   if (out.hint) log(`hint for ${short(did)}: ${out.hint.uri} seq ${out.hint.seq}, signed by ${out.hint.signer === did ? 'the subject' : 'delegated device ' + short(out.hint.signer)} — HINT-SOURCED, NOT AUTHORITATIVE (§8.1 rule 6)`, '§8.3');
   else if (frames.length) log(`hint for ${short(did)}: none of ${frames.length} verified`, '§8.3');
@@ -956,7 +956,7 @@ async function publishReachabilityOnce() {
   const endpoints = [{ uri }];
   const mb = mailboxOf();
   if (mb && mailboxInfo && mailboxInfo.did === mb.did) endpoints.push({ uri: mb.uri, service: 'DSIPMailbox', mailbox: mb.did, priority: 0, profiles: ['messaging/1.0'], accepts: ['text', 'audio'], voicemail: { max_duration_s: VOICEMAIL_MAX_S } });
-  const frame = hint_frame(JSON.stringify(identity), engine.newId(), JSON.stringify(endpoints), HINT_TTL_S, seq, now());
+  const frame = hint_frame(JSON.stringify(identity), engine.newId(), endpoints, HINT_TTL_S, seq, now());
   for (const n of nodesInEffect()) {
     try {
       const r = await fetch(`${n.replace(/\/$/, '')}/dsip/v1/hints`, { method: 'POST', body: frame, headers: { 'content-type': 'text/plain' } });
@@ -1209,7 +1209,7 @@ async function offerVoicemail(leg, reason) {
   const type = reason === 'session.timeout' ? 'cancel' : 'reject';   // §12.9: our own cancel on T-Establish/T-Ring expiry
   let mb = null;
   try { mb = await peerMailboxEntry(leg.peer); } catch { /* no entry: no offer */ }
-  const d = JSON.parse(voicemail_offer(JSON.stringify(mb?.entry ?? null), messenger.can_send(leg.peer), type, reason));
+  const d = voicemail_offer(mb?.entry ?? null, messenger.can_send(leg.peer), type, reason);
   log(`voicemail ${d.offer ? `offered (up to ${d.max_duration_s ?? '?'} s)` : 'not offered'}: ${type} ${reason}${mb?.entry?.voicemail ? '' : ', the callee advertises no voicemail'}`, 'M§13.2');
   if (!d.offer) return;
   pendingVoicemail = { peer: leg.peer, session: leg.sid, max_s: d.max_duration_s || VOICEMAIL_MAX_S };
@@ -1540,7 +1540,7 @@ function presenceTick() {
     if (!s || (s.renewAt && t >= s.renewAt) || (s.retryAt && t >= s.retryAt)) presenceWatch(c.did);
   }
   for (const did of presenceSubs.keys()) if (!contacts.some((c) => c.did === did)) presenceSubs.delete(did);
-  presenceRefresh(JSON.parse(engine.ep.presence_all(now())));
+  presenceRefresh(engine.ep.presence_all(now()));
 }
 
 /** Watch a contact's presence: subscribe at the relay that answers for it, ours or, when its hint names another,
@@ -1556,7 +1556,7 @@ async function presenceWatch(did) {
   if (!r?.bound) return;
   const authority = r === relay ? relayInfo?.did : r.did;
   if (!authority) return;
-  const out = JSON.parse(engine.ep.presence_subscribe(did, authority, PRESENCE_SUB_S, now()));
+  const out = engine.ep.presence_subscribe(did, authority, PRESENCE_SUB_S, now());
   Object.assign(pending, { sub: out.subscription, relay: r, renewAt: now() + PRESENCE_SUB_S - 300, retryAt: 0 });
   r.send(out.frame);
   log(`→ subscribe    presence of ${short(did)} at ${r === relay ? 'our relay' : r.url} for ${PRESENCE_SUB_S} s${out.grants ? `, presenting ${out.grants} grant(s) of theirs` : ', no grant of theirs to present'}`, '§9.3 · P§6');
@@ -1564,7 +1564,7 @@ async function presenceWatch(did) {
 
 /** P§12.5: a sealing device watches its own identity at our relay (P§6 rule 1 admits it) to learn its siblings' epochs. */
 function presenceWatchOwn() {
-  const out = JSON.parse(engine.ep.presence_subscribe(identity.identity, relayInfo.did, PRESENCE_SUB_S, now()));
+  const out = engine.ep.presence_subscribe(identity.identity, relayInfo.did, PRESENCE_SUB_S, now());
   ownWatch = { sub: out.subscription, renewAt: now() + PRESENCE_SUB_S - 300 };
   relay.send(out.frame);
   log(`→ subscribe    our own identity at our relay, sealed records too: a sibling's epoch is ours`, '§9.3 · P§12.5');
@@ -1594,10 +1594,10 @@ function presenceForget(did) {
 /** A presence notify: the wasm verifies each record and combines them (P§3, P§4). */
 async function presenceNotified(p) {
   let out;
-  try { out = engine.ep.presence_notify(JSON.stringify(p), now()); } catch (e) { return log(`✗ presence notify: ${e.message || e}`, 'P§12'); }
+  try { out = engine.ep.presence_notify(p, now()); } catch (e) { return log(`✗ presence notify: ${e.message || e}`, 'P§12'); }
   if (!out) return;
-  const v = JSON.parse(out);
-  if (v.own) {
+  const v = out;
+  if ('own' in v) {
     // P§12.5: our own watch; a sibling's higher epoch becomes ours, and the grants carrying it follow
     if (v.terminated) ownWatch = null;
     await engine.drive(v.events);
@@ -1646,13 +1646,13 @@ async function startEngine() {
   engine = new Engine(Endpoint, identity, { first_contact_required: !!settings.first_contact_required, one_call: true,
     seal: !!settings.seal, recording: settings.recording_accept || 'ask',
     seal_presence: !!settings.seal_presence, presence_audiences: Object.keys(settings.presence_audiences || {}) }, now);
-  sealing = JSON.parse(engine.ep.presence_sealing());
+  sealing = engine.ep.presence_sealing();
   renderSealing();
   engine.loadContactsFile(await store.get(key('engine.contacts')));
   engine.ep.presence_set(settings.presence || null, now());   // P§3: sent once our relay binds us
   for (const [a, st] of Object.entries(settings.presence_audiences || {})) engine.ep.presence_set_for(a, st, now());   // P§6
   for (const r of revoked) engine.ep.hold_revocation(r.frame);   // §7.4: revocations this identity issued apply here too
-  for (const d of Object.values(documents)) engine.ep.add_document(JSON.stringify(d));   // §8.1: documents held
+  for (const d of Object.values(documents)) engine.ep.add_document(d);   // §8.1: documents held
   engine.on = {
     send: (frame, meta) => {
       // a session placed through the peer's own relay stays there, an introduction through the relay their hint
@@ -1836,7 +1836,7 @@ function awaitEmission(pred, ms = 15000) {
  *  reachability hint on the nodes (a hint: never authority). `{did, uri, source}` or null. */
 async function peerMailbox(did) {
   const hint = did.startsWith('did:web:') && documents[did] ? null : await discover(did);
-  const sel = JSON.parse(mailbox_select(JSON.stringify(documents[did] ?? null), JSON.stringify(hint?.endpoints || [])));
+  const sel = mailbox_select(documents[did] ?? null, hint?.endpoints || []);
   if (!sel.selected) return null;
   log(`mailbox of ${short(did)}: ${sel.uri} ${short(sel.selected)} (${sel.source === 'hint' ? 'HINT-SOURCED, NOT AUTHORITATIVE, §8.1 rule 6' : 'from their DID document, §8.1'})`, 'M§4.2');
   return { did: sel.selected, uri: sel.uri, source: sel.source, entry: sel.entry };

@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::{FromDer as _, X509Version};
@@ -648,17 +649,20 @@ pub fn store(tn: &str, binding: &str, held: &[String], now: i64, policy: &Policy
 }
 
 /// The number's DID, chosen from the bindings a lookup returned (N§6, N§7).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
 pub struct Selected {
     /// The winner's DID.
     pub did: String,
     /// Who attested the winner.
+    #[cfg_attr(feature = "ts", tsify(type = "string | null"))]
     pub attested_by: Option<String>,
     /// The winner's `iat`.
     pub issued: i64,
     /// Other DIDs that also hold verified bindings for the number, sorted: a port in progress, or a hijack.
     pub others: Vec<String>,
     /// The winning binding's text (for `served_by`, route 2).
+    #[serde(skip)]
     pub binding: String,
 }
 
@@ -732,7 +736,9 @@ pub fn authority(tn: &str, answers: &[Value], documents: &Map<String, Value>, no
 }
 
 /// What a client does with a `tel` claim carrying a binding (N§4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(tag = "outcome", rename_all = "lowercase")]
 pub enum ClaimOutcome {
     /// Not a `tel` claim with a `binding`: not this rule's (a gateway's G§5 claim renders through `dsip_core::trust`).
     Ignored,
@@ -745,6 +751,7 @@ pub enum ClaimOutcome {
         /// The binding's `exp`.
         expires: i64,
         /// Who attested it (the N§3.4 `attested_by`), for the N§5 warning.
+        #[cfg_attr(feature = "ts", tsify(type = "string | null"))]
         attested_by: Option<String>,
     },
     /// Dropped: the reason, and `<number> (unverified)` when the claimed number is E.164 (§18.2).
@@ -752,6 +759,7 @@ pub enum ClaimOutcome {
         /// The first failing step's reason, `malformed` for a non-string binding, or `number-mismatch`.
         reason: &'static str,
         /// What may still be shown, marked.
+        #[cfg_attr(feature = "ts", tsify(type = "string | null"))]
         line: Option<String>,
     },
 }
@@ -785,7 +793,9 @@ pub fn check_claim(claim: &Value, identity: &str, did_document: &Value, now: i64
 }
 
 /// A stored contact: a name, the DID the user knows them by, and their numbers (E.164).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "ts", derive(tsify::Tsify))]
+#[serde(default)]
 pub struct Contact {
     /// The name the user gave them.
     pub name: String,

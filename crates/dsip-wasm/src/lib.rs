@@ -2,8 +2,10 @@
 //!
 //! Spec: none (infrastructure) — every normative behavior comes from
 //! `dsip-core`, `dsip-schema`, `dsip-session`, and `dsip-endpoint`; this crate
-//! only marshals JSON strings across the wasm-bindgen boundary. The browser
-//! supplies the clock (`Date.now()/1000`), the WebSocket, WebRTC, and storage.
+//! only marshals values across the wasm-bindgen boundary, as JavaScript objects
+//! typed by the declarations in [`types`]. Saved records (the identity, the
+//! contact file) cross as the JSON text that is stored. The browser supplies
+//! the clock (`Date.now()/1000`), the WebSocket, WebRTC, and storage.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -27,7 +29,9 @@ use dsip_endpoint::calls::AcceptPolicy;
 use dsip_endpoint::{AnswerPolicy, CallCommand, Calls, CallsConfig, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys, Invite,
                     MediaResult, PresenceSealing};
 use tsify::{Ts, Tsify as _};
-use types::{CallOuts, LocalCommand, Placed};
+use types::{CallOuts, Consent, Contacts, EndpointConfig, HintEndpoints, HintSelection, Json, LocalCommand, Mailbox, Notified, NumberContacts,
+            OwnPresence, Placed, SealingStatus, Presence, PresenceStates, PresenceSubscription, Presences, RelayHello, Requests,
+            SelectedHint, Sessions, Verdict, Voicemail, Whoami};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -122,10 +126,10 @@ pub fn rehome(identity_json: &str, did_web: &str, now: f64) -> Result<String, Js
 }
 
 /// The DID document of a `did:web` identity (§7.2; the shape `dsip identity init --did-web` writes): one Multikey
-/// verification method for the identity key, and `alsoKnownAs` (a JSON array of strings; `tel:+…` claims the
-/// number of a binding, N§3.3).
+/// verification method for the identity key, and `alsoKnownAs` (`tel:+…` claims the number of a binding, N§3.3).
+/// Returns the document's text, to host as it is.
 #[wasm_bindgen]
-pub fn did_document(identity_json: &str, also_known_as_json: &str) -> Result<String, JsValue> {
+pub fn did_document(identity_json: &str, also_known_as: Vec<String>) -> Result<String, JsValue> {
     let id: Value = serde_json::from_str(identity_json).map_err(js)?;
     let did = id["identity"].as_str().unwrap_or("").to_string();
     if !did.starts_with("did:web:") {
@@ -134,7 +138,7 @@ pub fn did_document(identity_json: &str, also_known_as_json: &str) -> Result<Str
     let controller = KeyPair::from_seed(unhex(id["controller_seed_hex"].as_str().unwrap_or(""))?);
     let kid = format!("{did}#key-1");
     let multibase = controller.did().trim_start_matches("did:key:").to_string();
-    let aka: Vec<String> = serde_json::from_str(also_known_as_json).unwrap_or_default();
+    let aka = also_known_as;
     let mut doc = json!({
         "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
         "id": did,
@@ -159,71 +163,50 @@ fn unseal_keys(id: &Value, keys: &IdentityKeys) -> Result<Vec<(String, [u8; 32])
     Ok(out)
 }
 
-fn policy_of(policy_json: &str) -> dsip_number::Policy {
-    dsip_number::Policy::from_json(&serde_json::from_str(policy_json).unwrap_or(json!({})))
+fn policy_of(policy: Json) -> dsip_number::Policy {
+    dsip_number::Policy::from_json(&if policy.0.is_null() { json!({}) } else { policy.0 })
 }
 
 /// N§4: check a `tel` claim from an invite's `identity.claims` against the envelope's verified signing identity and
-/// that identity's DID document (JSON, or `null` when none is held), under a `tn-binding` policy (the vectors'
-/// context shape: `trust_anchors`, `certificates`, …; `{}` for none). Returns
-/// `{"outcome": "ignored" | "attested" | "dropped", "line", "reason", "issued", "attested_by"}`: the lines the
-/// `tn-binding/claim-*` vectors pin.
+/// that identity's DID document (`null` when none is held), under a `tn-binding` policy (the vectors' context shape:
+/// `trust_anchors`, `certificates`, …; `{}` for none). Returns the outcome: the lines the `tn-binding/claim-*`
+/// vectors pin.
 #[wasm_bindgen]
-pub fn check_claim(claim_json: &str, identity: &str, did_document_json: &str, now: f64, policy_json: &str) -> String {
-    let claim: Value = serde_json::from_str(claim_json).unwrap_or(Value::Null);
-    let doc: Value = serde_json::from_str(did_document_json).unwrap_or(Value::Null);
-    match dsip_number::check_claim(&claim, identity, &doc, now as i64, &policy_of(policy_json)) {
-        dsip_number::ClaimOutcome::Ignored => json!({"outcome": "ignored"}),
-        dsip_number::ClaimOutcome::Attested { line, issued, expires, attested_by } => {
-            json!({"outcome": "attested", "line": line, "issued": issued, "expires": expires, "attested_by": attested_by})
-        }
-        dsip_number::ClaimOutcome::Dropped { reason, line } => json!({"outcome": "dropped", "reason": reason, "line": line}),
-    }
-    .to_string()
+pub fn check_claim(claim: Ts<Json>, identity: &str, did_document: Ts<Json>, now: f64, policy: Ts<Json>) -> Result<Ts<dsip_number::ClaimOutcome>, JsError> {
+    let out = dsip_number::check_claim(&claim.to_rust()?.0, identity, &did_document.to_rust()?.0, now as i64, &policy_of(policy.to_rust()?));
+    Ok(out.into_ts()?)
 }
 
-/// N§5: the warning when a verified number now belongs to another identity than a stored contact listing it;
-/// `contacts_json` is `[{"name", "did", "numbers": ["+…"]}]`. Returns the warning, or `""` when none is due.
+/// N§5: the warning when a verified number now belongs to another identity than a stored contact listing it.
+/// Returns the warning, or nothing when none is due.
 #[wasm_bindgen]
-pub fn identity_change(contacts_json: &str, tn: &str, did: &str, attested_by: Option<String>, issued: f64) -> String {
-    let v: Vec<Value> = serde_json::from_str(contacts_json).unwrap_or_default();
-    let contacts: Vec<dsip_number::Contact> = v
-        .iter()
-        .map(|c| dsip_number::Contact {
-            name: c["name"].as_str().unwrap_or_default().into(),
-            did: c["did"].as_str().unwrap_or_default().into(),
-            numbers: c["numbers"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect(),
-        })
-        .collect();
-    dsip_number::identity_change(&contacts, tn, did, attested_by.as_deref(), issued as i64).unwrap_or_default()
+pub fn identity_change(contacts: Ts<NumberContacts>, tn: &str, did: &str, attested_by: Option<String>, issued: f64) -> Result<Option<String>, JsError> {
+    Ok(dsip_number::identity_change(&contacts.to_rust()?.0, tn, did, attested_by.as_deref(), issued as i64))
 }
 
-/// N§6, N§7: the DID a number resolves to, from the bindings a lookup returned (a JSON array of compact JWS
-/// strings), each verified in full against its own DID's document (`documents_json`: `{did: document}`), the newest
-/// winning. Returns `{"did", "attested_by", "issued", "others"}`, or `null` when no binding verifies.
+/// N§6, N§7: the DID a number resolves to, from the bindings a lookup returned (compact JWS strings; anything else
+/// is passed over), each verified in full against its own DID's document (`documents`: `{did: document}`), the newest
+/// winning. Returns nothing when no binding verifies.
 #[wasm_bindgen]
-pub fn tn_select(tn: &str, bindings_json: &str, documents_json: &str, now: f64, policy_json: &str) -> String {
-    let bindings: Vec<Value> = serde_json::from_str(bindings_json).unwrap_or_default();
-    let docs: serde_json::Map<String, Value> = serde_json::from_str(documents_json).unwrap_or_default();
-    match dsip_number::select(tn, &bindings, &docs, now as i64, &policy_of(policy_json)) {
-        Some(s) => json!({"did": s.did, "attested_by": s.attested_by, "issued": s.issued, "others": s.others}).to_string(),
-        None => "null".into(),
-    }
+pub fn tn_select(tn: &str, bindings: Ts<Json>, documents: Ts<Json>, now: f64, policy: Ts<Json>) -> Result<Option<Ts<dsip_number::Selected>>, JsError> {
+    let bindings: Vec<Value> = serde_json::from_value(bindings.to_rust()?.0).unwrap_or_default();
+    let docs: serde_json::Map<String, Value> = serde_json::from_value(documents.to_rust()?.0).unwrap_or_default();
+    Ok(dsip_number::select(tn, &bindings, &docs, now as i64, &policy_of(policy.to_rust()?)).map(|s| s.into_ts()).transpose()?)
 }
 
 /// A signed reachability hint for this identity (DHT Hints Profile §2; §8.3: `seq` is the publisher's, newer wins):
-/// the frame to `POST /dsip/v1/hints` on a node (§10). `endpoints_json` is `[{uri, bindings?, service?, …}]`: the
+/// the frame to `POST /dsip/v1/hints` on a node (§10). `endpoints` are `{uri, bindings?, service?, …}`: the
 /// signaling relay (`service` absent) and, with `"service": "DSIPMailbox"`, the mailbox entry a `did:key` identity
 /// advertises this way (Messaging Profile M§4.2). Signed by the device under its delegation, as the CLI's
 /// `--publish-hint` signs; `ttl_s` is clamped to the profile's maximum (§12.9, spec-gap 96).
 #[wasm_bindgen]
-pub fn hint_frame(identity_json: &str, id: &str, endpoints_json: &str, ttl_s: f64, seq: f64, now: f64) -> Result<String, JsValue> {
+pub fn hint_frame(identity_json: &str, id: &str, endpoints: Ts<HintEndpoints>, ttl_s: f64, seq: f64, now: f64) -> Result<String, JsValue> {
     let id_v: Value = serde_json::from_str(identity_json).map_err(js)?;
     let device = KeyPair::from_seed(unhex(id_v["device_seed_hex"].as_str().unwrap_or(""))?);
     let delegation = Envelope::from_frame(id_v["delegation"].as_str().unwrap_or("")).map_err(|v| JsValue::from_str(&format!("{:?}", v.code)))?;
     let subject = id_v["identity"].as_str().unwrap_or("");
     let ttl = (ttl_s as i64).clamp(3, dsip_core::HINT_MAX_VALIDITY_S);
-    let endpoints: Vec<dsip_dht::record::Endpoint> = serde_json::from_str::<Vec<Value>>(endpoints_json)
+    let endpoints: Vec<dsip_dht::record::Endpoint> = serde_json::from_value::<Vec<Value>>(endpoints.to_rust().map_err(js)?.0)
         .map_err(js)?
         .into_iter()
         .map(|mut e| {
@@ -238,18 +221,14 @@ pub fn hint_frame(identity_json: &str, id: &str, endpoints_json: &str, ttl_s: f6
 }
 
 /// Fold the hint frames a node (or several) returned for `did` down to the winner (§8.3: verified against the
-/// subject DID or its delegation, unexpired, highest `seq`), with every candidate's verdict. `documents_json` is
-/// `{did: document}` for `did:web` subjects. Returns `{"hint": {uri, bindings, seq, issued_at, expires_at, signer} |
-/// null, "report": [[verdict], …]}`. What it returns is a hint: never authority (§8.1 rule 6).
+/// subject DID or its delegation, unexpired, highest `seq`), with every candidate's verdict. `documents` is
+/// `{did: document}` for `did:web` subjects. What it returns is a hint: never authority (§8.1 rule 6).
 #[wasm_bindgen]
-pub fn hint_select(did: &str, frames_json: &str, documents_json: &str, now: f64) -> String {
-    let frames: Vec<String> = serde_json::from_str(frames_json).unwrap_or_default();
+pub fn hint_select(did: &str, frames: Vec<String>, documents: Ts<Json>, now: f64) -> Result<Ts<HintSelection>, JsError> {
     let mut resolver = StaticResolver::default();
-    if let Ok(docs) = serde_json::from_str::<Value>(documents_json) {
-        for d in docs.as_object().map(|o| o.values().cloned().collect::<Vec<_>>()).unwrap_or_default() {
-            if let Ok(doc) = serde_json::from_value::<dsip_core::did::DidDocument>(d) {
-                resolver.insert(doc);
-            }
+    for d in documents.to_rust()?.0.as_object().map(|o| o.values().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+        if let Ok(doc) = serde_json::from_value::<dsip_core::did::DidDocument>(d) {
+            resolver.insert(doc);
         }
     }
     let ctx = Context::new(now as i64, &resolver);
@@ -257,68 +236,69 @@ pub fn hint_select(did: &str, frames_json: &str, documents_json: &str, now: f64)
     let hint = winner.filter(|h| h.subject == did).map(|h| {
         // `uri` is the signaling endpoint's (profile §2: `service` absent); every endpoint is in `endpoints`
         let signaling = h.endpoints.iter().find(|e| e.service() == "DSIPSignaling").or(h.endpoints.first());
-        json!({"uri": signaling.map(|e| e.uri.clone()), "bindings": signaling.map(|e| e.bindings.clone()), "endpoints": h.endpoints,
-               "seq": h.seq, "issued_at": h.issued_at, "expires_at": h.expires_at, "signer": h.signer})
+        SelectedHint { uri: signaling.map(|e| e.uri.clone()), bindings: signaling.map(|e| e.bindings.clone()), endpoints: h.endpoints.clone(),
+                       seq: h.seq, issued_at: h.issued_at, expires_at: h.expires_at, signer: h.signer }
     });
-    json!({"hint": hint, "report": report.into_iter().map(|(_, v)| v).collect::<Vec<_>>()}).to_string()
+    Ok(HintSelection { hint, report: report.into_iter().map(|(_, v)| v).collect() }.into_ts()?)
 }
 
-/// Verify a frame standalone (stages 1–14) with a vector-style context JSON. Returns the `expect` projection.
+/// Verify a frame standalone (stages 1–14) with a vector-style context. Returns the `expect` projection.
 #[wasm_bindgen]
-pub fn verify_frame(frame: &str, context_json: &str) -> String {
-    let ctx: Value = serde_json::from_str(context_json).unwrap_or(json!({}));
+pub fn verify_frame(frame: &str, context: Ts<Json>) -> Result<Ts<Verdict>, JsError> {
+    Ok(Verdict(verify_expect(frame, context.to_rust()?.0)).into_ts()?)
+}
+
+fn verify_expect(frame: &str, ctx: Value) -> Value {
+    let ctx = if ctx.is_null() { json!({}) } else { ctx };
     let resolver = Context::resolver_from_vector(&ctx);
     let c = Context::from_vector(&ctx, &resolver);
     let env = match Envelope::from_frame(frame) {
         Ok(e) => e,
-        Err(v) => return v.to_expect().to_string(),
+        Err(v) => return v.to_expect(),
     };
     match dsip_core::envelope::verify(&env, &c, Some(frame)) {
         Ok(ver) => {
             let sem = dsip_schema::check_payload(&ver.payload, &dsip_schema::SemanticContext::from_vector(&ctx));
             if !sem.ok() {
-                return sem.to_expect().to_string();
+                return sem.to_expect();
             }
             let mut out = dsip_core::envelope::accept_verdict(&ver).to_expect();
             for (k, v) in sem.extra {
                 out[k] = v;
             }
             out["payload"] = ver.payload;
-            out.to_string()
+            out
         }
-        Err(v) => v.to_expect().to_string(),
+        Err(v) => v.to_expect(),
     }
 }
 
-/// §18.1 verification basis for an identity + its `identity.claims` (JSON array). The browser
-/// renders exactly what the CLI does, through the one canonical `dsip_core::trust` function.
+/// §18.1 verification basis for an identity + its `identity.claims` (anything but an array counts as none). The
+/// browser renders exactly what the CLI does, through the one canonical `dsip_core::trust` function.
 #[wasm_bindgen]
-pub fn verification_basis(identity_did: &str, claims_json: &str) -> String {
-    let claims: Vec<Value> = serde_json::from_str(claims_json).unwrap_or_default();
-    dsip_core::trust::verification_basis(identity_did, &claims)
+pub fn verification_basis(identity_did: &str, claims: Ts<Json>) -> Result<String, JsError> {
+    let claims: Vec<Value> = serde_json::from_value(claims.to_rust()?.0).unwrap_or_default();
+    Ok(dsip_core::trust::verification_basis(identity_did, &claims))
 }
 
 /// The `tel` caller headline for a call surface, or `""` if the claim is not a `tel` claim.
 #[wasm_bindgen]
-pub fn tel_caller_line(claim_json: &str) -> String {
-    let claim: Value = serde_json::from_str(claim_json).unwrap_or(json!({}));
-    dsip_core::trust::tel_caller_line(&claim).unwrap_or_default()
+pub fn tel_caller_line(claim: Ts<Json>) -> Result<String, JsError> {
+    Ok(dsip_core::trust::tel_caller_line(&claim.to_rust()?.0).unwrap_or_default())
 }
 
-/// A human summary of a `gateway.downgraded` error's losses (JSON array of strings).
+/// A human summary of a `gateway.downgraded` error's losses.
 #[wasm_bindgen]
-pub fn downgrade_summary(losses_json: &str) -> String {
-    let losses: Vec<String> = serde_json::from_str(losses_json).unwrap_or_default();
+pub fn downgrade_summary(losses: Vec<String>) -> String {
     dsip_core::trust::downgrade_summary(&losses.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 /// A watched identity's presence, as the page shows it: sealed records opened with the keys `core` holds, and the
 /// devices whose records it cannot read listed as `unreadable`. Spec: P§4, P§12.4.
-fn presence_json(core: &Core, w: &dsip_broadcast::presence::Watch, now: i64) -> String {
+fn presence_of(core: &Core, w: &dsip_broadcast::presence::Watch, now: i64) -> Presence {
     let (c, unreadable) = w.view(now, |kid| core.presence_key(w.target(), kid));
-    json!({"target": w.target(), "state": c.state, "token": c.token, "source": c.source, "records": w.records().len(),
-           "unreadable": unreadable, "terminated": w.terminated()})
-    .to_string()
+    Presence { target: w.target().to_string(), state: c.state, token: c.token, source: c.source.to_string(), records: w.records().len(),
+               unreadable, terminated: w.terminated() }
 }
 
 /// A browser endpoint: the engine + verifier + builder behind a JSON API, with the call glue
@@ -341,18 +321,16 @@ pub struct Endpoint {
 
 #[wasm_bindgen]
 impl Endpoint {
-    /// `identity_json` as returned by [`create_identity`]; `config_json` = `{"video":bool,"first_contact_required":bool,
-    /// "t_establish":…, "seal":bool, "answer": "ring"|"accept"|"screen"|"decline"|"silent", "recording":
-    /// "ask"|"always"|"never", "one_call":bool}`. Sealed bodies addressed to this identity or device open with their
-    /// keys (§10.4); `did:web` signers whose documents are not held are asked for (`resolve` events, answered with
-    /// [`Endpoint::resolved`]). `"seal_presence": true` seals this device's presence records (P§12), those with no
-    /// audience and those of each label in `"presence_audiences"` (a label goes on the wire as its tag): it needs the
-    /// identity's key agreement secret, so a device without the identity's key publishes in clear
+    /// `identity_json` as returned by [`create_identity`], with its configuration. Sealed bodies addressed to this
+    /// identity or device open with their keys (§10.4); `did:web` signers whose documents are not held are asked for
+    /// (`resolve` events, answered with [`Endpoint::resolved`]). `seal_presence` seals this device's presence records
+    /// (P§12), those with no audience and those of each label in `presence_audiences` (a label goes on the wire as its
+    /// tag): it needs the identity's key agreement secret, so a device without the identity's key publishes in clear
     /// ([`Endpoint::presence_sealing`] says which).
     #[wasm_bindgen(constructor)]
-    pub fn new(identity_json: &str, config_json: &str, now: f64) -> Result<Endpoint, JsValue> {
+    pub fn new(identity_json: &str, config: Ts<EndpointConfig>, now: f64) -> Result<Endpoint, JsValue> {
         let id: Value = serde_json::from_str(identity_json).map_err(js)?;
-        let cfgv: Value = serde_json::from_str(config_json).unwrap_or(json!({}));
+        let cfgv = config.to_rust().map_err(js)?;
         let device = KeyPair::from_seed(unhex(id["device_seed_hex"].as_str().unwrap_or(""))?);
         let delegation = Envelope::from_frame(id["delegation"].as_str().unwrap_or("")).map_err(|v| JsValue::from_str(&format!("{:?}", v.code)))?;
         let keys = IdentityKeys {
@@ -365,44 +343,44 @@ impl Endpoint {
         // P§12.1, P§12.6: sealing is per audience; here `main` and every audience the user named, or none
         let secret = unseal.iter().find(|(did, _)| *did == keys.identity).map(|(_, sk)| *sk);
         let mut audience_tags = std::collections::BTreeMap::new();
-        let presence = match (cfgv["seal_presence"].as_bool().unwrap_or(false), secret) {
+        let presence = match (cfgv.seal_presence.unwrap_or(false), secret) {
             (true, Some(sk)) => {
-                for l in cfgv["presence_audiences"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                for l in &cfgv.presence_audiences {
                     audience_tags.insert(l.to_string(), dsip_core::presence_seal::audience_tag(&sk, &keys.identity, l));
                 }
                 Some(PresenceSealing {
                     sealed: std::iter::once(dsip_core::presence_seal::MAIN.to_string()).chain(audience_tags.values().cloned()).collect(),
-                    t_rotate: cfgv["t_presence_rotate"].as_i64(),
+                    t_rotate: cfgv.t_presence_rotate,
                 })
             }
             _ => None,
         };
         let cfg = CoreConfig {
-            video: cfgv["video"].as_bool().unwrap_or(false),
-            t_establish: cfgv["t_establish"].as_i64(),
-            t_ring: cfgv["t_ring"].as_i64(),
-            t_ring_local: cfgv["t_ring_local"].as_i64(),
-            first_contact_required: cfgv["first_contact_required"].as_bool().unwrap_or(false),
-            seal: cfgv["seal"].as_bool().unwrap_or(false),
+            video: cfgv.video.unwrap_or(false),
+            t_establish: cfgv.t_establish,
+            t_ring: cfgv.t_ring,
+            t_ring_local: cfgv.t_ring_local,
+            first_contact_required: cfgv.first_contact_required.unwrap_or(false),
+            seal: cfgv.seal.unwrap_or(false),
             resolve_on_demand: true,
             unseal_keys: unseal,
             presence,
         };
         let calls = CallsConfig {
             media: true,
-            answer: match cfgv["answer"].as_str().unwrap_or("ring") {
+            answer: match cfgv.answer.as_deref().unwrap_or("ring") {
                 "accept" => AnswerPolicy::Accept,
                 "screen" => AnswerPolicy::Screen,
                 "decline" => AnswerPolicy::Decline,
                 "silent" => AnswerPolicy::Silent,
                 _ => AnswerPolicy::Ring,
             },
-            recording: match cfgv["recording"].as_str().unwrap_or("ask") {
+            recording: match cfgv.recording.as_deref().unwrap_or("ask") {
                 "always" => AcceptPolicy::Always,
                 "never" => AcceptPolicy::Never,
                 _ => AcceptPolicy::Ask,
             },
-            one_call: cfgv["one_call"].as_bool().unwrap_or(false),
+            one_call: cfgv.one_call.unwrap_or(false),
         };
         let resolver = StaticResolver::default();
         Ok(Endpoint {
@@ -448,15 +426,13 @@ impl Endpoint {
         self.core.set_authority(None);
     }
 
-    /// Whether this device seals its presence records: `{"sealed": bool, "audiences": {label: tag}}`, and when sealing
-    /// was asked for but cannot be done, `"reason"`. Spec: P§12.1, P§12.6.
-    pub fn presence_sealing(&self) -> String {
+    /// Whether this device seals its presence records, the sealed audiences' tags, and when sealing was asked for but
+    /// cannot be done, why. Spec: P§12.1, P§12.6.
+    pub fn presence_sealing(&self) -> Result<Ts<SealingStatus>, JsError> {
         let sealed = self.core.presence_sealed(None);
-        let mut v = json!({"sealed": sealed, "audiences": self.audience_tags});
-        if !sealed && self.core.audience_tag("").is_none() {
-            v["reason"] = "this device does not hold the identity's key agreement secret (P§12.1)".into();
-        }
-        v.to_string()
+        let reason = (!sealed && self.core.audience_tag("").is_none())
+            .then(|| "this device does not hold the identity's key agreement secret (P§12.1)".to_string());
+        Ok(SealingStatus { sealed, audiences: self.audience_tags.clone(), reason }.into_ts()?)
     }
 
     /// The `audience` (or `presence_audience` of a grant) that goes on the wire for the audience labelled `label`: its
@@ -504,9 +480,9 @@ impl Endpoint {
         self.sign_presence(out, now as i64)
     }
 
-    /// The states being published, as a JSON object from audience (`""`: no audience) to state. Spec: P§6.
-    pub fn presence_states(&self) -> String {
-        Value::Object(self.presence_states.iter().map(|(a, s)| (a.clone().unwrap_or_default(), Value::from(s.as_str()))).collect()).to_string()
+    /// The states being published, by audience (`""`: no audience). Spec: P§6.
+    pub fn presence_states(&self) -> Result<Ts<PresenceStates>, JsError> {
+        Ok(PresenceStates(self.presence_states.iter().map(|(a, s)| (a.clone().unwrap_or_default(), s.clone())).collect()).into_ts()?)
     }
 
     /// One presence record due at `now` (a refresh, or one held back), signed, or `null`: call until `null`. Spec: P§8.
@@ -544,12 +520,12 @@ impl Endpoint {
     }
 
     /// A signed `subscribe` to `target`'s presence at its authority `authority` (the relay that answers for it,
-    /// §9.3), for `expires_in` seconds (at most 3,600 for presence; a renewal replaces). Returns
-    /// `{"frame", "subscription"}`; the host sends the frame on its connection to that relay. It lists `presence/0.2`,
+    /// §9.3), for `expires_in` seconds (at most 3,600 for presence; a renewal replaces). Returns the frame, the
+    /// subscription's id and how many grants it presents; the host sends the frame on its connection to that relay. It lists `presence/0.2`,
     /// so sealed records come too and are opened with the keys our grants carried. With `target` our own identity it
     /// is our own watch (P§6 rule 1), from which a sibling's higher epoch is adopted ([`Endpoint::presence_notify`]).
     /// Spec: §9.3, P§3, P§12.4, P§12.5.
-    pub fn presence_subscribe(&mut self, target: &str, authority: &str, expires_in: f64, now: f64) -> Result<String, JsValue> {
+    pub fn presence_subscribe(&mut self, target: &str, authority: &str, expires_in: f64, now: f64) -> Result<Ts<PresenceSubscription>, JsError> {
         let profiles = [dsip_broadcast::PROFILE, dsip_core::presence_seal::PROFILE];
         let mut p = json!({"dsip": dsip_core::version::version_block(&self.supported, &profiles),
                            "type": "subscribe", "to": authority, "target": target, "events": ["presence"], "expires_in": expires_in as i64});
@@ -559,7 +535,7 @@ impl Endpoint {
         if presented > 0 {
             p["claims"] = Value::Array(claims);
         }
-        let frame = self.core.sign_payload(p, now as i64, 30).map_err(js)?;
+        let frame = self.core.sign_payload(p, now as i64, 30)?;
         let sub = Envelope::from_frame(&frame)
             .ok()
             .and_then(|e| dsip_core::b64::decode(&e.payload))
@@ -569,20 +545,20 @@ impl Endpoint {
         // §9.3: a renewal replaces the subscription; the watch follows the new one
         self.watches.retain(|_, w| w.target() != target);
         self.watches.insert(sub.clone(), dsip_broadcast::presence::Watch::new(target));
-        Ok(json!({"frame": frame, "subscription": sub, "grants": presented}).to_string())
+        Ok(PresenceSubscription { frame, subscription: sub, grants: presented }.into_ts()?)
     }
 
     /// A verified presence `notify` payload (from a `received` event). Each carried record is verified here, independently
-    /// of the authority, and a sealed one opened with the keys our grants from the target carried. Returns `{"target",
-    /// "state", "token", "source", "records", "unreadable", "terminated"}` (P§4: `source` is `record`, `assertion` —
-    /// the authority's claim — or `none`; P§12.4: `unreadable` lists the devices whose records we hold no key for),
-    /// or `null` when it is for no presence watch of ours or out of order.
+    /// of the authority, and a sealed one opened with the keys our grants from the target carried. Returns the
+    /// target's presence (P§4: `source` is `record`, `assertion` — the authority's claim — or `none`; P§12.4:
+    /// `unreadable` lists the devices whose records we hold no key for), or nothing when it is for no presence watch
+    /// of ours or out of order.
     ///
-    /// On our own watch it returns `{"own": true, "events": […]}` instead: each record of a sibling device may carry
-    /// a higher epoch, which this device adopts, re-granting the grants that carry it; the events are driven like
+    /// On our own watch it returns `{own: true, events}` instead: each record of a sibling device may carry a higher
+    /// epoch, which this device adopts, re-granting the grants that carry it; the events are driven like
     /// [`Endpoint::local`]'s. Spec: §9.3, P§3, P§4, P§12.4, P§12.5.
-    pub fn presence_notify(&mut self, payload_json: &str, now: f64) -> Result<Option<String>, JsValue> {
-        let Ok(payload) = serde_json::from_str::<Value>(payload_json) else { return Ok(None) };
+    pub fn presence_notify(&mut self, payload: Ts<Json>, now: f64) -> Result<Option<Ts<Notified>>, JsError> {
+        let payload = payload.to_rust()?.0;
         let Some(sub) = payload["subscription"].as_str().map(String::from) else { return Ok(None) };
         let core = &self.core;
         let Some(w) = self.watches.get_mut(&sub) else { return Ok(None) };
@@ -596,19 +572,19 @@ impl Endpoint {
             for f in payload["body"]["records"].as_array().into_iter().flatten().filter_map(|r| r["frame"].as_str()) {
                 if let Some((rec, identity)) = self.core.verify_record(f, now as i64) {
                     if identity == me && rec["device"] == rec["from"] {
-                        events.extend(self.core.own_record(&rec, now as i64).map_err(js)?);
+                        events.extend(self.core.own_record(&rec, now as i64)?);
                     }
                 }
             }
-            let events = serde_json::to_value(self.observe(events, now)?.0).map_err(js)?;
-            json!({"own": true, "target": me, "events": events, "terminated": terminated}).to_string()
+            let events = self.calls.observe(&mut self.core, events, now as i64)?;
+            Notified::Own(OwnPresence { own: true, target: me, events, terminated })
         } else {
-            presence_json(&self.core, w, now as i64)
+            Notified::Presence(presence_of(&self.core, w, now as i64))
         };
         if terminated {
             self.watches.remove(&sub);
         }
-        Ok(Some(out))
+        Ok(Some(out.into_ts()?))
     }
 
     /// The authority refused the subscription `subscription` (a `reject`, §9.3): its watch is dropped, so nothing is
@@ -619,16 +595,10 @@ impl Endpoint {
 
     /// Every watched identity's presence at `now`, as [`Endpoint::presence_notify`] gives it (records expire, P§4); our
     /// own watch, and a watch the authority has not answered yet, are not listed.
-    pub fn presence_all(&self, now: f64) -> String {
+    pub fn presence_all(&self, now: f64) -> Result<Ts<Presences>, JsError> {
         let me = &self.core.keys().identity;
-        Value::Array(
-            self.watches
-                .values()
-                .filter(|w| w.target() != me && w.notified())
-                .map(|w| serde_json::from_str(&presence_json(&self.core, w, now as i64)).unwrap_or(Value::Null))
-                .collect(),
-        )
-        .to_string()
+        let all = self.watches.values().filter(|w| w.target() != me && w.notified()).map(|w| presence_of(&self.core, w, now as i64));
+        Ok(Presences(all.collect()).into_ts()?)
     }
 
     /// The client `hello` frame to send first on a connection (§13.2).
@@ -638,19 +608,20 @@ impl Endpoint {
         client_hello(self.core.keys(), &self.supported, &id, now as i64).frame()
     }
 
-    /// Verify the relay's `hello` (must echo our id, §20.5). Returns `{"ok":true,"did":…,"capabilities":…}` or `{"ok":false,"code":…}`.
-    pub fn relay_hello(&mut self, frame: &str, now: f64) -> String {
+    /// Verify the relay's `hello` (must echo our id, §20.5): its DID and capabilities, or the verdict's code.
+    pub fn relay_hello(&mut self, frame: &str, now: f64) -> Result<Ts<RelayHello>, JsError> {
         let sent = self.hello_id.clone().unwrap_or_default();
-        match verify_relay_hello(frame, &sent, now as i64, &self.resolver, &mut self.seen, &self.supported) {
-            Ok(r) => json!({"ok": true, "did": r.did, "capabilities": r.capabilities}).to_string(),
-            Err(v) => json!({"ok": false, "code": v.to_expect()["code"], "detail": v.detail}).to_string(),
-        }
+        let out = match verify_relay_hello(frame, &sent, now as i64, &self.resolver, &mut self.seen, &self.supported) {
+            Ok(r) => RelayHello::Ok { ok: true, did: r.did, capabilities: r.capabilities },
+            Err(v) => RelayHello::Refused { ok: false, code: v.to_expect()["code"].clone(), detail: v.detail },
+        };
+        Ok(out.into_ts()?)
     }
 
     /// Our DIDs and display name.
-    pub fn whoami(&self) -> String {
+    pub fn whoami(&self) -> Result<Ts<Whoami>, JsError> {
         let k = self.core.keys();
-        json!({"identity": k.identity, "device": k.device.did(), "display_name": k.display_name}).to_string()
+        Ok(Whoami { identity: k.identity.clone(), device: k.device.did(), display_name: k.display_name.clone() }.into_ts()?)
     }
 
     /// A fresh ULID.
@@ -663,11 +634,9 @@ impl Endpoint {
         self.core.set_video(video);
     }
 
-    /// Video codec registry ids (JSON array) the next offer lists; they must appear as `rtpmap`s in the SDP (B§3.4).
-    pub fn set_video_codecs(&mut self, ids_json: &str) {
-        if let Ok(ids) = serde_json::from_str::<Vec<String>>(ids_json) {
-            self.core.set_video_codecs(ids);
-        }
+    /// Video codec registry ids the next offer lists; they must appear as `rtpmap`s in the SDP (B§3.4).
+    pub fn set_video_codecs(&mut self, ids: Vec<String>) {
+        self.core.set_video_codecs(ids);
     }
 
     /// A local event (README vocabulary), with what the host supplies for its message beside it: `sdp` on
@@ -688,10 +657,6 @@ impl Endpoint {
     pub fn tick(&mut self, now: f64) -> Result<Ts<CallOuts>, JsError> {
         let out = self.core.tick(now as i64)?;
         self.observe_ts(out, now)
-    }
-
-    fn observe(&mut self, events: Vec<CoreEvent>, now: f64) -> Result<CallOuts, JsValue> {
-        Ok(CallOuts(self.calls.observe(&mut self.core, events, now as i64).map_err(js)?))
     }
 
     fn observe_ts(&mut self, events: Vec<CoreEvent>, now: f64) -> Result<Ts<CallOuts>, JsError> {
@@ -748,9 +713,9 @@ impl Endpoint {
         self.core.set_seal(on);
     }
 
-    /// The other side's recording in `session` (C§4): `{disclosure, pending, hold_media, …}`, or `null`.
-    pub fn recording(&self, session: &str) -> String {
-        self.calls.consent(session).unwrap_or(Value::Null).to_string()
+    /// The other side's recording in `session` (C§4), or nothing for a session that is not a call.
+    pub fn recording(&self, session: &str) -> Result<Option<Ts<Consent>>, JsError> {
+        Ok(self.calls.consent(session).map(|c| Consent(c).into_ts()).transpose()?)
     }
 
     /// Whether the other side's recording holds our media in `session` (C§4).
@@ -764,18 +729,18 @@ impl Endpoint {
     }
 
     /// Session snapshot (README shape) for one session id.
-    pub fn session(&self, id: &str) -> String {
-        self.core.endpoint().snapshot([id.to_string()]).to_string()
+    pub fn session(&self, id: &str) -> Result<Ts<Sessions>, JsError> {
+        Ok(Sessions(self.core.endpoint().snapshot([id.to_string()])).into_ts()?)
     }
 
     /// Contacts snapshot (README shape).
-    pub fn contacts_snapshot(&self) -> String {
-        self.core.endpoint().contacts.snapshot().to_string()
+    pub fn contacts_snapshot(&self) -> Result<Ts<Contacts>, JsError> {
+        Ok(Contacts(self.core.endpoint().contacts.snapshot()).into_ts()?)
     }
 
-    /// Pending introductions `[[id, identity], …]`.
-    pub fn requests(&self) -> String {
-        json!(self.core.requests()).to_string()
+    /// Pending introductions, `[id, identity]` each.
+    pub fn requests(&self) -> Result<Ts<Requests>, JsError> {
+        Ok(Requests(self.core.requests()).into_ts()?)
     }
 
     /// Export persisted first-contact state (store it; reload with [`Endpoint::load_contacts`]).
@@ -790,18 +755,18 @@ impl Endpoint {
         }
     }
 
-    /// Hold a DID document (JSON) for resolution (§8.1: the document is the authority for its DID; the host obtained
-    /// it, as the CLI's `--did-document`): `did:web` signers verify against it. Returns false for text that is not
-    /// a document.
-    pub fn add_document(&mut self, doc_json: &str) -> bool {
-        match serde_json::from_str::<dsip_core::did::DidDocument>(doc_json) {
+    /// Hold a DID document for resolution (§8.1: the document is the authority for its DID; the host obtained it, as
+    /// the CLI's `--did-document`): `did:web` signers verify against it. Returns false for a value that is not a
+    /// document.
+    pub fn add_document(&mut self, doc: Ts<Json>) -> Result<bool, JsError> {
+        Ok(match serde_json::from_value::<dsip_core::did::DidDocument>(doc.to_rust()?.0) {
             Ok(d) => {
                 self.resolver.insert(d.clone());
                 self.core.add_document(d);
                 true
             }
             Err(_) => false,
-        }
+        })
     }
 
     /// Hold a `delegation-revocation` frame (one we signed, or one handed to us): every later verification applies
@@ -819,13 +784,13 @@ impl Endpoint {
 
 /// Choose a peer's mailbox (M§4.2, §8.1): its DID document's `DSIPMailbox` entries when it has a document held here,
 /// else the `DSIPMailbox` endpoints of its reachability hint (`hint_select`'s `endpoints`), through the vector-pinned
-/// `select_mailbox`. Returns `{"source": "did-document"|"hint"|null, "selected": did|null, "uri": …, "order": […]}`.
+/// `select_mailbox`, with the selected entry and its URI.
 #[wasm_bindgen]
-pub fn mailbox_select(document_json: &str, hint_endpoints_json: &str) -> String {
-    let doc: Value = serde_json::from_str(document_json).unwrap_or(Value::Null);
+pub fn mailbox_select(document: Ts<Json>, hint_endpoints: Ts<Json>) -> Result<Ts<Mailbox>, JsError> {
+    let doc = document.to_rust()?.0;
     let document_entries: Vec<Value> = doc["service"].as_array().into_iter().flatten()
         .filter(|s| s["type"] == "DSIPMailbox").map(|s| s["serviceEndpoint"].clone()).collect();
-    let hint_entries: Vec<Value> = serde_json::from_str::<Vec<Value>>(hint_endpoints_json).unwrap_or_default().into_iter()
+    let hint_entries: Vec<Value> = serde_json::from_value::<Vec<Value>>(hint_endpoints.to_rust()?.0).unwrap_or_default().into_iter()
         .filter(|e| e["service"] == "DSIPMailbox")
         .map(|mut e| { if let Some(m) = e.as_object_mut() { m.remove("service"); } e }).collect();
     let all: Vec<Value> = document_entries.iter().chain(hint_entries.iter()).cloned().collect();
@@ -833,17 +798,18 @@ pub fn mailbox_select(document_json: &str, hint_endpoints_json: &str) -> String 
     let entry = all.iter().find(|e| e["mailbox"] == out["selected"]).cloned().unwrap_or(Value::Null);
     out["uri"] = entry["uri"].clone();
     out["entry"] = entry; // M§4.2: `accepts` and `voicemail` are read from the selected entry
-    out.to_string()
+    Ok(Mailbox(out).into_ts()?)
 }
 
 /// Whether the caller may offer to record a voicemail after an attempt ended (M§13.2, the pinned rule):
 /// `entry_json` the callee's selected `DSIPMailbox` entry, `can_send` from [`messaging::Messenger::can_send`],
-/// `outcome_type` `reject` or `cancel` (our own), `reason` its token. `{"offer": bool, "max_duration_s"?}`.
+/// `outcome_type` `reject` or `cancel` (our own), `reason` its token.
 #[wasm_bindgen]
-pub fn voicemail_offer(entry_json: &str, can_send: bool, outcome_type: &str, reason: &str) -> String {
-    let entry: Value = serde_json::from_str(entry_json).unwrap_or(Value::Null);
-    dsip_messaging::client::voicemail_offer(&json!({"voicemail": entry["voicemail"], "can_send": can_send,
-        "outcome": {"type": outcome_type, "reason": reason}})).to_string()
+pub fn voicemail_offer(entry: Ts<Json>, can_send: bool, outcome_type: &str, reason: &str) -> Result<Ts<Voicemail>, JsError> {
+    let entry = entry.to_rust()?.0;
+    let out = dsip_messaging::client::voicemail_offer(&json!({"voicemail": entry["voicemail"], "can_send": can_send,
+        "outcome": {"type": outcome_type, "reason": reason}}));
+    Ok(Voicemail(out).into_ts()?)
 }
 
 /// Re-issue this identity's delegation with `dsip.messaging` (M§4.3), and `extra` when given (`dsip.record` for a
