@@ -418,6 +418,28 @@ PoC better on their own terms: each removes duplicated glue from the reference c
 
 4. **Facades, testkit, examples.** `dsip-phone`, `dsip-messenger`, `dsip-testkit`; runnable examples (a
    20-line softphone, a chat bot, an embedded relay); a usage guide.
+
+   *Plan (2026-10-27, at poc-v1.0).* The products that follow (desktop and mobile clients, relay, DHT and mailbox
+   nodes) are built on what this stage leaves, so the services become libraries as well as the facades. In parts,
+   each with no behaviour change and every vector, parity run, fuzz seed, CI demo and web test green:
+   - **4a, the relay as a library.** `dsip_relay::RelayServer` (a `RelayConfig`, its clock, the status port, a TLS
+     listener, and one connection over any byte stream); the `dsip-relay` binary parses flags and hosts it. A client
+     `Connection` runs over a TLS socket or any stream (`Connection::over`), so a relay and its devices can share a
+     process. Example: `embedded_relay`.
+   - **4b, the testkit.** `dsip-testkit`: an in-process network (a relay, devices with `did:key` identities bound
+     over pipes) for multi-party tests without sockets or ports; the `Agent` dials through a `Dialer`, so the
+     same agent runs on the testkit and on `wss`.
+   - **4c, `dsip-phone`.** `Phone::builder()…build()`, `phone.call(did) -> Call` (await its outcome, hang up, its
+     events), incoming calls to accept, screen, decline or let ring, native media through `dsip-media` or none.
+     Tested on the testkit. Example: a softphone of about 20 lines.
+   - **4d, the mailbox and `dsip-messenger`.** The mailbox service as a library with a thin binary; `dsip-messenger`,
+     the native host loop of the `Messenger` that dsip-msg runs today (hub connections, the SQLite store), with
+     dsip-msg on it. The testkit gains a mailbox. Example: a chat bot.
+   - **4e, the guide.** A usage guide for building on the stack, and the examples built in CI.
+
+   *Status (2026-10-27):* 4a done: `RelayServer` with the binary on it, `Connection::over`, a call through a relay
+   embedded in a test over in-memory pipes (`dsip-relay/tests/in_process.rs`), and `examples/embedded_relay.rs`.
+
 5. **Its own repository and release.** Move the stack crates (or the whole of `impl/`) out when core reaches 1.0,
    tag the first CalVer release, and switch the gateway to git dependencies on it. The vectors move with the spec,
    not the stack.
