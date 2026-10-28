@@ -29,6 +29,7 @@ openssl-sys.workspace = true   # DTLS timeout handling: SSL_ctrl(DTLS_CTRL_HANDL
 foreign-types.workspace = true
 futures-util.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

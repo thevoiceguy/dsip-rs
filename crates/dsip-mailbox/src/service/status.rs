@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use dsip_transport::status::{Metrics, Page, JSON_TYPE, METRICS_TYPE};
 
-use crate::Service;
+use super::Service;
 
 /// Counters since the service started.
 #[derive(Debug, Default)]
