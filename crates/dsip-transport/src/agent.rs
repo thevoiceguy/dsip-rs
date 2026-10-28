@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::conn::{ConnectParams, Connection};
+use crate::conn::{ConnectParams, Connection, Dialer};
 use crate::resolver::{DidResolver, DidWebResolver};
 use crate::identity::Identity;
 use crate::verify::SeenIds;
@@ -92,6 +92,9 @@ pub struct AgentConfig {
     /// [`AgentEvent::Media`]; calls are placed with [`Agent::place`] and driven with [`Agent::call`]. `None` leaves
     /// all of that to the host.
     pub calls: Option<CallsConfig>,
+    /// How to reach the relay: `None` dials [`AgentConfig::relay_url`] over `wss`; a [`Dialer`] supplies the stream
+    /// instead (an embedded relay; `dsip-testkit`), for the first connection and every reconnect.
+    pub dialer: Option<Arc<dyn Dialer>>,
     /// P§12: seal this device's presence records for these scopes (`main` and audience tags, [`audience_tag`]) and put
     /// keys in the grants it issues. `None` seals nothing; the keys of grants held open either way.
     pub presence: Option<PresenceSealing>,
@@ -128,7 +131,7 @@ impl Agent {
     pub async fn connect(id: Identity, cfg: AgentConfig, resolver: StaticResolver) -> Result<Agent> {
         let supported = Supported::all_known();
         let mut seen = SeenIds::default();
-        let conn = Connection::connect(&Self::params(&id, &cfg, &supported), &resolver, &mut seen).await?;
+        let conn = Connection::dial(cfg.dialer.as_deref(), &Self::params(&id, &cfg, &supported), &resolver, &mut seen).await?;
         let keys = IdentityKeys {
             identity: id.meta.identity.clone(),
             device: id.device.clone(),
@@ -453,7 +456,7 @@ impl Agent {
             attempts += 1;
             let jitter = Duration::from_millis((now_s() as u64 * 7919 + attempts as u64 * 104_729) % (delay * 1000));
             tokio::time::sleep(jitter).await;
-            match Connection::connect(&Self::params(&self.id, &self.cfg, &self.supported), &self.resolver, &mut seen).await {
+            match Connection::dial(self.cfg.dialer.as_deref(), &Self::params(&self.id, &self.cfg, &self.supported), &self.resolver, &mut seen).await {
                 Ok(c) => {
                     self.conn = c;
                     self.core.set_authority(Some(self.conn.relay.did.clone()));

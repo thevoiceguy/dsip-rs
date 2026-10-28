@@ -439,6 +439,10 @@ PoC better on their own terms: each removes duplicated glue from the reference c
 
    *Status (2026-10-27):* 4a done: `RelayServer` with the binary on it, `Connection::over`, a call through a relay
    embedded in a test over in-memory pipes (`dsip-relay/tests/in_process.rs`), and `examples/embedded_relay.rs`.
+   4b done: `dsip_transport::conn::Dialer` (`AgentConfig::dialer`, used for the first connection and every
+   reconnect) and `dsip-testkit`: `Network` (an embedded relay, `did:key` identities, second devices), `Device`
+   (an `Agent` with `expect`, `until`, `call`, `command`), checked by a call, a forked call, an unknown recipient and a
+   replaced connection, all in-process.
 
 5. **Its own repository and release.** Move the stack crates (or the whole of `impl/`) out when core reaches 1.0,
    tag the first CalVer release, and switch the gateway to git dependencies on it. The vectors move with the spec,

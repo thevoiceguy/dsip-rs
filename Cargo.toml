@@ -23,6 +23,7 @@ members = [
     "crates/dsip-relay",
     "crates/dsip-cli",
     "crates/dsip-node",
+    "crates/dsip-testkit",
 ]
 
 [workspace.package]
@@ -57,6 +58,8 @@ dsip-mls = { path = "crates/dsip-mls" }
 dsip-messaging-device = { path = "crates/dsip-messaging-device" }
 dsip-mailbox = { path = "crates/dsip-mailbox" }
 dsip-broadcast = { path = "crates/dsip-broadcast" }
+dsip-relay = { path = "crates/dsip-relay" }
+dsip-testkit = { path = "crates/dsip-testkit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

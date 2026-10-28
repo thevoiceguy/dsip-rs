@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         // downgraded `recording-not-disclosed` (spec-gap 133, decided): the gateway is not the recorded party's client.
         calls: Some(CallsConfig { media: true, answer: AnswerPolicy::Host, recording: AcceptPolicy::Always, one_call: false }),
         presence: None,
+        dialer: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;
     let my_did = agent.identity_did().to_string();

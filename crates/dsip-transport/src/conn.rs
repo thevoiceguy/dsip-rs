@@ -70,6 +70,16 @@ pub struct ConnectParams<'a> {
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Io for T {}
 
+/// What a [`Dialer`] returns: a fresh stream to the relay.
+pub type DialFuture = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Box<dyn Io>>> + Send>>;
+
+/// How a host reaches its relay when the connection does not dial `wss` itself: each call opens one fresh stream,
+/// for the first connection and for every reconnect (§13.2). `dsip-testkit` dials an embedded relay over a pipe.
+pub trait Dialer: Send + Sync {
+    /// Open a stream to the relay.
+    fn dial(&self) -> DialFuture;
+}
+
 /// A WebSocket, whatever it runs over.
 trait Socket:
     futures_util::Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
@@ -106,6 +116,15 @@ impl Connection {
                 .await
                 .map_err(|e| Error::Connect { url: p.url.clone(), source: Box::new(e) })?;
         Self::bind(Box::new(ws), p, resolver, seen).await
+    }
+
+    /// Connect through `dialer`'s stream ([`Connection::over`]), or dial `p.url` over `wss` when there is none
+    /// ([`Connection::connect`]).
+    pub async fn dial(dialer: Option<&dyn Dialer>, p: &ConnectParams<'_>, resolver: &dyn Resolver, seen: &mut SeenIds) -> Result<Connection> {
+        match dialer {
+            None => Self::connect(p, resolver, seen).await,
+            Some(d) => Self::over(d.dial().await?, p, resolver, seen).await,
+        }
     }
 
     /// Run the WebSocket handshake for `p.url` over `stream`, send `hello`, verify the relay's `hello`. Fails closed on

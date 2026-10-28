@@ -526,6 +526,7 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
         first_contact_required: matches!(&mode, Mode::Answer { first_contact: true, .. }),
         seal: opts.seal,
         presence: opts.seal_presence.then(|| dsip_transport::PresenceSealing { sealed: ["main".to_string()].into(), t_rotate: None }),
+        dialer: None,
         did_resolver: None,
         calls: Some(CallsConfig { media: media_enabled(&opts), answer, recording: accept_policy, one_call: false }),
     };
