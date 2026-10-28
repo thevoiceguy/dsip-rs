@@ -1,0 +1,16 @@
+[package]
+name = "dsip-testkit"
+description = "An in-process DSIP network for tests: an embedded relay and agents bound to it over in-memory pipes, no sockets or ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+dsip-endpoint.workspace = true
+dsip-relay.workspace = true
+dsip-session.workspace = true
+dsip-transport.workspace = true
+tokio.workspace = true

@@ -57,6 +57,7 @@ async fn connect_with(c: &Conn, presence: Option<dsip_transport::PresenceSealing
         did_resolver: None,
         calls: None,
         presence,
+        dialer: None,
     };
     let agent = Agent::connect(id, cfg, StaticResolver::default()).await?;
     println!("identity  {}", agent.identity_did());

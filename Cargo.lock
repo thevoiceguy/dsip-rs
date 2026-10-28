@@ -1615,6 +1615,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsip-testkit"
+version = "0.1.0"
+dependencies = [
+ "dsip-core",
+ "dsip-endpoint",
+ "dsip-relay",
+ "dsip-session",
+ "dsip-transport",
+ "tokio",
+]
+
+[[package]]
 name = "dsip-transport"
 version = "0.1.0"
 dependencies = [
