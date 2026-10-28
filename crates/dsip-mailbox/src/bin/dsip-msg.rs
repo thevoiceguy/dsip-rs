@@ -36,17 +36,13 @@ use dsip_core::delegation::delegation_payload;
 use dsip_core::did::StaticResolver;
 use dsip_core::envelope::{sign, Envelope};
 use dsip_core::keys::KeyPair;
-use dsip_core::version::Supported;
 use dsip_mailbox::wire;
-use dsip_messaging::client::select_mailbox;
-use dsip_messaging_device::messenger::Messenger;
 use dsip_messaging_device::events::{NewRecorder, SuccessorDue};
 use dsip_messaging_device::{blob, CallLeg, CallLog, Conversation, Event, OpInfo, ReceiptPolicy, Store, Ui};
 use dsip_mls::sqlite::SqliteProvider;
-use dsip_mls::{conversation_extension, digest, MlsError};
-use dsip_transport::conn::{ConnectParams, Connection};
-use dsip_transport::verify::SeenIds;
-use dsip_transport::{now_s, tls};
+use dsip_mls::{conversation_extension, MlsError};
+use dsip_messenger::{resolver, mailbox_of, Engine, Host, Output};
+use dsip_transport::now_s;
 
 #[path = "dsip-msg/events.rs"]
 mod events;
@@ -261,41 +257,10 @@ fn did_document(identity: &str, controller: &KeyPair, mailbox_did: &str, mailbox
     })
 }
 
-fn resolver(files: &[PathBuf]) -> StaticResolver {
-    let mut r = StaticResolver::default();
-    for f in files {
-        if let Ok(text) = std::fs::read_to_string(f) {
-            if let Ok(doc) = serde_json::from_str(&text) {
-                r.insert(doc);
-            }
-        }
-    }
-    r
-}
-
-/// The mailbox an identity advertises, chosen by the profile's rules (M§4.2).
-fn mailbox_of(identity: &str, resolver: &StaticResolver) -> Result<(String, String)> {
-    let doc = dsip_core::did::Resolver::resolve(resolver, identity).with_context(|| format!("no document for {identity}"))?;
-    let entries: Vec<Value> =
-        doc.service.iter().filter(|s| s.service_type == "DSIPMailbox").map(|s| s.service_endpoint.clone()).collect();
-    let choice = select_mailbox(&json!({"document_entries": entries}));
-    let did = choice["selected"].as_str().with_context(|| format!("no usable mailbox for {identity}: {choice}"))?.to_string();
-    let uri = entries
-        .iter()
-        .find(|e| e["mailbox"] == json!(did))
-        .and_then(|e| e["uri"].as_str())
-        .context("entry without uri")?
-        .to_string();
-    Ok((did, uri))
-}
-
 fn compact(e: &Envelope) -> String {
     format!("{}.{}.{}", e.protected, e.payload, e.signature)
 }
 
-fn unb64(v: &Value) -> Vec<u8> {
-    v.as_str().and_then(dsip_core::b64::decode).unwrap_or_default()
-}
 
 fn display(o: &Value) -> String {
     match o["kind"].as_str() {
@@ -314,10 +279,6 @@ fn messenger_err(e: dsip_messaging_device::messenger::Error) -> anyhow::Error {
     anyhow::anyhow!("{}", e.0)
 }
 
-/// The id of a frame's payload.
-fn frame_id(frame: &str) -> String {
-    Envelope::from_frame(frame).ok().and_then(|e| wire::payload_of(&e)).and_then(|p| p["id"].as_str().map(String::from)).unwrap_or_default()
-}
 
 /// `["a", "b"]` as dsip-msg always printed a list of identities.
 fn list(v: &Value) -> String {
@@ -506,41 +467,17 @@ enum Sent {
     Successor,
 }
 
-/// Work an event asks for that needs the network, done after the frame or tick that asked for it.
-enum Job {
-    /// Fetch a received content's blob (M§8.4); `attempt` from 1.
-    Media { sender: String, object: Value, blobs: Value, attempt: i64 },
-    /// Create (or use) the successor of a group whose hub is gone (M§7.5, M§9.4).
-    Successor(String),
-}
-
-/// What fetching a content's blob came to (M§8.4, spec-gap 106).
-enum Fetched {
-    /// Verified and decrypted: the file, the plaintext digest, the source used.
-    Played(PathBuf, String, String),
-    /// No source had it yet: try again later.
-    Retry,
-    /// Given up, with the reason (`mismatch`, or `unavailable` after the last attempt).
-    GaveUp(String),
-}
-
-/// This device: the `Messenger`, its connection, and what only this console keeps.
+/// This device: the messenger (the `Messenger` engine, its mailbox connection and the work it does on the network) and
+/// what only this console keeps.
 struct Client {
+    mx: dsip_messenger::Messenger<Db>,
+    c: Console,
+}
+
+/// What only this console keeps, and how it prints what the messenger tells it ([`Host`]).
+struct Console {
     keys: Keys,
     identity: String,
-    delegation: Envelope,
-    m: Messenger<Db>,
-    resolver_files: Vec<PathBuf>,
-    ca: Option<PathBuf>,
-    conn: Option<Connection>,
-    /// The operator took this device `offline`: the ticker leaves it there until something connects again.
-    held_offline: bool,
-    /// Unexpected connection loss: the ticker redials at this time (§13.2 backoff).
-    reconnect_at: Option<i64>,
-    /// The current backoff ceiling, seconds (§13.2: initial 1, factor 2, max 60).
-    reconnect_ceiling: i64,
-    mailbox: (String, String),
-    seen: SeenIds,
     /// The conversation commands act on.
     active: Option<String>,
     /// Each group's conversation id and kind, as last seen (kept after the group is gone, to name it).
@@ -549,15 +486,10 @@ struct Client {
     items: HashMap<String, Item>,
     /// What the commit a command proposed in a group does, as its lines say it.
     labels: HashMap<String, String>,
-    /// Answers awaited by request id, taken off the connection before the `Messenger` sees them.
-    replies: HashMap<String, Option<Value>>,
     /// KeyPackages fetched ahead of an add, by identity: the mailbox's answer (M§5.5: single use, held until used).
     prefetched: HashMap<String, Value>,
     /// A dead group's pending items by content id: the item id each had there (M§9.4).
     resent: HashMap<String, String>,
-    jobs: Vec<Job>,
-    /// Blob fetches to try again (M§8.4 "Fetching", spec-gap 106): `{object, blobs, sender, attempt, next_at}`, persisted.
-    pending_blobs: Vec<Value>,
     /// Device events (E§3–E§6): the alarm lists, and the gateway in gateway mode.
     events: events::Events,
     /// Recording Profile C§5: this device is a recorder.
@@ -565,53 +497,149 @@ struct Client {
     /// TEST ONLY: a recorder that sends anyway.
     recorder_misbehave: bool,
     state: PathBuf,
-    http: reqwest::Client,
+}
+
+/// Now, as the `Messenger` takes it.
+fn now_f() -> f64 {
+    now_s() as f64
+}
+
+/// The conversations, as the `Messenger` lists them.
+fn conversations(m: &Engine<Db>) -> Vec<Conversation> {
+    m.conversations(now_s() as f64)
+}
+
+/// One conversation as the `Messenger` lists it: `gid`, or the successor this device converged on (M§7.5).
+fn conv(m: &Engine<Db>, gid: &str) -> Result<Conversation> {
+    let live = m.successor(gid).unwrap_or_else(|| gid.to_string());
+    conversations(m).into_iter().find(|c| c.group == live).context("not a member of that group")
+}
+
+impl Host<Db> for Console {
+    /// One output of the messenger, as the lines dsip-msg prints.
+    async fn output(&mut self, m: &Engine<Db>, out: Output) {
+        self.refresh_names(m);
+        match out {
+            Output::Event(e) => match e {
+                Event::Ui(ui) => self.ui(m, &ui).await,
+                Event::Refused { refused, item, pending, .. } => self.refused(&refused, item.as_deref(), pending == Some(true)).await,
+                Event::SuccessorDue { successor_due } => self.successor_due(&successor_due),
+                // the mailbox's own error, not an answer to a deposit
+                Event::Error { reason: Some(reason), detail, .. } => println!("ERR {reason} {}", detail.as_ref().unwrap_or(&Value::Null)),
+                Event::Error { error, .. } => println!("ERR {error}"),
+                Event::Drop { drop } => println!("DROP {drop}"),
+                Event::Rejected { rejected } => println!("ERR frame rejected: {} {}", json!(rejected.code), rejected.reason.as_deref().unwrap_or("")),
+                _ => {}
+            },
+            Output::Connected { identity, mailbox } => println!("OK connected {identity} mailbox={mailbox}"),
+            Output::Disconnected => println!("DISCONNECTED by the mailbox"),
+            Output::ConnectionError(e) => println!("ERR connection {e}"),
+            Output::ReconnectFailed { error, wait_s } => println!("RECONNECT failed ({error}); next attempt in {wait_s} s"),
+            Output::Error(e) => println!("ERR {e}"),
+            Output::Blob { sender, object, path, sha256, from } => println!(
+                "RECV-AUDIO {sender} purpose={} duration_ms={} session={} file={} sha256={sha256} from={from}",
+                object["purpose"].as_str().unwrap_or("message"), object["duration_ms"],
+                object["session"].as_str().unwrap_or("-"), path.display()
+            ),
+            Output::BlobPending { id, attempt, retry_in } => println!("AUDIO-PENDING {id} attempt={attempt} retry_in={retry_in}"),
+            Output::BlobSourceRejected { uri, why } => println!("BLOB-SOURCE-REJECTED {uri}: {why}"),
+            Output::BlobGaveUp { id, why } => println!("ERR blob {id}: given up ({why})"),
+            Output::SuccessorExists { group, of } => {
+                println!("SUCCESSOR exists group={group} of={of}");
+                self.active = Some(group);
+            }
+            Output::SuccessorCreated { group, of } => {
+                println!("SUCCESSOR created group={group} of={of}");
+                self.active = Some(group);
+            }
+            Output::SuccessorRetry { of, error } => println!("SUCCESSOR-RETRY of={of}: {error}"),
+            other => println!("?? {other:?}"),
+        }
+        self.refresh_names(m);
+    }
+
+    fn saved(&self) -> Value {
+        json!({"active": self.active})
+    }
+
+    /// `crash-next` crashes inside the transaction of an item of this frame: the store needs to know which.
+    fn frame_in(&mut self, m: &Engine<Db>, p: &Value) {
+        let db = m.store();
+        *db.classes.borrow_mut() = p["items"].as_array().into_iter().flatten().map(|i| (s(&i["cursor"]).to_string(), s(&i["class"]).to_string())).collect();
+        db.processing.set(true);
+    }
+
+    fn frame_done(&mut self, m: &Engine<Db>) {
+        m.store().processing.set(false);
+    }
 }
 
 impl Client {
-    fn now(&self) -> f64 {
-        now_s() as f64
-    }
-
-    /// Hold every DID document the device resolves from, as the files say now: a revocation published since is seen
-    /// (§8.1, spec-gap 57).
-    fn refresh_docs(&mut self) {
-        for f in &self.resolver_files {
-            if let Ok(text) = std::fs::read_to_string(f) {
-                if let Ok(doc) = serde_json::from_str(&text) {
-                    self.m.add_document(doc);
-                }
-            }
-        }
-    }
-
-    /// Write the `Messenger`'s state beside its MLS state, and this console's, in one transaction (spec-gap 44).
-    fn save(&self) -> Result<()> {
-        let st = self.m.state();
-        let host = json!({"active": self.active, "pending_blobs": self.pending_blobs});
-        let db = self.m.store();
-        db.atomically(|| {
-            db.put("messenger", &st)?;
-            // the item transactions write the delivery state under its own key too: this keeps the two equal
-            db.put("resume", &st["resume"])?;
-            db.put("dsip-msg", &host)
-        })
-        .map_err(state_err)
-    }
-
     /// The conversations, as the `Messenger` lists them.
     fn conversations(&self) -> Vec<Conversation> {
-        self.m.conversations(self.now())
+        conversations(self.mx.engine())
     }
 
     /// One conversation as the `Messenger` lists it: `gid`, or the successor this device converged on (M§7.5).
     fn conv(&self, gid: &str) -> Result<Conversation> {
-        let live = self.m.successor(gid).unwrap_or_else(|| gid.to_string());
-        self.conversations().into_iter().find(|c| c.group == live).context("not a member of that group")
+        conv(self.mx.engine(), gid)
     }
 
-    fn refresh_names(&mut self) {
-        for c in self.conversations() {
+    /// Deposit content to `gid` (M§9.2): `kind` says what its `sent` prints.
+    async fn send_content(&mut self, gid: &str, obj: Value, kind: Item) -> Result<Sent> {
+        let r = self.mx.engine_mut().send(gid, &obj, now_f()).map_err(messenger_err)?;
+        let Some(item) = r.item else {
+            println!("PENDING kept for the successor of {gid}");
+            self.mx.save(&self.c)?;
+            return Ok(Sent::Successor);
+        };
+        self.c.items.insert(item.clone(), kind);
+        // M§9.2: pending, durably, before it goes out
+        self.mx.save(&self.c)?;
+        let frame = r.send;
+        if frame.is_empty() {
+            // M§9.4: the hub is down; the item waits behind the pending ones and goes out with them
+            println!("PENDING {item} queued");
+            return Ok(Sent::Queued(item));
+        }
+        self.mx.send_frame(&mut self.c, &frame).await?;
+        Ok(Sent::Out(item))
+    }
+
+    /// What may go to `gid` (C§5): nothing from a recorder; content into a recorded conversation once its recorders
+    /// are accepted.
+    fn may_send(&self, gid: &str) -> Result<()> {
+        if self.mx.engine().is_recorder() && !self.c.recorder_misbehave {
+            bail!("a recorder device is receive-only (C§5)");
+        }
+        if !self.conv(gid)?.may_send {
+            bail!("recorded conversation: type accept-recording first (C§5)");
+        }
+        Ok(())
+    }
+
+    /// A content object of this identity for `gid`'s conversation (M§8.1), with `fields`.
+    fn content(&mut self, gid: &str, fields: Value) -> Result<Value> {
+        let now = now_f();
+        let mut obj = json!({"object": "content", "id": self.mx.engine_mut().new_id(now), "conversation": self.conv(gid)?.conversation,
+            "sender": self.c.identity, "sent_at": now as i64, "purpose": "message"});
+        for (k, v) in fields.as_object().into_iter().flatten() {
+            obj[k.as_str()] = v.clone();
+        }
+        Ok(obj)
+    }
+
+    async fn send_text(&mut self, text: &str) -> Result<()> {
+        let group = self.c.active()?;
+        self.may_send(&group)?;
+        let obj = self.content(&group, json!({"kind": "text", "content_type": "text/plain", "text": text}))?;
+        self.send_content(&group, obj, Item::Text).await.map(|_| ())
+    }
+}
+
+impl Console {
+    fn refresh_names(&mut self, m: &Engine<Db>) {
+        for c in conversations(m) {
             self.names.insert(c.group, (c.conversation, c.kind));
         }
     }
@@ -625,211 +653,10 @@ impl Client {
     }
 
     /// The conversation commands act on after `gone` went: the first other conversation, never the personal group.
-    fn active_after(&mut self, gone: &str) {
+    fn active_after(&mut self, m: &Engine<Db>, gone: &str) {
         if self.active.as_deref() == Some(gone) {
-            self.active = self.conversations().into_iter().find(|c| c.kind != "personal" && c.group != gone).map(|c| c.group);
+            self.active = conversations(m).into_iter().find(|c| c.kind != "personal" && c.group != gone).map(|c| c.group);
         }
-    }
-
-    async fn connect(&mut self) -> Result<()> {
-        if self.conn.is_some() {
-            return Ok(());
-        }
-        let tls = tls::client_config(self.ca.as_deref())?;
-        let params = ConnectParams {
-            url: self.mailbox.1.clone(),
-            tls,
-            device: &self.keys.device,
-            on_behalf_of: Some(self.identity.clone()),
-            delegations: vec![self.delegation.clone()],
-            supported: Supported::all_known(),
-        };
-        let conn = {
-            let r = resolver(&self.resolver_files);
-            Connection::connect(&params, &r, &mut self.seen).await?
-        };
-        anyhow::ensure!(conn.relay.did == self.mailbox.0, "mailbox is {} not {}", conn.relay.did, self.mailbox.0);
-        println!("OK connected {} mailbox={}", self.identity, self.mailbox.0);
-        self.conn = Some(conn);
-        self.held_offline = false;
-        self.reconnect_at = None;
-        self.reconnect_ceiling = 1;
-        // M§9.3: what the binding that ended took with it goes again, the same bytes; no sync until asked for
-        let frames = self.m.rebind(self.now());
-        for f in frames {
-            let env = Envelope::from_frame(&f).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
-            self.conn.as_mut().context("offline")?.send(&env).await?;
-        }
-        self.save()
-    }
-
-    /// The connection dropped without the operator asking: schedule a redial.
-    ///
-    /// Spec: §13.2 — on unexpected connection loss an endpoint SHOULD reconnect with exponential
-    /// backoff plus full jitter (initial 1 s, factor 2, max 60 s); `connect` sends the fresh `hello`.
-    fn lost_connection(&mut self) {
-        self.conn = None;
-        self.schedule_reconnect();
-    }
-
-    /// Pick the next redial time under full jitter and double the ceiling; returns the wait in seconds.
-    fn schedule_reconnect(&mut self) -> i64 {
-        let wait = (rand::random::<u64>() % (self.reconnect_ceiling as u64 + 1)) as i64;
-        self.reconnect_at = Some(now_s() + wait);
-        self.reconnect_ceiling = (self.reconnect_ceiling * 2).min(60);
-        wait
-    }
-
-    /// The ticker's redial: connect when due, then sync what arrived while the device was away (M§5.4).
-    async fn check_reconnect(&mut self) -> Result<()> {
-        match self.reconnect_at {
-            Some(at) if self.conn.is_none() && !self.held_offline && now_s() >= at => {}
-            _ => return Ok(()),
-        }
-        match self.connect().await {
-            Ok(()) => self.sync(false).await,
-            Err(e) => {
-                let wait = self.schedule_reconnect();
-                println!("RECONNECT failed ({e}); next attempt in {wait} s");
-                Ok(())
-            }
-        }
-    }
-
-    /// Send one frame to the mailbox, connecting first if need be (what the `Messenger` keeps pending goes again at
-    /// the next binding, M§9.3).
-    async fn send_frame(&mut self, frame: &str) -> Result<()> {
-        if self.conn.is_none() {
-            Box::pin(self.connect()).await?;
-        }
-        let env = Envelope::from_frame(frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?;
-        Ok(self.conn.as_mut().context("offline")?.send(&env).await?)
-    }
-
-    /// Send each frame.
-    async fn send_frames(&mut self, frames: &[String]) -> Result<()> {
-        for f in frames {
-            self.send_frame(f).await?;
-        }
-        Ok(())
-    }
-
-    async fn sync(&mut self, live: bool) -> Result<()> {
-        let frame = self.m.sync_frame(live, self.now());
-        self.send_frame(&frame).await
-    }
-
-    /// Send `frame`, a request to this device's own mailbox, and wait for its answer, processing every other frame as
-    /// it comes.
-    async fn request(&mut self, frame: &str) -> Result<Value> {
-        let id = frame_id(frame);
-        self.replies.insert(id.clone(), None);
-        let answer = async {
-            self.send_frame(frame).await?;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-            loop {
-                if let Some(Some(p)) = self.replies.get(&id) {
-                    return Ok(p.clone());
-                }
-                let conn = self.conn.as_mut().context("offline")?;
-                let frame = tokio::time::timeout_at(deadline, conn.recv()).await.context("no answer")??.context("mailbox closed")?;
-                self.on_frame(&frame).await;
-            }
-        }
-        .await;
-        self.replies.remove(&id);
-        answer
-    }
-
-    /// One frame from the mailbox: an answer a request waits for, or the `Messenger`'s to process.
-    async fn on_frame(&mut self, frame: &str) {
-        let p = Envelope::from_frame(frame).ok().and_then(|e| wire::payload_of(&e)).unwrap_or_default();
-        if let Some(slot) = p["in_reply_to"].as_str().and_then(|id| self.replies.get_mut(id)) {
-            if slot.is_none() && p["type"] != "items" {
-                *slot = Some(p);
-                return;
-            }
-        }
-        self.refresh_docs();
-        let db = self.m.store();
-        *db.classes.borrow_mut() = p["items"].as_array().into_iter().flatten().map(|i| (s(&i["cursor"]).to_string(), s(&i["class"]).to_string())).collect();
-        db.processing.set(true);
-        let out = self.m.inbound(frame, self.now());
-        self.m.store().processing.set(false);
-        if let Err(e) = self.handle(&out).await {
-            println!("ERR {e}");
-        }
-    }
-
-    /// The `Messenger`'s clock (M§9.4 retries and outages, M§10.3 read intervals, M§11.2 activity, M§6.5 gaps); it
-    /// waits while there is no connection.
-    async fn tick(&mut self) {
-        if self.conn.is_none() {
-            return;
-        }
-        self.refresh_docs();
-        let out = self.m.tick(self.now());
-        if let Err(e) = self.handle(&out).await {
-            println!("ERR {e}");
-        }
-    }
-
-    /// Wait until what a command set going is settled (`Messenger::settled`), processing frames and the clock as
-    /// they come; at most a minute, and not at all without a connection.
-    async fn settle(&mut self) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            self.run_jobs().await;
-            if self.m.settled() || tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            let Some(conn) = self.conn.as_mut() else { return };
-            tokio::select! {
-                frame = conn.recv() => match frame {
-                    Ok(Some(text)) => self.on_frame(&text).await,
-                    Ok(None) => {
-                        println!("DISCONNECTED by the mailbox");
-                        self.lost_connection();
-                    }
-                    Err(e) => {
-                        println!("ERR connection {e}");
-                        self.lost_connection();
-                    }
-                },
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => self.tick().await,
-            }
-        }
-    }
-
-    /// Act on what the `Messenger` emitted: frames to the mailbox, events printed as lines, network work queued.
-    async fn handle(&mut self, out: &[Event]) -> Result<()> {
-        self.refresh_names();
-        for e in out {
-            match e {
-                Event::Send { send } => {
-                    if let Err(err) = self.send_frame(send).await {
-                        println!("ERR {err}");
-                    }
-                }
-                Event::Sync { .. } => {
-                    // spec-gap 58: a refused commit syncs past the winning one before anything is re-proposed
-                    if let Err(err) = self.sync(false).await {
-                        println!("ERR {err}");
-                    }
-                }
-                Event::Ui(ui) => self.ui(ui).await,
-                Event::Refused { refused, item, pending, .. } => self.refused(refused, item.as_deref(), *pending == Some(true)).await,
-                Event::SuccessorDue { successor_due } => self.successor_due(successor_due),
-                // the mailbox's own error, not an answer to a deposit
-                Event::Error { reason: Some(reason), detail, .. } => println!("ERR {reason} {}", detail.as_ref().unwrap_or(&Value::Null)),
-                Event::Error { error, .. } => println!("ERR {error}"),
-                Event::Drop { drop } => println!("DROP {drop}"),
-                Event::Rejected { rejected } => println!("ERR frame rejected: {} {}", json!(rejected.code), rejected.reason.as_deref().unwrap_or("")),
-                Event::KeyPackages { .. } => {}
-            }
-        }
-        self.refresh_names();
-        self.save()
     }
 
     /// The line a commit in `gid` is reported under: what the command that proposed it said, or what it does.
@@ -852,7 +679,7 @@ impl Client {
     }
 
     /// One event of the `Messenger`, as the line dsip-msg prints.
-    async fn ui(&mut self, ui: &Ui) {
+    async fn ui(&mut self, m: &Engine<Db>, ui: &Ui) {
         match ui {
             Ui::Joined { group, conversation, kind, epoch, external: Some(true), seq, .. } => {
                 println!("OK rejoined {} kind={kind} epoch={epoch} seq={}", s(conversation), opt(&seq.flatten()));
@@ -873,7 +700,7 @@ impl Client {
             }
             Ui::Conflict { group, reason, op, .. } if reason == "mailbox.unknown-group" => {
                 // spec-gap 60: the hub may have handed the group on; the sync shows whether it did
-                let hub = self.conv(group).map(|c| c.hub.did).unwrap_or_default();
+                let hub = conv(m, group).map(|c| c.hub.did).unwrap_or_default();
                 println!("MOVED? {}: mailbox.unknown-group from {hub}; syncing", self.label(group, op.as_ref()));
             }
             Ui::Conflict { reason, epoch, op: Some(OpInfo::Rejoin), .. } => {
@@ -893,9 +720,9 @@ impl Client {
             Ui::HubMoved { group, seq, hub, .. } => println!("HUB-MOVED {} to {hub} at seq={seq}", self.name(group).0),
             Ui::Removed { group, by, conversation, kind, .. } => {
                 println!("REMOVED from {} kind={} by={by}", conversation.as_deref().unwrap_or(""), kind.as_deref().unwrap_or(""));
-                self.active_after(group);
+                self.active_after(m, group);
             }
-            Ui::Message { group, from, seq, from_device, object, blobs, .. } => self.message_in(group, from, *seq, from_device, object, blobs),
+            Ui::Message { group, from, seq, from_device, object, .. } => self.message_in(group, from, *seq, from_device, object),
             Ui::DuplicateContent { seq } => println!("DUP-HISTORY seq={seq}"),
             Ui::Duplicate { class, cursor } => println!("DUP {class} {}", cursor.as_deref().unwrap_or("")),
             Ui::Own { class, seq } => println!("SELF {class} seq={}", opt(seq)),
@@ -932,7 +759,7 @@ impl Client {
             Ui::CallRecord { from, session, outcome, .. } => println!("CALL-RECORD from {from} session={} outcome={}", s(session), s(outcome)),
             Ui::Receipt { group, from, kind, targets, through } => {
                 let what = if kind == "read" { through } else { targets };
-                let personal = self.m.personal().is_some_and(|p| p == *group);
+                let personal = m.personal().is_some_and(|p| p == *group);
                 println!("RECEIPT {from} {} {what}{}", s(kind), if personal { " (personal group)" } else { "" });
             }
             Ui::ReceiptSent { kind, targets, through, via, .. } => {
@@ -961,7 +788,7 @@ impl Client {
             Ui::HubArriving { group, in_s } => println!("ARRIVING {group}: the hub does not host the group yet; again in {in_s}s"),
             Ui::HubArrivalExpired { group } => println!("ARRIVAL-EXPIRED {group}: the new hub never hosted the group"),
             Ui::MovedCheck { group, .. } => {
-                let hub = self.conv(group).map(|c| c.hub.did).unwrap_or_default();
+                let hub = conv(m, group).map(|c| c.hub.did).unwrap_or_default();
                 println!("RETRY send: mailbox.unknown-group from {hub}; syncing");
             }
             Ui::HandedOver { sent, .. } => {
@@ -976,8 +803,8 @@ impl Client {
                 println!("SUCCESSOR joined group={group} of={of}");
                 self.active = Some(group.clone());
             }
-            Ui::SuccessorDeclined { group, of, why } => self.successor_gone(group, of, why),
-            Ui::SuccessorLeft { group, of } => self.successor_gone(group, of, ""),
+            Ui::SuccessorDeclined { group, of, why } => self.successor_gone(m, group, of, why),
+            Ui::SuccessorLeft { group, of } => self.successor_gone(m, group, of, ""),
             Ui::KeyPackagesUploaded { count } => println!("OK uploaded {} key packages", *count as i64 - 1),
             Ui::LeaveProposed { group, seq } => println!("LEAVE proposed group={group} seq={}", opt(seq)),
             Ui::LeaveProposalRefused { group, reason } => println!("LEAVE proposal refused group={group}: {reason}"),
@@ -991,21 +818,21 @@ impl Client {
     }
 
     /// A successor this device was in is left: not valid (first contact required), or another converged (M§7.5).
-    fn successor_gone(&mut self, group: &str, of: &str, why: &str) {
+    fn successor_gone(&mut self, m: &Engine<Db>, group: &str, of: &str, why: &str) {
         let why = if why.contains("first contact") {
             "not a valid successor: first contact required".to_string()
         } else {
             format!("successor of {of} converged elsewhere")
         };
         println!("LEFT group={group} conversation={} ({why})", self.name(group).0);
-        self.active_after(group);
-        if let Some(w) = self.m.successor(of) {
+        self.active_after(m, group);
+        if let Some(w) = m.successor(of) {
             self.active = Some(w);
         }
     }
 
     /// A content message (M§8.1): a device event to the alarm list, a blob fetched, or text shown.
-    fn message_in(&mut self, gid: &str, sender: &str, seq: i64, sender_device: &str, object: &Value, blobs: &Value) {
+    fn message_in(&mut self, gid: &str, sender: &str, seq: i64, sender_device: &str, object: &Value) {
         if self.recorder_mode {
             // C§5: the compliance archive
             let line = json!({"group": gid, "seq": seq, "sender": sender, "sender_device": sender_device, "object": object});
@@ -1019,8 +846,7 @@ impl Client {
         if self.event_in(gid, sender, object) {
             // device events and alarm acknowledgements went to the alarm list (E§5)
         } else if object.get("blob").is_some() {
-            // the item is committed; a fetch that finds nothing is tried again (spec-gap 106)
-            self.jobs.push(Job::Media { sender: sender.to_string(), object: object.clone(), blobs: blobs.clone(), attempt: 1 });
+            // the messenger fetches it, and tries again when a fetch finds nothing (spec-gap 106): `Output::Blob`
         } else {
             println!("RECV {sender}: {}", s(&object["text"]));
         }
@@ -1078,7 +904,7 @@ impl Client {
     }
 
     /// M§9.4: the hub of `group` has been unreachable past this device's threshold: its pending items wait for the
-    /// successor, which this device creates (M§7.5).
+    /// successor, which the messenger creates (M§7.5).
     fn successor_due(&mut self, d: &SuccessorDue) {
         for p in &d.pending {
             let item = p.item.clone().unwrap_or_default();
@@ -1086,180 +912,28 @@ impl Client {
             self.resent.insert(s(&p.id).to_string(), item);
         }
         println!("OUTAGE-SUCCESSOR group={} pending={}", d.group, d.pending.len());
-        self.jobs.push(Job::Successor(d.group.clone()));
     }
-
-    /// The network work events asked for, in order.
-    async fn run_jobs(&mut self) {
-        while !self.jobs.is_empty() {
-            let job = self.jobs.remove(0);
-            let result = match job {
-                Job::Media { sender, object, blobs, attempt } => self.media_in(&sender, &object, &blobs, attempt).await,
-                Job::Successor(dead) => match self.successor(&dead).await {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        // M§9.4 (spec-gap 72): the hand-over is retried with the §13.2 backoff; the items stay pending
-                        self.m.successor_failed(&dead);
-                        println!("SUCCESSOR-RETRY of={dead}: {e}");
-                        Ok(())
-                    }
-                },
-            };
-            if let Err(e) = result {
-                println!("ERR {e}");
-            }
-        }
-    }
-
-    /// Create the successor of `dead`, whose hub is gone: same conversation, this mailbox as hub, the last known roster
-    /// re-added (M§7.5); or use the one this device converged on. The pending items follow (M§9.4).
-    async fn successor(&mut self, dead: &str) -> Result<()> {
-        let now = self.now();
-        if let Some(w) = self.m.successor(dead) {
-            println!("SUCCESSOR exists group={w} of={dead}");
-            self.active = Some(w);
-            let frames = self.m.create_successor(dead, &BTreeMap::new(), now).map_err(messenger_err)?;
-            return self.send_frames(&frames).await;
-        }
-        let me = self.identity.clone();
-        let members: Vec<String> = self.conversations().into_iter().find(|c| c.group == dead).map(|c| c.members).unwrap_or_default();
-        let mut answers = BTreeMap::new();
-        for peer in members.into_iter().filter(|p| *p != me) {
-            // M§7.5 (spec-gap 61): the peer's mailbox serves a successor's creator without a grant
-            match self.fetch_key_packages(&peer, Some(dead)).await {
-                Ok(a) => {
-                    answers.insert(peer, a);
-                }
-                Err(e) => bail!("{peer}'s KeyPackages: {e}"),
-            }
-        }
-        let frames = self.m.create_successor(dead, &answers, self.now()).map_err(messenger_err)?;
-        let gid = frames.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
-            .and_then(|p| p["groups"][0]["group"].as_str().map(String::from)).unwrap_or_default();
-        println!("SUCCESSOR created group={gid} of={dead}");
-        self.active = Some(gid);
-        self.save()?;
-        self.send_frames(&frames).await
-    }
-
-    /// Deposit content to `gid` (M§9.2): `kind` says what its `sent` prints.
-    async fn send_content(&mut self, gid: &str, obj: Value, kind: Item) -> Result<Sent> {
-        let r = self.m.send(gid, &obj, self.now()).map_err(messenger_err)?;
-        let Some(item) = r.item else {
-            println!("PENDING kept for the successor of {gid}");
-            self.save()?;
-            return Ok(Sent::Successor);
-        };
-        self.items.insert(item.clone(), kind);
-        // M§9.2: pending, durably, before it goes out
-        self.save()?;
-        let frame = r.send;
-        if frame.is_empty() {
-            // M§9.4: the hub is down; the item waits behind the pending ones and goes out with them
-            println!("PENDING {item} queued");
-            return Ok(Sent::Queued(item));
-        }
-        self.send_frame(&frame).await?;
-        Ok(Sent::Out(item))
-    }
-
-    /// What may go to `gid` (C§5): nothing from a recorder; content into a recorded conversation once its recorders
-    /// are accepted.
-    fn may_send(&self, gid: &str) -> Result<()> {
-        if self.m.is_recorder() && !self.recorder_misbehave {
-            bail!("a recorder device is receive-only (C§5)");
-        }
-        if !self.conv(gid)?.may_send {
-            bail!("recorded conversation: type accept-recording first (C§5)");
-        }
-        Ok(())
-    }
-
-    /// A content object of this identity for `gid`'s conversation (M§8.1), with `fields`.
-    fn content(&mut self, gid: &str, fields: Value) -> Result<Value> {
-        let now = self.now();
-        let mut obj = json!({"object": "content", "id": self.m.new_id(now), "conversation": self.conv(gid)?.conversation,
-            "sender": self.identity, "sent_at": now as i64, "purpose": "message"});
-        for (k, v) in fields.as_object().into_iter().flatten() {
-            obj[k.as_str()] = v.clone();
-        }
-        Ok(obj)
-    }
-
-    async fn send_text(&mut self, text: &str) -> Result<()> {
-        let group = self.active()?;
-        self.may_send(&group)?;
-        let obj = self.content(&group, json!({"kind": "text", "content_type": "text/plain", "text": text}))?;
-        self.send_content(&group, obj, Item::Text).await.map(|_| ())
-    }
-
-    /// A short-lived connection to another identity's mailbox (M§5.5 fetch, M§14.1 first contact).
-    async fn peer_connect(&mut self, identity: &str) -> Result<Connection> {
-        let r = resolver(&self.resolver_files);
-        let (did, uri) = mailbox_of(identity, &r)?;
-        let tls = tls::client_config(self.ca.as_deref())?;
-        let params = ConnectParams {
-            url: uri,
-            tls,
-            device: &self.keys.device,
-            on_behalf_of: Some(self.identity.clone()),
-            delegations: vec![self.delegation.clone()],
-            supported: Supported::all_known(),
-        };
-        let conn = Connection::connect(&params, &r, &mut self.seen).await?;
-        anyhow::ensure!(conn.relay.did == did, "peer mailbox is {} not {did}", conn.relay.did);
-        Ok(conn)
-    }
-
-    /// The `key-packages` answer for `target` (M§5.5): from its mailbox, or this identity's own over the bound
-    /// connection, so no second binding displaces it. `successor_of` names the dead group a successor is created for
-    /// (M§7.5, spec-gap 61). A grant held from `target` is presented (M§14.2).
-    async fn fetch_key_packages(&mut self, target: &str, successor_of: Option<&str>) -> Result<Value> {
-        let so = successor_of.map(String::from);
-        let payload = if target == self.identity {
-            let mailbox = self.mailbox.0.clone();
-            let frame = self.m.fetch_frame(&mailbox, target, self.now(), so);
-            self.request(&frame).await?
-        } else {
-            let mut conn = self.peer_connect(target).await?;
-            let did = conn.relay.did.clone();
-            let frame = self.m.fetch_frame(&did, target, self.now(), so);
-            peer_exchange(&mut conn, &frame).await?
-        };
-        if payload["type"] != "key-packages" {
-            bail!("key-package-fetch refused: {} {}", payload["type"], payload["reason"]);
-        }
-        Ok(payload)
-    }
-}
-
-/// Send one request on a connection to another identity's mailbox and return its answer, closing the connection.
-async fn peer_exchange(conn: &mut Connection, frame: &str) -> Result<Value> {
-    conn.send(&Envelope::from_frame(frame).map_err(|v| anyhow::anyhow!("{:?}", v.code))?).await?;
-    let reply = conn.recv().await?.context("no answer from the mailbox")?;
-    conn.close(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, "done").await;
-    wire::payload_of(&Envelope::from_frame(&reply).map_err(|v| anyhow::anyhow!("{:?}", v.code))?).context("bad answer")
 }
 
 impl Client {
     /// A group a command proposed a commit in, and what the commit's lines call it.
     fn label_for(&mut self, gid: &str, label: String) {
-        self.labels.insert(gid.to_string(), label);
+        self.c.labels.insert(gid.to_string(), label);
     }
 
     /// Create a conversation of `kind` with `peer` (M§7.2, M§7.3), presenting a held grant when none is given: the
     /// peer's devices and this identity's own others, added in one commit once the group is hubbed here.
     async fn create(&mut self, kind: &str, peer: &str, grant: Option<String>) -> Result<()> {
         if let Some(g) = grant {
-            self.m.set_grants(&BTreeMap::from([(peer.to_string(), g)]));
+            self.mx.engine_mut().set_grants(&BTreeMap::from([(peer.to_string(), g)]));
         }
-        let answer = self.fetch_key_packages(peer, None).await?;
-        self.m.key_package_devices(peer, &answer, self.now()).map_err(messenger_err)?;
+        let answer = self.mx.fetch_key_packages(&mut self.c, peer, None).await?;
+        self.mx.engine_mut().key_package_devices(peer, &answer, now_f()).map_err(messenger_err)?;
         // M§7.2: the creator adds its own other devices with the peer's — recorder devices included (C§5), so a
         // conversation created after a recorder exists is recorded too
-        let me = self.identity.clone();
-        let own = match self.fetch_key_packages(&me, None).await {
-            Ok(a) => match self.m.key_package_devices(&me, &a, self.now()) {
+        let me = self.c.identity.clone();
+        let own = match self.mx.fetch_key_packages(&mut self.c, &me, None).await {
+            Ok(a) => match self.mx.engine_mut().key_package_devices(&me, &a, now_f()) {
                 Ok(d) => {
                     println!("OWN-DEVICES {} added with the peer's", d.len());
                     Some(a)
@@ -1274,51 +948,51 @@ impl Client {
                 None
             }
         };
-        let now = self.now();
+        let now = now_f();
         let frames = if kind == "direct" {
-            self.m.create_direct(peer, &answer, own.as_ref(), now)
+            self.mx.engine_mut().create_direct(peer, &answer, own.as_ref(), now)
         } else {
-            self.m.create_group(&BTreeMap::from([(peer.to_string(), answer)]), own.as_ref(), now)
+            self.mx.engine_mut().create_group(&BTreeMap::from([(peer.to_string(), answer)]), own.as_ref(), now)
         }
         .map_err(messenger_err)?;
         let gid = frames.first().and_then(|f| Envelope::from_frame(f).ok()).and_then(|e| wire::payload_of(&e))
             .and_then(|p| p["groups"][0]["group"].as_str().map(String::from)).context("no group created")?;
-        self.active = Some(gid.clone());
+        self.c.active = Some(gid.clone());
         println!("OK conversation {} kind={kind}", self.conv(&gid)?.conversation);
-        self.save()?;
-        self.send_frames(&frames).await
+        self.mx.save(&self.c)?;
+        Ok(self.mx.send_frames(&mut self.c, &frames).await?)
     }
 
     /// Add `peer`'s devices to the active conversation (M§7.3, M§14.2), from KeyPackages prefetched or fetched now.
     async fn add(&mut self, peer: &str, grant: Option<String>) -> Result<()> {
-        let group = self.active()?;
+        let group = self.c.active()?;
         if let Some(g) = grant {
-            self.m.set_grants(&BTreeMap::from([(peer.to_string(), g)]));
+            self.mx.engine_mut().set_grants(&BTreeMap::from([(peer.to_string(), g)]));
         }
-        let answer = match self.prefetched.remove(peer) {
+        let answer = match self.c.prefetched.remove(peer) {
             Some(a) => a,
-            None => self.fetch_key_packages(peer, None).await?,
+            None => self.mx.fetch_key_packages(&mut self.c, peer, None).await?,
         };
-        let frame = self.m.add_member(&group, peer, &answer, self.now()).map_err(messenger_err)?;
-        self.send_frame(&frame).await
+        let frame = self.mx.engine_mut().add_member(&group, peer, &answer, now_f()).map_err(messenger_err)?;
+        Ok(self.mx.send_frame(&mut self.c, &frame).await?)
     }
 
     /// The personal group and the first archive key (M§7.1, M§12.1).
     async fn create_personal(&mut self) -> Result<()> {
-        let frames = self.m.create_personal(self.now()).map_err(messenger_err)?;
-        let personal = self.m.personal().context("no personal group")?;
+        let frames = self.mx.engine_mut().create_personal(now_f()).map_err(messenger_err)?;
+        let personal = self.mx.engine_mut().personal().context("no personal group")?;
         println!("OK conversation {} kind=personal", self.conv(&personal)?.conversation);
-        self.save()?;
-        self.send_frames(&frames).await
+        self.mx.save(&self.c)?;
+        Ok(self.mx.send_frames(&mut self.c, &frames).await?)
     }
 
     /// M§12.3: add a new device of this identity, first to the personal group (re-sending every archive key in the
     /// epoch after the commit), then to each conversation group; each add from a KeyPackage of its own (M§5.5).
     async fn add_device(&mut self, device: &str) -> Result<()> {
-        let personal = self.m.personal().context("no personal group: create it first (M§7.1)")?;
-        let me = self.identity.clone();
-        let probe = self.fetch_key_packages(&me, None).await?;
-        let devices = self.m.key_package_devices(&me, &probe, self.now()).map_err(messenger_err)?;
+        let personal = self.mx.engine_mut().personal().context("no personal group: create it first (M§7.1)")?;
+        let me = self.c.identity.clone();
+        let probe = self.mx.fetch_key_packages(&mut self.c, &me, None).await?;
+        let devices = self.mx.engine_mut().key_package_devices(&me, &probe, now_f()).map_err(messenger_err)?;
         let found = devices.iter().find(|d| d.device == device).with_context(|| format!("no KeyPackage of {device} at the mailbox"))?;
         // Recording Profile C§5: a recorder device joins conversations only — never the personal group, so it holds no
         // archive key and records only what is sent while it is a visible member
@@ -1326,7 +1000,7 @@ impl Client {
         if recorder {
             println!("RECORDER {device}: conversations only, never the personal group or the archive key   C§5");
         }
-        let order = self.m.groups_for_new_device(device, self.now());
+        let order = self.mx.engine_mut().groups_for_new_device(device, now_f());
         let mut first = Some(probe);
         for gid in order {
             if recorder && gid == personal {
@@ -1334,21 +1008,21 @@ impl Client {
             }
             let answer = match first.take() {
                 Some(a) => a,
-                None => self.fetch_key_packages(&me, None).await?,
+                None => self.mx.fetch_key_packages(&mut self.c, &me, None).await?,
             };
             let label = format!("added device {device} to {}", self.conv(&gid)?.kind);
             self.label_for(&gid, label);
-            let frame = self.m.add_device(&gid, device, &answer, self.now()).map_err(messenger_err)?;
-            self.send_frame(&frame).await?;
-            self.settle().await;
+            let frame = self.mx.engine_mut().add_device(&gid, device, &answer, now_f()).map_err(messenger_err)?;
+            self.mx.send_frame(&mut self.c, &frame).await?;
+            self.mx.settle(&mut self.c).await;
             if gid == personal {
                 // M§12.3 step 3: a new member cannot read earlier epochs, so every live archive key is re-sent
-                let frames = self.m.resend_archive_keys(self.now());
-                let n = self.m.archive_keys().len();
-                self.save()?;
-                self.send_frames(&frames).await?;
+                let frames = self.mx.engine_mut().resend_archive_keys(now_f());
+                let n = self.mx.engine_mut().archive_keys().len();
+                self.mx.save(&self.c)?;
+                self.mx.send_frames(&mut self.c, &frames).await?;
                 println!("OK re-sent {n} archive key(s)");
-                self.settle().await;
+                self.mx.settle(&mut self.c).await;
             }
         }
         Ok(())
@@ -1358,22 +1032,22 @@ impl Client {
     /// the identity's DID document (authoritative, §8.1) and sent to its mailbox, which closes the device's binding.
     async fn revoke_device(&mut self, device: &str) -> Result<()> {
         let now = now_s();
-        let p = json!({"dsip": wire::version_block(), "type": "delegation-revocation", "id": wire::new_id(now), "from": self.identity,
-            "subject": self.identity, "device": device, "revoked_at": now, "reason": "lost", "issued_at": now, "expires_at": now + 300});
-        let rev = sign(&p, &self.keys.controller, &format!("{}#key-1", self.identity));
+        let p = json!({"dsip": wire::version_block(), "type": "delegation-revocation", "id": wire::new_id(now), "from": self.c.identity,
+            "subject": self.c.identity, "device": device, "revoked_at": now, "reason": "lost", "issued_at": now, "expires_at": now + 300});
+        let rev = sign(&p, &self.c.keys.controller, &format!("{}#key-1", self.c.identity));
         // Publish: the identity's document is one of the files this device resolves from.
-        let doc_file = self.resolver_files.iter().find(|f| {
-            std::fs::read_to_string(f).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|d| d["id"] == json!(self.identity))
+        let doc_file = self.mx.config().resolver_files.iter().find(|f| {
+            std::fs::read_to_string(f).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|d| d["id"] == json!(self.c.identity))
         });
         let doc_file = doc_file.cloned().context("this identity's DID document is not among --resolver-file")?;
         let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&doc_file)?)?;
         let list = doc.as_object_mut().context("document")?.entry("dsipDelegationRevocations").or_insert(json!([]));
         list.as_array_mut().context("revocations")?.push(json!(compact(&rev)));
         std::fs::write(&doc_file, serde_json::to_string_pretty(&doc)?)?;
-        self.refresh_docs();
-        let env = wire::message(&self.keys.device, "mailbox-config", &self.mailbox.0, now, wire::TTL_S,
-            json!({"subject": self.identity, "revoked_delegations": [compact(&rev)]}));
-        let reply = self.request(&env.frame()).await?;
+        self.mx.refresh_docs();
+        let env = wire::message(&self.c.keys.device, "mailbox-config", &self.mx.config().mailbox.0, now, wire::TTL_S,
+            json!({"subject": self.c.identity, "revoked_delegations": [compact(&rev)]}));
+        let reply = self.mx.request(&mut self.c, &env.frame()).await?;
         anyhow::ensure!(reply["type"] == "accepted", "mailbox refused the revocation: {}", reply["reason"]);
         println!("OK revoked {device} published={} mailbox=accepted", doc_file.display());
         Ok(())
@@ -1381,18 +1055,18 @@ impl Client {
 
     /// M§14.1: ask `target` for permission to message, the purpose sealed to its key agreement key unless `plain`.
     async fn introduce(&mut self, target: &str, purpose: &str, plain: bool) -> Result<()> {
-        let r = self.m.introduce(target, purpose, plain, self.now()).map_err(messenger_err)?;
+        let r = self.mx.engine_mut().introduce(target, purpose, plain, now_f()).map_err(messenger_err)?;
         let id = r.id.clone();
         // M§14.1 (spec-gap 81): tell our own mailbox first, so the grant that answers this is not rate-limited there.
         // Best-effort: it only spares the answer a rate limit. A device that cannot reach its own mailbox still introduces.
-        if let Err(e) = self.send_frame(&r.send).await {
+        if let Err(e) = self.mx.send_frame(&mut self.c, &r.send).await {
             println!("WARN introduction {id} not announced to our own mailbox: {e}");
         }
-        self.save()?;
-        let mut conn = self.peer_connect(target).await?;
+        self.mx.save(&self.c)?;
+        let mut conn = self.mx.peer_connect(target).await?;
         let did = conn.relay.did.clone();
-        let frame = self.m.first_contact_frame(&did, "introduction", target, &r.envelope, self.now());
-        let answer = peer_exchange(&mut conn, &frame).await?;
+        let frame = self.mx.engine_mut().first_contact_frame(&did, "introduction", target, &r.envelope, now_f());
+        let answer = dsip_messenger::peer_exchange(&mut conn, &frame).await?;
         match answer["type"].as_str() {
             Some("accepted") => println!("OK introduction {id} to {target} accepted sealed={}", !plain),
             _ => println!("ERR introduction {id} refused: {} retry_after={}", answer["reason"], answer["retry_after"]),
@@ -1402,22 +1076,22 @@ impl Client {
 
     /// M§14.1: answer a request with a `dsip.message` grant, deposited at the requester's mailbox.
     async fn accept_request(&mut self, id: &str) -> Result<()> {
-        let r = self.m.accept_request(id, self.now()).map_err(messenger_err)?;
+        let r = self.mx.engine_mut().accept_request(id, now_f()).map_err(messenger_err)?;
         let requester = r.requester.clone();
-        let mut conn = self.peer_connect(&requester).await?;
+        let mut conn = self.mx.peer_connect(&requester).await?;
         let did = conn.relay.did.clone();
-        let frame = self.m.first_contact_frame(&did, "grant", &requester, &r.envelope, self.now());
-        let answer = peer_exchange(&mut conn, &frame).await?;
+        let frame = self.mx.engine_mut().first_contact_frame(&did, "grant", &requester, &r.envelope, now_f());
+        let answer = dsip_messenger::peer_exchange(&mut conn, &frame).await?;
         anyhow::ensure!(answer["type"] == "accepted", "grant refused: {}", answer["reason"]);
-        self.m.forget_request(id);
-        self.save()?;
+        self.mx.engine_mut().forget_request(id);
+        self.mx.save(&self.c)?;
         println!("OK granted {requester} dsip.message for request {id}");
         Ok(())
     }
 
     /// Send an Ogg Opus recording: seal, upload, reference (M§8.2, M§8.4, M§5.6).
     async fn send_audio(&mut self, path: &str, purpose: &str, session: Option<String>, max_duration_s: Option<i64>) -> Result<()> {
-        let group = self.active()?;
+        let group = self.c.active()?;
         self.may_send(&group)?;
         let plain = std::fs::read(path).with_context(|| format!("reading {path}"))?;
         let duration_ms = ogg_opus_duration_ms(&plain).context("not an Ogg Opus file")?;
@@ -1429,22 +1103,22 @@ impl Client {
         let key: [u8; 32] = rand::random();
         let nonce: [u8; 12] = rand::random();
         let blob::Sealed { bytes: sealed, sha256: sha } = blob::seal_blob(&key, &nonce, &plain);
-        let conn = self.conn.as_ref().context("offline")?;
+        let conn = self.mx.connection().context("offline")?;
         let endpoint = conn.relay.capabilities["mailbox"]["blob_endpoint"].as_str().context("mailbox advertises no blob_endpoint")?;
         let uri = format!("{endpoint}/{sha}");
         // M§5.6: one upload, authorized by a signed blob-put carrying the device's delegation.
-        let auth = self.m.blob_put(&sha, sealed.len() as f64, self.now());
-        let resp = self.http.put(&uri).header("Authorization", format!("DSIP {auth}")).body(sealed.clone()).send().await?;
+        let auth = self.mx.engine_mut().blob_put(&sha, sealed.len() as f64, now_f());
+        let resp = self.mx.http().put(&uri).header("Authorization", format!("DSIP {auth}")).body(sealed.clone()).send().await?;
         let status = resp.status().as_u16();
         let answer = Envelope::from_frame(&resp.text().await?).ok().and_then(|e| wire::payload_of(&e)).unwrap_or_default();
         anyhow::ensure!(matches!(status, 200 | 201) && answer["type"] == "accepted", "blob upload refused: {status} {}", answer["reason"]);
 
-        let now = self.now();
+        let now = now_f();
         let key_b64 = dsip_core::b64::encode(&key);
         let uploaded = blob::Uploaded { uri: &uri, sha256: &sha, size: sealed.len() as u64, key: &key_b64, content_type: "audio/ogg; codecs=opus" };
         let conversation = self.conv(&group)?.conversation;
-        let id = self.m.new_id(now);
-        let obj = blob::audio_content(&id, &conversation, &self.identity, now as i64, purpose, duration_ms, &uploaded, session.as_deref());
+        let id = self.mx.engine_mut().new_id(now);
+        let obj = blob::audio_content(&id, &conversation, &self.c.identity, now as i64, purpose, duration_ms, &uploaded, session.as_deref());
         // M§8.4 rule 4: the deposit's manifest names the blob without its key (the Messenger writes it)
         let item = Item::Audio { purpose: purpose.to_string(), duration_ms, sha256: sha };
         self.send_content(&group, obj, item).await.map(|_| ())
@@ -1452,12 +1126,12 @@ impl Client {
 
     /// M§13.2: after a call attempt to the conversation's peer ended with `reason`, may we leave a voicemail?
     async fn voicemail(&mut self, session: &str, reason: &str, path: &str) -> Result<()> {
-        let group = self.active()?;
-        let me = self.identity.clone();
+        let group = self.c.active()?;
+        let me = self.c.identity.clone();
         let c = self.conv(&group)?;
         let peer = c.peer.or_else(|| c.members.into_iter().find(|m| *m != me))
             .context("no callee in the conversation")?;
-        let r = resolver(&self.resolver_files);
+        let r = resolver(&self.mx.config().resolver_files);
         let doc = dsip_core::did::Resolver::resolve(&r, &peer).with_context(|| format!("no document for {peer}"))?;
         let entry = doc.service.iter().find(|s| s.service_type == "DSIPMailbox").map(|s| s.service_endpoint.clone()).unwrap_or_default();
         let outcome_type = if reason == "session.timeout" { "cancel" } else { "reject" };
@@ -1471,100 +1145,9 @@ impl Client {
         self.send_audio(path, "voicemail", Some(session.to_string()), offer["max_duration_s"].as_i64()).await
     }
 
-    /// Fetch, verify and decrypt a content object's blob into `--state`/media (M§8.4 rule 7).
-    ///
-    /// Sources come from the pinned [`blob_sources`](dsip_messaging::client::blob_sources): this identity's mailbox's
-    /// copy first when the item's manifest names one, then the content's own `uri` (M§8.4 rule 6, spec-gap 65).
-    async fn fetch_media(&self, object: &Value, manifest: &Value, attempt: i64) -> Result<Fetched> {
-        let b = &object["blob"];
-        let _: [u8; 32] = unb64(&b["key"]).try_into().ok().context("blob key")?;
-        let mut tried = vec![];
-        for uri in &blob::sources(object, manifest) {
-            let uri = uri.as_str();
-            let stored = match self.http.get(uri).send().await {
-                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                    Ok(body) => body,
-                    Err(e) => {
-                        println!("BLOB-SOURCE-REJECTED {uri}: {e}");
-                        tried.push(blob::tried(uri, 0, None));
-                        continue;
-                    }
-                },
-                Ok(resp) => {
-                    println!("BLOB-SOURCE-REJECTED {uri}: {}", resp.status());
-                    tried.push(blob::tried(uri, resp.status().as_u16(), None));
-                    continue;
-                }
-                Err(e) => {
-                    println!("BLOB-SOURCE-REJECTED {uri}: {e}");
-                    tried.push(blob::tried(uri, 0, None));
-                    continue;
-                }
-            };
-            // M§8.4 rule 7: whichever source, the hash and size must match before decrypting
-            match blob::open(object, &stored) {
-                Ok(plain) => {
-                    let dir = self.state.join("media");
-                    std::fs::create_dir_all(&dir)?;
-                    let path = dir.join(format!("{}.ogg", object["id"].as_str().unwrap_or("blob")));
-                    std::fs::write(&path, &plain)?;
-                    return Ok(Fetched::Played(path, digest(&plain), uri.to_string()));
-                }
-                Err(c) => {
-                    println!("BLOB-SOURCE-REJECTED {uri}: {c}");
-                    // a 200 that is not the content's blob: other bytes (M§8.4 rule 7)
-                    tried.push(blob::tried(uri, 200, Some(&stored)));
-                }
-            }
-        }
-        // M§8.4 "Fetching" (spec-gap 106): try again when a source had nothing to serve; never when all served other bytes
-        Ok(match blob::fetch_decision(object, &tried, attempt) {
-            blob::Fetch::Retry => Fetched::Retry,
-            blob::Fetch::GiveUp(reason) => Fetched::GaveUp(reason),
-            // a source served the content's size and hash but it did not decrypt: nothing to play
-            blob::Fetch::Play(_) => Fetched::GaveUp(String::new()),
-        })
-    }
-
-    /// Fetch a received content's blob now; a fetch that found nothing is kept and tried again (spec-gap 106).
-    async fn media_in(&mut self, sender: &str, object: &Value, blobs: &Value, attempt: i64) -> Result<()> {
-        match self.fetch_media(object, blobs, attempt).await? {
-            Fetched::Played(path, sha, from) => println!(
-                "RECV-AUDIO {sender} purpose={} duration_ms={} session={} file={} sha256={sha} from={from}",
-                object["purpose"].as_str().unwrap_or("message"), object["duration_ms"],
-                object["session"].as_str().unwrap_or("-"), path.display()
-            ),
-            Fetched::Retry => {
-                let delay = blob::retry_delay_s(attempt);
-                println!("AUDIO-PENDING {} attempt={attempt} retry_in={delay}", object["id"].as_str().unwrap_or(""));
-                self.pending_blobs.push(json!({"object": object, "blobs": blobs, "sender": sender, "attempt": attempt + 1,
-                    "next_at": now_s() + delay}));
-                self.save()?;
-            }
-            Fetched::GaveUp(why) => println!("ERR blob {}: given up ({why})", object["id"]),
-        }
-        Ok(())
-    }
-
-    /// Try again the blob fetches that are due (spec-gap 106), from the ticker.
-    fn retry_blobs(&mut self) -> Result<()> {
-        let now = now_s();
-        let (due, later): (Vec<Value>, Vec<Value>) =
-            std::mem::take(&mut self.pending_blobs).into_iter().partition(|p| p["next_at"].as_i64().unwrap_or(0) <= now);
-        self.pending_blobs = later;
-        if due.is_empty() {
-            return Ok(());
-        }
-        for p in due {
-            self.jobs.push(Job::Media { sender: s(&p["sender"]).to_string(), object: p["object"].clone(), blobs: p["blobs"].clone(),
-                                        attempt: p["attempt"].as_i64().unwrap_or(2) });
-        }
-        self.save()
-    }
-
     /// The latest content of the active conversation's thread, `pred` choosing among them.
     fn latest(&self, gid: &str, pred: impl Fn(&Value) -> bool) -> Option<String> {
-        let thread = self.m.thread(gid);
+        let thread = self.mx.engine().thread(gid);
         thread.iter().rev().find(|m| pred(m)).and_then(|m| m["object"]["id"].as_str().map(String::from))
     }
 
@@ -1574,20 +1157,20 @@ impl Client {
     }
 
     async fn command(&mut self, cmd: &str, rest: &str) -> Result<()> {
-        let now = self.now();
+        let now = now_f();
         match cmd {
             "" => Ok(()),
             "kp" => {
-                let frame = self.m.key_packages_frame(rest.trim().parse().unwrap_or(2), now).map_err(messenger_err)?;
-                self.send_frame(&frame).await
+                let frame = self.mx.engine_mut().key_packages_frame(rest.trim().parse().unwrap_or(2), now).map_err(messenger_err)?;
+                Ok(self.mx.send_frame(&mut self.c, &frame).await?)
             }
             "release" => {
                 // M§4.1, M§5.7 (spec-gap 130): the mailbox closes the binding once it has released the identity; the
                 // device then stays offline instead of redialling, since the sync after a redial would enrol it again
-                println!("RELEASE sent to {}", self.mailbox.0);
-                let frame = self.m.release(now);
-                self.send_frame(&frame).await?;
-                self.held_offline = true;
+                println!("RELEASE sent to {}", self.mx.config().mailbox.0);
+                let frame = self.mx.engine_mut().release(now);
+                self.mx.send_frame(&mut self.c, &frame).await?;
+                self.mx.hold_offline();
                 Ok(())
             }
             "introduce" | "introduce-plain" => {
@@ -1596,14 +1179,14 @@ impl Client {
                 self.introduce(target, purpose.trim(), cmd == "introduce-plain").await
             }
             "requests" => {
-                for (id, p) in self.m.requests() {
+                for (id, p) in self.mx.engine_mut().requests() {
                     println!("PENDING {id} from {}", s(&p["from"]));
                 }
                 Ok(())
             }
             "accept-request" => self.accept_request(rest.trim()).await,
             "grant" => {
-                println!("GRANT {}", self.m.grant(rest.trim(), None, now));
+                println!("GRANT {}", self.mx.engine_mut().grant(rest.trim(), None, now));
                 Ok(())
             }
             "create" | "add" => {
@@ -1626,28 +1209,28 @@ impl Client {
             "remove-device" => {
                 // M§12.4: by credential from every group (a revoked device's leaf no longer authenticates, spec-gap 57),
                 // then a new archive key
-                let out = self.m.remove_device(rest.trim(), now).map_err(messenger_err)?;
-                self.handle(&out).await
+                let out = self.mx.engine_mut().remove_device(rest.trim(), now).map_err(messenger_err)?;
+                Ok(self.mx.handle(&mut self.c, out).await?)
             }
             "revoke-device" => self.revoke_device(rest.trim()).await,
             "remove-leaf" => {
-                let group = self.active()?;
+                let group = self.c.active()?;
                 let device = rest.trim();
-                let frame = self.m.remove_lapsed_leaf(&group, device, now).map_err(messenger_err)?;
+                let frame = self.mx.engine_mut().remove_lapsed_leaf(&group, device, now).map_err(messenger_err)?;
                 self.label_for(&group, format!("removed lapsed leaf {device}"));
-                self.send_frame(&frame).await
+                Ok(self.mx.send_frame(&mut self.c, &frame).await?)
             }
             "remove" => {
-                let group = self.active()?;
-                let frame = self.m.remove_member(&group, rest.trim(), now).map_err(messenger_err)?;
-                self.send_frame(&frame).await
+                let group = self.c.active()?;
+                let frame = self.mx.engine_mut().remove_member(&group, rest.trim(), now).map_err(messenger_err)?;
+                Ok(self.mx.send_frame(&mut self.c, &frame).await?)
             }
             "successor" => {
-                let dead = self.active()?;
-                self.successor(&dead).await
+                let dead = self.c.active()?;
+                Ok(self.mx.successor(&mut self.c, &dead).await?)
             }
             "available" => {
-                for a in self.m.available() {
+                for a in self.mx.engine_mut().available() {
                     let or_unknown = |v: &str| if v.is_empty() { "?".to_string() } else { v.to_string() };
                     println!("AVAILABLE group={} conversation={} kind={}", a.group, or_unknown(&a.conversation), or_unknown(&a.kind));
                 }
@@ -1658,11 +1241,11 @@ impl Client {
                 let w: Vec<&str> = rest.split_whitespace().collect();
                 let peer = w.first().context("usage: prefetch <peer> [grant file]")?.to_string();
                 if let Some(f) = w.get(1) {
-                    self.m.set_grants(&BTreeMap::from([(peer.clone(), std::fs::read_to_string(f)?.trim().to_string())]));
+                    self.mx.engine_mut().set_grants(&BTreeMap::from([(peer.clone(), std::fs::read_to_string(f)?.trim().to_string())]));
                 }
-                let answer = self.fetch_key_packages(&peer, None).await?;
-                self.m.key_package_devices(&peer, &answer, now).map_err(messenger_err)?;
-                self.prefetched.insert(peer.clone(), answer);
+                let answer = self.mx.fetch_key_packages(&mut self.c, &peer, None).await?;
+                self.mx.engine_mut().key_package_devices(&peer, &answer, now).map_err(messenger_err)?;
+                self.c.prefetched.insert(peer.clone(), answer);
                 println!("OK prefetched a key package for {peer}");
                 Ok(())
             }
@@ -1674,7 +1257,7 @@ impl Client {
                 };
                 let leg = CallLeg { session: session.to_string(), peer: peer.to_string(), alerted: *alerted == "1", answered_here: *answered == "1",
                                     ended_by: by.to_string(), reason: reason.to_string() };
-                let r = self.m.call_ended_item(&leg, now).map_err(messenger_err)?;
+                let r = self.mx.engine_mut().call_ended_item(&leg, now).map_err(messenger_err)?;
                 if r.event.is_none() {
                     println!("NO-CALL-EVENT session={session} reason={reason}");
                     return Ok(());
@@ -1682,12 +1265,12 @@ impl Client {
                 // M§13.3 (spec-gap 63): every alerted device may report the call; one entry per session
                 if let Some(item) = r.item {
                     let outcome = r.event.as_ref().map(|e| s(&e["outcome"]).to_string()).unwrap_or_default();
-                    self.items.insert(item, Item::CallEvent { outcome, session: session.to_string(), fresh: r.fresh });
+                    self.c.items.insert(item, Item::CallEvent { outcome, session: session.to_string(), fresh: r.fresh });
                 }
-                self.save()?;
+                self.mx.save(&self.c)?;
                 match r.send.as_str() {
                     "" => Ok(()),
-                    f => self.send_frame(f).await,
+                    f => Ok(self.mx.send_frame(&mut self.c, f).await?),
                 }
             }
             "timeline" => {
@@ -1695,7 +1278,7 @@ impl Client {
                 let peer = rest.trim();
                 let gid = self.conversations().into_iter().find(|c| c.kind == "direct" && c.peer.as_deref() == Some(peer))
                     .map(|c| c.group).with_context(|| format!("no direct conversation with {peer}"))?;
-                let entries = self.m.timeline(&gid);
+                let entries = self.mx.engine_mut().timeline(&gid);
                 println!("PEER-TIMELINE {peer} {}", entries.len());
                 for e in entries {
                     match e.get("call") {
@@ -1707,41 +1290,41 @@ impl Client {
             }
             "rejoin" => {
                 // M§6.8: join by external commit from the latest GroupInfo this identity's mailbox delivered
-                let frames = self.m.external_join(rest.trim(), now).map_err(messenger_err)?;
-                self.save()?;
-                self.send_frames(&frames).await
+                let frames = self.mx.engine_mut().external_join(rest.trim(), now).map_err(messenger_err)?;
+                self.mx.save(&self.c)?;
+                Ok(self.mx.send_frames(&mut self.c, &frames).await?)
             }
             "move-hub" => {
                 // M§7.4: move the active group to another hub, by default this identity's own mailbox
-                let group = self.active()?;
+                let group = self.c.active()?;
                 let w: Vec<&str> = rest.split_whitespace().collect();
                 let frame = match w.as_slice() {
-                    [did, uri] => self.m.move_hub_to(&group, did, uri, now),
-                    [] => self.m.move_hub(&group, now),
+                    [did, uri] => self.mx.engine_mut().move_hub_to(&group, did, uri, now),
+                    [] => self.mx.engine_mut().move_hub(&group, now),
                     _ => bail!("usage: move-hub [<hub did> <wss uri>]"),
                 }
                 .map_err(messenger_err)?;
-                self.send_frame(&frame).await
+                Ok(self.mx.send_frame(&mut self.c, &frame).await?)
             }
             "rekey" => {
                 // M§6.5: a self-update commit, applied only once the hub accepts it
-                let group = self.active()?;
-                let frame = self.m.rekey(&group, now).map_err(messenger_err)?;
-                self.send_frame(&frame).await
+                let group = self.c.active()?;
+                let frame = self.mx.engine_mut().rekey(&group, now).map_err(messenger_err)?;
+                Ok(self.mx.send_frame(&mut self.c, &frame).await?)
             }
             "send" => self.send_text(rest).await,
             "accept-recording" => {
                 // C§5: per conversation, every recorder device present now
-                let gid = self.active()?;
+                let gid = self.c.active()?;
                 let c = self.conv(&gid)?;
                 if c.recorders.is_empty() {
                     println!("OK not recorded");
                     return Ok(());
                 }
-                let r = self.m.accept_recording(&gid, now).map_err(messenger_err)?;
+                let r = self.mx.engine_mut().accept_recording(&gid, now).map_err(messenger_err)?;
                 println!("OK recording accepted group={gid} recorders={}", list(&json!(r.accepted)));
-                self.save()?;
-                self.send_frames(&r.frames).await?;
+                self.mx.save(&self.c)?;
+                self.mx.send_frames(&mut self.c, &r.frames).await?;
                 // C§5 (v0.10): the acceptance is the person's — this identity's other devices are told
                 if !r.frames.is_empty() {
                     println!("OK recording acceptance shared with this identity's devices");
@@ -1750,17 +1333,17 @@ impl Client {
             }
             "leave" => {
                 // M§7.3 "Leaving": this identity's Remove proposals; another member's device commits them
-                let gid = self.active()?;
-                let out = self.m.leave(&gid, now).map_err(messenger_err)?;
+                let gid = self.c.active()?;
+                let out = self.mx.engine_mut().leave(&gid, now).map_err(messenger_err)?;
                 println!("OK leaving group={gid}");
-                self.handle(&out).await
+                Ok(self.mx.handle(&mut self.c, out).await?)
             }
             "decline-recording" => {
                 // C§5: declining is leaving the conversation (M§7.3)
-                let gid = self.active()?;
-                let out = self.m.leave(&gid, now).map_err(messenger_err)?;
+                let gid = self.c.active()?;
+                let out = self.mx.engine_mut().leave(&gid, now).map_err(messenger_err)?;
                 println!("OK leaving group={gid} (declined being recorded, C§5)");
-                self.handle(&out).await
+                Ok(self.mx.handle(&mut self.c, out).await?)
             }
             "device-event" => self.send_device_event(rest).await,
             "alarm-ack" => {
@@ -1780,61 +1363,60 @@ impl Client {
                     _ => Err(anyhow::anyhow!("usage: voicemail <session> <reason> <file.ogg>")),
                 }
             }
-            "sync" => self.sync(false).await,
-            "live" => self.sync(true).await,
+            "sync" => Ok(self.mx.sync(&mut self.c, false).await?),
+            "live" => Ok(self.mx.sync(&mut self.c, true).await?),
             "offline" => {
-                self.conn = None;
-                self.held_offline = true;
+                self.mx.go_offline();
                 println!("OK offline");
                 Ok(())
             }
-            "online" => self.connect().await,
+            "online" => Ok(self.mx.connect(&mut self.c).await?),
             "read" => {
                 // M§10.3: the local user has read everything up to the latest content of the active conversation
-                let group = self.active()?;
+                let group = self.c.active()?;
                 let through = self.latest(&group, |_| true).context("nothing to read")?;
-                let out = self.m.read_through(&group, &through, now);
+                let out = self.mx.engine_mut().read_through(&group, &through, now);
                 println!("OK read through={} ({} to send)", json!(through), Self::decided(&out));
-                self.handle(&out).await
+                Ok(self.mx.handle(&mut self.c, out).await?)
             }
             "play" => {
                 // M§10.4: the local user played a media item (default: the latest received)
-                let group = self.active()?;
+                let group = self.c.active()?;
                 let id = match rest.trim() {
                     "" => self.latest(&group, |m| m["mine"] != json!(true) && m["object"].get("blob").is_some()),
                     id => Some(id.to_string()),
                 }
                 .context("nothing to play")?;
-                let out = self.m.played(&group, &id, now);
+                let out = self.mx.engine_mut().played(&group, &id, now);
                 println!("OK played {id} ({} to send)", Self::decided(&out));
-                self.handle(&out).await
+                Ok(self.mx.handle(&mut self.c, out).await?)
             }
             "typing" | "uploading" | "recording-audio" | "recording-video" => {
-                let group = self.active()?;
+                let group = self.c.active()?;
                 let state = if rest.trim() == "stop" { "stopped" } else { "active" };
-                let out = self.m.activity(&group, cmd, state, now);
-                self.handle(&out).await
+                let out = self.mx.engine_mut().activity(&group, cmd, state, now);
+                Ok(self.mx.handle(&mut self.c, out).await?)
             }
             "status" => {
-                let group = self.active()?;
-                let live = self.m.successor(&group).unwrap_or(group);
-                println!("STATUS {}", self.m.receipt_state(&live));
+                let group = self.c.active()?;
+                let live = self.mx.engine_mut().successor(&group).unwrap_or(group);
+                println!("STATUS {}", self.mx.engine_mut().receipt_state(&live));
                 Ok(())
             }
             "history" => {
                 // M§8.5: the conversation's timeline in hub seq order, from MLS and archive alike
-                let group = self.active()?;
-                let thread = self.m.thread(&group);
+                let group = self.c.active()?;
+                let thread = self.mx.engine_mut().thread(&group);
                 for (i, m) in thread.iter().enumerate() {
                     println!("TIMELINE {i} {}: {}", s(&m["sender"]), display(&m["object"]));
                 }
-                let keys = self.m.archive_keys();
+                let keys = self.mx.engine_mut().archive_keys();
                 let current = keys.iter().max_by_key(|k| k.created_at).map(|k| json!(k.akid)).unwrap_or(Value::Null);
                 println!("OK history {} item(s), current key {current}", thread.len());
                 Ok(())
             }
             "crash-next" => {
-                self.m.store().crash.set(true);
+                self.mx.engine_mut().store().crash.set(true);
                 println!("OK crash-next");
                 Ok(())
             }
@@ -1869,17 +1451,6 @@ fn ogg_opus_duration_ms(bytes: &[u8]) -> Option<i64> {
         pos = data + len;
     }
     Some((last_granule? - pre_skip?).max(0) * 1000 / 48_000)
-}
-
-/// HTTPS for blobs, trusting the same anchors as the `wss` connections (M§5.6: TLS as in §13.2).
-fn http_client(ca: Option<&Path>) -> Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder().use_rustls_tls().https_only(true);
-    if let Some(ca) = ca {
-        for cert in reqwest::Certificate::from_pem_bundle(&std::fs::read(ca)?)? {
-            b = b.add_root_certificate(cert);
-        }
-    }
-    Ok(b.build()?)
 }
 
 #[tokio::main]
@@ -1919,7 +1490,7 @@ async fn main() -> Result<()> {
     }
     let identity_json = json!({"identity": args.identity, "device_seed_hex": hex(&keys.device.seed()), "delegation": delegation.frame(),
                                "controller_seed_hex": hex(&keys.controller.seed()), "display_name": args.identity}).to_string();
-    let mut m = Messenger::open(&identity_json, &mailbox.0, &mailbox.1, db, &state, now as f64).map_err(messenger_err)?;
+    let mut m = Engine::open(&identity_json, &mailbox.0, &mailbox.1, db, &state, now as f64).map_err(messenger_err)?;
     // C§5: a recorder discloses nothing (it sends no receipts)
     let policy = ReceiptPolicy { delivered: !args.no_delivered && !args.recorder, read: !args.recorder && args.disclose.iter().any(|d| d == "read"),
         played: args.disclose.iter().any(|d| d == "played"), activity: args.disclose.iter().any(|d| d == "activity") };
@@ -1928,43 +1499,40 @@ async fn main() -> Result<()> {
     m.set_hub_timeout(args.hub_timeout as f64);
     m.set_no_answer_timeout(args.no_answer_timeout);
     m.set_recorder_sends(args.recorder_misbehave);
-    let mut client = Client {
-        keys,
+    let cfg = dsip_messenger::Config {
         identity: args.identity.clone(),
+        device: keys.device.clone(),
         delegation,
-        m,
+        mailbox,
         resolver_files: args.resolver_files.clone(),
         ca: args.ca.clone(),
-        conn: None,
-        held_offline: false,
-        reconnect_at: None,
-        reconnect_ceiling: 1,
-        mailbox,
-        seen: SeenIds::default(),
+        media_dir: args.state.join("media"),
+        host_key: "dsip-msg".into(),
+    };
+    let mx = dsip_messenger::Messenger::new(m, cfg, host["pending_blobs"].as_array().cloned().unwrap_or_default())?;
+    let c = Console {
+        keys,
+        identity: args.identity.clone(),
         active: host["active"].as_str().map(String::from),
         names: HashMap::new(),
         items: HashMap::new(),
         labels: HashMap::new(),
-        replies: HashMap::new(),
         prefetched: HashMap::new(),
         resent: HashMap::new(),
-        jobs: vec![],
-        pending_blobs: host["pending_blobs"].as_array().cloned().unwrap_or_default(),
         events: events::Events::new(&args).await?,
         recorder_mode: args.recorder,
         recorder_misbehave: args.recorder_misbehave,
         state: args.state.clone(),
-        http: http_client(args.ca.as_deref())?,
     };
-    client.refresh_docs();
-    client.save()?;
+    let mut client = Client { mx, c };
+    client.mx.save(&client.c)?;
     if migrated {
-        clear_migrated(client.m.store())?;
+        clear_migrated(client.mx.engine().store())?;
         println!("MIGRATED dsip-msg state into the Messenger's: {} group(s)", client.conversations().len());
     }
 
     // Restart: everything below comes from the database, exactly as last committed.
-    let since = client.m.state()["resume"]["cursor"].clone();
+    let since = client.mx.engine().state()["resume"]["cursor"].clone();
     for c in client.conversations() {
         println!("RESTORED {} kind={} since={since}", c.conversation, c.kind);
         if c.pending > 0 {
@@ -1972,15 +1540,15 @@ async fn main() -> Result<()> {
             println!("PENDING restored {} item(s) for {}", c.pending, c.group);
         }
     }
-    if client.active.as_ref().is_none_or(|a| client.conv(a).is_err()) {
-        client.active = client.conversations().into_iter().rev().find(|c| c.kind != "personal").map(|c| c.group);
+    if client.c.active.as_ref().is_none_or(|a| client.conv(a).is_err()) {
+        client.c.active = client.conversations().into_iter().rev().find(|c| c.kind != "personal").map(|c| c.group);
     }
-    client.refresh_names();
-    client.connect().await?;
+    client.c.refresh_names(client.mx.engine());
+    client.mx.connect(&mut client.c).await?;
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-    let mut gw_rx = client.events.listen(&args).await?;
+    let mut gw_rx = client.c.events.listen(&args).await?;
     loop {
         let gw = async {
             match gw_rx.recv().await {
@@ -1988,18 +1556,13 @@ async fn main() -> Result<()> {
                 None => std::future::pending().await,
             }
         };
-        let recv = async {
-            match client.conn.as_mut() {
-                Some(c) => c.recv().await,
-                None => std::future::pending().await,
-            }
-        };
+        let recv = client.mx.recv();
         tokio::select! {
             input = gw => {
                 if let Err(e) = client.gateway_input(input).await {
                     println!("ERR {e}");
                 }
-                client.settle().await;
+                client.mx.settle(&mut client.c).await;
             }
             line = stdin.next_line() => {
                 let Some(line) = line? else { break };
@@ -2011,45 +1574,33 @@ async fn main() -> Result<()> {
                 if let Err(e) = client.command(cmd, rest).await {
                     println!("ERR {e}");
                 }
-                if let Err(e) = client.save() {
+                if let Err(e) = client.mx.save(&client.c) {
                     println!("ERR {e}");
                 }
-                client.settle().await;
+                client.mx.settle(&mut client.c).await;
             }
             _ = ticker.tick() => {
-                client.tick().await;
-                if let Err(e) = client.check_reconnect().await {
+                client.mx.tick(&mut client.c).await;
+                if let Err(e) = client.mx.check_reconnect(&mut client.c).await {
                     println!("ERR {e}");
                 }
                 // M§8.4 (spec-gap 106): blob fetches that found nothing are tried again
-                if let Err(e) = client.retry_blobs() {
+                if let Err(e) = client.mx.retry_blobs(&client.c) {
                     println!("ERR {e}");
                 }
                 // E§5–E§6: alarm timers (escalation, gateway silence)
-                client.tick_alarms();
-                if client.events.gateway_due() {
+                client.c.tick_alarms();
+                if client.c.events.gateway_due() {
                     if let Err(e) = client.gateway_tick().await {
                         println!("ERR {e}");
                     }
                 }
-                client.settle().await;
+                client.mx.settle(&mut client.c).await;
             }
-            frame = recv => {
-                match frame {
-                    Ok(Some(text)) => {
-                        client.on_frame(&text).await;
-                        // what the frame set going (receipts, archive records) is answered before the next command
-                        client.settle().await;
-                    }
-                    Ok(None) => {
-                        println!("DISCONNECTED by the mailbox");
-                        client.lost_connection();
-                    }
-                    Err(e) => {
-                        println!("ERR connection {e}");
-                        client.lost_connection();
-                    }
-                }
+            Some(frame) = recv => {
+                // what the frame set going (receipts, archive records) is answered before the next command
+                client.mx.received(&mut client.c, frame).await;
+                client.mx.settle(&mut client.c).await;
             }
         }
         std::io::stdout().flush()?;

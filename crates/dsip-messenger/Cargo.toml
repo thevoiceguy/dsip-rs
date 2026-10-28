@@ -1,0 +1,27 @@
+[package]
+name = "dsip-messenger"
+description = "DSIP messaging facade: the native host of the Messenger — its mailbox connection, reconnects, KeyPackage and blob fetches, successors and persistence — handing the application ordered outputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Inherits dsip-mls's floor (OpenMLS 0.9).
+rust-version = "1.91"
+
+[dependencies]
+dsip-core.workspace = true
+dsip-messaging.workspace = true
+dsip-messaging-device.workspace = true
+dsip-mls.workspace = true
+dsip-transport.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+
+[dev-dependencies]
+dsip-messaging-device.workspace = true

@@ -25,6 +25,7 @@ members = [
     "crates/dsip-node",
     "crates/dsip-testkit",
     "crates/dsip-phone",
+    "crates/dsip-messenger",
 ]
 
 [workspace.package]
@@ -62,6 +63,7 @@ dsip-broadcast = { path = "crates/dsip-broadcast" }
 dsip-relay = { path = "crates/dsip-relay" }
 dsip-testkit = { path = "crates/dsip-testkit" }
 dsip-phone = { path = "crates/dsip-phone" }
+dsip-messenger = { path = "crates/dsip-messenger" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
