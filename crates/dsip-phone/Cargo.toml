@@ -1,0 +1,31 @@
+[package]
+name = "dsip-phone"
+description = "DSIP phone facade: a Phone that places and takes calls, with Call handles to await, answer and hang up, and native media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+dsip-endpoint.workspace = true
+dsip-session.workspace = true
+dsip-transport.workspace = true
+dsip-media = { workspace = true, optional = true }
+rustls.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# Native WebRTC audio through dsip-media. Without it a phone signals calls with no media (bots, tests, gateways that
+# bring their own).
+default = ["media"]
+media = ["dep:dsip-media"]
+
+[dev-dependencies]
+dsip-testkit.workspace = true
+dsip-media.workspace = true
+rustls = { workspace = true, features = ["ring"] }

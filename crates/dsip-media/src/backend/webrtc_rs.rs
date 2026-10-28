@@ -36,7 +36,7 @@ pub struct WebRtcRsLeg {
     pc: Arc<RTCPeerConnection>,
     track: Option<Arc<TrackLocalStaticSample>>,
     source: Source,
-    events: mpsc::UnboundedReceiver<MediaEvent>,
+    pub(crate) events: mpsc::UnboundedReceiver<MediaEvent>,
     packets_in: Arc<AtomicU64>,
     bytes_in: Arc<AtomicU64>,
     frames_out: Arc<AtomicU64>,

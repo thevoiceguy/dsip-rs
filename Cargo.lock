@@ -1561,6 +1561,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsip-phone"
+version = "0.1.0"
+dependencies = [
+ "dsip-core",
+ "dsip-endpoint",
+ "dsip-media",
+ "dsip-session",
+ "dsip-testkit",
+ "dsip-transport",
+ "rustls",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dsip-recording"
 version = "0.1.0"
 dependencies = [

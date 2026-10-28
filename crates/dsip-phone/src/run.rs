@@ -1,0 +1,358 @@
+//! The phone's task: it owns the agent and the media legs, takes commands from the handles, and tells each call's
+//! handle where its call is.
+//!
+//! Spec: §12.4 (states read from the endpoint's sessions), §12.11 (hanging up: cancel, decline or bye by state),
+//! §16.3 and §12.12 (SDP and candidates for the call glue), §14.1 (sending starts when the call glue says so).
+
+use std::collections::{HashMap, VecDeque};
+
+use tokio::sync::{mpsc, watch};
+
+use dsip_endpoint::{CallCommand, MediaRequest};
+use dsip_session::{Emission, Role, SessionState, UiEvent};
+use dsip_transport::agent::{Agent, AgentEvent};
+
+use crate::{Call, CallState, Cmd, IncomingCall, Line, Media, Result};
+
+/// One call the handles follow.
+struct Track {
+    state: watch::Sender<CallState>,
+    error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    #[cfg_attr(not(feature = "media"), allow(dead_code))] // only a native leg hears anything
+    heard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub(crate) struct Runner {
+    agent: Agent,
+    cmds: mpsc::UnboundedReceiver<Cmd>,
+    line: Line,
+    incoming: mpsc::UnboundedSender<IncomingCall>,
+    calls: HashMap<String, Track>,
+    #[cfg(feature = "media")]
+    legs: legs::Legs,
+}
+
+/// What one batch of events said about calls, read before their states are.
+#[derive(Default)]
+struct Batch {
+    /// The `reason` of messages, by session.
+    reasons: HashMap<String, String>,
+    /// The `answered_by` of answers, by session.
+    answered_by: HashMap<String, String>,
+    /// Sessions whose callee rings.
+    ringing: Vec<String>,
+    /// The engine's `Ended` and `Answered` emissions, which name no session.
+    ended: VecDeque<String>,
+    answered: VecDeque<String>,
+}
+
+impl Runner {
+    pub(crate) fn new(agent: Agent, cmds: mpsc::UnboundedReceiver<Cmd>, line: Line, incoming: mpsc::UnboundedSender<IncomingCall>,
+                      media: Media) -> Runner {
+        #[cfg(not(feature = "media"))]
+        let _ = media;
+        Runner {
+            #[cfg(feature = "media")]
+            legs: legs::Legs::new(media, line.wake.clone()),
+            agent,
+            cmds,
+            line,
+            incoming,
+            calls: HashMap::new(),
+        }
+    }
+
+    pub(crate) async fn run(mut self) -> Result<()> {
+        loop {
+            let events = match self.agent.next().await {
+                Ok(events) => events,
+                Err(e) => {
+                    self.end_all("transport.closed");
+                    return Err(e.into());
+                }
+            };
+            self.observe(events).await?;
+            loop {
+                match self.cmds.try_recv() {
+                    Ok(Cmd::Close) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.agent.save_contacts()?;
+                        self.agent.close().await;
+                        self.end_all("transport.closed");
+                        return Ok(());
+                    }
+                    Ok(cmd) => self.command(cmd).await?,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                }
+            }
+            #[cfg(feature = "media")]
+            for session in self.legs.events(&mut self.agent).await? {
+                if let Some(t) = self.calls.get(&session) {
+                    t.heard.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    async fn command(&mut self, cmd: Cmd) -> Result<()> {
+        match cmd {
+            Cmd::Place { to, invite, reply } => {
+                let placed = self.agent.place(&to, invite).await.map(|session| self.track(session, CallState::Calling));
+                let _ = reply.send(placed.map_err(Into::into));
+            }
+            Cmd::Call(c) => {
+                if let Err(e) = self.agent.call(c).await {
+                    tracing::warn!("call command: {e}");
+                }
+            }
+            Cmd::HangUp(session) => {
+                let s = self.agent.endpoint().session(&session).map(|s| (s.role, s.state));
+                let cmd = match s {
+                    Some((_, SessionState::Ended)) => return Ok(()),
+                    Some((_, SessionState::Active)) => CallCommand::Hangup { session },
+                    Some((Role::Responder, _)) => CallCommand::Decline { session },
+                    // placed: cancel before the answer (§12.11); a call still waiting on its offer is cancelled too
+                    _ => CallCommand::Cancel { session },
+                };
+                if let Err(e) = self.agent.call(cmd).await {
+                    tracing::warn!("hanging up: {e}");
+                }
+            }
+            Cmd::Close => unreachable!("handled by run"),
+        }
+        Ok(())
+    }
+
+    fn track(&mut self, session: String, state: CallState) -> Call {
+        let (tx, rx) = watch::channel(state);
+        let (error, heard) = (std::sync::Arc::default(), std::sync::Arc::<std::sync::atomic::AtomicBool>::default());
+        self.calls.insert(session.clone(), Track { state: tx, error: std::sync::Arc::clone(&error), heard: std::sync::Arc::clone(&heard) });
+        Call { session, state: rx, error, heard, line: self.line.clone() }
+    }
+
+    async fn observe(&mut self, events: Vec<AgentEvent>) -> Result<()> {
+        let mut b = Batch::default();
+        for ev in events {
+            match ev {
+                AgentEvent::Received { message, identity, display_name, .. } => {
+                    let sid = message.session_id().to_string();
+                    if let Some(r) = &message.reason {
+                        b.reasons.insert(sid.clone(), r.clone());
+                    }
+                    match message.msg_type.as_str() {
+                        "answer" => {
+                            if let Some(a) = &message.answered_by {
+                                b.answered_by.insert(sid.clone(), a.clone());
+                            }
+                        }
+                        "progress" if message.status.as_deref() == Some("ringing") => b.ringing.push(sid.clone()),
+                        "error" => {
+                            // a refused invite is answered in reply to it, and an invite's id is its session (§12.2)
+                            let about = message.session.clone().or_else(|| message.in_reply_to.clone()).unwrap_or_default();
+                            if let (Some(t), Some(r)) = (self.calls.get(&about), &message.reason) {
+                                if let Ok(mut e) = t.error.lock() {
+                                    *e = Some(r.clone());
+                                }
+                            }
+                        }
+                        "invite" if !self.calls.contains_key(&sid)
+                            && self.agent.endpoint().session(&sid).is_some_and(|s| s.role == Role::Responder) =>
+                        {
+                            let call = self.track(sid, CallState::Ringing);
+                            let _ = self.incoming.send(IncomingCall { call, from: identity, display_name });
+                        }
+                        _ => {}
+                    }
+                }
+                AgentEvent::Emission(Emission::Ui(UiEvent::Ended { reason })) => b.ended.push_back(reason),
+                AgentEvent::Emission(Emission::Ui(UiEvent::Answered { answered_by })) => b.answered.push_back(answered_by),
+                AgentEvent::Media(req) => self.media(req).await?,
+                _ => {}
+            }
+        }
+        self.update(b);
+        Ok(())
+    }
+
+    /// Tell each handle where its call is now.
+    fn update(&mut self, mut b: Batch) {
+        let mut over = vec![];
+        for (sid, t) in &self.calls {
+            let now = self.agent.endpoint().session(sid).map(|s| s.state);
+            let shown = t.state.borrow().clone();
+            let next = match now {
+                Some(SessionState::Ended) => {
+                    over.push(sid.clone());
+                    let reason = b.reasons.remove(sid).or_else(|| b.ended.pop_front()).unwrap_or_else(|| "unknown".into());
+                    Some(CallState::Ended { reason })
+                }
+                Some(SessionState::Active) if !matches!(shown, CallState::Answered { .. }) => {
+                    let answered_by = b.answered_by.remove(sid).or_else(|| b.answered.pop_front()).unwrap_or_else(|| "user".into());
+                    Some(CallState::Answered { answered_by })
+                }
+                _ if shown == CallState::Calling && b.ringing.contains(sid) => Some(CallState::Ringing),
+                _ => None,
+            };
+            if let Some(n) = next {
+                t.state.send_replace(n);
+            }
+        }
+        for sid in over {
+            self.calls.remove(&sid);
+        }
+    }
+
+    fn end_all(&mut self, reason: &str) {
+        for (_, t) in self.calls.drain() {
+            t.state.send_replace(CallState::Ended { reason: reason.into() });
+        }
+    }
+
+    #[cfg(feature = "media")]
+    async fn media(&mut self, req: MediaRequest) -> Result<()> {
+        self.legs.request(&mut self.agent, req).await
+    }
+
+    #[cfg(not(feature = "media"))]
+    async fn media(&mut self, req: MediaRequest) -> Result<()> {
+        tracing::warn!("media request without the media feature: {req:?}");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "media")]
+mod legs {
+    //! One native media leg per call, as the call glue asks.
+    //!
+    //! Spec: §16.3 (SDP in `transports[0].sdp`), §14.4 (a screening leg sends nothing; escalation adds the source),
+    //! §12.12 (local candidates for signed `info`, remote ones from it), §14.1 (send only once told).
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::sync::{mpsc, Notify};
+
+    use dsip_endpoint::{MediaRequest, MediaResult};
+    use dsip_media::{Candidate, MediaConfig, MediaEvent, MediaLeg, Source};
+    use dsip_transport::agent::Agent;
+
+    use crate::{Media, Result};
+
+    struct Leg {
+        leg: MediaLeg,
+        screening: bool,
+    }
+
+    pub(super) struct Legs {
+        cfg: Option<MediaConfig>,
+        legs: HashMap<String, Leg>,
+        tx: mpsc::UnboundedSender<(String, MediaEvent)>,
+        rx: mpsc::UnboundedReceiver<(String, MediaEvent)>,
+        wake: Arc<Notify>,
+    }
+
+    impl Legs {
+        pub(super) fn new(media: Media, wake: Arc<Notify>) -> Legs {
+            let cfg = match media {
+                Media::Native(c) => Some(c),
+                Media::None => None,
+            };
+            let (tx, rx) = mpsc::unbounded_channel();
+            Legs { cfg, legs: HashMap::new(), tx, rx, wake }
+        }
+
+        /// Make a leg for `session`, its events forwarded to the phone's task.
+        async fn open(&mut self, session: &str, screening: bool) -> Result<()> {
+            let Some(cfg) = &self.cfg else { return Ok(()) };
+            let mut cfg = cfg.clone();
+            if screening {
+                cfg.source = Source::None;
+            }
+            let mut leg = MediaLeg::new(cfg).await?;
+            let mut events = leg.take_events();
+            let (tx, wake, sid) = (self.tx.clone(), self.wake.clone(), session.to_string());
+            tokio::spawn(async move {
+                while let Some(e) = events.recv().await {
+                    if tx.send((sid.clone(), e)).is_err() {
+                        break;
+                    }
+                    wake.notify_one();
+                }
+            });
+            if let Some(old) = self.legs.insert(session.into(), Leg { leg, screening }) {
+                old.leg.close().await;
+            }
+            Ok(())
+        }
+
+        pub(super) async fn request(&mut self, agent: &mut Agent, req: MediaRequest) -> Result<()> {
+            match req {
+                MediaRequest::Offer { session, add_source } => {
+                    if !self.legs.contains_key(&session) {
+                        self.open(&session, false).await?;
+                    }
+                    let source = self.cfg.as_ref().map(|c| c.source.clone());
+                    let Some(l) = self.legs.get_mut(&session) else { return Ok(()) };
+                    if let (true, Some(source)) = (add_source, source) {
+                        l.leg.add_source(source).await?; // §14.4 step 3
+                        l.screening = false;
+                    }
+                    let sdp = l.leg.create_offer().await?;
+                    agent.media(MediaResult::Offer { session, sdp }).await?;
+                }
+                MediaRequest::Answer { session, offer, screening } => {
+                    if self.legs.get(&session).is_none_or(|l| screening && !l.screening) {
+                        self.open(&session, screening).await?;
+                    }
+                    let Some(l) = self.legs.get(&session) else { return Ok(()) };
+                    let sdp = l.leg.accept_offer(&offer).await?;
+                    agent.media(MediaResult::Answer { session, sdp }).await?;
+                }
+                MediaRequest::ApplyAnswer { session, sdp } => {
+                    if let Some(l) = self.legs.get(&session) {
+                        l.leg.set_answer(&sdp).await?;
+                    }
+                }
+                MediaRequest::RemoteCandidates { session, candidates } => {
+                    if let Some(l) = self.legs.get(&session) {
+                        for c in candidates.into_iter().filter_map(|c| serde_json::from_value::<Candidate>(c).ok()) {
+                            l.leg.add_remote_candidate(&c).await.ok();
+                        }
+                    }
+                }
+                MediaRequest::StartSending { session } => {
+                    if let Some(l) = self.legs.get(&session) {
+                        l.leg.start_sending();
+                    }
+                }
+                MediaRequest::HoldSending { session } => {
+                    if let Some(l) = self.legs.get(&session) {
+                        l.leg.hold_sending();
+                    }
+                }
+                MediaRequest::Close { session } => {
+                    if let Some(l) = self.legs.remove(&session) {
+                        l.leg.close().await;
+                    }
+                }
+                other => tracing::warn!("unhandled media request {other:?}"),
+            }
+            Ok(())
+        }
+
+        /// Hand the call glue the local candidates the legs gathered; the sessions whose first packet arrived.
+        pub(super) async fn events(&mut self, agent: &mut Agent) -> Result<Vec<String>> {
+            let mut heard = vec![];
+            while let Ok((session, e)) = self.rx.try_recv() {
+                match e {
+                    MediaEvent::Candidate(c) if self.legs.contains_key(&session) => {
+                        let candidate = c.map(|c| serde_json::to_value(c).unwrap_or_default());
+                        agent.media(MediaResult::Candidate { session, candidate }).await?;
+                    }
+                    MediaEvent::FirstPacket => heard.push(session),
+                    _ => {}
+                }
+            }
+            Ok(heard)
+        }
+    }
+}

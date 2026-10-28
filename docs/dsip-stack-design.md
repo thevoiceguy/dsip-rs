@@ -443,6 +443,12 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    reconnect) and `dsip-testkit`: `Network` (an embedded relay, `did:key` identities, second devices), `Device`
    (an `Agent` with `expect`, `until`, `call`, `command`), checked by a call, a forked call, an unknown recipient and a
    replaced connection, all in-process.
+   4c done: `dsip-phone`. `Phone::builder()` (identity, relay or dialer, TLS, answer and recording policy, media,
+   `configure` for the agent) → `Phone::call` / `Phone::incoming` → `Call` (state, `outcome`, `ended`, `hang_up`,
+   `error`, `media_received`) and `IncomingCall` (accept, screen, decline). A task owns the agent and one native leg
+   per call; `Agent::waker` lets it take commands without cancelling `Agent::next`. An `error` changes no call state
+   (§12.7 rule 6): a call refused `transport.unknown-recipient` ends by T-Establish, as in both clients, and the
+   `Call` keeps the refusal. Eight tests on the testkit, native audio both ways included; `examples/softphone.rs`.
 
 5. **Its own repository and release.** Move the stack crates (or the whole of `impl/`) out when core reaches 1.0,
    tag the first CalVer release, and switch the gateway to git dependencies on it. The vectors move with the spec,
