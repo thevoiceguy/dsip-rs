@@ -124,6 +124,8 @@ pub struct Agent {
     replaced: bool,
     /// ... and the connection has closed: [`Agent::next`] returns [`Error::Replaced`] once its events are handed over
     replaced_closed: bool,
+    /// Wakes [`Agent::next`] for the host ([`Agent::waker`]).
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl Agent {
@@ -162,7 +164,8 @@ impl Agent {
         let did_resolver = cfg.did_resolver.clone().unwrap_or_else(|| Arc::new(DidWebResolver::new()));
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let calls = cfg.calls.map(Calls::new);
-        Ok(Agent { id, cfg, supported, resolver, conn, core, calls, events: vec![], did_resolver, resolved_tx, resolved_rx, replaced: false, replaced_closed: false })
+        Ok(Agent { id, cfg, supported, resolver, conn, core, calls, events: vec![], did_resolver, resolved_tx, resolved_rx, replaced: false, replaced_closed: false,
+                   wake: Arc::new(tokio::sync::Notify::new()) })
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -406,8 +409,15 @@ impl Agent {
         Ok(())
     }
 
-    /// Wait for the next thing to happen (inbound frame, timer, or connection loss) and return
-    /// the accumulated application events. Reconnects with backoff on connection loss.
+    /// A handle that makes [`Agent::next`] return what it holds, even nothing, so the host can act (a command from
+    /// another task, a media event). A wake before `next` is waiting is kept for it. Waking is how a host interrupts
+    /// `next` without cancelling it mid-step, as dropping it in a `select!` could.
+    pub fn waker(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.wake)
+    }
+
+    /// Wait for the next thing to happen (inbound frame, timer, connection loss, or a [`Agent::waker`] wake) and
+    /// return the accumulated application events. Reconnects with backoff on connection loss.
     pub async fn next(&mut self) -> Result<Vec<AgentEvent>> {
         loop {
             if !self.events.is_empty() {
@@ -442,6 +452,7 @@ impl Agent {
                     self.dispatch(out).await?;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(wait.max(1))) => {}
+                _ = self.wake.notified() => return Ok(std::mem::take(&mut self.events)),
             }
             self.tick_and_handle().await?;
         }

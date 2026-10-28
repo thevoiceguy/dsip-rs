@@ -33,7 +33,7 @@ pub struct ForgeLeg {
     source: Source,
     record: Option<PathBuf>,
     events_tx: mpsc::UnboundedSender<MediaEvent>,
-    events: mpsc::UnboundedReceiver<MediaEvent>,
+    pub(crate) events: mpsc::UnboundedReceiver<MediaEvent>,
     pump_started: AtomicBool,
     packets_in: Arc<AtomicU64>,
     bytes_in: Arc<AtomicU64>,

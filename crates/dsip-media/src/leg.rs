@@ -121,6 +121,14 @@ pub struct MediaConfig {
     pub tap_out: Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>,
 }
 
+impl Default for MediaConfig {
+    /// Sends nothing, records nothing, no STUN or TURN, the default backend.
+    fn default() -> MediaConfig {
+        MediaConfig { source: Source::None, record: None, stun: vec![], turn: vec![], backend: Backend::default(), send_only: false,
+                      tap_in: None, tap_out: None }
+    }
+}
+
 /// Events from the leg to its host.
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
@@ -218,6 +226,12 @@ impl MediaLeg {
     /// Next leg event.
     pub async fn next_event(&mut self) -> Option<MediaEvent> {
         dispatch!(self, l => l.next_event().await)
+    }
+
+    /// Take the leg's events, for a host that reads them on another task while it keeps using the leg; afterwards
+    /// [`MediaLeg::next_event`] returns `None`.
+    pub fn take_events(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<MediaEvent> {
+        dispatch!(self, l => std::mem::replace(&mut l.events, tokio::sync::mpsc::unbounded_channel().1))
     }
 
     /// Begin transmitting the configured source. Spec §14.1: the host calls this only once ACTIVE.
