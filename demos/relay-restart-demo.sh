@@ -20,14 +20,14 @@ RELAY=
 relay() { $B/dsip-relay --listen 127.0.0.1:8624 --state "$D/relay" >>"$D/relay.log" 2>&1 & RELAY=$!; }
 restart() { # count: the relay's (count)th start
   kill -9 $RELAY; wait $RELAY 2>/dev/null || true
-  relay; for _ in $(seq 50); do [ "$(plain | grep -c "queue store:")" -ge "$1" ] && break; sleep 0.2; done
+  relay; for _ in $(seq 50); do [ "$(plain | grep -c "listening on")" -ge "$1" ] && break; sleep 0.2; done
   plain | grep "queue store:" | tail -1 | sed -E 's/.*dsip_relay[^ ]*: /  /'
 }
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 for who in alice bob carol; do $B/dsip identity init --dir "$D/$who" --name "$who" >/dev/null; done
 id() { python3 -c "import json;print(json.load(open('$D/$1/identity.json'))['identity'])"; }
 BOB=$(id bob); CAROL=$(id carol)
-relay; wait_relay "queue store:" 10; CA="$D/relay/cert.pem"
+relay; wait_relay "listening on" 10; CA="$D/relay/cert.pem"
 
 echo "════════ Bob's phone binds once (the relay knows him) and goes offline; Alice calls him"
 $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --script "sleep 1; quit" >"$D/bob-0.log" 2>&1
