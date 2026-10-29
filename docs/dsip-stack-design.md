@@ -449,6 +449,18 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    per call; `Agent::waker` lets it take commands without cancelling `Agent::next`. An `error` changes no call state
    (§12.7 rule 6): a call refused `transport.unknown-recipient` ends by T-Establish, as in both clients, and the
    `Call` keeps the refusal. Eight tests on the testkit, native audio both ways included; `examples/softphone.rs`.
+   4d, first part: the mailbox as a library. `dsip_mailbox::MailboxServer` (`open` from a `MailboxConfig`, which
+   loads the saved state; `spawn_tasks` for fan-out retries, idle release and blob replication; `spawn_status`;
+   `serve_tls`; `accept` over any stream, a WebSocket or a blob request), with a typed `dsip_mailbox::service::Error`;
+   the `dsip-mailbox` binary parses flags and hosts it. A device binds to an embedded mailbox over a pipe
+   (`tests/in_process.rs`).
+   4d, second part: `dsip-messenger`. `Messenger<S: Store>` holds the engine (the `Messenger` of
+   `dsip-messaging-device`) and does what dsip-msg did around it: the mailbox connection and its §13.2 reconnects,
+   requests that wait for their answers, KeyPackages fetched from other identities' mailboxes, blobs fetched and retried
+   (spec-gap 106), successors created when a hub is gone (M§7.5, M§9.4), and the state written after every step. The
+   application implements `Host`: each `Output` reaches it in order, with the engine to read, so dsip-msg prints the
+   lines it printed. dsip-msg is now its commands and its console (`Console: Host`), the device-events gateway included;
+   all 25 of its demos pass unchanged. `examples/echo_bot.rs`.
 
 5. **Its own repository and release.** Move the stack crates (or the whole of `impl/`) out when core reaches 1.0,
    tag the first CalVer release, and switch the gateway to git dependencies on it. The vectors move with the spec,

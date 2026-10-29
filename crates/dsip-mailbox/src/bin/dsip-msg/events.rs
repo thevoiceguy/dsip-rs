@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use dsip_transport::now_s;
 
-use super::{Args, Client, Item, Sent};
+use super::{Args, Client, Console, Item, Sent};
 
 /// The device-events state of one device: its alarm lists, and in gateway mode everything the gateway holds.
 pub(super) struct Events {
@@ -167,26 +167,6 @@ impl Client {
         }
     }
 
-    /// A received `device-event` or `alarm-ack` (E§5) applied to its group's alarm list; false for other content.
-    pub(super) fn event_in(&mut self, gid: &str, sender: &str, object: &Value) -> bool {
-        if object["kind"] == "device-event" {
-            // E§5: the gateway signed it; the device is a claim with its basis
-            let ev = &object["event"];
-            if let Some(h) = ev.get("heartbeat") {
-                self.alarm_step(gid, &json!({"heartbeat": {"gateway": sender, "interval_s": h["interval_s"]}}));
-            } else {
-                println!("EVENT {sender} {}", render_event(ev));
-                if let Some(a) = ev.get("alarm") {
-                    self.alarm_step(gid, &json!({"report": a}));
-                }
-            }
-        } else if object["kind"] == "alarm-ack" {
-            self.alarm_step(gid, &json!({"ack": {"alarm": object["alarm"], "state": object["state"], "by": sender}}));
-        } else {
-            return false;
-        }
-        true
-    }
     /// Send a `device-event` (E§5) given as JSON: this device is the gateway that signs it.
     pub(super) async fn send_device_event(&mut self, event_json: &str) -> Result<()> {
         let event: Value = serde_json::from_str(event_json.trim()).context("device-event: not JSON")?;
@@ -201,12 +181,12 @@ impl Client {
             alarm["type"].as_str().unwrap_or("").to_string(),
             alarm["qualifier"].as_str().unwrap_or("").to_string(),
         );
-        if self.events.hold_down.report(&alarm).is_empty() {
+        if self.c.events.hold_down.report(&alarm).is_empty() {
             println!("HELD clear of {}/{} for hold-down   E§4", key.0, key.1);
-            self.events.held_events.entry(key).or_insert(event);
+            self.c.events.held_events.entry(key).or_insert(event);
             return Ok(());
         }
-        if self.events.held_events.remove(&key).is_some() {
+        if self.c.events.held_events.remove(&key).is_some() {
             println!("CANCELLED held clear of {}/{}: re-raised within the hold-down (a flap)   E§4", key.0, key.1);
         }
         self.deposit_event(event).await.map(|_| ())
@@ -215,7 +195,7 @@ impl Client {
     /// Deposit one `device-event` into the active conversation through the outbox (M§9.2): its `sent` says
     /// `OK sent event`.
     async fn deposit_event(&mut self, event: Value) -> Result<Sent> {
-        let group = self.active()?;
+        let group = self.c.active()?;
         self.may_send(&group)?;
         let obj = self.content(&group, json!({"kind": "device-event", "event": event}))?;
         self.send_content(&group, obj, Item::Event).await
@@ -226,7 +206,7 @@ impl Client {
     async fn snmp_in(&mut self, datagram: &[u8], from: std::net::SocketAddr) -> Result<()> {
         let address = from.ip().to_string();
         let (trap, source, response) = if dsip_events::usm::is_v3(datagram) {
-            let Some(usm) = self.events.usm.as_mut() else {
+            let Some(usm) = self.c.events.usm.as_mut() else {
                 println!("SNMP dropped from {from}: SNMPv3, and no --snmp-users");
                 return Ok(());
             };
@@ -241,7 +221,7 @@ impl Client {
                 }
                 dsip_events::usm::Verdict::Refused { reason, report } => {
                     // E§3: only discovery and time synchronization are answered
-                    let sent = match (&report, &self.events.snmp) {
+                    let sent = match (&report, &self.c.events.snmp) {
                         (Some(r), Some(sock)) => sock.send_to(r, from).await.is_ok(),
                         _ => false,
                     };
@@ -275,7 +255,7 @@ impl Client {
             }
         };
         if r.kind == dsip_events::tsm::Kind::Discovery {
-            let _ = peer.reply.send(r.discovery_response(&self.events.snmp_engine));
+            let _ = peer.reply.send(r.discovery_response(&self.c.events.snmp_engine));
             println!("SNMP tls discovery from {from} ({}): answered with our engine ID   RFC 5343", peer.security_name);
             return Ok(());
         }
@@ -289,7 +269,7 @@ impl Client {
         // E§2: the authenticated identity is the certificate and the name it mapped to
         let mut source = json!({"address": from.ip().to_string(), "basis": "snmpv3-tls", "certificate_sha256": peer.certificate_sha256,
                                 "tsm": {"security_name": peer.security_name, "transport": peer.transport}});
-        if let Some(name) = self.events.tls_names.get(&peer.certificate_sha256).and_then(Value::as_str) {
+        if let Some(name) = self.c.events.tls_names.get(&peer.certificate_sha256).and_then(Value::as_str) {
             source["name"] = json!(name);
         }
         // informs are remembered by security name, so a retransmission on a new connection is not stored twice
@@ -305,7 +285,7 @@ impl Client {
             return Ok(());
         }
         let mut event = json!({"source": source, "raw": raw});
-        if let Some(alarm) = dsip_events::map_alarm(&raw, &self.events.snmp_rules, &address).get("alarm") {
+        if let Some(alarm) = dsip_events::map_alarm(&raw, &self.c.events.snmp_rules, &address).get("alarm") {
             event["alarm"] = alarm.clone();
         }
         let Some(rid) = trap["inform"]["request_id"].as_i64() else {
@@ -315,26 +295,26 @@ impl Client {
         let key = (from.clone(), rid);
         // the response to the latest copy: a v3 retransmission may carry a new msgID, which its sender matches on
         if let Some(resp) = response {
-            self.events.inform_responses.insert(key.clone(), resp);
+            self.c.events.inform_responses.insert(key.clone(), resp);
         }
-        let emitted = self.events.informs.step(&json!({"inform": {"source": key.0, "request_id": rid}}));
+        let emitted = self.c.events.informs.step(&json!({"inform": {"source": key.0, "request_id": rid}}));
         if emitted.is_empty() {
             println!("SNMP inform {from} rid={rid}: retransmission while pending, not answered yet");
         }
         for e in emitted {
             if e.get("respond").is_some() {
                 println!("SNMP inform {from} rid={rid}: retransmission, answered again");
-                self.inform_respond(&key).await;
+                self.c.inform_respond(&key).await;
             } else if e.get("deposit").is_some() {
                 println!("SNMP inform {from} rid={rid}: {}", raw["snmp"]["trap_oid"].as_str().unwrap_or("-"));
                 // answered when the hub accepts its event, whenever that is (M§9.4: an outage keeps it pending)
                 match self.deposit_event(event.clone()).await? {
                     Sent::Out(id) => {
-                        self.events.inform_items.insert(id, key.clone());
+                        self.c.events.inform_items.insert(id, key.clone());
                     }
                     Sent::Queued(id) => {
-                        self.events.inform_items.insert(id.clone(), key.clone());
-                        self.inform_pending(&id);
+                        self.c.events.inform_items.insert(id.clone(), key.clone());
+                        self.c.inform_pending(&id);
                     }
                     Sent::Successor => println!("SNMP inform {from} rid={rid}: pending, not answered"),
                 }
@@ -346,16 +326,16 @@ impl Client {
     /// Gateway mode (E§3): one syslog message, over UDP or (with the device's verified certificate) TLS → a signed
     /// `device-event`.
     async fn syslog_in(&mut self, message: &[u8], from: std::net::SocketAddr, certificate: Option<String>) -> Result<()> {
-        let Some((col, _)) = self.events.syslog_sign.as_mut() else { return self.syslog_event(message, from, certificate, None).await };
+        let Some((col, _)) = self.c.events.syslog_sign.as_mut() else { return self.syslog_event(message, from, certificate, None).await };
         let outs = col.receive(message);
         if let Some(h) = dsip_events::syslog::parse_syslog(message)["syslog"]["hostname"].as_str() {
-            self.events.syslog_signer_at.insert(h.to_ascii_lowercase(), from);
+            self.c.events.syslog_signer_at.insert(h.to_ascii_lowercase(), from);
         }
         if outs.is_empty() {
             // E§3: held for its Signature Block; remember how it came, for an unsigned deposit later
             use sha2::Digest as _;
             let sha: String = sha2::Sha256::digest(message).iter().map(|b| format!("{b:02x}")).collect();
-            self.events.syslog_held.entry(sha).or_default().push_back((from, certificate.clone()));
+            self.c.events.syslog_held.entry(sha).or_default().push_back((from, certificate.clone()));
             println!("SYSLOG from {from}: held for its signature   E§3");
         }
         self.syslog_sign_out(outs, Some((from, certificate))).await
@@ -371,9 +351,9 @@ impl Client {
                 Out::Deposit { message, signed } => {
                     let sha: String = sha2::Sha256::digest(&message).iter().map(|b| format!("{b:02x}")).collect();
                     // a held message deposits with the transport it came by; the current one with its own
-                    let held = self.events.syslog_held.get_mut(&sha).and_then(|q| q.pop_front());
-                    if self.events.syslog_held.get(&sha).is_some_and(|q| q.is_empty()) {
-                        self.events.syslog_held.remove(&sha);
+                    let held = self.c.events.syslog_held.get_mut(&sha).and_then(|q| q.pop_front());
+                    if self.c.events.syslog_held.get(&sha).is_some_and(|q| q.is_empty()) {
+                        self.c.events.syslog_held.remove(&sha);
                     }
                     let Some((from, cert)) = held.or_else(|| current.clone()) else { continue };
                     self.syslog_event(&message, from, cert, signed).await?;
@@ -385,7 +365,7 @@ impl Client {
                 Out::Gap(g) => {
                     // E§3/E§5 (v0.11): a gateway event raising (signer, dsip-syslog-gap, "app/sg/spri")
                     let host = g["hostname"].as_str().unwrap_or("").to_ascii_lowercase();
-                    let address = current.as_ref().map(|(a, _)| *a).or_else(|| self.events.syslog_signer_at.get(&host).copied())
+                    let address = current.as_ref().map(|(a, _)| *a).or_else(|| self.c.events.syslog_signer_at.get(&host).copied())
                         .map(|a| a.ip().to_string()).unwrap_or_default();
                     let (from, to) = (g["from"].as_u64().unwrap_or(0), g["to"].as_u64().unwrap_or(0));
                     let qualifier = format!("{}/{}/{}", g["app_name"].as_str().unwrap_or(""), g["sg"], g["spri"]);
@@ -414,7 +394,7 @@ impl Client {
         let mut source = json!({"address": address, "basis": if certificate.is_some() { "syslog-tls" } else { "syslog-udp" }});
         if let Some(c) = certificate {
             // E§2 (v0.10): the gateway's configured name for this certificate, as its claim
-            if let Some(name) = self.events.tls_names.get(&c).and_then(Value::as_str) {
+            if let Some(name) = self.c.events.tls_names.get(&c).and_then(Value::as_str) {
                 source["name"] = json!(name);
             }
             source["certificate_sha256"] = json!(c);
@@ -424,13 +404,81 @@ impl Client {
             source["signed"] = s;
         }
         let mut event = json!({"source": source, "raw": raw});
-        if let Some(alarm) = dsip_events::syslog::map_syslog(&raw, &self.events.snmp_rules, &address, &self.events.syslog_table).get("alarm") {
+        if let Some(alarm) = dsip_events::syslog::map_syslog(&raw, &self.c.events.snmp_rules, &address, &self.c.events.syslog_table).get("alarm") {
             event["alarm"] = alarm.clone();
         }
         let sl = &raw["syslog"];
         println!("SYSLOG from {from} ({}): severity {} {} {}", event["source"]["basis"].as_str().unwrap_or("-"),
                  sl["severity"], sl["app_name"].as_str().unwrap_or("-"), sl["msg"].as_str().unwrap_or(""));
         self.gateway_deposit(event).await
+    }
+
+    /// Gateway mode, from the ticker: the heartbeat (E§5) and the inform memory's clock (E§3).
+    pub(super) async fn gateway_tick(&mut self) -> Result<()> {
+        let now = now_s();
+        // E§3 signed syslog: messages whose signature did not come in time are deposited with their transport's basis
+        if let Some((col, last)) = self.c.events.syslog_sign.as_mut() {
+            let outs = col.advance(now - *last);
+            *last = now;
+            self.syslog_sign_out(outs, None).await?;
+        }
+        // E§4 hold-down: the clears that held long enough are deposited now
+        for r in self.c.events.hold_down.advance_to(now) {
+            let key = (r["resource"].as_str().unwrap_or("").to_string(), r["type"].as_str().unwrap_or("").to_string(),
+                       r["qualifier"].as_str().unwrap_or("").to_string());
+            if let Some(event) = self.c.events.held_events.remove(&key) {
+                println!("RELEASED held clear of {}/{} after the hold-down   E§4", key.0, key.1);
+                self.deposit_event(event).await?;
+            }
+        }
+        if now > self.c.events.inform_clock {
+            self.c.events.informs.step(&json!({"advance": now - self.c.events.inform_clock}));
+            self.c.events.inform_clock = now;
+        }
+        if let Some((every, last)) = self.c.events.heartbeat {
+            if now - last >= every {
+                self.c.events.heartbeat = Some((every, now));
+                self.deposit_event(json!({"heartbeat": {"interval_s": every}})).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Send an `alarm-ack` (E§5): this operator owns the alarm (`ack`) or has finished with it (`closed`).
+    pub(super) async fn send_alarm_ack(&mut self, resource: &str, kind: &str, state: &str) -> Result<()> {
+        let group = self.c.active()?;
+        self.may_send(&group)?;
+        let obj = self.content(&group, json!({"kind": "alarm-ack", "alarm": {"resource": resource, "type": kind, "qualifier": ""},
+                                              "state": state}))?;
+        let alarm = obj["alarm"].clone();
+        self.send_content(&group, obj, Item::AlarmAck).await?;
+        // our own acknowledgement counts in our own alarm list too (it is fanned back to us as SELF)
+        let me = self.c.identity.clone();
+        self.c.alarm_step(&group, &json!({"ack": {"alarm": alarm, "state": state, "by": me}}));
+        Ok(())
+    }
+}
+
+impl Console {
+    /// A received `device-event` or `alarm-ack` (E§5) applied to its group's alarm list; false for other content.
+    pub(super) fn event_in(&mut self, gid: &str, sender: &str, object: &Value) -> bool {
+        if object["kind"] == "device-event" {
+            // E§5: the gateway signed it; the device is a claim with its basis
+            let ev = &object["event"];
+            if let Some(h) = ev.get("heartbeat") {
+                self.alarm_step(gid, &json!({"heartbeat": {"gateway": sender, "interval_s": h["interval_s"]}}));
+            } else {
+                println!("EVENT {sender} {}", render_event(ev));
+                if let Some(a) = ev.get("alarm") {
+                    self.alarm_step(gid, &json!({"report": a}));
+                }
+            }
+        } else if object["kind"] == "alarm-ack" {
+            self.alarm_step(gid, &json!({"ack": {"alarm": object["alarm"], "state": object["state"], "by": sender}}));
+        } else {
+            return false;
+        }
+        true
     }
 
     /// The hub's verdict on an inform's event (E§3): answer it, or forget it so its next retransmission deposits anew.
@@ -476,51 +524,6 @@ impl Client {
             }
             _ => {}
         }
-    }
-
-    /// Gateway mode, from the ticker: the heartbeat (E§5) and the inform memory's clock (E§3).
-    pub(super) async fn gateway_tick(&mut self) -> Result<()> {
-        let now = now_s();
-        // E§3 signed syslog: messages whose signature did not come in time are deposited with their transport's basis
-        if let Some((col, last)) = self.events.syslog_sign.as_mut() {
-            let outs = col.advance(now - *last);
-            *last = now;
-            self.syslog_sign_out(outs, None).await?;
-        }
-        // E§4 hold-down: the clears that held long enough are deposited now
-        for r in self.events.hold_down.advance_to(now) {
-            let key = (r["resource"].as_str().unwrap_or("").to_string(), r["type"].as_str().unwrap_or("").to_string(),
-                       r["qualifier"].as_str().unwrap_or("").to_string());
-            if let Some(event) = self.events.held_events.remove(&key) {
-                println!("RELEASED held clear of {}/{} after the hold-down   E§4", key.0, key.1);
-                self.deposit_event(event).await?;
-            }
-        }
-        if now > self.events.inform_clock {
-            self.events.informs.step(&json!({"advance": now - self.events.inform_clock}));
-            self.events.inform_clock = now;
-        }
-        if let Some((every, last)) = self.events.heartbeat {
-            if now - last >= every {
-                self.events.heartbeat = Some((every, now));
-                self.deposit_event(json!({"heartbeat": {"interval_s": every}})).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Send an `alarm-ack` (E§5): this operator owns the alarm (`ack`) or has finished with it (`closed`).
-    pub(super) async fn send_alarm_ack(&mut self, resource: &str, kind: &str, state: &str) -> Result<()> {
-        let group = self.active()?;
-        self.may_send(&group)?;
-        let obj = self.content(&group, json!({"kind": "alarm-ack", "alarm": {"resource": resource, "type": kind, "qualifier": ""},
-                                              "state": state}))?;
-        let alarm = obj["alarm"].clone();
-        self.send_content(&group, obj, Item::AlarmAck).await?;
-        // our own acknowledgement counts in our own alarm list too (it is fanned back to us as SELF)
-        let me = self.identity.clone();
-        self.alarm_step(&group, &json!({"ack": {"alarm": alarm, "state": state, "by": me}}));
-        Ok(())
     }
 
     /// Apply one event to a group's alarm list (E§5) and act on what it emits: print each transition, and as an
@@ -589,7 +592,8 @@ impl Client {
             };
             self.alarm_out(emitted);
         }
-    }}
+    }
+}
 
 /// One input to a Device Events gateway (E§3), from the listener tasks.
 pub(super) enum GatewayInput {

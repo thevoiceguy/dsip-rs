@@ -1428,6 +1428,7 @@ dependencies = [
  "dsip-events",
  "dsip-messaging",
  "dsip-messaging-device",
+ "dsip-messenger",
  "dsip-mls",
  "dsip-recording",
  "dsip-transport",
@@ -1442,6 +1443,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1501,6 +1503,24 @@ dependencies = [
  "serde_json",
  "tsify",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "dsip-messenger"
+version = "0.1.0"
+dependencies = [
+ "dsip-core",
+ "dsip-messaging",
+ "dsip-messaging-device",
+ "dsip-mls",
+ "dsip-transport",
+ "rand 0.8.7",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

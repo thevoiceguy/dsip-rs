@@ -15,6 +15,7 @@ dsip-messaging.workspace = true
 dsip-events.workspace = true
 dsip-recording.workspace = true
 dsip-messaging-device = { workspace = true, features = ["sqlite"] }
+dsip-messenger.workspace = true
 dsip-mls = { workspace = true, features = ["sqlite"] }
 dsip-transport.workspace = true
 serde.workspace = true
@@ -29,6 +30,7 @@ openssl-sys.workspace = true   # DTLS timeout handling: SSL_ctrl(DTLS_CTRL_HANDL
 foreign-types.workspace = true
 futures-util.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

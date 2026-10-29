@@ -18,7 +18,10 @@
 #![forbid(unsafe_code)]
 
 pub mod http;
+pub mod service;
 pub mod store;
+
+pub use service::{MailboxConfig, MailboxServer};
 
 /// Profile-aware inbound verification and envelope building now live with the profile (shared with the browser
 /// client); re-exported so the service and the console keep their paths.
