@@ -1,0 +1,324 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# `shell: bash` makes GitHub run steps with `-eo pipefail`. Without it a step like `bash demos/x.sh | tail -20` takes
+# tail's exit status, and a failing demo passes CI — which is how a broken revocation demo got through PR #38.
+defaults:
+  run:
+    shell: bash
+
+# The runner image's CMake 4 refuses projects declaring cmake_minimum_required < 3.5, which the Opus source vendored
+# by audiopus_sys does; this lets it configure (ubuntu-latest moved to 26.04 on 2026-10-19).
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  rust:
+    name: build, test, docs, the vector suite, demos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }   # spec/: DSIP at the pinned tag (schemas, vectors)
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install jsonschema pynacl cryptography pysnmp
+      - name: Rust, as pinned in rust-toolchain.toml
+        # installs the channel, components and targets the file names, and makes it the default
+        run: rustup toolchain install && rustup default "$(rustup show active-toolchain | cut -d' ' -f1)" && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - name: clippy, warnings are errors
+        # Every feature, so the gateway host and both media backends are linted too. The toolchain is pinned
+        # (rust-toolchain.toml) so that a new Rust release cannot fail this step on an unrelated change: new lints
+        # arrive with the version bump.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo doc --workspace --no-deps
+        env: { RUSTDOCFLAGS: "-D warnings" }
+      - run: cargo run -q -p dsip-cli -- vectors run
+      - name: media fallback build (webrtc-rs only, no forge/OpenSSL) still compiles and passes
+        run: cargo test -p dsip-media --no-default-features --features webrtc-rs
+      - name: gateway host + round trip (Phase 4 G1/G2; siphon-rs + forge from git)
+        # SIP leg on the wire (G1) and the full DSIP↔gateway↔SIP round trip with Opus⇄G.711
+        # transcoding, in-process and deterministic (G2).
+        run: cargo test -p dsip-gateway --features host --test sip_leg_live --test round_trip
+      - name: media demos, both backends paired both ways (forge-media plan step 3)
+        # A signalled call through the relay with DTLS-SRTP Opus each way; the script fails unless
+        # both sides decrypt media and both Ogg recordings are real. forge→webrtc-rs and
+        # webrtc-rs→forge cover both DTLS roles for each stack; forge→forge is the default path.
+        run: |
+          set -eo pipefail
+          for pair in "forge webrtc-rs" "webrtc-rs forge" "forge forge"; do
+            DEMO_DIR=/tmp/dsip-media-demo-${pair// /-} timeout 240 bash demos/media-demo.sh $pair | tail -6
+          done
+      - name: speech and Opus tools for the voicemail demo
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends espeak-ng ffmpeg
+      - name: private relay (§13.6)
+        # Self-verifying: an outsider reaches the served identity live and queued; outsider-to-outsider refused; nothing
+        # held for an outsider; an introduction between outsiders dropped silently.
+        run: timeout 300 bash demos/private-relay-demo.sh | tail -12
+      - name: device events alongside SNMP (v0.9 draft)
+        # Self-verifying: real SNMPv1/v2c traps → the gateway's dsip-msg → signed device events in an MLS alarm group → the same
+        # alarm list on every member; a repeat pages nobody; an acknowledged alarm does not escalate; an unacknowledged
+        # critical one makes the escalation agent call the on-call phone over a relay; an inform is answered only once
+        # stored, and across a hub outage its retransmissions deposit nothing more; a silent gateway raises its own
+        # alarm; the community string never leaves the gateway.
+        run: timeout 300 bash demos/device-events-demo.sh | tail -30
+      - name: device events, authenticated inputs (SNMPv3 USM, syslog over UDP and TLS; v0.9 draft)
+        # Self-verifying, with real senders (pysnmp for SNMPv3, util-linux logger, a TLS client): an authPriv v3 trap
+        # carries its engine and user; a wrong digest and a pre-reboot replay are refused; a v3 inform is answered only
+        # once stored, after discovery; RFC 5424 / 3164 syslog map through the rules and the severity table; a TLS client
+        # with a device certificate gets basis syslog-tls and one without is refused; no USM password leaves the gateway.
+        run: timeout 300 bash demos/device-events-v3-syslog-demo.sh | tail -30
+      - name: device events over SNMPv3/TLS (Device Events Profile draft E§3, RFC 6353)
+        # Self-verifying with net-snmp 5.9.5.2 (Debian's packages, pinned by SHA-256: older net-snmp caps its TLS client
+        # at TLS 1.0): a trap is named by its certificate's fingerprint row; an inform runs RFC 5343 discovery, then is
+        # answered once stored; a certificate no row names, and a client without one, are refused; the same trap over
+        # DTLS (v0.11) is named by its session's certificate, and a nameless DTLS session is closed.
+        run: timeout 300 bash demos/device-events-snmp-tls-demo.sh | tail -28
+      - name: device events from signed syslog (Device Events Profile draft E§3, RFC 5848)
+        # Self-verifying: a fragmented Certificate Block establishes the session; two held messages become
+        # syslog-signed events when their Signature Block verifies; an unsigned message from the signer's host and one
+        # listed by a foreign key are deposited as syslog-udp after the hold.
+        run: timeout 300 bash demos/device-events-syslog-sign-demo.sh | tail -20
+      - name: recording disclosure and consent (Recording Profile draft)
+        # Self-verifying, four calls over a relay with real media: a callee's recorded answer makes the caller hold all
+        # audio (0 frames sent) until acceptance; a callee never answers a recorded invite before acceptance and its
+        # decline is reject policy.recording-declined; a standing never policy declines at once; recording begun
+        # mid-call by update and declined ends with bye policy.recording-declined.
+        run: timeout 300 bash demos/recording-consent-demo.sh | tail -14
+      - name: number attestation (Number Attestation Profile draft, N§3–N§5)
+        # Self-verifying, four calls to Bob over a relay (did:web callers): Alice's carrier-bound number is shown as
+        # attested by that carrier; a number the certificate does not cover and a binding replayed by another identity
+        # are refused and shown "(unverified)"; a ported number is attested for its new identity with the N§5 warning
+        # that it no longer belongs to Bob's stored contact.
+        run: timeout 300 bash demos/number-attestation-demo.sh | tail -4
+      - name: number discovery (Number Attestation Profile draft, N§6–N§7)
+        # Self-verifying: Bob dials tel:+15551234567 through a dsip-node and reaches the DID the number is bound to,
+        # verified end to end; nothing unpublished is found; the node refuses forged and uncovered bindings; a binding
+        # whose DID does not claim the number never wins; after a port the newer binding wins and the client says so;
+        # and (route 2, v0.12) the number's authority serves the binding at its .well-known, named on the answer.
+        run: timeout 300 bash demos/number-discovery-demo.sh | tail -5
+      - name: number gateway (Number Attestation Profile draft, N§4.1, N§6.1)
+        # Self-verifying, two gateways over SIP between a DSIP caller and a DSIP callee: Alice's bound number crosses
+        # to the PSTN with a SHAKEN PASSporT (attestation A) signed under the gateway's RFC 9060 delegate
+        # certificate, is verified by the far gateway, which reaches Bob through the binding he published, and audio
+        # crosses both gateways in both directions; a caller without a binding crosses downgraded; a number nobody
+        # published is refused identity.unknown.
+        run: timeout 300 bash demos/number-gateway-demo.sh | tail -6
+      - name: the recorder leg (Recording Profile draft, C§6)
+        # Self-verifying: from a second device of Bob's identity, one sendonly recording session per voice to the
+        # declared recorder (checked for dsip.record first), Opus forwarded unchanged end to end; the recorder keeps one
+        # Ogg/Opus file per voice and RFC 7865-shaped metadata; a counterparty who never accepted contributes 0 frames;
+        # a "recorder" without dsip.record is refused before any media.
+        run: timeout 300 bash demos/recorder-leg-demo.sh | tail -16
+      - name: a recorder device in an E2EE conversation (Recording Profile draft, C§5)
+        # Self-verifying: a recorder device of Bob's identity (dsip.record) joins the conversation, never his personal
+        # group, so nothing sent before it joined reaches it; Alice cannot send until she accepts, Bob (recorded
+        # himself) need not; the recorder cannot send, and a misbehaving one is dropped by both members; it archives
+        # what was sent while disclosed; removing it ends the recording for everyone.
+        run: timeout 300 bash demos/recorder-device-demo.sh | tail -16
+      - name: presence across two devices (Presence Profile draft, P§3–P§5)
+        # Self-verifying: two of Bob's devices publish their own signed records to his relay; Alice watches, verifies
+        # each record herself and combines them (busy beats away); the phone's record outlives its unbind by the grace
+        # and is then dropped; a state newer than Alice's client shows as available with its token raw.
+        run: timeout 300 bash demos/presence-demo.sh | tail -16
+      - name: presence audiences and time-boxed shares (Presence Profile draft, P§6, P§7)
+        # Self-verifying: Bob's phone publishes a record per audience; a family grant sees busy, a plain 25 s share sees
+        # only the record with no audience, and the share ends the watch at its valid_until (policy.terminated).
+        run: timeout 300 bash demos/presence-audiences-demo.sh | tail -16
+      - name: sealed presence (Presence Profile draft, P§12)
+        # Self-verifying: Bob seals his presence; the grants carry the keys and Alice and Carol open his records, Dave's
+        # keyless grant sees them unreadable; ending Alice's share revokes her grant, rotates main and re-grants Carol;
+        # Bob's laptop adopts the phone's epoch from its own watch.
+        run: timeout 300 bash demos/presence-sealed-demo.sh | tail -16
+      - name: reachability hints on Pkarr (v0.9 draft)
+        # Self-verifying: Bob publishes _dsip records signed by his did:key to two Pkarr relays (local stand-ins of the
+        # HTTP API); Alice, knowing only his did:key, rejects a hostile relay's forged newer packet and calls him through
+        # the honest one; Bob re-signs before expiry with a rising seq and keeps another application's record in his zone.
+        run: timeout 120 bash demos/pkarr-demo.sh | tail -16
+      - name: dsip-node, the deployable hints node (DHT Hints §10, v0.11)
+        # Self-verifying: three dsip-nodes (overlay + a local Mainline testnet + HTTP). DSIP's unchanged clients
+        # publish through node A; Alice's call resolves through node C via Mainline; a browser (curl) reads the
+        # overlay hint from C over HTTP; a forged packet is 400 and Bob's older one 409.
+        run: timeout 180 bash demos/dsip-node-demo.sh | tail -16
+      - name: dsip-node restarts with its state (stage 2)
+        # Self-verifying: a bootstrap node run from a config file restarts with an empty state directory (new PeerId,
+        # no peers) and then with its own (same PeerId, peers within seconds, held hints served from disk).
+        run: timeout 240 bash demos/dsip-node-restart-demo.sh | tail -14
+      - name: dsip-node under a flooding overlay peer (stage 3)
+        # Self-verifying: the same flood against three victims — budget only, ban in place, ban by address before
+        # the handshake; the address ban must cost the least CPU and the in-place ban no more than the budget.
+        run: timeout 300 bash demos/dsip-node-flood-demo.sh | tail -12
+      - name: reachability hints on Pkarr for a multi-device identity (DHT Hints §9.1)
+        # Self-verifying: one identity-signed pointer to two devices; each device publishes its own zone with its
+        # delegation (device key only); Bob, knowing only the identity did:key, reaches the phone on R1, and after the
+        # phone's hint lapses, the laptop on R2.
+        run: timeout 180 bash demos/pkarr-multidevice-demo.sh | tail -16
+      - name: reachability hints on the Mainline DHT directly (v0.9 draft)
+        # Self-verifying, on a local 10-node Mainline testnet (nothing public): Bob puts his signed _dsip packet as a
+        # BEP 44 item with no relay in his path; Alice gets it from the DHT, rejects a hostile relay's forgery, and
+        # calls him; the seq rises over re-publishes; a fresh node finds the newest packet after Bob left.
+        run: timeout 180 bash demos/pkarr-mainline-demo.sh | tail -18
+      - name: messaging over the wire (two mailboxes, federated hub, real MLS)
+        # Self-verifying: fails unless the MLS-encrypted text arrives live, after a disconnect, after a
+        # device restart, after a crash between processing and commit (SQLite device state), and a
+        # voicemail (real Opus, sealed blob over HTTPS) that must arrive byte for byte.
+        run: timeout 300 bash demos/messaging-demo.sh | tail -16
+      - name: group messaging over the wire (three identities, three mailboxes)
+        # Self-verifying: forwarding to the hub, welcomes proven by origin, an add while a member's device
+        # is dead, a removal while the removed member is away; no device may hit an unprocessable item.
+        run: timeout 300 bash demos/group-demo.sh | tail -30
+      - name: receipts and typing over the wire
+        # Self-verifying: delivered, read and played under disclosure rules, an undisclosed read kept private,
+        # typing sealed, refresh-bounded, cleared at expiry and on stop, never stored for an offline device.
+        run: timeout 300 bash demos/receipts-demo.sh | tail -30
+      - name: one identity, two devices
+        # Self-verifying: personal group and archive key, a device added with history from archive (held until its
+        # key), sibling welcomes and pre-join items skipped, a private read synced, the device removed, key rotated.
+        run: timeout 300 bash demos/multidevice-demo.sh | tail -40
+      - name: messaging first contact over the wire
+        # Self-verifying: sealed introduction shown as a request with its purpose never on the wire, anti-enumeration
+        # and rate limiting at the mailbox, a dsip.message grant returned and presented at conversation creation.
+        run: timeout 300 bash demos/messaging-first-contact-demo.sh | tail -20
+      - name: revoking a device delegation
+        # Self-verifying: the revoked device is disconnected, refused by its own and a foreign mailbox, removable by
+        # any member only after revocation, removed from its identity's groups with the archive key rotated; its last
+        # message, processed after the revocation, is unauthenticated and not shown (M§6.2).
+        run: timeout 300 bash demos/revocation-demo.sh | tail -20
+      - name: concurrent commits
+        # Self-verifying: a member committing from a stale epoch is refused (commit-conflict, stale-epoch), syncs past the
+        # winning commit, re-proposes, and both members keep reading each other.
+        run: timeout 300 bash demos/commit-conflict-demo.sh | tail -60
+      - name: mailbox and hub restarts
+        # Self-verifying: a mailbox killed with a message waiting and a hub killed with fan-out queued both reload their
+        # state; the hub re-sends until the member mailbox is back; nothing lost, replayed or reordered; the next commit validates.
+        run: timeout 300 bash demos/mailbox-restart-demo.sh | tail -25
+      - name: mailbox enrolment ends (spec-gap 130)
+        # Self-verifying: one place (--serve-any 1); a second identity is refused mailbox.not-served; release: true frees
+        # the place; idle expiry (--release-idle) frees it again; the enrolment survives a restart.
+        run: timeout 300 bash demos/mailbox-enrolment-demo.sh | tail -18
+      - name: relay says transport.no-response (spec-gap 132)
+        # Self-verifying: a frozen callee's leg expires with the invite and the caller ends on transport.no-response;
+        # a ringing callee is still ringing well past the invite's 30 s.
+        run: timeout 300 bash demos/relay-no-response-demo.sh | tail -8
+      - name: a second hello replaces the prior connection, and only it (§13.2)
+        # Self-verifying: a frozen device's connection is replaced by the same device's new hello; the relay closes
+        # the old one and keeps the new one bound (it used to drop both), and tells it transport.replaced, so the
+        # replaced client stops instead of reconnecting (spec-gap 158).
+        run: timeout 120 bash demos/relay-rebind-demo.sh | tail -8
+      - name: status pages (relay and mailbox --status-listen)
+        # Self-verifying: the relay follows a call ringing → answered → ended by bye and counts a refusal; the mailbox
+        # reports its --serve-any place taken, the owner's KeyPackages, a mailbox.not-served refusal and a blob 404.
+        run: timeout 300 bash demos/status-demo.sh | tail -14
+      - name: moving a group to another hub
+        # Self-verifying: the old hub orders the move and nothing after; the new hub continues the numbering; a member who
+        # missed the move is refused by the old hub, syncs and re-sends; the new hub validates the next commit.
+        run: timeout 300 bash demos/hub-change-demo.sh | tail -30
+      - name: successor groups
+        # Self-verifying: the hub service dies with its state; two members create successors concurrently; every device
+        # checks them against the dead group and converges on the lowest group_id; the conversation continues there.
+        run: timeout 300 bash demos/successor-demo.sh | tail -20
+      - name: external joins
+        # Self-verifying: a new device with no sibling online joins a personal group and a conversation by external commit;
+        # a device that lost its state rejoins and replaces its own leaf; hub and members check each join.
+        run: timeout 300 bash demos/external-join-demo.sh | tail -20
+      - name: call history and archived receipts
+        # Self-verifying: call events per M§13.3 across two devices (answered-elsewhere none, shared miss shown once,
+        # declined), receipts and calls restored from archive on a device added later, which sends nothing for history.
+        run: timeout 300 bash demos/call-history-demo.sh | tail -20
+      - name: blob replication
+        # Self-verifying: a member mailbox replicates a verified blob and serves it while the origin is down; a damaged
+        # copy fails the device's check and the origin serves it; a blob over the member's limit stays at the origin;
+        # a device whose fetch finds nothing tries again until the blob is there (spec-gap 106).
+        run: timeout 300 bash demos/blob-replication-demo.sh | tail -20
+      - name: welcome retry
+        # Self-verifying: a welcome to a mailbox that is down is retried until it lands, nothing sequenced after the add
+        # overtakes it, and the retried welcome does not become a second invitation.
+        run: timeout 300 bash demos/welcome-retry-demo.sh | tail -20
+      - name: hub retention
+        # Self-verifying: a member that acknowledges nothing for mls_retention_s has its queue dropped at the hub, welcome
+        # included; the hub stops retrying what it held, and the other members carry on (spec-gap 119).
+        run: timeout 300 bash demos/hub-retention-demo.sh | tail -20
+      - name: re-joining when a gap will not fill
+        # Self-verifying: the mailbox loses an item, the device holds the commit beyond the gap, re-joins by external
+        # commit on its own timer, and carries on from the current epoch.
+        run: timeout 300 bash demos/auto-rejoin-demo.sh | tail -20
+      - name: a hub move whose old hub never finishes delivering
+        # Self-verifying: the old hub dies before Bob's mailbox has the move; the mailbox holds its own hub off for
+        # handover_wait, then admits it, and the queued fan-out is retried until Bob catches up.
+        run: timeout 300 bash demos/handover-wait-demo.sh | tail -20
+      - name: the hub cannot be reached
+        # Self-verifying: the hub dies; a device keeps content pending, retries with backoff, creates the successor
+        # group itself after hub_timeout and re-sends there; the others converge.
+        run: timeout 300 bash demos/hub-outage-demo.sh | tail -20
+      - name: the hub comes back
+        # Self-verifying: the hub stops and restarts; the pending item's retry is accepted and the queued one follows
+        # in order, each re-deposit's answer handled as it arrives; every member receives each message once.
+        run: timeout 300 bash demos/hub-return-demo.sh | tail -20
+      - name: the echo bot (dsip-messenger example)
+        # Self-verifying: the guide's echo_bot example grants Alice first contact, joins the conversation she creates
+        # and answers each of her texts; dsip-msg receives both answers.
+        run: timeout 300 bash demos/echo-bot-demo.sh | tail -8
+
+  wasm:
+    name: dsip-wasm builds; the Node smoke test and the browser client's headless call test pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }   # spec/: DSIP at the pinned tag (schemas, vectors)
+      - name: Rust, as pinned in rust-toolchain.toml
+        # installs the channel, components and targets the file names, and makes it the default
+        run: rustup toolchain install && rustup default "$(rustup show active-toolchain | cut -d' ' -f1)" && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      # Pinned: "latest" once resolved to v0.9.1, which cannot parse workspace-inherited package fields
+      # (`license.workspace = true`). Installed by hand: jetli/wasm-pack-action renames across filesystems, which
+      # fails (EXDEV) on the ubuntu-26.04 image, where /tmp is its own filesystem.
+      - name: install wasm-pack v0.15.0
+        run: |
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/wasm-pack"
+          wasm-pack --version
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pynacl cryptography   # the test number authority (demos/tn_issuer.py) behind the gateway fixture
+      - run: web/build.sh
+      - run: node web/test/engine.mjs
+      - run: npm ci
+        working-directory: web
+      - name: the page's types against the wasm declarations, and the hand-declared shapes against the vectors
+        run: npm run types
+        working-directory: web
+      - run: npx playwright install --with-deps firefox chromium
+        working-directory: web
+      - name: the client's headless tests through a local relay and the gateway fixture (Firefox, then Chromium)
+        run: web/test/run.sh all
+
+  packages:
+    name: dsip-node packages build, install and run (static binaries, .deb under systemd, container)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }   # spec/: DSIP at the pinned tag (schemas, vectors)
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # ziglang: zig is cargo-zigbuild's C compiler for ring on both musl targets; cryptography etc.: test.sh's packet
+      - run: pip install ziglang==0.13.0 pynacl cryptography
+      - name: Rust, as pinned in rust-toolchain.toml, plus the musl targets
+        run: |
+          rustup toolchain install && rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-zigbuild@0.23,cargo-deb@3" }
+      - name: build — musl binaries (x86_64, aarch64), tarballs, .debs, the image
+        run: bash crates/dsip-node/packaging/build.sh --image
+      - name: test — the .deb under systemd, the image locked down; state survives restarts in both
+        run: bash crates/dsip-node/packaging/test.sh

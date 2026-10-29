@@ -1,0 +1,16 @@
+# Rust
+target/
+**/*.rs.bk
+# Python
+__pycache__/
+*.pyc
+.venv/
+# Local state
+.dsip/
+*.key
+crates/dsip-node/dist/
+# Browser client
+web/pkg/
+web/node_modules/
+demos/browser/
+web/test/types/vectors.gen.ts
