@@ -20,6 +20,10 @@ use dsip_transport::tls;
 #[derive(Parser)]
 #[command(name = "dsip-relay", version, about = "DSIP relay (ws/1.0, forking with leg tracking, store-and-forward within the §13.3 boundary)")]
 struct Args {
+    /// TOML config file: each key is one of these flags in snake_case (`config.example.toml`); a flag given here
+    /// wins over the file.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// DID document JSON files (repeatable) for verifying `did:web` identities that bind here (§8.1: the document is
     /// authoritative). Without them only `did:key` identities can bind.
     #[arg(long)]
@@ -109,7 +113,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
     ).init();
-    let args = Args::parse();
+    let args: Args = dsip_transport::config_file::parse();
     std::fs::create_dir_all(&args.state)?;
 
     // Relay identity: a did:key from a persisted seed. Spec §7.2 recommends did:web for relays;

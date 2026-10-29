@@ -1,0 +1,36 @@
+# dsip-mailbox configuration: `dsip-mailbox --config /etc/dsip-mailbox/mailbox.toml`.
+#
+# Each key is one of the mailbox's flags in snake_case (`dsip-mailbox --help` describes them all), and a flag given
+# on the command line wins over the file. A repeatable flag takes a list; a flag given on the command line replaces
+# the file's list. An unknown key is an error. Paths should be absolute. `state` is required; every other key here is
+# commented out at its default or at an example value.
+
+# --- listening and TLS
+state = "/var/lib/dsip-mailbox"                    # the service key, the self-signed certificate, the stored state
+# listen = "0.0.0.0:9443"
+# cert = "/etc/letsencrypt/live/mailbox.example.com/fullchain.pem"
+# key = "/etc/letsencrypt/live/mailbox.example.com/privkey.pem"
+# host = ["mailbox.example.com"]                   # extra certificate names; the first is the blob endpoint's host
+# ca = "/etc/dsip-mailbox/peers-ca.pem"            # trust anchor for dialling peer mailboxes
+
+# --- whom it serves (M§4.1)
+# owner = ["did:web:example.com"]                  # identities whose documents (or hints) name this mailbox
+# serve_any = 32                                   # up to this many more identities enrol by binding (spec-gap 115)
+# release_idle = false                             # end an enrolment idle for mls_retention (M§4.1; spec-gap 130)
+# resolver_file = ["/etc/dsip-mailbox/docs/example.com.json"]   # did:web documents, re-read when resolving
+# hints_node = ["https://hints.example.com"]       # asked for the mailbox hint of a member with no DID document
+
+# --- policy and limits (M§4.3, M§5.7, §19.4)
+# admit = "grant"                                  # or "open"
+# intro_limit = 5
+# intro_window = 3600
+# inbox_cap = 16                                   # introductions held per recipient inbox
+# max_blob_bytes = 16777216
+# quota_bytes = 10737418240                        # per owner: stored items plus blobs
+
+# --- the hub (M§4.4, M§7.4)
+# handover_wait = 300
+# mls_retention = 2592000
+
+# --- operating
+# status_listen = "127.0.0.1:9102"                 # GET /status and /metrics, plain HTTP: keep it on loopback

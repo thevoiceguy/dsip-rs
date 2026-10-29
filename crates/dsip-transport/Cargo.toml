@@ -27,3 +27,9 @@ rcgen.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+clap = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[features]
+# `config_file`: a service binary's TOML config file, read as its flags
+cli = ["dep:clap", "dep:toml"]

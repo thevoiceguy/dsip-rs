@@ -7,6 +7,14 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+### Added
+
+- **Config files for the relay and the mailbox** (service-nodes plan S1). `dsip-relay --config <file>` and
+  `dsip-mailbox --config <file>` read a TOML file whose keys are their flags in `snake_case`. A flag on the command
+  line wins, and a repeatable one replaces the file's list. An unknown key is an error. Each crate has a
+  `config.example.toml` explaining every key, which a test checks against the binary. The mechanism is
+  `dsip_transport::config_file`, behind dsip-transport's new `cli` feature.
+
 ## [2026-10-29] — workspace release
 
 The first release. DSIP spec: `poc-v1.0` (DSIP Core 1.0 and its profiles; 2,323 vectors, 0 failures).

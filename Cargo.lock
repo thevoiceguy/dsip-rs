@@ -1668,6 +1668,7 @@ name = "dsip-transport"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "clap",
  "dsip-core",
  "dsip-endpoint",
  "dsip-schema",
@@ -1685,6 +1686,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "toml",
  "tracing",
 ]
 

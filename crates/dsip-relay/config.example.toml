@@ -1,0 +1,40 @@
+# dsip-relay configuration: `dsip-relay --config /etc/dsip-relay/relay.toml`.
+#
+# Each key is one of the relay's flags in snake_case (`dsip-relay --help` describes them all), and a flag given on
+# the command line wins over the file. A repeatable flag takes a list; a flag given on the command line replaces the
+# file's list. An unknown key is an error. Paths should be absolute. Every key here is commented out at its default
+# or at an example value.
+
+# --- listening and TLS (§13.2)
+# listen = "0.0.0.0:8443"
+# state = "/var/lib/dsip-relay"                   # the relay's key seed and, without `cert`, a self-signed certificate
+# cert = "/etc/letsencrypt/live/relay.example.com/fullchain.pem"
+# key = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
+# host = ["relay.example.com"]                     # extra names on the self-signed certificate
+
+# --- whom it serves (§13.6)
+# serve = ["did:web:example.com"]                  # unset: an open relay, serving every identity that binds
+# serve_file = "/etc/dsip-relay/served.txt"        # one DID per line, added to `serve`
+# did_document = ["/etc/dsip-relay/docs/example.com.json"]   # did:web documents for identities that bind here (§8.1)
+
+# --- store-and-forward (§13.3)
+# inbox_cap = 100                                  # queued envelopes per recipient
+# queue_budget_bytes = 67108864                    # across all recipients; beyond it, transport.routing-refused
+# offline_retention = 86400                        # seconds an envelope is held (advertised as offline_retention_s)
+
+# --- first contact (§19.4) and presence (P§6, P§8)
+# intro_limit = 5                                  # introductions per sender and per inbox within intro_window
+# intro_window = 3600
+# presence_grace = 60                              # seconds a presence record outlives its device's unbind (0–300)
+# presence_public = ["did:web:news.example.com"]   # identities whose presence anyone may watch
+
+# --- the browser client on the same origin
+# www = "/usr/share/dsip-web"                      # static files served on the TLS port
+# client_config = "/etc/dsip-relay/client.json"    # served as /config.json: the operator's client defaults
+# node_proxy = "127.0.0.1:8080"                    # /dsip/v1/* forwarded to a hints node
+# turn_uri = ["turn:turn.example.com:3478"]         # minted into short-lived credentials at /turn
+# turn_secret_file = "/etc/dsip-relay/turn.secret" # coturn's static-auth-secret (not `turn_secret`: keep it in a file)
+# turn_ttl = 3600
+
+# --- operating
+# status_listen = "127.0.0.1:9101"                 # GET /status and /metrics, plain HTTP: keep it on loopback

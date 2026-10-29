@@ -36,7 +36,7 @@ resolution over HTTPS, and an admin command.
 Each stage is a dsip-rs PR. Vectors, parity, fuzz seeds, every CI demo and the web tests stay green throughout. A
 stage that changes behaviour a vector can see starts with the vector in DSIP (CLAUDE.md rule 2).
 
-- **S1, configuration files.** `dsip-relay` and `dsip-mailbox` read a TOML file (`/etc/dsip-relay/relay.toml`,
+- **S1, configuration files.** *Done: keys are the flags in `snake_case`, flat, through `dsip_transport::config_file`.* `dsip-relay` and `dsip-mailbox` read a TOML file (`/etc/dsip-relay/relay.toml`,
   `/etc/dsip-mailbox/mailbox.toml`), using dsip-node's pattern: every key also a flag, flags win, unknown keys are
   an error, and every key is explained in a `config.example.toml`. Existing flags keep their names, so the demos and
   `node-setup.sh` work unchanged.
@@ -76,7 +76,9 @@ stage that changes behaviour a vector can see starts with the vector in DSIP (CL
 S1 and S2 come first: everything later assumes a config file, and an operator with `did:web` users needs S2 before
 anything else.
 
-## 4. Decisions for the user
+## 4. Decisions
+
+*Decided 2026-10-29: the user took every draft below.*
 
 1. **Packages per service, or one server package.** (a) three packages, `dsip-relay`, `dsip-mailbox` and
    `dsip-node`, plus `dsip-web`, and a compose file and guide for a single host. (b) One `dsip-server` package with
