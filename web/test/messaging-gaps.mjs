@@ -88,6 +88,7 @@ try {
   await holdItems(alice, 'application', aConv.group);
   await say(bob, bConv.group, 'from an old epoch');
   await until(alice.page, () => window.__tap.held.length >= 1, null, 20000);
+  const bobEpochs = await count(bob, /◇ epoch /g);
   await rekey(alice, aConv.group);
   await rekey(alice, aConv.group);
   await alice.page.evaluate(() => window.__tap.release());
@@ -100,6 +101,8 @@ try {
   await sleep(3000);
   check('Alice: after a reload the item is not delivered again: it was acknowledged', (await count(alice, /◇ unprocessable |✗ messaging error/g)) === 0,
     (await logOf(alice)).split('\n').filter((l) => /unprocessable|✗/.test(l)).join(' // '));
+  // Bob writes once he has Alice's two commits: before that his message is from a stale epoch (M§16 mailbox.stale-epoch)
+  await until(bob.page, (n) => (document.getElementById('log').textContent.match(/◇ epoch /g) || []).length >= n + 2, bobEpochs, 20000);
   await say(bob, bConv.group, 'and from the current one');
   await until(alice.page, (g) => window.dsip.thread(g).some((m) => m.object.text === 'and from the current one'), aConv.group, 20000);
   check('Alice: the next message decrypts', true);
