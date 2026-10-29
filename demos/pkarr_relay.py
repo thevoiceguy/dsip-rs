@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A local stand-in for a Pkarr relay, so the demo runs offline: Pkarr's HTTP API (`PUT /<z32>`, `GET /<z32>`, the
 body `signature ‖ ts ‖ dns`) over an in-memory store. The real relay also writes the packet to the Mainline DHT;
-this one only stores it. The interoperability check against the real `pkarr-relay` is in impl/docs/spec-gaps.md
+this one only stores it. The interoperability check against the real `pkarr-relay` is in spec/impl/docs/spec-gaps.md
 (gap 105).
 
     pkarr_relay.py PORT              an honest relay: verifies the BEP 44 signature, keeps the highest ts (409 otherwise)

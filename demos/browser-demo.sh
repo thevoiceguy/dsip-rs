@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Browser client, served locally: the relay serves impl/web over the same TLS port it speaks wss on.
+# Browser client, served locally: the relay serves web/ over the same TLS port it speaks wss on.
 # 1. builds dsip-wasm (wasm-pack)  2. starts the relay with --www  3. prints what to open.
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -4,7 +4,7 @@ A client a person can use on the DSIP network, and a host of the pure crates: th
 payload builder and the first-contact state are `dsip-wasm`, unchanged. This directory adds the screens, browser
 storage, the relay WebSocket and WebRTC. No signaling decision is made in JavaScript: a screen changes only when the
 engine emits, and every trust line on screen comes from the vector-pinned renderers (`verification_basis`,
-`tel_caller_line`, `downgrade_summary`). Plan: `impl/docs/dsip-client-plan.md`.
+`tel_caller_line`, `downgrade_summary`). Plan: `docs/dsip-client-plan.md`.
 
 **Stage 1:** a persistent identity, a contact list, audio and video calls between two browsers through a relay,
 the verification basis on both screens, export and import of the identity. Nothing is hosted: the deliverable is the
@@ -49,7 +49,7 @@ bind) and looks a callee up before the invite (§8.1): the frames the nodes retu
 node applies (`hint_select`, the DHT crate's `record` module compiled to wasm), and a callee whose hint names another
 relay is called through that relay on a connection opened for the call, labelled hint-sourced on the call screen. The
 media path in use (candidate types, TURN or direct) is shown once connected. Runbook below; the WAN record in
-`impl/docs/dht-findings.md` ("The browser client on the WAN").
+`spec/impl/docs/dht-findings.md` ("The browser client on the WAN").
 
 **Stage 6:** messaging. The Messaging Profile's device side runs in the browser: `dsip-wasm::messaging` is OpenMLS
 (on its rust-crypto provider, `js` for the browser's randomness) and the profile's vector-pinned client rules behind a
@@ -117,7 +117,7 @@ the start (spec-gap 122), which is what lets a successor's creator find it.
 ## Run it locally
 
 ```bash
-# once: the wasm32 target comes from impl/rust-toolchain.toml; wasm-pack from `cargo install wasm-pack`
+# once: the wasm32 target comes from rust-toolchain.toml; wasm-pack from `cargo install wasm-pack`
 web/build.sh                 # wasm-pack → web/pkg
 demos/browser-demo.sh        # the relay serves the client: https://127.0.0.1:8443/
 ```
@@ -132,8 +132,8 @@ be reachable by both ends. Hosting is the runbook below.
 
 ## Runbook: hosting it (stage 5)
 
-What the WAN testbed runs (`impl/tools/wan/README.md`), as an operator would set it up. Everything below is
-`impl/tools/wan/node-setup.sh` with its stage 5 variables; the units it writes are the reference.
+What the WAN testbed runs (`spec/impl/tools/wan/README.md`), as an operator would set it up. Everything below is
+`spec/impl/tools/wan/node-setup.sh` with its stage 5 variables; the units it writes are the reference.
 
 1. **A name and a certificate.** The relay's `wss://` and the page share one origin, so one certificate covers both
    (§13.2: validated against the advertised hostname). Any name that resolves to the host works; a Linode's reverse
@@ -144,7 +144,7 @@ What the WAN testbed runs (`impl/tools/wan/README.md`), as an operator would set
    certbot certonly --standalone -d <name>          # port 80 open for the HTTP-01 challenge; nothing listens between renewals
    ```
    `node-setup.sh` installs a deploy hook that restarts the relay when the certificate renews.
-2. **TURN.** A call across two NATs needs it (`impl/docs/dht-findings.md`, Run 3: symmetric NAT fails without). coturn
+2. **TURN.** A call across two NATs needs it (`spec/impl/docs/dht-findings.md`, Run 3: symmetric NAT fails without). coturn
    with `use-auth-secret` and a `static-auth-secret` (`ROLE=turn`, the secret in `/var/lib/dsip/turn.secret`; the relay
    ports 49160–49200/udp open). Copy the secret file to every relay host: the relay mints credentials from it, valid
    `--turn-ttl` seconds, for whoever loads the page. coturn allows one credential mechanism at a time, so the CLI
@@ -279,7 +279,7 @@ node web/test/engine.mjs                 # the engine in Node
 web/test/run.sh firefox                  # or chromium, or all; starts a relay on 127.0.0.1:8443
 ```
 
-**Types** (dsip-rs B1–B4, `impl/docs/dsip-stack-design.md` §6). The engine (`Endpoint`), the `Messenger` and the
+**Types** (dsip-rs B1–B4, `docs/dsip-stack-design.md` §6). The engine (`Endpoint`), the `Messenger` and the
 free functions take and return JavaScript objects, typed by the declarations `wasm-pack` writes into
 `pkg/dsip_wasm.d.ts` from the Rust types; saved records (the identity, the contact file, the `Messenger`'s save) stay
 the JSON text that is stored. The page stays plain JavaScript with no build step, and every file of it opens with

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dsip-node, stage 2: a restarted bootstrap node rejoins at once. On the WAN testbed a restarted bootstrap node with
-# nothing kept took minutes to see its peers again (impl/docs/dht-findings.md, "WAN results"); a dsip-node keeps its
+# nothing kept took minutes to see its peers again (spec/impl/docs/dht-findings.md, "WAN results"); a dsip-node keeps its
 # identity, learned peers, held records and Mainline routing nodes in its state directory. Self-verifying:
 #   1. node A (config file + state directory) is the overlay's bootstrap; B and C join it; Bob publishes through A;
 #   2. A restarts with an EMPTY state directory, as before: a new PeerId, no peers, nothing held;

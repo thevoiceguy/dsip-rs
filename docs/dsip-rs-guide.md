@@ -2,7 +2,7 @@
 
 This is a guide for application developers. It covers placing and answering calls, sending messages, running a
 relay or a mailbox inside your own process, and testing all of it without sockets. dsip-rs is the set of `dsip-*`
-crates in this workspace. It implements DSIP Core 1.0 (`v1.0/`) and its profiles. The design behind it, and what
+crates in this workspace. It implements DSIP Core 1.0 (`spec/v1.0/`) and its profiles. The design behind it, and what
 is still to come, are in [`dsip-stack-design.md`](dsip-stack-design.md).
 
 Every example named here is built in CI, by `cargo clippy --all-targets`. The chat bot also runs end to end in CI
@@ -19,7 +19,7 @@ Most applications need only a facade, plus a service crate if they run their own
 | run a relay in your process | `dsip-relay` (`RelayServer`) | `examples/embedded_relay.rs` |
 | run a mailbox in your process | `dsip-mailbox` (`MailboxServer`) | `tests/in_process.rs` |
 | test several parties in one process, with no ports | `dsip-testkit` | `tests/network.rs`, `dsip-phone/tests/phone.rs` |
-| build a browser client | `dsip-wasm`, with its generated TypeScript types | `impl/web/` |
+| build a browser client | `dsip-wasm`, with its generated TypeScript types | `web/` |
 | drive the protocol yourself | `dsip-transport` (`Agent`), `dsip-endpoint` (`Core`) | `dsip-cli`'s console |
 
 The layers underneath have the same split as the spec:
@@ -261,10 +261,10 @@ The testkit has no mailbox yet. Messaging is tested by the demos, against `dsip-
 
 ## 8. Conformance
 
-dsip-rs is measured against the language-neutral test vectors in `impl/vectors/`: 2,323 of them, run by the Rust
-runner, the Python harness and the independent TypeScript implementation, which must all agree. A change to the
+dsip-rs is measured against the language-neutral test vectors in `spec/impl/vectors/`: 2,323 of them, run by the Rust
+runner here, and in DSIP by the Python harness and the independent TypeScript implementation, which must all agree. A change to the
 stack that changes behaviour shows up there first. If you build your own DSIP implementation, run the vectors
-(`impl/vectors/README.md`). They are the contract, not this code.
+(`spec/impl/vectors/README.md`). They are the contract, not this code.
 
 ## 9. Not yet
 

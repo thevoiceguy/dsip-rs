@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dsip-node, stage 3: what a flooding overlay peer costs. WAN Run 5 measured that dropping a flooder's PUTs unverified
 # cut signature checks 3,001 → 40 but not CPU: the cost is the connection, its streams and Kademlia
-# (impl/docs/dht-findings.md). Three victims face the same flood of forged hints (~50 PUTs/s), one at a time:
+# (spec/impl/docs/dht-findings.md). Three victims face the same flood of forged hints (~50 PUTs/s), one at a time:
 #   (a) --ban-secs 0  — the budget only: PUTs past it dropped unverified for its 60 s window;
 #   (b) bans          — dropped unverified for the whole ban, out of the routing table, connection kept;
 #   (c) bans + --ban-ip — the address refused before the handshake, the connection closed.
