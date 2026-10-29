@@ -4,8 +4,8 @@ A Rust stack for **DSIP** (Decentralized Session Initiation Protocol), an identi
 media negotiation and messaging. Build DSIP applications on it: softphones, chat clients, bots, gateways, relays and
 mailboxes.
 
-**Status: pre-release, private.** It implements DSIP Core 1.0 and its profiles, and passes the whole conformance
-suite: 2,323 vectors from DSIP at `poc-v1.0`. The first CalVer release makes it public (`RELEASING.md`). Start
+**Status: pre-release.** It implements DSIP Core 1.0 and its profiles, and passes the whole conformance
+suite: 2,323 vectors from DSIP at `poc-v1.0`. No release has been cut yet (`RELEASING.md`). Start
 with the [usage guide](docs/dsip-rs-guide.md).
 
 ## How it relates to the other projects
