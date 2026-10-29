@@ -1,7 +1,7 @@
 # Releasing dsip-rs
 
-dsip-rs uses siphon-rs's release model (siphon-rs `RELEASING.md`), so a consumer of both sees one convention. No
-release has been cut yet. The first is stage 5c of `docs/dsip-stack-design.md`.
+dsip-rs uses siphon-rs's release model (siphon-rs `RELEASING.md`), so a consumer of both sees one convention. The
+first release was `v2026.10.29`.
 
 ## The two-layer versioning model
 
