@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 
 use dsip_core::keys::KeyPair;
+use dsip_relay::store::QueueStore;
 use dsip_relay::{www, RelayConfig, RelayServer};
 use dsip_transport::tls;
 
@@ -40,7 +41,7 @@ struct Args {
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
-    /// State directory (relay key seed, self-signed cert/key).
+    /// State directory (relay key seed, self-signed cert/key, the store-and-forward queue `queue.redb`).
     #[arg(long, default_value = ".dsip-relay")]
     state: PathBuf,
     /// Extra hostnames for the self-signed certificate.
@@ -175,6 +176,8 @@ async fn main() -> Result<()> {
         served,
         offline_retention: args.offline_retention,
         did_web: dsip_transport::resolver::web_documents(!args.no_fetch_did_web, args.did_web_ttl, args.did_web_ca.as_deref())?,
+        // §13.3: what the relay holds for offline recipients survives a restart
+        queue_store: Some(Arc::new(QueueStore::open(&args.state.join("queue.redb")).with_context(|| format!("opening {}", args.state.join("queue.redb").display()))?)),
     };
     let resolver = dsip_transport::resolver::build_resolver(&args.did_document, &[]).await?;
     let relay = RelayServer::new(key, resolver, cfg);

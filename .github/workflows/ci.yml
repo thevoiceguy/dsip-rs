@@ -215,6 +215,10 @@ jobs:
         # Self-verifying: with no document files, a relay binds a did:web identity from its fetched document and a call
         # to it is answered; a relay with --no-fetch-did-web refuses its hello; a mailbox enrols a did:web identity.
         run: timeout 120 bash demos/did-web-demo.sh | tail -14
+      - name: the relay's queue survives a restart (§13.3; service-nodes S3)
+        # Self-verifying: a relay killed with an invite queued for an offline callee delivers it after a restart, and
+        # still knows the callee (queued, not transport.unknown-recipient) after another.
+        run: timeout 120 bash demos/relay-restart-demo.sh | tail -10
       - name: status pages (relay and mailbox --status-listen)
         # Self-verifying: the relay follows a call ringing → answered → ended by bye and counts a refusal; the mailbox
         # reports its --serve-any place taken, the owner's KeyPackages, a mailbox.not-served refusal and a blob 404.
