@@ -471,6 +471,28 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    tag the first CalVer release, and switch the gateway to git dependencies on it. The vectors move with the spec,
    not the stack.
 
+   *Plan (2026-10-29, decisions 6–9 below).* `thevoiceguy/dsip-rs` takes every crate, the workspace, `demos/` and
+   `web/`, with their history. DSIP keeps the spec, the schemas, the vectors, `tools/` (the Python harness, parity,
+   fuzzing, spec_lint, the WAN testbed) and `impl-ts`. In parts:
+   - **5a, the spec found from either layout (DSIP).** The schema build scripts find the DSIP root (`DSIP_SPEC`, or
+     the repository the workspace sits in, or a `spec/` submodule) and pass it to `include_str!`. The vector suite
+     is found the same way (`DSIP_VECTORS`, `impl/vectors`, or `spec/impl/vectors`), by dsip-cli and the web type
+     check. The same code builds in both repositories.
+   - **5b, the repository (private).** `git filter-repo` of DSIP keeps `impl/crates`, `impl/demos`, `impl/web`, the
+     workspace files and the stack's documents (this note, the guide, the client plan), moved to the root. `spec/`
+     is DSIP as a submodule at `poc-v1.0`. README, CLAUDE.md, RELEASING.md (siphon-rs's model) and CHANGELOG come
+     from the 2026-10-16 seed. Its CI runs what DSIP's runs on the code: build, clippy, tests, docs, the Rust
+     vector runner, the demos, the wasm build and the web tests. From 5b to 5d, DSIP's copy of the code is frozen:
+     changes go to dsip-rs, and DSIP's CI keeps checking parity with the frozen copy.
+   - **5c, the first release.** `v2026.MM.DD`, every crate at `0.1.0` (listed in the tag and the changelog), and the
+     repository made public.
+   - **5d, DSIP without the code.** DSIP drops `impl/crates`, `impl/demos`, `impl/web` and the workspace. Its CI
+     checks out dsip-rs at a pinned commit for the Rust side of parity and fuzzing, and for spec_lint's coverage
+     table. CLAUDE.md, the overview and the deploy recipe follow.
+
+   The gateway's siphon-rs and forge-media dependencies are already git dependencies pinned to a rev; nothing
+   outside this workspace depends on the DSIP crates yet.
+
 **When to start:** stages 1 and 2 are worth doing once the next spec version shows no core churn. The endpoint
 state machine and envelope rules have not changed after v0.12. v0.13–v0.16 changed the profiles, added one core
 message (`alias-monitor`, v0.14) and changed relay behaviour (§12.7, §13.3 in v0.16; Appendix A.10–A.13). Stage 4 waited for the core spec's 1.0, final 2026-10-27 at tag `poc-v1.0` as `v1.0/` (the v0.17 text declared normative, with §11.4's rule for 1.x); it is unblocked.
@@ -515,3 +537,11 @@ Today the equivalent is the select loop in `console.rs`, around 500 lines.
    boundary.
 5. **Name: `dsip-rs`**, the repository and umbrella name; the crates keep their `dsip-*` names. The licence stays
    `MIT OR Apache-2.0`, as the workspace and siphon-rs already are.
+
+Decisions for stage 5 (the owner, 2026-10-29):
+
+6. **What moves: all the crates and the demos**, and the workspace with them. The spec, vectors, tools and `impl-ts`
+   stay in DSIP.
+7. **Spec inputs: DSIP as a git submodule (`spec/`)**, pinned to a tag and moved forward on purpose.
+8. **Private first**, public at the first CalVer release.
+9. **The browser client moves with dsip-rs**: it is built from dsip-wasm and its tests check the crates.

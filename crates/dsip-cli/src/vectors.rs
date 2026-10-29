@@ -15,9 +15,15 @@ use dsip_schema::{check_payload, SemanticContext};
 use dsip_broadcast::{evaluate_publication, Authority, AuthorityEvent, Subscriber};
 use dsip_session::{Endpoint, EndpointConfig, Event, Relay, RelayEvent};
 
-/// `impl/vectors` relative to this crate's manifest.
+/// The suite: `DSIP_VECTORS` if set, else `impl/vectors` of the DSIP repository this workspace sits in, or of its
+/// `spec/` submodule (dsip-rs).
 pub fn default_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors")
+    if let Some(dir) = std::env::var_os("DSIP_VECTORS") {
+        return dir.into();
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [manifest.join("../../vectors"), manifest.join("../../spec/impl/vectors")];
+    candidates.iter().find(|d| d.is_dir()).unwrap_or(&candidates[0]).clone()
 }
 
 struct Outcome {

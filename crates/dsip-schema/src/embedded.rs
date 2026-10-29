@@ -8,7 +8,7 @@
 
 macro_rules! schema {
     ($name:literal) => {
-        ($name, include_str!(concat!("../../../../v1.0/dsip-schemas-v1.0/dsip-schemas/schemas/", $name, ".schema.json")))
+        ($name, include_str!(concat!(env!("DSIP_SPEC"), "/v1.0/dsip-schemas-v1.0/dsip-schemas/schemas/", $name, ".schema.json")))
     };
 }
 

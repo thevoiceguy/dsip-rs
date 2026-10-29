@@ -6,9 +6,12 @@
 // Run from web/: node test/types/vectors.mjs && npx tsc -p .
 //
 // Spec: none (infrastructure). The shapes are the vectors README's (kinds `state`, `envelope`, `payload`, `semantic`).
+import { existsSync } from 'node:fs';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 
-const vectors = new URL('../../../vectors/', import.meta.url);
+// impl/vectors: in DSIP beside the workspace, in dsip-rs in its spec/ submodule
+const vectors = [new URL('../../../vectors/', import.meta.url), new URL('../../spec/impl/vectors/', import.meta.url)]
+  .find((u) => existsSync(u)) ?? new URL('../../../vectors/', import.meta.url);
 const found = { emissions: [], sessions: [], contacts: [], verdicts: [] };
 const walk = (x, name) => {
   if (Array.isArray(x)) x.forEach((y) => walk(y, name));
