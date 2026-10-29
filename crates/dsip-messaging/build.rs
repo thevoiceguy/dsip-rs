@@ -8,13 +8,30 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn schema_dir() -> PathBuf {
+/// The root of the DSIP repository, which holds `v1.0/` and `impl/vectors`: `DSIP_SPEC` if set, else this
+/// workspace's own (in DSIP, `impl/` sits in it) or its `spec/` submodule (in dsip-rs).
+fn spec_root() -> PathBuf {
+    if let Ok(root) = std::env::var("DSIP_SPEC") {
+        return PathBuf::from(root);
+    }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    manifest.join("../../../v1.0/dsip-messaging-schemas-draft")
+    [manifest.join("../../.."), manifest.join("../../spec")]
+        .into_iter()
+        .find(|root| root.join("v1.0").is_dir())
+        .expect("the DSIP spec: set DSIP_SPEC, or check out the spec/ submodule")
+        .canonicalize()
+        .expect("spec root")
+}
+
+fn schema_dir(root: &Path) -> PathBuf {
+    root.join("v1.0/dsip-messaging-schemas-draft")
 }
 
 fn main() {
-    let dir = schema_dir();
+    let root = spec_root();
+    println!("cargo:rerun-if-env-changed=DSIP_SPEC");
+    println!("cargo:rustc-env=DSIP_SPEC={}", root.display());
+    let dir = schema_dir(&root);
     let schemas = dir.join("schemas");
     println!("cargo:rerun-if-changed={}", schemas.display());
     println!("cargo:rerun-if-changed={}", dir.join("generate_schemas.py").display());

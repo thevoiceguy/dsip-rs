@@ -1223,8 +1223,13 @@ mod tests {
     /// `verify_passport` accepts (the far end of `demos/number-gateway-demo.sh`).
     #[test]
     fn asserted_passport_verifies_at_the_far_end() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../vectors/tn-binding/");
-        let v: Value = serde_json::from_slice(&std::fs::read(format!("{dir}assert-signed.json")).unwrap()).unwrap();
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = [manifest.join("../../vectors"), manifest.join("../../spec/impl/vectors")] // DSIP, or dsip-rs's submodule
+            .into_iter()
+            .map(|d| d.join("tn-binding/assert-signed.json"))
+            .find(|f| f.is_file())
+            .expect("the suite");
+        let v: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
         let (c, i) = (&v["context"], &v["input"]);
         let policy = Policy::from_json(c);
         let gw = GatewayCert::from_json(&c["gateway"]).unwrap();
