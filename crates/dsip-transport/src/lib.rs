@@ -14,6 +14,8 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+#[cfg(feature = "cli")]
+pub mod config_file;
 pub mod conn;
 pub mod error;
 pub mod identity;

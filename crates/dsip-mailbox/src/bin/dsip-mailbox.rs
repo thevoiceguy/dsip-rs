@@ -16,6 +16,10 @@ use dsip_transport::tls;
 #[derive(Parser)]
 #[command(name = "dsip-mailbox", about = "DSIP mailbox and hub service (Messaging Profile 1.0)")]
 struct Args {
+    /// TOML config file: each key is one of these flags in snake_case (`config.example.toml`); a flag given here
+    /// wins over the file.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// State directory: service key, TLS certificate.
     #[arg(long)]
     state: PathBuf,
@@ -95,7 +99,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())).init();
-    let args = Args::parse();
+    let args: Args = dsip_transport::config_file::parse();
     std::fs::create_dir_all(&args.state)?;
     let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
     hosts.extend(args.host.iter().cloned());
