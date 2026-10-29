@@ -14,7 +14,7 @@ import http.server
 import struct
 import sys
 
-sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__file__), "..", "tools"))
+sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__file__), "..", "spec", "impl", "tools"))
 from dsipvec.crypto import ed25519_verify  # noqa: E402
 from dsipvec.pkarr import bep44_signable, z32_decode  # noqa: E402
 

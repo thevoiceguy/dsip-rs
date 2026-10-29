@@ -20,7 +20,7 @@ cleanup
 fail() { echo "FAIL: $*"; exit 1; }
 # a Pkarr packet (a fixture key's _dsip hint): its z32 key and its bytes
 read -r Z HEX < <(cd "$IMPL" && python3 -c '
-import sys; sys.path.insert(0, "tools")
+import sys; sys.path.insert(0, "spec/impl/tools")
 from dsipvec.gen.pkarr import payload, EP, K
 from dsipvec.pkarr import z32_encode
 print(z32_encode(K.public), payload([EP]))')

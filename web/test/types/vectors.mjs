@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 
 // impl/vectors: in DSIP beside the workspace, in dsip-rs in its spec/ submodule
-const vectors = [new URL('../../../vectors/', import.meta.url), new URL('../../spec/impl/vectors/', import.meta.url)]
+const vectors = [new URL('../../../vectors/', import.meta.url), new URL('../../../spec/impl/vectors/', import.meta.url)]
   .find((u) => existsSync(u)) ?? new URL('../../../vectors/', import.meta.url);
 const found = { emissions: [], sessions: [], contacts: [], verdicts: [] };
 const walk = (x, name) => {

@@ -34,7 +34,7 @@ for n in a b c; do wait_for "$D/$n.log" '^http: ' 20; grep -E '^(mainline|http):
 $B/dsip identity init --dir "$D/alice" --name "Alice" >/dev/null
 $B/dsip identity init --dir "$D/bob" --name "Bob" >/dev/null
 BOB=$(python3 -c "import json;print(json.load(open('$D/bob/identity.json'))['identity'])")
-ZBOB=$(python3 -c "import sys;sys.path.insert(0,'tools');from dsipvec.pkarr import did_key_public,z32_encode;print(z32_encode(did_key_public('$BOB')))")
+ZBOB=$(python3 -c "import sys;sys.path.insert(0,'spec/impl/tools');from dsipvec.pkarr import did_key_public,z32_encode;print(z32_encode(did_key_public('$BOB')))")
 $B/dsip-relay --listen 127.0.0.1:$RELAY_PORT --state "$D/relay" >"$D/relay.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 50); do [ -s "$D/relay/cert.pem" ] && break; sleep 0.2; done; CA="$D/relay/cert.pem"
 
@@ -66,7 +66,7 @@ echo "  browser: $N verified hint(s) for Bob from node C, Access-Control-Allow-O
 echo; echo "════════ 4. node A refuses a forgery for Bob's key, and Bob's own older packet once he has re-signed"
 FORGED=$(python3 - "$BOB" <<'PY'
 import sys, time, struct
-sys.path.insert(0, "tools")
+sys.path.insert(0, "spec/impl/tools")
 from nacl.signing import SigningKey
 from dsipvec.gen.pkarr import dns, txt
 from dsipvec.pkarr import bep44_signable, did_key_public

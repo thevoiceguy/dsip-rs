@@ -47,7 +47,7 @@ done
 for n in b c; do wait_for "$D/$n.log" '^http: ' 20; done
 $B/dsip identity init --dir "$D/bob" --name "Bob" >/dev/null
 BOB=$(python3 -c "import json;print(json.load(open('$D/bob/identity.json'))['identity'])")
-ZBOB=$(python3 -c "import sys;sys.path.insert(0,'tools');from dsipvec.pkarr import did_key_public,z32_encode;print(z32_encode(did_key_public('$BOB')))")
+ZBOB=$(python3 -c "import sys;sys.path.insert(0,'spec/impl/tools');from dsipvec.pkarr import did_key_public,z32_encode;print(z32_encode(did_key_public('$BOB')))")
 $B/dsip-relay --listen 127.0.0.1:$RELAY_PORT --state "$D/relay" >"$D/relay.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 50); do [ -s "$D/relay/cert.pem" ] && break; sleep 0.2; done
 $B/dsip answer --identity "$D/bob" --relay wss://127.0.0.1:$RELAY_PORT/dsip --ca "$D/relay/cert.pem" \

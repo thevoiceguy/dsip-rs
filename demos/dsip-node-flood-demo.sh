@@ -31,7 +31,7 @@ run() { # name http-port overlay-port flags…
   local c0; c0=$(cpu $v)
   python3 - "$(grep -m1 '^control: ' "$D/$name-flooder.log" | cut -d' ' -f2)" "$FLOOD_S" >"$D/$name.sent" <<'PY'
 import json, socket, sys, time
-sys.path.insert(0, "tools")
+sys.path.insert(0, "spec/impl/tools")
 from dht_testnet import hint_frame
 from dsipvec import fixtures as F
 host, port = sys.argv[1].rsplit(":", 1)

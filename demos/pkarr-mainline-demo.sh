@@ -30,7 +30,7 @@ BOB=$(python3 -c "import json;print(json.load(open('$D/bob/identity.json'))['ide
 # a forgery for Bob's key, signed by someone else, naming an attacker's relay with a newer timestamp
 read -r ZBOB FORGED < <(python3 - "$BOB" <<'PY'
 import sys, time, struct
-sys.path.insert(0, "tools")
+sys.path.insert(0, "spec/impl/tools")
 from nacl.signing import SigningKey
 from dsipvec.gen.pkarr import dns, txt
 from dsipvec.pkarr import bep44_signable, did_key_public, z32_encode

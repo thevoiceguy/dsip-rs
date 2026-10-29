@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "spec" / "impl" / "tools"))
 from dsipvec.gen import tnbinding as G  # noqa: E402
 
 NOW = int(time.time())

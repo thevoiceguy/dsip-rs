@@ -25,7 +25,7 @@ BOB=$(python3 -c "import json;print(json.load(open('$D/bob/identity.json'))['ide
 # zone), and a forgery for Bob's key (signed by someone else) naming an attacker's relay with a newer timestamp.
 read -r ZBOB IROH FORGED < <(python3 - "$D/bob/controller.key" <<'PY'
 import sys, time, struct
-sys.path.insert(0, "tools")
+sys.path.insert(0, "spec/impl/tools")
 from nacl.signing import SigningKey
 from dsipvec.gen.pkarr import dns, txt
 from dsipvec.pkarr import bep44_signable, z32_encode
@@ -88,7 +88,7 @@ echo "$SEQS" | sort -c -n -u 2>/dev/null || fail "seq did not rise: $SEQS"
 echo "  $N publishes, seq strictly rising"
 python3 - "http://127.0.0.1:$HONEST/$ZBOB" <<'PY' || fail "the zone lost a record"
 import sys, urllib.request
-sys.path.insert(0, "tools")
+sys.path.insert(0, "spec/impl/tools")
 from dsipvec.pkarr import parse_dns
 p = urllib.request.urlopen(sys.argv[1]).read()
 from dsipvec.pkarr import carry, z32_encode
