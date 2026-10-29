@@ -43,6 +43,7 @@ use dsip_broadcast::Authority;
 use dsip_session::fork::{RelayAction, RelayEvent};
 use dsip_session::{Emission, Message, Relay};
 use dsip_transport::conn::ws_config;
+use dsip_transport::resolver::{Over, WebDocuments};
 use dsip_transport::verify::{verify_frame_with, Inbound, SeenIds};
 use dsip_transport::{now_s, HELLO_TIMEOUT_S};
 
@@ -75,6 +76,9 @@ pub struct RelayConfig {
     pub served: Option<HashSet<String>>,
     /// Maximum seconds an envelope is held for an offline recipient (advertised as `offline_retention_s`).
     pub offline_retention: i64,
+    /// Fetch the `did:web` documents of identities binding here over HTTPS (§7.2, §8.1), after the documents given to
+    /// [`RelayServer::new`]. `None`: only those documents (and `did:key`) verify.
+    pub did_web: Option<Arc<WebDocuments>>,
 }
 
 impl Default for RelayConfig {
@@ -88,6 +92,7 @@ impl Default for RelayConfig {
             queue_budget_bytes: 67_108_864,
             served: None,
             offline_retention: 86_400,
+            did_web: None,
         }
     }
 }
@@ -100,8 +105,8 @@ pub struct RelayServer {
 }
 
 impl RelayServer {
-    /// A relay signing as `key`, verifying `did:web` identities against the documents `resolver` holds (§8.1: without
-    /// them only `did:key` identities can bind). Its clock does not run until [`RelayServer::spawn_clock`].
+    /// A relay signing as `key`, verifying `did:web` identities against the documents `resolver` holds, then those
+    /// [`RelayConfig::did_web`] fetches (§8.1: without either only `did:key` identities can bind). Its clock does not run until [`RelayServer::spawn_clock`].
     pub fn new(key: KeyPair, resolver: StaticResolver, cfg: RelayConfig) -> RelayServer {
         let did = key.did();
         let mut authority = Authority::new(now_s(), HashMap::new());
@@ -113,6 +118,7 @@ impl RelayServer {
             key,
             supported: Supported::all_known(),
             resolver,
+            web: cfg.did_web.clone(),
             seen: SeenIds::default(),
             devices: HashMap::new(),
             identities: HashMap::new(),
@@ -204,6 +210,7 @@ struct State {
     key: KeyPair,
     supported: Supported,
     resolver: StaticResolver,
+    web: Option<Arc<WebDocuments>>,
     seen: SeenIds,
     devices: HashMap<String, Tx>,
     identities: HashMap<String, HashSet<String>>,
@@ -299,7 +306,8 @@ impl State {
     /// `{type: dsip-grant, grant: {id, from, identity, to, scope, valid_until, presence_audience?}}`. One that does not
     /// verify is left out: it could not admit.
     fn presented_grants(&self, p: &Value) -> Value {
-        let mut ctx = dsip_core::envelope::Context::new(now_s(), &self.resolver);
+        let resolver = Over(&self.resolver, self.web.as_deref());
+        let mut ctx = dsip_core::envelope::Context::new(now_s(), &resolver);
         ctx.revocations = self.revocations.clone();
         let out: Vec<Value> = p["claims"]
             .as_array()
@@ -640,7 +648,40 @@ impl State {
     }
 }
 
+/// The grants an unverified `subscribe` frame presents in `claims`, as frames; empty for anything else.
+fn presented_grant_frames(frame: &str) -> Vec<String> {
+    let Ok(env) = Envelope::from_frame(frame) else { return vec![] };
+    let Some(p) = dsip_core::b64::decode(&env.payload).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return vec![] };
+    if p["type"] != "subscribe" {
+        return vec![];
+    }
+    p["claims"].as_array().into_iter().flatten().filter(|c| c["type"] == "dsip-grant").map(|c| c["grant"].to_string()).collect()
+}
+
 impl RelayServer {
+    /// Fetch the `did:web` documents `frame` names that the relay does not hold, before it is verified under the
+    /// lock (a fetch must not hold it): the signer, its delegations' issuers, and for a `subscribe` the signers of the
+    /// grants it presents (P§6). Without [`RelayConfig::did_web`], nothing.
+    async fn fetch_documents(&self, frame: &str) {
+        let (web, dids) = {
+            let st = self.state.lock().await;
+            let Some(web) = st.web.clone() else { return };
+            let mut dids = web.missing(frame, &st.resolver);
+            for grant in presented_grant_frames(frame) {
+                for d in web.missing(&grant, &st.resolver) {
+                    if !dids.contains(&d) {
+                        dids.push(d);
+                    }
+                }
+            }
+            dids.truncate(WebDocuments::PER_FRAME);
+            (web, dids)
+        };
+        if !dids.is_empty() {
+            web.fetch(&dids).await;
+        }
+    }
+
     /// Serve one WebSocket connection until it closes: its `hello` binds a device (§13.2), then every frame is verified
     /// and routed. `peer` names it in log lines.
     pub async fn connection<S: AsyncRead + AsyncWrite + Unpin>(&self, mut ws: WebSocketStream<S>, peer: &str) -> Result<()> {
@@ -656,11 +697,12 @@ impl RelayServer {
                 return Err(Error::HelloTimeout(HELLO_TIMEOUT_S));
             }
         };
+        self.fetch_documents(&first).await;
         let (device, identity, hello_id) = {
             let mut st = state.lock().await;
             let sem = dsip_schema::SemanticContext { supported: st.supported.clone(), ..Default::default() };
-            let State { resolver, seen, revocations, .. } = &mut *st;
-            match verify_frame_with(&first, now_s(), resolver, &[], revocations, seen, &sem) {
+            let State { resolver, web, seen, revocations, .. } = &mut *st;
+            match verify_frame_with(&first, now_s(), &Over(resolver, web.as_deref()), &[], revocations, seen, &sem) {
                 Ok(inb) if inb.verified.msg_type() == "hello" && inb.verified.payload.get("in_reply_to").is_none() => {
                     let p = &inb.verified.payload;
                     (inb.verified.signer_did.clone(), inb.verified.identity.clone(), p["id"].as_str().unwrap_or("").to_string())
@@ -732,11 +774,12 @@ impl RelayServer {
                 tokio::select! {
                     inbound = ws.next() => match inbound {
                         Some(Ok(WsMessage::Text(t))) => {
+                            self.fetch_documents(&t).await;
                             let mut st = state.lock().await;
                             let sem = dsip_schema::SemanticContext { supported: st.supported.clone(), ..Default::default() };
                             let verdict = {
-                                let State { resolver, seen, revocations, .. } = &mut *st;
-                                verify_frame_with(&t, now_s(), resolver, &[], revocations, seen, &sem)
+                                let State { resolver, web, seen, revocations, .. } = &mut *st;
+                                verify_frame_with(&t, now_s(), &Over(resolver, web.as_deref()), &[], revocations, seen, &sem)
                             };
                             match verdict {
                                 Ok(inb) => {
