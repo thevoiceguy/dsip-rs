@@ -14,6 +14,17 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   line wins, and a repeatable one replaces the file's list. An unknown key is an error. Each crate has a
   `config.example.toml` explaining every key, which a test checks against the binary. The mechanism is
   `dsip_transport::config_file`, behind dsip-transport's new `cli` feature.
+- **`did:web` over HTTPS in the relay and the mailbox** (S2). Both fetch the `did:web` documents a frame needs (its
+  signer, its delegations' issuers, and the grants a `subscribe` presents) before verifying it, after their document
+  files, which still answer first (§8.1). A document is reused for `--did-web-ttl` (300 s). A DID whose fetch failed
+  is not fetched again for 60 s, and fetches are capped per frame and in flight. `--did-web-ca` adds PEM roots and
+  `--no-fetch-did-web` turns fetching off. `dsip_transport::resolver` gains `WebDocuments`, `Over`, `web_documents`,
+  `DidWebResolver::with_ca` and `DidWebResolver::cached`. `demos/did-web-demo.sh` runs in CI.
+
+### Changed
+
+- **Breaking:** `dsip_relay::RelayConfig` and `dsip_mailbox::MailboxConfig` gain a `did_web` field (`None` by
+  default: the library fetches nothing unless asked). Struct literals need it, or `..Default::default()`.
 
 ## [2026-10-29] — workspace release
 

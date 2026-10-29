@@ -28,6 +28,15 @@ struct Args {
     /// authoritative). Without them only `did:key` identities can bind.
     #[arg(long)]
     did_document: Vec<PathBuf>,
+    /// Do not fetch `did:web` documents over HTTPS (§7.2): only the --did-document files, and `did:key`, verify.
+    #[arg(long)]
+    no_fetch_did_web: bool,
+    /// Seconds a fetched `did:web` document is reused before it is fetched again.
+    #[arg(long, default_value_t = dsip_transport::resolver::DidWebResolver::TTL_S)]
+    did_web_ttl: u64,
+    /// PEM certificates trusted, besides the public web PKI, for fetching `did:web` documents (a private CA).
+    #[arg(long)]
+    did_web_ca: Option<PathBuf>,
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
@@ -165,6 +174,7 @@ async fn main() -> Result<()> {
         queue_budget_bytes: args.queue_budget_bytes,
         served,
         offline_retention: args.offline_retention,
+        did_web: dsip_transport::resolver::web_documents(!args.no_fetch_did_web, args.did_web_ttl, args.did_web_ca.as_deref())?,
     };
     let resolver = dsip_transport::resolver::build_resolver(&args.did_document, &[]).await?;
     let relay = RelayServer::new(key, resolver, cfg);

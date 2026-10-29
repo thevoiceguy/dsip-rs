@@ -18,6 +18,9 @@ state = "/var/lib/dsip-mailbox"                    # the service key, the self-s
 # serve_any = 32                                   # up to this many more identities enrol by binding (spec-gap 115)
 # release_idle = false                             # end an enrolment idle for mls_retention (M§4.1; spec-gap 130)
 # resolver_file = ["/etc/dsip-mailbox/docs/example.com.json"]   # did:web documents, re-read when resolving
+# no_fetch_did_web = false                         # true: never fetch did:web documents, only the files above verify
+# did_web_ttl = 300                                # seconds a fetched did:web document is reused
+# did_web_ca = "/etc/dsip-mailbox/did-web-ca.pem"  # PEM roots trusted for did:web hosts, besides the public web PKI
 # hints_node = ["https://hints.example.com"]       # asked for the mailbox hint of a member with no DID document
 
 # --- policy and limits (M§4.3, M§5.7, §19.4)

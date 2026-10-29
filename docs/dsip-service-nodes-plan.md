@@ -40,7 +40,8 @@ stage that changes behaviour a vector can see starts with the vector in DSIP (CL
   `/etc/dsip-mailbox/mailbox.toml`), using dsip-node's pattern: every key also a flag, flags win, unknown keys are
   an error, and every key is explained in a `config.example.toml`. Existing flags keep their names, so the demos and
   `node-setup.sh` work unchanged.
-- **S2, `did:web` over HTTPS.** Both services resolve `did:web` identities with `dsip_transport::resolver`
+- **S2, `did:web` over HTTPS.** *Done: `dsip_transport::resolver::WebDocuments`, fetched before verification;
+  `--did-web-ttl`, `--did-web-ca`, `--no-fetch-did-web`; `demos/did-web-demo.sh`.* Both services resolve `did:web` identities with `dsip_transport::resolver`
   (`DidWebResolver`, which reuses a document for a configured TTL; `Chain` puts the document files first, so
   they still work as overrides). Authority order is unchanged (§8.1): a fetched document is authoritative, a cached one only within its
   lifetime, and a hint never.

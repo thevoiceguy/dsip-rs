@@ -211,6 +211,10 @@ jobs:
         # the old one and keeps the new one bound (it used to drop both), and tells it transport.replaced, so the
         # replaced client stops instead of reconnecting (spec-gap 158).
         run: timeout 120 bash demos/relay-rebind-demo.sh | tail -8
+      - name: did:web documents fetched over HTTPS (relay and mailbox; service-nodes S2)
+        # Self-verifying: with no document files, a relay binds a did:web identity from its fetched document and a call
+        # to it is answered; a relay with --no-fetch-did-web refuses its hello; a mailbox enrols a did:web identity.
+        run: timeout 120 bash demos/did-web-demo.sh | tail -14
       - name: status pages (relay and mailbox --status-listen)
         # Self-verifying: the relay follows a call ringing → answered → ended by bye and counts a refusal; the mailbox
         # reports its --serve-any place taken, the owner's KeyPackages, a mailbox.not-served refusal and a blob 404.

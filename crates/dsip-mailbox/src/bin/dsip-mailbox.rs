@@ -46,6 +46,15 @@ struct Args {
     /// DID document files (re-read when resolving, so documents may be written after startup).
     #[arg(long = "resolver-file")]
     resolver_files: Vec<PathBuf>,
+    /// Do not fetch `did:web` documents over HTTPS (§7.2): only the --resolver-file documents, and `did:key`, verify.
+    #[arg(long)]
+    no_fetch_did_web: bool,
+    /// Seconds a fetched `did:web` document is reused before it is fetched again.
+    #[arg(long, default_value_t = dsip_transport::resolver::DidWebResolver::TTL_S)]
+    did_web_ttl: u64,
+    /// PEM certificates trusted, besides the public web PKI, for fetching `did:web` documents (a private CA).
+    #[arg(long)]
+    did_web_ca: Option<PathBuf>,
     /// Trust anchor for dialling peer mailboxes.
     #[arg(long)]
     ca: Option<PathBuf>,
@@ -115,6 +124,7 @@ async fn main() -> Result<()> {
     cfg.serve_any = args.serve_any;
     cfg.hints_nodes = args.hints_nodes;
     cfg.resolver_files = args.resolver_files;
+    cfg.did_web = dsip_transport::resolver::web_documents(!args.no_fetch_did_web, args.did_web_ttl, args.did_web_ca.as_deref())?;
     cfg.ca = args.ca;
     cfg.admit = args.admit;
     cfg.intro_limit = args.intro_limit;

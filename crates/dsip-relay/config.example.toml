@@ -16,6 +16,9 @@
 # serve = ["did:web:example.com"]                  # unset: an open relay, serving every identity that binds
 # serve_file = "/etc/dsip-relay/served.txt"        # one DID per line, added to `serve`
 # did_document = ["/etc/dsip-relay/docs/example.com.json"]   # did:web documents for identities that bind here (§8.1)
+# no_fetch_did_web = false                         # true: never fetch did:web documents, only the files above verify
+# did_web_ttl = 300                                # seconds a fetched did:web document is reused
+# did_web_ca = "/etc/dsip-relay/did-web-ca.pem"    # PEM roots trusted for did:web hosts, besides the public web PKI
 
 # --- store-and-forward (§13.3)
 # inbox_cap = 100                                  # queued envelopes per recipient

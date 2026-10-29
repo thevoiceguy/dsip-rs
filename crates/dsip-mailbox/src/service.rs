@@ -40,7 +40,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use dsip_core::envelope::{self, Context, Envelope};
 use dsip_core::keys::KeyPair;
-use dsip_core::did::StaticResolver;
+use dsip_core::did::{DidDocument, Resolver, StaticResolver};
 use dsip_core::version::Supported;
 use crate::store::{write_atomically, Item, Store};
 use crate::verify::{delegated_identity, verify_frame};
@@ -51,6 +51,7 @@ use dsip_messaging::hub::Hub;
 use dsip_messaging::mailbox::Mailbox;
 use dsip_mls::{digest, message_header, HubView};
 use dsip_transport::conn::{ConnectParams, Connection};
+use dsip_transport::resolver::{Over, WebDocuments};
 use dsip_transport::verify::SeenIds;
 use dsip_transport::{now_s, tls};
 
@@ -121,6 +122,8 @@ struct Service {
     /// it expires (§8.1 rule 6: never authority).
     hinted: HashMap<String, (String, String, i64)>,
     resolver_files: Vec<PathBuf>,
+    /// `did:web` documents fetched over HTTPS, after the files (§7.2, §8.1).
+    web: Option<Arc<WebDocuments>>,
     ca: Option<PathBuf>,
     seen: SeenIds,
     supported: Supported,
@@ -179,7 +182,7 @@ enum PeerMsg {
     Forward(Envelope, String),
 }
 
-fn ctx_of<'a>(resolver: &'a StaticResolver, seen: &SeenIds, supported: &Supported, revocations: &[Envelope]) -> Context<'a> {
+fn ctx_of<'a>(resolver: &'a Documents, seen: &SeenIds, supported: &Supported, revocations: &[Envelope]) -> Context<'a> {
     let mut ctx = Context::new(now_s(), resolver);
     ctx.seen_ids = seen.set();
     ctx.supported = supported.clone();
@@ -518,7 +521,7 @@ impl Service {
         }
     }
 
-    fn resolver(&self) -> StaticResolver {
+    fn resolver(&self) -> Documents {
         let mut r = StaticResolver::default();
         for f in &self.resolver_files {
             let Ok(text) = std::fs::read_to_string(f) else { continue };
@@ -529,7 +532,7 @@ impl Service {
                 }
             }
         }
-        r
+        Documents { files: r, web: self.web.clone() }
     }
 
     /// An item as `items` carries it, with blobs this mailbox holds named at its own blob endpoint (M§8.4 rule 6).
@@ -814,6 +817,9 @@ pub struct MailboxConfig {
     pub hints_nodes: Vec<String>,
     /// DID document files, re-read when resolving.
     pub resolver_files: Vec<PathBuf>,
+    /// Fetch `did:web` documents over HTTPS (§7.2, §8.1), after [`MailboxConfig::resolver_files`]. `None`: only the
+    /// files (and `did:key`) verify.
+    pub did_web: Option<Arc<WebDocuments>>,
     /// Trust anchor for dialling peer mailboxes.
     pub ca: Option<PathBuf>,
     /// Admit policy (M§5.7): `grant` or `open`.
@@ -852,6 +858,7 @@ impl MailboxConfig {
             serve_any: None,
             hints_nodes: vec![],
             resolver_files: vec![],
+            did_web: None,
             ca: None,
             admit: "grant".into(),
             intro_limit: 5,
@@ -984,6 +991,7 @@ impl MailboxServer {
             hints_nodes: cfg.hints_nodes,
             hinted: HashMap::new(),
             resolver_files: cfg.resolver_files,
+            web: cfg.did_web,
             ca: cfg.ca,
             seen: SeenIds::default(),
             supported: Supported::all_known(),
@@ -1123,28 +1131,26 @@ async fn blob_request<S: AsyncRead + AsyncWrite + Unpin>(mut req: http::Request<
         }
         "PUT" => {
             let now = now_s();
+            let credential = req.header("authorization").and_then(|h| h.strip_prefix("DSIP ")).and_then(|compact| {
+                let mut parts = compact.trim().split('.');
+                Some(Envelope { protected: parts.next()?.to_string(), payload: parts.next()?.to_string(), signature: parts.next()?.to_string() })
+            });
+            if let Some(env) = &credential {
+                fetch_documents(&service, &env.frame()).await;
+            }
             // The credential: the full envelope pipeline, the device's delegation, the message rules (M§5.1).
             let (authorization, mbx, stored) = {
                 let mut st = service.lock().await;
                 let resolver = st.resolver();
                 let ctx = ctx_of(&resolver, &st.seen, &st.supported, &st.revocations);
-                let auth = req
-                    .header("authorization")
-                    .and_then(|h| h.strip_prefix("DSIP "))
-                    .and_then(|compact| {
-                        let mut parts = compact.trim().split('.');
-                        let env = Envelope {
-                            protected: parts.next()?.to_string(),
-                            payload: parts.next()?.to_string(),
-                            signature: parts.next()?.to_string(),
-                        };
-                        let ver = envelope::verify(&env, &ctx, None).ok()?;
-                        if ver.msg_type() != "blob-put" || dsip_messaging::checks::check_message(&ver.payload)["verdict"] != "accept" {
-                            return None;
-                        }
-                        let identity = delegated_identity(&ver, &ctx)?;
-                        Some(json!({"identity": identity, "payload": ver.payload}))
-                    });
+                let auth = credential.as_ref().and_then(|env| {
+                    let ver = envelope::verify(env, &ctx, None).ok()?;
+                    if ver.msg_type() != "blob-put" || dsip_messaging::checks::check_message(&ver.payload)["verdict"] != "accept" {
+                        return None;
+                    }
+                    let identity = delegated_identity(&ver, &ctx)?;
+                    Some(json!({"identity": identity, "payload": ver.payload}))
+                });
                 if let Some(a) = &auth {
                     let id = a["payload"]["id"].as_str().unwrap_or("").to_string();
                     st.seen.insert(&id, now, now);
@@ -1303,6 +1309,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(tls: http::Prefixed<S>, servic
         Ok(Some(Ok(WsMessage::Text(t)))) => t.to_string(),
         _ => return Err(Error::NoHello),
     };
+    fetch_documents(&service, &first).await;
     let (device, identity, hello_env) = {
         let mut st = service.lock().await;
         let resolver = st.resolver();
@@ -1445,6 +1452,7 @@ async fn take_binding(service: &Arc<Mutex<Service>>, device: &str, tx: &mpsc::Un
 
 /// Verify one frame and run it through the state machines; returns frames for this connection.
 async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, bound_identity: &str) -> Vec<String> {
+    fetch_documents(service, &frame).await;
     let now = now_s();
     let mut st = service.lock().await;
     st.catch_up(now);
@@ -1498,7 +1506,7 @@ fn dispatch(
     frame: &str,
     hello_device: &str,
     bound_identity: &str,
-    resolver: &StaticResolver,
+    resolver: &Documents,
     now: i64,
 ) -> Vec<Out> {
     let p = inb.payload().clone();
@@ -1802,7 +1810,7 @@ fn hub_deposit(
     device: &str,
     identity: &str,
     item: Item,
-    resolver: &StaticResolver,
+    resolver: &Documents,
     now: i64,
 ) -> Vec<Out> {
     let group = p["group"].as_str().unwrap_or("").to_string();
@@ -1954,9 +1962,38 @@ impl PeerTarget {
     }
 }
 
+/// What the mailbox verifies with: its document files, re-read each time (a host may rewrite them), then the
+/// `did:web` documents it fetched.
+///
+/// Spec: §8.1 — the files answer first, as overrides; a fetched document within its TTL next; hints never.
+struct Documents {
+    files: StaticResolver,
+    web: Option<Arc<WebDocuments>>,
+}
+
+impl Resolver for Documents {
+    fn resolve(&self, did: &str) -> Option<DidDocument> {
+        Over(&self.files, self.web.as_deref()).resolve(did)
+    }
+}
+
+/// Fetch the `did:web` documents `frame` names that the mailbox does not hold, before it is verified under the lock
+/// (a fetch must not hold it). Without [`MailboxConfig::did_web`], nothing.
+async fn fetch_documents(service: &Arc<Mutex<Service>>, frame: &str) {
+    let (web, dids) = {
+        let st = service.lock().await;
+        let Some(web) = st.web.clone() else { return };
+        let dids = web.missing(frame, &st.resolver());
+        (web, dids)
+    };
+    if !dids.is_empty() {
+        web.fetch(&dids).await;
+    }
+}
+
 /// The `DSIPMailbox` entries an identity's DID document lists, if it has one held here.
-fn document_mailboxes(identity: &str, resolver: &StaticResolver) -> Option<Vec<Value>> {
-    let doc = dsip_core::did::Resolver::resolve(resolver, identity)?;
+fn document_mailboxes(identity: &str, resolver: &Documents) -> Option<Vec<Value>> {
+    let doc = resolver.resolve(identity)?;
     Some(doc.service.iter().filter(|s| s.service_type == "DSIPMailbox").map(|s| s.service_endpoint.clone()).collect())
 }
 
@@ -1964,6 +2001,14 @@ fn document_mailboxes(identity: &str, resolver: &StaticResolver) -> Option<Vec<V
 /// `select_mailbox` (M§4.2); with no document, the hints nodes' records folded by §8.3 (`dsip_dht::record::select`)
 /// and their `DSIPMailbox` endpoints offered as `hint_entries`. `None` when nothing usable is found.
 async fn resolve_mailbox(service: &Arc<Mutex<Service>>, identity: &str) -> Option<(String, String)> {
+    // M§4.2: the identity's own document first, fetched when it is a did:web the files do not hold.
+    let web = {
+        let st = service.lock().await;
+        st.web.clone().filter(|w| w.needs(identity, &st.resolver()))
+    };
+    if let Some(web) = web {
+        web.fetch(&[identity.to_string()]).await;
+    }
     let (entries, nodes, ca) = {
         let st = service.lock().await;
         let resolver = st.resolver();
