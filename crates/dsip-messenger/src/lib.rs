@@ -240,6 +240,45 @@ pub fn mailbox_of(identity: &str, resolver: &StaticResolver) -> Result<(String, 
     Ok((did, uri))
 }
 
+/// The DID document an identity serves (§7.2, as `did:web` does) to be reachable for messaging: its controller key as
+/// `#key-1`, the X25519 key sealed introductions are encrypted to (M§6.9; spec-gap 55: derived from the controller
+/// key), and one `DSIPMailbox` service naming its mailbox (M§4.2).
+///
+/// Spec: M§4.2, M§6.9.
+pub fn did_document(identity: &str, controller: &KeyPair, mailbox_did: &str, mailbox_uri: &str) -> Value {
+    let x25519 = dsip_messaging::first_contact::x25519_public(&dsip_messaging::first_contact::x25519_from_ed25519_seed(&controller.seed()));
+    json!({
+        "keyAgreement": [{
+            "id": format!("{identity}#key-agreement-1"), "type": "Multikey", "controller": identity,
+            "publicKeyMultibase": dsip_core::did::multibase_x25519(&x25519),
+        }],
+        "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+        "id": identity,
+        "verificationMethod": [{
+            "id": format!("{identity}#key-1"), "type": "Multikey", "controller": identity,
+            "publicKeyMultibase": dsip_core::did::multibase_ed25519(&controller.public()),
+        }],
+        "authentication": [format!("{identity}#key-1")],
+        "assertionMethod": [format!("{identity}#key-1")],
+        "service": [{
+            "id": format!("{identity}#dsip-mailbox"), "type": "DSIPMailbox",
+            "serviceEndpoint": {
+                "uri": mailbox_uri, "bindings": ["ws/1.0"], "mailbox": mailbox_did, "priority": 0,
+                "profiles": [wire::PROFILE], "accepts": ["text", "audio", "image", "file"],
+                "voicemail": {"max_duration_s": 180},
+            },
+        }],
+    })
+}
+
+/// The identity JSON [`Engine::open`] takes: the identity, its device and controller seeds, the delegation to the
+/// device and a display name.
+pub fn engine_identity(identity: &str, device: &KeyPair, controller: &KeyPair, delegation: &Envelope, display_name: &str) -> String {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    json!({"identity": identity, "device_seed_hex": hex(&device.seed()), "delegation": delegation.frame(),
+           "controller_seed_hex": hex(&controller.seed()), "display_name": display_name}).to_string()
+}
+
 /// HTTPS for blobs, trusting the same anchors as the `wss` connections (M§5.6: TLS as in §13.2).
 pub fn http_client(ca: Option<&std::path::Path>) -> Result<reqwest::Client> {
     let mut b = reqwest::Client::builder().use_rustls_tls().https_only(true);

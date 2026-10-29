@@ -229,34 +229,6 @@ impl Keys {
     }
 }
 
-/// The `did:web` document for this identity, carrying its mailbox entry (M§4.2).
-fn did_document(identity: &str, controller: &KeyPair, mailbox_did: &str, mailbox_uri: &str) -> Value {
-    // M§6.9: the key sealed introductions are encrypted to (spec-gap 55: derived from the identity key).
-    let x25519 = dsip_messaging::first_contact::x25519_public(&dsip_messaging::first_contact::x25519_from_ed25519_seed(&controller.seed()));
-    json!({
-        "keyAgreement": [{
-            "id": format!("{identity}#key-agreement-1"), "type": "Multikey", "controller": identity,
-            "publicKeyMultibase": dsip_core::did::multibase_x25519(&x25519),
-        }],
-        "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
-        "id": identity,
-        "verificationMethod": [{
-            "id": format!("{identity}#key-1"), "type": "Multikey", "controller": identity,
-            "publicKeyMultibase": dsip_core::did::multibase_ed25519(&controller.public()),
-        }],
-        "authentication": [format!("{identity}#key-1")],
-        "assertionMethod": [format!("{identity}#key-1")],
-        "service": [{
-            "id": format!("{identity}#dsip-mailbox"), "type": "DSIPMailbox",
-            "serviceEndpoint": {
-                "uri": mailbox_uri, "bindings": ["ws/1.0"], "mailbox": mailbox_did, "priority": 0,
-                "profiles": [wire::PROFILE], "accepts": ["text", "audio", "image", "file"],
-                "voicemail": {"max_duration_s": 180},
-            },
-        }],
-    })
-}
-
 fn compact(e: &Envelope) -> String {
     format!("{}.{}.{}", e.protected, e.payload, e.signature)
 }
@@ -1458,7 +1430,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let keys = Keys::load_or_create(&args.state, args.controller.as_deref())?;
     if let Some(path) = &args.write_doc {
-        let doc = did_document(&args.identity, &keys.controller, args.mailbox_did.as_deref().context("--mailbox-did")?,
+        let doc = dsip_messenger::did_document(&args.identity, &keys.controller, args.mailbox_did.as_deref().context("--mailbox-did")?,
             args.mailbox_uri.as_deref().context("--mailbox-uri")?);
         std::fs::write(path, serde_json::to_string_pretty(&doc)?)?;
         println!("OK wrote {}", path.display());
@@ -1488,8 +1460,7 @@ async fn main() -> Result<()> {
     if let (Some(resume), true) = (db.get("resume").map_err(state_err)?, state.is_object()) {
         state["resume"] = resume;
     }
-    let identity_json = json!({"identity": args.identity, "device_seed_hex": hex(&keys.device.seed()), "delegation": delegation.frame(),
-                               "controller_seed_hex": hex(&keys.controller.seed()), "display_name": args.identity}).to_string();
+    let identity_json = dsip_messenger::engine_identity(&args.identity, &keys.device, &keys.controller, &delegation, &args.identity);
     let mut m = Engine::open(&identity_json, &mailbox.0, &mailbox.1, db, &state, now as f64).map_err(messenger_err)?;
     // C§5: a recorder discloses nothing (it sends no receipts)
     let policy = ReceiptPolicy { delivered: !args.no_delivered && !args.recorder, read: !args.recorder && args.disclose.iter().any(|d| d == "read"),

@@ -461,6 +461,11 @@ PoC better on their own terms: each removes duplicated glue from the reference c
    application implements `Host`: each `Output` reaches it in order, with the engine to read, so dsip-msg prints the
    lines it printed. dsip-msg is now its commands and its console (`Console: Host`), the device-events gateway included;
    all 25 of its demos pass unchanged. `examples/echo_bot.rs`.
+   4e done: [the usage guide](dsip-rs-guide.md) (which crate for what, identities, `dsip-phone`, `dsip-messenger`,
+   embedded relay and mailbox, the testkit, what is not there yet). Every example is built by CI's clippy
+   `--all-targets`, and the chat bot runs end to end in CI (`demos/echo-bot-demo.sh`: it grants dsip-msg first
+   contact, joins the conversation and answers each text). `dsip_messenger::did_document` and `engine_identity`
+   came out of dsip-msg for it. The testkit's mailbox is left for when a test needs one.
 
 5. **Its own repository and release.** Move the stack crates (or the whole of `impl/`) out when core reaches 1.0,
    tag the first CalVer release, and switch the gateway to git dependencies on it. The vectors move with the spec,
