@@ -484,8 +484,8 @@ PoC better on their own terms: each removes duplicated glue from the reference c
      from the 2026-10-16 seed. Its CI runs what DSIP's runs on the code: build, clippy, tests, docs, the Rust
      vector runner, the demos, the wasm build and the web tests. From 5b to 5d, DSIP's copy of the code is frozen:
      changes go to dsip-rs, and DSIP's CI keeps checking parity with the frozen copy.
-   - **5c, the first release.** `v2026.MM.DD`, every crate at `0.1.0` (listed in the tag and the changelog), and the
-     repository made public.
+   - **5c, the first release.** `v2026.10.29`, every crate at `0.1.0` (listed in the tag and the changelog). The
+     repository went public before it, on 2026-10-29 (decision 8).
    - **5d, DSIP without the code.** DSIP drops `impl/crates`, `impl/demos`, `impl/web` and the workspace. Its CI
      checks out dsip-rs at a pinned commit for the Rust side of parity and fuzzing, and for spec_lint's coverage
      table. CLAUDE.md, the overview and the deploy recipe follow.
@@ -543,5 +543,6 @@ Decisions for stage 5 (the owner, 2026-10-29):
 6. **What moves: all the crates and the demos**, and the workspace with them. The spec, vectors, tools and `impl-ts`
    stay in DSIP.
 7. **Spec inputs: DSIP as a git submodule (`spec/`)**, pinned to a tag and moved forward on purpose.
-8. **Private first**, public at the first CalVer release.
+8. **Private first**, public at the first CalVer release. *Changed 2026-10-29:* public at once, before the release:
+   GitHub Actions minutes for a private repository were not available, and CI had to run.
 9. **The browser client moves with dsip-rs**: it is built from dsip-wasm and its tests check the crates.
