@@ -29,7 +29,9 @@ tracing.workspace = true
 reqwest.workspace = true
 clap = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing-journald = { workspace = true, optional = true }
 
 [features]
-# `config_file`: a service binary's TOML config file, read as its flags
-cli = ["dep:clap", "dep:toml"]
+# `config_file`: a service binary's TOML config file, read as its flags; `logging`: where its log lines go
+cli = ["dep:clap", "dep:toml", "dep:tracing-subscriber", "dep:tracing-journald"]

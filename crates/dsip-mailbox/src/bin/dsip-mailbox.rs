@@ -5,16 +5,19 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
 
 use dsip_mailbox::service::blob_endpoint;
 use dsip_mailbox::{MailboxConfig, MailboxServer};
+use dsip_transport::logging::LogTo;
 use dsip_transport::tls;
 
 #[derive(Parser)]
-#[command(name = "dsip-mailbox", about = "DSIP mailbox and hub service (Messaging Profile 1.0)")]
+#[command(name = "dsip-mailbox", about = "DSIP mailbox and hub service (Messaging Profile 1.0)",
+    after_help = "dsip-mailbox admin --help: operate a running mailbox (enrolments, release) through its status port")]
 struct Args {
     /// TOML config file: each key is one of these flags in snake_case (`config.example.toml`); a flag given here
     /// wins over the file.
@@ -99,16 +102,23 @@ struct Args {
     /// `--listen` address is not one a peer can dial.
     #[arg(long)]
     host: Vec<String>,
-    /// Serve `GET /status` (JSON; `?detail=1` adds each owner's storage and each hub) and `GET /metrics`
-    /// (Prometheus) on this address, plain HTTP. Keep it on loopback (`dsipctl mailbox-status`).
+    /// Serve `GET /status` (JSON; `?detail=1` adds each owner's storage and each hub), `GET /metrics`
+    /// (Prometheus) and the admin commands (`dsip-mailbox admin`) on this address, plain HTTP. Keep it on loopback
+    /// (`dsipctl mailbox-status`).
     #[arg(long)]
     status_listen: Option<SocketAddr>,
+    /// Where log lines go: `auto` is journald under systemd, standard error elsewhere. `RUST_LOG` filters.
+    #[arg(long, value_enum, default_value_t)]
+    log: LogTo,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())).init();
+async fn main() -> Result<ExitCode> {
+    if dsip_transport::admin::invoked() {
+        return Ok(dsip_transport::admin::run("dsip-mailbox", dsip_mailbox::service::ADMIN_COMMANDS).await);
+    }
     let args: Args = dsip_transport::config_file::parse();
+    dsip_transport::logging::init(args.log);
     std::fs::create_dir_all(&args.state)?;
     let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
     hosts.extend(args.host.iter().cloned());
@@ -116,7 +126,9 @@ async fn main() -> Result<()> {
         (Some(c), Some(k)) => (c.clone(), k.clone()), // a real certificate: browsers bind here (client stage 6)
         _ => tls::ensure_self_signed(&args.state, &hosts)?,
     };
-    let acceptor = tls::acceptor(&cert, &keyfile)?;
+    // SIGHUP reads the certificate again (a renewal): new connections get it, bound devices stay bound
+    let certs = tls::Certificates::load(&cert, &keyfile)?;
+    certs.reload_on_sighup()?;
     anyhow::ensure!(!args.owners.is_empty() || args.serve_any.is_some(), "give --owner <did> (repeatable) and/or --serve-any <n>");
 
     let mut cfg = MailboxConfig::new(args.state.clone(), blob_endpoint(&args.listen, args.host.first().map(String::as_str)));
@@ -146,5 +158,6 @@ async fn main() -> Result<()> {
         server.spawn_status(addr);
     }
     server.spawn_tasks();
-    Ok(server.serve_tls(listener, acceptor).await?)
+    server.serve_tls(listener, certs.acceptor()).await?;
+    Ok(ExitCode::SUCCESS)
 }

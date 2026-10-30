@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -16,10 +17,12 @@ use tokio::net::TcpListener;
 use dsip_core::keys::KeyPair;
 use dsip_relay::store::QueueStore;
 use dsip_relay::{www, RelayConfig, RelayServer};
+use dsip_transport::logging::LogTo;
 use dsip_transport::tls;
 
 #[derive(Parser)]
-#[command(name = "dsip-relay", version, about = "DSIP relay (ws/1.0, forking with leg tracking, store-and-forward within the §13.3 boundary)")]
+#[command(name = "dsip-relay", version, about = "DSIP relay (ws/1.0, forking with leg tracking, store-and-forward within the §13.3 boundary)",
+    after_help = "dsip-relay admin --help: operate a running relay (bindings) through its status port")]
 struct Args {
     /// TOML config file: each key is one of these flags in snake_case (`config.example.toml`); a flag given here
     /// wins over the file.
@@ -112,18 +115,23 @@ struct Args {
     /// reaches the node through the origin that served it.
     #[arg(long)]
     node_proxy: Option<String>,
-    /// Serve `GET /status` (JSON; `?detail=1` adds DIDs and sessions) and `GET /metrics` (Prometheus) on this
-    /// address, plain HTTP: bound devices, sessions, queues, refusals. Keep it on loopback (`dsipctl relay-status`).
+    /// Serve `GET /status` (JSON; `?detail=1` adds DIDs and sessions), `GET /metrics` (Prometheus) and the admin
+    /// commands (`dsip-relay admin`) on this address, plain HTTP: bound devices, sessions, queues, refusals. Keep it
+    /// on loopback (`dsipctl relay-status`).
     #[arg(long)]
     status_listen: Option<SocketAddr>,
+    /// Where log lines go: `auto` is journald under systemd, standard error elsewhere. `RUST_LOG` filters.
+    #[arg(long, value_enum, default_value_t)]
+    log: LogTo,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-    ).init();
+async fn main() -> Result<ExitCode> {
+    if dsip_transport::admin::invoked() {
+        return Ok(dsip_transport::admin::run("dsip-relay", dsip_relay::ADMIN_COMMANDS).await);
+    }
     let args: Args = dsip_transport::config_file::parse();
+    dsip_transport::logging::init(args.log);
     std::fs::create_dir_all(&args.state)?;
 
     // Relay identity: a did:key from a persisted seed. Spec §7.2 recommends did:web for relays;
@@ -151,7 +159,9 @@ async fn main() -> Result<()> {
         (Some(c), Some(k)) => (c.clone(), k.clone()),
         _ => tls::ensure_self_signed(&args.state, &hosts)?,
     };
-    let acceptor = tls::acceptor(&cert, &keyfile)?;
+    // SIGHUP reads the certificate again (a renewal): new connections get it, bound devices stay bound
+    let certs = tls::Certificates::load(&cert, &keyfile)?;
+    certs.reload_on_sighup()?;
 
     tracing::info!("relay did: {}", key.did());
 
@@ -212,5 +222,6 @@ async fn main() -> Result<()> {
     } else {
         tracing::info!("listening on wss://{}/dsip  (clients: --ca {})", args.listen, cert.display());
     }
-    Ok(relay.serve_tls(listener, acceptor, routes).await?)
+    relay.serve_tls(listener, certs.acceptor(), routes).await?;
+    Ok(ExitCode::SUCCESS)
 }

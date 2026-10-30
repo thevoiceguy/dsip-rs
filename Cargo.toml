@@ -104,6 +104,7 @@ futures-util = "0.3"
 mainline = { version = "8.0.1", default-features = false, features = ["async"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
 libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "kad", "identify", "macros", "ed25519"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 

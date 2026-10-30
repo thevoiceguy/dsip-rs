@@ -13,12 +13,16 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "cli")]
+pub mod admin;
 pub mod agent;
 #[cfg(feature = "cli")]
 pub mod config_file;
 pub mod conn;
 pub mod error;
 pub mod identity;
+#[cfg(feature = "cli")]
+pub mod logging;
 pub mod resolver;
 pub mod status;
 pub mod tls;
