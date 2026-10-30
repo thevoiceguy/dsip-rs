@@ -3,7 +3,7 @@
 //! Spec: M§4.1 ("Whom a mailbox serves", "When an enrolment ends"), M§4.4 (a registered device completed a verified
 //! `hello` within `mls_retention_s`), M§5.7 (`release`), M§16 (`mailbox.not-served`, `mailbox.not-enrolled`).
 //!
-//! Impl: pinned by the `enrolment-trace` vectors (spec-gaps 115, 130). The machine decides; the host acts on what it
+//! Impl: pinned by the `enrolment-trace` vectors (spec-gaps 115, 130, 164). The machine decides; the host acts on what it
 //! emits: `enrolled` creates the identity's mailbox, `released` deletes everything held for it and closes its bindings.
 
 use serde_json::{json, Value};
@@ -15,8 +15,8 @@ use crate::hub::MLS_RETENTION_S;
 /// Spec: M§4.1. Configured identities are always served and never count against the bound. Any other identity enrols
 /// with its first owner operation while fewer than `serve_any` are enrolled; past the bound its owner operations are
 /// refused `mailbox.not-served`. An enrolment ends by `mailbox-config` `release: true` (a configured identity is refused
-/// `mailbox.not-enrolled`) or, when the operator chose idle expiry (a MAY), once no device of the identity has
-/// completed a verified `hello` within `mls_retention_s` (M§4.4).
+/// `mailbox.not-enrolled`), by its operator (spec-gap 164) or, when the operator chose idle expiry (a MAY), once no
+/// device of the identity has completed a verified `hello` within `mls_retention_s` (M§4.4).
 #[derive(Debug, Clone)]
 pub struct Enrolment {
     now: i64,
@@ -85,17 +85,15 @@ impl Enrolment {
         ]
     }
 
-    /// The operator ends `identity`'s enrolment (`dsip-mailbox admin release`): its place is free at once. Whether it
-    /// was enrolled; a configured identity is not, and ends by leaving the configuration.
+    /// The operator ends `identity`'s enrolment (`dsip-mailbox admin release`): its place is free at once.
     ///
-    /// Impl (spec-gap 164): M§4.1 names two ends of an enrolment, the identity's release and idle expiry. An operator
-    /// ending one is a third, with the same effect as a release: everything held for the identity is deleted and its
-    /// bindings closed (the host acts on `true` as on `released`). Not a trace event; the vectors pin the two the spec
-    /// names.
-    pub fn end(&mut self, identity: &str) -> bool {
-        let Some(i) = self.enrolled.iter().position(|(e, _)| e == identity) else { return false };
+    /// Spec: M§4.1 "By its operator" (spec-gap 164) — the same effects as a release, with nothing sent: `released`
+    /// with cause `operator`. A configured identity is not ended this way (it leaves by the configuration), and one not
+    /// enrolled emits nothing.
+    pub fn operator_release(&mut self, identity: &str) -> Vec<Value> {
+        let Some(i) = self.enrolled.iter().position(|(e, _)| e == identity) else { return vec![] };
         self.enrolled.remove(i);
-        true
+        vec![json!({"released": {"identity": identity, "cause": "operator"}})]
     }
 
     /// Whether `identity` is one of the operator's configured identities.
@@ -146,13 +144,14 @@ impl Enrolment {
         self.now
     }
 
-    /// Apply one trace event (`owner_op`, `release`, `hello`, `advance`).
+    /// Apply one trace event (`owner_op`, `release`, `operator_release`, `hello`, `advance`).
     pub fn step(&mut self, ev: &Value) -> Vec<Value> {
         let Some((name, e)) = ev.as_object().and_then(|o| o.iter().next()) else { return vec![] };
         let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
         match name.as_str() {
             "owner_op" => self.owner_op(&s("identity"), &s("device"), &s("id")),
             "release" => self.release(&s("identity"), &s("device"), &s("id")),
+            "operator_release" => self.operator_release(&s("identity")),
             "hello" => self.hello(&s("identity")),
             "advance" => self.advance(e.as_i64().unwrap_or(0)),
             _ => vec![],

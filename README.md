@@ -5,7 +5,7 @@ media negotiation and messaging. Build DSIP applications on it: softphones, chat
 mailboxes.
 
 **Status: pre-release.** It implements DSIP Core 1.0 and its profiles, and passes the whole conformance
-suite: 2,323 vectors from DSIP at `poc-v1.0`. The first release is `v2026.10.29` (`RELEASING.md`). Start
+suite: 2,325 vectors from DSIP. The first release is `v2026.10.29` (`RELEASING.md`). Start
 with the [usage guide](docs/dsip-rs-guide.md).
 
 ## How it relates to the other projects

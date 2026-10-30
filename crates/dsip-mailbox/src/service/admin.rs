@@ -38,7 +38,7 @@ pub(super) fn answer(st: &mut Service, command: &str, args: &BTreeMap<String, St
             if st.enrolment.is_configured(identity) {
                 return json!({"error": format!("{identity} is configured (--owner), not enrolled: remove it from the configuration")});
             }
-            if !st.enrolment.end(identity) {
+            if st.enrolment.operator_release(identity).is_empty() {
                 return json!({"error": format!("{identity} is not enrolled here")});
             }
             let row = owners(st, now).into_iter().find(|r| &r.identity == identity);

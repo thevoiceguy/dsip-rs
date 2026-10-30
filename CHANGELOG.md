@@ -43,11 +43,12 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
     address it bound from and for how long. `dsip-mailbox admin enrolments` lists the enrolled identities against
     `--serve-any` (storage, devices bound, last `hello`, when idle expiry releases them) and the configured owners.
     `dsip-mailbox admin release <did>` ends an enrolment: everything held for the identity is deleted and its
-    bindings closed, as when it releases itself (M§4.1; the operator's end of an enrolment is spec-gap 164). The
+    bindings closed, as when it releases itself (M§4.1 "By its operator", spec-gap 164). The
     commands find the service from `--status <addr>`, or from `status_listen` in its `--config` file, and print
     JSON with `--json`. A command that changes state is a `POST` carrying an `x-dsip-admin` header, so a web page
     cannot send one. `dsip_transport::admin`, `dsip_transport::status::request`;
-    `dsip_messaging::enrolment::Enrolment` gains `end` and `is_configured`.
+    `dsip_messaging::enrolment::Enrolment` gains `operator_release`, the `enrolment-trace` event
+    `operator_release`, and `is_configured`.
   - **journald.** `--log auto|journald|stderr`. When standard error is the journal (`JOURNAL_STREAM` names it),
     `auto` logs to the journal natively, with each line's level as its priority, so `journalctl -p warning` works.
     Elsewhere it logs to standard error, as before.
