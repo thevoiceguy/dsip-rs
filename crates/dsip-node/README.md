@@ -23,7 +23,8 @@ messages, media or presence. Design and measurements: `impl/docs/dsip-node-plan.
 The package starts at once with its default config. To start with your own instead (another HTTP port, bootstrap
 nodes), put `/etc/dsip-node/config.toml` in place first and install with `-o Dpkg::Options::=--force-confold`.
 
-Releases carry `SHA256SUMS`. To build everything yourself, run `packaging/build.sh --image`; to test it as an
+The packages and the image (`ghcr.io/thevoiceguy/dsip-node:<release>`, e.g. `2026.11.02`, signed) come with each
+dsip-rs workspace release, verified by its `SHA256SUMS` (RELEASING.md). To build everything yourself, run `packaging/build.sh --image`; to test it as an
 operator would, run `packaging/test.sh`.
 
 ## Ports

@@ -80,8 +80,9 @@ async fn main() -> Result<()> {
         // colour only on a terminal: journald and log files get plain text
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
-    // As PID 1 in a container a process with no handler ignores SIGTERM (docker stop waited 10 s, then killed it). The
-    // node writes its records as they change and its Mainline nodes each minute, so it leaves at once.
+    // As PID 1 in a container a process with no handler ignores SIGTERM (docker stop waited 10 s, then killed it). It
+    // leaves at once, as a kill would: the record store is made durable once per maintenance tick and Mainline's nodes
+    // are saved each minute, and republishing restores what a tick held (dsip_dht::store).
     tokio::spawn(async {
         use tokio::signal::unix::{signal, SignalKind};
         let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };

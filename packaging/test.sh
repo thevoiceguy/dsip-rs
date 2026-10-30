@@ -31,6 +31,7 @@ fail() {
   for svc in dsip-relay dsip-mailbox; do
     docker exec $SD journalctl -u $svc -o cat --no-pager 2>/dev/null | tail -15 | sed "1i--- journal of $svc" || true
   done
+  for c in $RC $MC; do docker logs $c 2>&1 | tail -25 | sed "1i--- log of container $c" || true; done
   exit 1
 }
 until_ok() { # seconds command...: retry a check every 0.2 s
