@@ -303,6 +303,8 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install pynacl cryptography   # the test number authority (demos/tn_issuer.py) behind the gateway fixture
       - run: web/build.sh
+      - name: the dsip-web tarball (what the relay serves with --www)
+        run: bash packaging/build.sh dsip-web
       - run: node web/test/engine.mjs
       - run: npm ci
         working-directory: web
@@ -315,7 +317,7 @@ jobs:
         run: web/test/run.sh all
 
   packages:
-    name: dsip-node packages build, install and run (static binaries, .deb under systemd, container)
+    name: service packages build, install and run (dsip-node, dsip-relay, dsip-mailbox: static binaries, .debs under systemd, containers)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -335,3 +337,7 @@ jobs:
         run: bash crates/dsip-node/packaging/build.sh --image
       - name: test — the .deb under systemd, the image locked down; state survives restarts in both
         run: bash crates/dsip-node/packaging/test.sh
+      - name: build — dsip-relay and dsip-mailbox (musl x86_64 and aarch64, tarballs, .debs, images)
+        run: bash packaging/build.sh --image
+      - name: test — both .debs on one systemd host, the certificate hook, the images locked down; state survives restarts
+        run: bash packaging/test.sh

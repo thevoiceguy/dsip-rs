@@ -1,0 +1,20 @@
+# One dsip-mailbox on 9443 (TLS: a self-signed certificate in its volume until you mount a real one). Its service
+# key, mailbox.sqlite and certificate live in the `dsip-mailbox` volume.
+services:
+  dsip-mailbox:
+    image: ghcr.io/thevoiceguy/dsip-mailbox:latest
+    restart: unless-stopped
+    ports:
+      - "9443:9443/tcp"
+    volumes:
+      - dsip-mailbox:/var/lib/dsip-mailbox
+      # a real certificate: a directory with fullchain.pem and privkey.pem readable by uid 65532 (certbot's own
+      # files are root's), then `docker compose kill -s HUP dsip-mailbox` after each renewal
+      # - /srv/dsip-mailbox/tls:/tls:ro
+    # command: ["--cert", "/tls/fullchain.pem", "--key", "/tls/privkey.pem", "--host", "mailbox.example.com",
+    #           "--serve-any", "32"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+volumes:
+  dsip-mailbox:

@@ -1,0 +1,21 @@
+# dsip-mailbox, as packaged. A command-line flag of the same name overrides a key, and unknown keys are an error.
+# The template with every key explained: /usr/share/doc/dsip-mailbox/config.example.toml.
+
+state = "/var/lib/dsip-mailbox"                    # its service key (service.did), mailbox.sqlite, the certificate
+listen = "0.0.0.0:9443"
+status_listen = "127.0.0.1:9102"                   # `dsip-mailbox admin --config /etc/dsip-mailbox/mailbox.toml enrolments`
+
+# TLS. Without cert and key the mailbox makes a self-signed certificate in its state directory, for tests. For a real
+# name, let certbot's deploy hook install the certificate where the service can read it, and reload it on renewal:
+#   certbot certonly ... -d mailbox.example.com --deploy-hook /usr/libexec/dsip-mailbox/install-certificate
+# then:
+# cert = "/var/lib/dsip-mailbox/tls/fullchain.pem"
+# key = "/var/lib/dsip-mailbox/tls/privkey.pem"
+# host = ["mailbox.example.com"]                   # the blob endpoint's host
+
+# Whom it serves (M§4.1): the identities whose documents name this mailbox, and how many more may enrol. As
+# installed it serves no one: its service DID (/var/lib/dsip-mailbox/service.did) and certificate are made, and
+# enrolment is closed. List owners, or open enrolment, then `systemctl restart dsip-mailbox`.
+# owner = ["did:web:example.com"]
+serve_any = 0                                      # e.g. 32: up to 32 identities enrol by binding (spec-gap 115)
+# release_idle = true                              # end an enrolment idle for mls_retention

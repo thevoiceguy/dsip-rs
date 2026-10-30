@@ -41,6 +41,11 @@ rand.workspace = true
 rusqlite = "0.37"
 openmls = "0.9.0"
 
+[features]
+# The packages' static (musl) binaries: SQLite and OpenSSL compiled in, not linked from the system
+# (crates/dsip-mailbox/packaging/build.sh).
+static = ["rusqlite/bundled", "openssl/vendored"]
+
 [[bin]]
 name = "dsip-mailbox"
 path = "src/bin/dsip-mailbox.rs"
@@ -48,3 +53,26 @@ path = "src/bin/dsip-mailbox.rs"
 [[bin]]
 name = "dsip-msg"
 path = "src/bin/dsip-msg.rs"
+
+# The .deb (packaging/build.sh): the static binary (feature `static`), the hardened DynamicUser unit, the config as
+# a conffile.
+[package.metadata.deb]
+name = "dsip-mailbox"
+maintainer = "DSIP PoC <thevoiceguy@users.noreply.github.com>"
+copyright = "the DSIP authors; MIT OR Apache-2.0"
+section = "net"
+priority = "optional"
+extended-description = """\
+A DSIP mailbox and hub (Messaging Profile 1.0): it holds the items, KeyPackages and blobs of the identities it \
+serves while their devices are offline, and orders and fans out the messages of the MLS groups it hosts."""
+depends = "procps"   # /bin/kill, for the unit's ExecReload (SIGHUP)
+conf-files = ["/etc/dsip-mailbox/mailbox.toml"]
+maintainer-scripts = "packaging/debian/"
+systemd-units = { unit-name = "dsip-mailbox", enable = true, start = true, restart-after-upgrade = true }
+assets = [
+    ["target/release/dsip-mailbox", "usr/bin/", "755"],
+    ["packaging/config.toml", "etc/dsip-mailbox/mailbox.toml", "644"],
+    ["../../packaging/install-certificate", "usr/libexec/dsip-mailbox/install-certificate", "755"],
+    ["config.example.toml", "usr/share/doc/dsip-mailbox/config.example.toml", "644"],
+    ["packaging/compose.yaml", "usr/share/doc/dsip-mailbox/compose.yaml", "644"],
+]

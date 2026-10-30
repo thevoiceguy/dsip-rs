@@ -1,0 +1,36 @@
+#!/bin/sh
+# Install a TLS certificate for this package's service and reload it, without dropping bound devices (SIGHUP).
+#
+#   install-certificate [<dir with fullchain.pem and privkey.pem>]
+#
+# Without an argument it takes certbot's $RENEWED_LINEAGE, so it is the certificate's deploy hook:
+#   certbot certonly ... -d relay.example.com --deploy-hook /usr/libexec/dsip-relay/install-certificate
+# The service runs as a DynamicUser and cannot read /etc/letsencrypt, so the pair is copied into its state directory,
+# /var/lib/<service>/tls/, readable only by the service; its config names cert and key there. The service is
+# reloaded if it runs; a certificate the service refuses (not a certificate, or not the key's) is logged and the one
+# it had stays in use.
+#
+# Spec: none (infrastructure).
+set -eu
+SERVICE=$(basename "$(dirname "$(readlink -f "$0")")")
+SRC=${1:-${RENEWED_LINEAGE:-}}
+[ -n "$SRC" ] || { echo "usage: $0 <dir with fullchain.pem and privkey.pem> (or set RENEWED_LINEAGE)" >&2; exit 2; }
+for f in fullchain.pem privkey.pem; do [ -r "$SRC/$f" ] || { echo "$0: no $SRC/$f" >&2; exit 1; }; done
+# /var/lib/<service> is systemd's link to /var/lib/private/<service> (DynamicUser). Before the first start neither
+# exists: create the private one as root; systemd hands the whole tree to the service's user when it starts.
+install -d -m 0700 /var/lib/private
+DIR=/var/lib/private/$SERVICE
+install -d -m 0700 "$DIR"
+OWNER=$(stat -c %u:%g "$DIR")
+install -d -m 0700 -o "${OWNER%:*}" -g "${OWNER#*:}" "$DIR/tls"
+# each file whole or not at all: written beside, then renamed over the old one
+for f in fullchain.pem privkey.pem; do
+  install -m 0600 -o "${OWNER%:*}" -g "${OWNER#*:}" "$SRC/$f" "$DIR/tls/.$f.new"
+  mv -f "$DIR/tls/.$f.new" "$DIR/tls/$f"
+done
+if systemctl is-active -q "$SERVICE" 2>/dev/null; then
+  systemctl reload "$SERVICE"
+  echo "$SERVICE: certificate installed from $SRC and reloaded"
+else
+  echo "$SERVICE: certificate installed from $SRC (the service is not running)"
+fi

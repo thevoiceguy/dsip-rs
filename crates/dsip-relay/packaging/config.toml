@@ -1,0 +1,21 @@
+# dsip-relay, as packaged. Every key is optional; a command-line flag of the same name overrides it, and unknown keys
+# are an error. The template with every key explained: /usr/share/doc/dsip-relay/config.example.toml.
+
+listen = "0.0.0.0:8443"
+state = "/var/lib/dsip-relay"                      # its key seed, the queue, and the certificate
+status_listen = "127.0.0.1:9101"                   # /status, /metrics, `dsip-relay admin --config /etc/dsip-relay/relay.toml`
+
+# TLS. Without cert and key the relay makes a self-signed certificate in its state directory, for tests. For a real
+# name, let certbot's deploy hook install the certificate where the service can read it, and reload it on renewal:
+#   certbot certonly ... -d relay.example.com --deploy-hook /usr/libexec/dsip-relay/install-certificate
+# then:
+# cert = "/var/lib/dsip-relay/tls/fullchain.pem"
+# key = "/var/lib/dsip-relay/tls/privkey.pem"
+
+# An open relay serves every identity that binds (§13.6); list identities to make it private.
+# serve = ["did:web:example.com"]
+
+# The browser client on the same origin (the dsip-web tarball, unpacked here), and the hints node behind it.
+# www = "/usr/share/dsip-web"
+# client_config = "/etc/dsip-relay/client.json"
+# node_proxy = "127.0.0.1:8080"

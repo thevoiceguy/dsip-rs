@@ -1,0 +1,16 @@
+# dsip-mailbox: a distroless image around the static (musl) binary, SQLite and OpenSSL compiled in. Build context:
+# crates/dsip-mailbox, with the binaries staged at dist/<amd64|arm64>/dsip-mailbox and the empty state directory at
+# dist/state (packaging/build.sh). Nothing is pulled from Docker Hub (crates/dsip-node/packaging/Containerfile says why).
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.title="dsip-mailbox" \
+      org.opencontainers.image.description="DSIP mailbox and hub (Messaging Profile): items, KeyPackages, blobs, group fan-out" \
+      org.opencontainers.image.source="https://github.com/thevoiceguy/dsip-rs" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+COPY --chmod=0755 dist/${TARGETARCH}/dsip-mailbox /usr/bin/dsip-mailbox
+COPY packaging/container.toml /etc/dsip-mailbox/mailbox.toml
+COPY --chown=65532:65532 --chmod=0700 dist/state /var/lib/dsip-mailbox
+USER 65532:65532
+VOLUME ["/var/lib/dsip-mailbox"]
+EXPOSE 9443/tcp
+ENTRYPOINT ["/usr/bin/dsip-mailbox", "--config", "/etc/dsip-mailbox/mailbox.toml"]

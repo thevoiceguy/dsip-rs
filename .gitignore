@@ -9,6 +9,9 @@ __pycache__/
 .dsip/
 *.key
 crates/dsip-node/dist/
+crates/dsip-relay/dist/
+crates/dsip-mailbox/dist/
+web/dist/
 # Browser client
 web/pkg/
 web/node_modules/
