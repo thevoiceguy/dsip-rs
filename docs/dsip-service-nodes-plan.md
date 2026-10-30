@@ -45,7 +45,8 @@ stage that changes behaviour a vector can see starts with the vector in DSIP (CL
   (`DidWebResolver`, which reuses a document for a configured TTL; `Chain` puts the document files first, so
   they still work as overrides). Authority order is unchanged (§8.1): a fetched document is authoritative, a cached one only within its
   lifetime, and a hint never.
-- **S3, the relay's queue on disk.** The store-and-forward queue (§13.3: `inbox_cap`, `queue_budget_bytes`,
+- **S3, the relay's queue on disk.** *Done: `<state>/queue.redb` (`dsip_relay::store`), with the known recipients;
+  `demos/relay-restart-demo.sh`.* The store-and-forward queue (§13.3: `inbox_cap`, `queue_budget_bytes`,
   `offline_retention_s`) is kept in a `redb` file in the state directory, as dsip-node keeps its records. A
   restarted relay delivers what it held, within each envelope's retention. A demo restarts a relay with a queued
   invite and an offline callee.

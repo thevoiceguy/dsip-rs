@@ -22,7 +22,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +49,7 @@ use dsip_transport::{now_s, HELLO_TIMEOUT_S};
 
 mod error;
 mod status;
+pub mod store;
 pub mod www;
 
 pub use error::{Error, Result};
@@ -79,6 +80,9 @@ pub struct RelayConfig {
     /// Fetch the `did:web` documents of identities binding here over HTTPS (§7.2, §8.1), after the documents given to
     /// [`RelayServer::new`]. `None`: only those documents (and `did:key`) verify.
     pub did_web: Option<Arc<WebDocuments>>,
+    /// Keep the store-and-forward queue, and the recipients the relay knows, on disk, so a restarted relay delivers
+    /// what it held (§13.3). `None`: in memory only, lost on a restart.
+    pub queue_store: Option<Arc<store::QueueStore>>,
 }
 
 impl Default for RelayConfig {
@@ -93,6 +97,7 @@ impl Default for RelayConfig {
             served: None,
             offline_retention: 86_400,
             did_web: None,
+            queue_store: None,
         }
     }
 }
@@ -114,6 +119,19 @@ impl RelayServer {
         for d in &cfg.presence_public {
             authority.set_policy(d, "public", vec![]);
         }
+        let mut tracker = Relay::with_retention(now_s(), cfg.offline_retention);
+        let mut frames = HashMap::new();
+        if let Some(store) = &cfg.queue_store {
+            match store.load() {
+                Ok(held) => {
+                    let n: usize = held.inbox.values().map(Vec::len).sum();
+                    tracing::info!("queue store: {n} envelopes held for {} recipients, {} recipients known", held.inbox.len(), held.known.len());
+                    tracker.restore(held.inbox, held.known);
+                    frames = held.frames;
+                }
+                Err(e) => tracing::warn!("{e}: starting with an empty queue"),
+            }
+        }
         let state = State {
             key,
             supported: Supported::all_known(),
@@ -122,9 +140,12 @@ impl RelayServer {
             seen: SeenIds::default(),
             devices: HashMap::new(),
             identities: HashMap::new(),
-            tracker: Relay::with_retention(now_s(), cfg.offline_retention),
+            tracker,
+            queue_store: cfg.queue_store,
+            touched: BTreeSet::new(),
+            known_touched: false,
             reject_frames: HashMap::new(),
-            frames: HashMap::new(),
+            frames,
             intro_log: HashMap::new(),
             intro_limit: cfg.intro_limit,
             intro_window: cfg.intro_window,
@@ -215,6 +236,11 @@ struct State {
     devices: HashMap<String, Tx>,
     identities: HashMap<String, HashSet<String>>,
     tracker: Relay,
+    queue_store: Option<Arc<store::QueueStore>>,
+    /// Recipients whose queues changed since the store was last written.
+    touched: BTreeSet<String>,
+    /// Whether a binding began or ended, or the clock advanced, since then (the known recipients may have changed).
+    known_touched: bool,
     /// Per (session, leg): the leg's reject frame, forwarded if chosen as the attempt outcome.
     reject_frames: HashMap<(String, String), String>,
     /// Every verified frame within the retention window, by envelope id (served for queued deliveries).
@@ -451,6 +477,7 @@ impl State {
         if delta > 0 {
             let em = self.tracker.step(&RelayEvent::Advance { advance: delta });
             self.forget(now);
+            self.known_touched = true;
             em
         } else {
             vec![]
@@ -486,6 +513,26 @@ impl State {
         self.statements.retain(|id, _| current.contains(id.as_str()));
     }
 
+    /// Write what changed to the queue store: the queues touched and, after a binding change or a clock advance, the
+    /// known recipients. A failure is logged; the relay goes on from memory.
+    fn persist(&mut self) {
+        let Some(store) = &self.queue_store else { return };
+        let known = if std::mem::take(&mut self.known_touched) {
+            Some(self.tracker.known_recipients()).filter(|k| store.known_changed(k))
+        } else {
+            None
+        };
+        if self.touched.is_empty() && known.is_none() {
+            return;
+        }
+        let touched = std::mem::take(&mut self.touched);
+        let (inbox, frames) = (&self.tracker.inbox, &self.frames);
+        let queues = touched.iter().map(|to| (to.as_str(), inbox.get(to)));
+        if let Err(e) = store.write(queues, known.as_ref(), |id| frames.get(id).map(|(f, _)| f.as_str())) {
+            tracing::warn!("{e}");
+        }
+    }
+
     /// Act on tracker emissions for a frame that just arrived (or `None` on bind/advance).
     fn apply(&mut self, em: Vec<Emission>, sender: Option<&str>, inbound: Option<&Inbound>, sid: &str) {
         for e in em {
@@ -518,8 +565,14 @@ impl State {
                         self.deliver(&initiator, &inb.frame);
                     }
                 }
-                Emission::Queue { to, msg_type } => tracing::info!("queued {msg_type} for {to} (§13.3)"),
-                Emission::Dequeue { to, msg_type, why } => tracing::info!("dequeued {msg_type} for {to}: {why}"),
+                Emission::Queue { to, msg_type } => {
+                    tracing::info!("queued {msg_type} for {to} (§13.3)");
+                    self.touched.insert(to);
+                }
+                Emission::Dequeue { to, msg_type, why } => {
+                    tracing::info!("dequeued {msg_type} for {to}: {why}");
+                    self.touched.insert(to);
+                }
                 Emission::Send(m) if m.msg_type == "error" => {
                     // The relay's own signed error. Usually it answers the sender of the frame in hand; the attempt
                     // outcome `transport.no-response` (§12.7 rule 6, spec-gap 76) goes to the initiator and may come
@@ -540,6 +593,7 @@ impl State {
                 _ => {}
             }
         }
+        self.persist();
     }
 
     /// Route one verified frame from `sender` (a bound device) acting for `sender_identity`.
@@ -761,6 +815,10 @@ impl RelayServer {
             // §13.3: binding flushes the store-and-forward queues and adds this device as a leg to live attempts (§12.7 rule 3)
             st.advance();
             let em = st.tracker.step(&RelayEvent::Relay(RelayAction::Bind { device: device.clone(), identity: identity.clone() }));
+            // the bind flushed both queues (§13.3), and the device and its identity are known
+            st.touched.insert(identity.clone());
+            st.touched.insert(device.clone());
+            st.known_touched = true;
             st.apply(em, None, None, "");
             let em = st.authority.advance_to(now_s());
             st.apply_authority(em);
@@ -861,6 +919,8 @@ impl RelayServer {
             }
         }
         let _ = st.tracker.step(&RelayEvent::Relay(RelayAction::Unbind { device: device.clone(), identity: identity.clone() }));
+        st.known_touched = true;
+        st.persist();
         // P§3: every device's unbind, not only the identity's last: its own record's grace starts from it
         let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Unbind { device: device.clone(), identity: identity.clone() }));
         st.apply_authority(em);

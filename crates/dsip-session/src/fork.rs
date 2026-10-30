@@ -150,7 +150,7 @@ pub struct Relay {
 }
 
 /// A queued envelope.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Queued {
     /// The message.
     pub message: Message,
@@ -158,6 +158,22 @@ pub struct Queued {
     pub deadline: i64,
     /// Arrival order across every queue of this relay: a flush delivers in it (spec-gap 98).
     pub arrival: u64,
+}
+
+/// A recipient the relay knows (§13.3), as kept across a restart: an identity, or a device and its identity.
+///
+/// Spec: §13.3 (a recipient is known while bound, and within the retention window after its last binding ends;
+/// spec-gap 131).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Known {
+    /// The identity or device DID.
+    pub who: String,
+    /// For a device, the identity it was bound for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// When its last binding ended; `None` while one is bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_bound: Option<i64>,
 }
 
 impl Relay {
@@ -282,6 +298,51 @@ impl Relay {
             self.out.push(Emission::Deliver { leg: device.into(), msg_type: "invite".into(), reason: None, id: Some(sid) });
         } else {
             self.out.push(Emission::Deliver { leg: device.into(), msg_type: m.msg_type.clone(), reason: None, id: Some(m.id.clone()) });
+        }
+    }
+
+    /// Every recipient this relay knows, identities and devices, by DID: what a relay keeps across a restart, with
+    /// [`Relay::inbox`].
+    ///
+    /// Spec: none (infrastructure).
+    pub fn known_recipients(&self) -> BTreeMap<String, Known> {
+        let mut out = BTreeMap::new();
+        for who in self.bindings.keys() {
+            out.insert(who.clone(), Known { who: who.clone(), identity: None, last_bound: self.last_bound.get(who).copied() });
+        }
+        for (device, identity) in &self.devices {
+            let k = Known { who: device.clone(), identity: Some(identity.clone()), last_bound: self.last_bound.get(device).copied() };
+            out.insert(device.clone(), k);
+        }
+        out
+    }
+
+    /// Take back what a relay kept across a restart: its queues and the recipients it knew. Nothing is bound after a
+    /// restart, so a recipient bound when the relay stopped counts as unbound from now: it stays known for the
+    /// retention window (§13.3, spec-gap 131), and its queue is flushed when it binds again. Queues past their
+    /// deadline are dropped at the next clock advance ([`Relay::expire_queues`]).
+    ///
+    /// Spec: §13.3 (store-and-forward until `min(expires_at, offline_retention_s)`; spec-gap 98: arrival order).
+    pub fn restore(&mut self, inbox: BTreeMap<String, Vec<Queued>>, known: impl IntoIterator<Item = Known>) {
+        let now = self.now;
+        for k in known {
+            match &k.identity {
+                Some(identity) => {
+                    self.devices.insert(k.who.clone(), identity.clone());
+                    self.bindings.entry(identity.clone()).or_default();
+                }
+                None => {
+                    self.bindings.entry(k.who.clone()).or_default();
+                }
+            }
+            self.last_bound.insert(k.who, k.last_bound.unwrap_or(now));
+        }
+        for (to, mut q) in inbox {
+            q.sort_by_key(|e| e.arrival);
+            self.arrivals = self.arrivals.max(q.last().map_or(0, |e| e.arrival));
+            if !q.is_empty() {
+                self.inbox.insert(to, q);
+            }
         }
     }
 

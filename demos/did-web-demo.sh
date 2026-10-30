@@ -30,7 +30,7 @@ HOST_CA="$D/host/cert.pem"
 $B/dsip-relay --listen 127.0.0.1:8622 --state "$D/relay" --did-web-ca "$HOST_CA" >"$D/relay.log" 2>&1 &
 $B/dsip-relay --listen 127.0.0.1:8623 --state "$D/nofetch" --no-fetch-did-web >"$D/nofetch.log" 2>&1 &
 $B/dsip-mailbox --state "$D/mbx" --listen 127.0.0.1:9621 --serve-any 1 --did-web-ca "$HOST_CA" >"$D/mbx.log" 2>&1 &
-wait_for "$D/relay.log" "listening|relay did:key" 10; wait_for "$D/nofetch.log" "listening|relay did:key" 10
+wait_for "$D/host.log" "listening on" 10; wait_for "$D/relay.log" "listening on" 10; wait_for "$D/nofetch.log" "listening on" 10
 wait_for "$D/mbx.log" "mailbox did:key" 20
 
 answer() { # name port: Alice answers on the relay at port

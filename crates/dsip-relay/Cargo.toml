@@ -20,7 +20,9 @@ dsip-schema.workspace = true
 dsip-session.workspace = true
 dsip-transport = { workspace = true, features = ["cli"] }
 dsip-broadcast.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+redb.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true

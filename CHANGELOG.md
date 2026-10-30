@@ -20,11 +20,17 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   is not fetched again for 60 s, and fetches are capped per frame and in flight. `--did-web-ca` adds PEM roots and
   `--no-fetch-did-web` turns fetching off. `dsip_transport::resolver` gains `WebDocuments`, `Over`, `web_documents`,
   `DidWebResolver::with_ca` and `DidWebResolver::cached`. `demos/did-web-demo.sh` runs in CI.
+- **The relay's queue on disk** (S3). `dsip-relay` keeps its store-and-forward queue and the recipients it knows
+  in `<state>/queue.redb`. A restarted relay, even one that was killed, delivers what it held within each
+  envelope's deadline, and a known, offline recipient stays known (§13.3). After each step only the queues it touched
+  are rewritten, durably. `dsip_relay::store::QueueStore`; `dsip_session::fork::Relay` gains `known_recipients` and
+  `restore` (`Known`; `Queued` is now serde). `demos/relay-restart-demo.sh` runs in CI.
 
 ### Changed
 
 - **Breaking:** `dsip_relay::RelayConfig` and `dsip_mailbox::MailboxConfig` gain a `did_web` field (`None` by
-  default: the library fetches nothing unless asked). Struct literals need it, or `..Default::default()`.
+  default: the library fetches nothing unless asked), and `RelayConfig` a `queue_store` field (`None`: in memory, as
+  before). Struct literals need them, or `..Default::default()`.
 
 ## [2026-10-29] — workspace release
 
