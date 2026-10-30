@@ -317,7 +317,7 @@ jobs:
         run: web/test/run.sh all
 
   packages:
-    name: service packages build, install and run (dsip-node, dsip-relay, dsip-mailbox: static binaries, .debs under systemd, containers)
+    name: "service packages build, install and run (dsip-node, dsip-relay, dsip-mailbox: static binaries, .debs under systemd, containers)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

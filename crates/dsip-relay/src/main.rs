@@ -162,6 +162,7 @@ async fn main() -> Result<ExitCode> {
     // SIGHUP reads the certificate again (a renewal): new connections get it, bound devices stay bound
     let certs = tls::Certificates::load(&cert, &keyfile)?;
     certs.reload_on_sighup()?;
+    dsip_transport::shutdown::exit_on_terminate()?;
 
     tracing::info!("relay did: {}", key.did());
 

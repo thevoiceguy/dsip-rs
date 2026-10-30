@@ -24,6 +24,8 @@ pub mod identity;
 #[cfg(feature = "cli")]
 pub mod logging;
 pub mod resolver;
+#[cfg(feature = "cli")]
+pub mod shutdown;
 pub mod status;
 pub mod tls;
 /// Inbound verification (re-exported from `dsip-endpoint`, where it is shared with the WASM build).

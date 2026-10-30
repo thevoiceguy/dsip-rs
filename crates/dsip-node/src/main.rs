@@ -80,6 +80,15 @@ async fn main() -> Result<()> {
         // colour only on a terminal: journald and log files get plain text
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
+    // As PID 1 in a container a process with no handler ignores SIGTERM (docker stop waited 10 s, then killed it). The
+    // node writes its records as they change and its Mainline nodes each minute, so it leaves at once.
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+        let which = tokio::select! { _ = term.recv() => "SIGTERM", _ = int.recv() => "SIGINT" };
+        tracing::info!("{which}: exiting");
+        std::process::exit(0);
+    });
     let a = Args::parse();
     let cfg = match &a.config {
         Some(p) => Config::load(p)?,
