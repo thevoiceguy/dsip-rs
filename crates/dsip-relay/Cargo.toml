@@ -37,3 +37,26 @@ base64.workspace = true
 
 [dev-dependencies]
 dsip-endpoint.workspace = true
+
+# The .deb (packaging/build.sh): the static binary, the hardened DynamicUser unit, the config as a conffile.
+[package.metadata.deb]
+name = "dsip-relay"
+maintainer = "DSIP PoC <thevoiceguy@users.noreply.github.com>"
+copyright = "the DSIP authors; MIT OR Apache-2.0"
+section = "net"
+priority = "optional"
+extended-description = """\
+A DSIP relay: it binds devices by their verified hello, routes their signed envelopes, holds envelopes for offline \
+recipients on disk, and is the presence and broadcast authority for the identities it serves. It can serve the \
+browser client (dsip-web) on the same origin."""
+depends = "procps"   # /bin/kill, for the unit's ExecReload (SIGHUP)
+conf-files = ["/etc/dsip-relay/relay.toml"]
+maintainer-scripts = "packaging/debian/"
+systemd-units = { unit-name = "dsip-relay", enable = true, start = true, restart-after-upgrade = true }
+assets = [
+    ["target/release/dsip-relay", "usr/bin/", "755"],
+    ["packaging/config.toml", "etc/dsip-relay/relay.toml", "644"],
+    ["../../packaging/install-certificate", "usr/libexec/dsip-relay/install-certificate", "755"],
+    ["config.example.toml", "usr/share/doc/dsip-relay/config.example.toml", "644"],
+    ["packaging/compose.yaml", "usr/share/doc/dsip-relay/compose.yaml", "644"],
+]

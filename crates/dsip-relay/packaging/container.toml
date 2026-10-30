@@ -1,0 +1,7 @@
+# dsip-relay in a container (the image's /etc/dsip-relay/relay.toml). Mount your own over it, or pass flags after the
+# image name (they override these keys). State lives in the /var/lib/dsip-relay volume. For a real certificate,
+# mount it and set cert and key; after a renewal, `docker kill -s HUP <container>` reloads it.
+listen = "0.0.0.0:8443"
+state = "/var/lib/dsip-relay"
+status_listen = "127.0.0.1:9101"                   # `docker exec <container> dsip-relay admin --config /etc/dsip-relay/relay.toml bindings`
+log = "stderr"

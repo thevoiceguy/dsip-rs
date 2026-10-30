@@ -36,7 +36,7 @@ for i in 1 2 3 4; do
   [ "$i" = 4 ] && fail "no registry served debian:trixie"
   sleep $((i * 15))
 done
-docker build -q --build-arg BASE=$BASE -f packaging/systemd-test.Containerfile -t dsip-node-systemd-test . >/dev/null
+docker build -q --build-arg BASE=$BASE -f ../../packaging/systemd-test.Containerfile -t dsip-node-systemd-test . >/dev/null
 docker run -d --name $SD --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
   dsip-node-systemd-test >/dev/null
 docker exec $SD systemctl is-system-running --wait >/dev/null 2>&1 || true

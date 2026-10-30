@@ -1,0 +1,16 @@
+# dsip-relay: a distroless image around the static (musl) binary. Build context: crates/dsip-relay, with the binaries
+# staged at dist/<amd64|arm64>/dsip-relay and the empty state directory at dist/state (packaging/build.sh). Nothing
+# is pulled from Docker Hub (crates/dsip-node/packaging/Containerfile says why).
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.title="dsip-relay" \
+      org.opencontainers.image.description="DSIP relay: device binding, routing, store-and-forward, presence and broadcast authority" \
+      org.opencontainers.image.source="https://github.com/thevoiceguy/dsip-rs" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+COPY --chmod=0755 dist/${TARGETARCH}/dsip-relay /usr/bin/dsip-relay
+COPY packaging/container.toml /etc/dsip-relay/relay.toml
+COPY --chown=65532:65532 --chmod=0700 dist/state /var/lib/dsip-relay
+USER 65532:65532
+VOLUME ["/var/lib/dsip-relay"]
+EXPOSE 8443/tcp
+ENTRYPOINT ["/usr/bin/dsip-relay", "--config", "/etc/dsip-relay/relay.toml"]

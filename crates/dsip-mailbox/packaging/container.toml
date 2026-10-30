@@ -1,0 +1,8 @@
+# dsip-mailbox in a container (the image's /etc/dsip-mailbox/mailbox.toml). Mount your own over it, or pass flags
+# after the image name (they override these keys). State lives in the /var/lib/dsip-mailbox volume. For a real
+# certificate, mount it and set cert and key; after a renewal, `docker kill -s HUP <container>` reloads it.
+state = "/var/lib/dsip-mailbox"
+listen = "0.0.0.0:9443"
+status_listen = "127.0.0.1:9102"                   # `docker exec <container> dsip-mailbox admin --config /etc/dsip-mailbox/mailbox.toml enrolments`
+log = "stderr"
+serve_any = 0                                      # serves no one until owners are listed or enrolment opened

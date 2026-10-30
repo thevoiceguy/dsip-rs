@@ -54,6 +54,24 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
     Elsewhere it logs to standard error, as before.
     `dsip_transport::logging`.
   - `demos/operating-demo.sh` runs in CI.
+- **Packages for the relay and the mailbox** (S6). `packaging/build.sh [--image]` builds, for `dsip-relay` and
+  `dsip-mailbox`:
+  - static musl binaries for x86_64 and aarch64, and their tarballs;
+  - a `.deb` for each architecture, and `SHA256SUMS`;
+  - with `--image`, a distroless image.
+
+  Each `.deb` installs:
+  - the config `/etc/dsip-relay/relay.toml` or `/etc/dsip-mailbox/mailbox.toml`, a conffile kept on upgrade and
+    removal;
+  - a `DynamicUser` unit with the same sandbox as dsip-node's, whose `ExecReload` sends SIGHUP;
+  - `/usr/libexec/<service>/install-certificate`. As certbot's `--deploy-hook`, it copies the renewed pair into the
+    service's state directory (the service cannot read `/etc/letsencrypt`) and reloads the service in place.
+
+  `packaging/build.sh dsip-web` packs the browser client as `dsip-web-<version>.tar.gz` for the relay's `--www`.
+  `packaging/test.sh` runs in CI. It installs both `.debs` on one systemd host and runs the images locked down. In
+  both it checks that the relay's queued invite and certificate, and the mailbox's enrolment and service key,
+  survive a crash and a restart. It also checks that a certificate renewal reaches the running relay. dsip-mailbox
+  gains the feature `static`: SQLite and OpenSSL compiled in.
 
 ### Fixed
 
