@@ -15,7 +15,7 @@ HOST=localhost%3A8621; ALICE=did:web:$HOST:alice; CAROL=did:web:$HOST:carol
 fail() { echo "FAIL: $*"; for f in "$D"/*.log; do echo "--- $f"; tail -20 "$f"; done; exit 1; }
 plain() { sed 's/\x1b\[[0-9;]*m//g' "$1"; }
 wait_for() { # file pattern seconds
-  for _ in $(seq $(($3 * 5))); do plain "$1" | grep -qE "$2" && return 0; sleep 0.2; done
+  for _ in $(seq $(($3 * 5))); do plain "$1" | grep -E >/dev/null "$2" && return 0; sleep 0.2; done
   fail "timeout waiting for /$2/ in $1"
 }
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
@@ -49,8 +49,8 @@ call() { # name port: Alice answers on the relay at port; Bob calls her identity
 echo "════════ 1. A relay that fetches: Alice binds for $ALICE, and Bob's call reaches her"
 call relay 8622
 plain "$D/relay.log" | grep "did:web .*fetched\|bound device" | sed -E 's/.*dsip_(relay|transport)[^ ]*: /  /'
-plain "$D/relay.log" | grep -q "did:web $ALICE: document fetched" || fail "1: the relay did not fetch Alice's document"
-plain "$D/relay.log" | grep -q "for identity $ALICE" || fail "1: Alice's device was not bound for her identity"
+plain "$D/relay.log" | grep >/dev/null "did:web $ALICE: document fetched" || fail "1: the relay did not fetch Alice's document"
+plain "$D/relay.log" | grep >/dev/null "for identity $ALICE" || fail "1: Alice's device was not bound for her identity"
 grep -q "← answer" "$D/relay-bob.log" || fail "1: Alice did not answer"
 echo "  ok: answered"
 
@@ -58,8 +58,8 @@ echo "════════ 2. A relay with --no-fetch-did-web: Alice's hello
 answer nofetch 8623
 wait_for "$D/nofetch.log" "hello rejected" 10; wait $AP 2>/dev/null || true
 plain "$D/nofetch.log" | grep "hello rejected" | sed -E 's/.*dsip_relay[^ ]*: /  /'
-plain "$D/nofetch.log" | grep -q "hello rejected: delegation-invalid" || fail "2: not refused for her delegation"
-! plain "$D/nofetch.log" | grep -q "bound device" || fail "2: Alice bound without her document"
+plain "$D/nofetch.log" | grep >/dev/null "hello rejected: delegation-invalid" || fail "2: not refused for her delegation"
+! plain "$D/nofetch.log" | grep >/dev/null "bound device" || fail "2: Alice bound without her document"
 grep -q "transport.hello-rejected" "$D/nofetch-alice.log" || fail "2: Alice was not told"
 echo "  ok: Alice told transport.hello-rejected"
 

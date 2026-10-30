@@ -89,7 +89,7 @@ printf 'damaged' | dd of="$DIR/mbx-b/blobs/$COPY" bs=1 seek=100 conv=notrunc sta
 echo "live" >&4
 wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 2 30
 wait_for "$DIR/b.log" "^BLOB-SOURCE-REJECTED https://127.0.0.1:9572/blobs/$COPY: " 10
-grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9571/blobs/$COPY" || { echo "FAIL: the damaged copy was not rejected in favour of the original"; exit 1; }
+grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep >/dev/null "from=https://127.0.0.1:9571/blobs/$COPY" || { echo "FAIL: the damaged copy was not rejected in favour of the original"; exit 1; }
 
 echo "=== a fetch that finds nothing to serve is tried again until the blob is there (spec-gap 67)"
 # Bob's device stays offline until the replication has succeeded: a device that is online is pushed the message at
@@ -105,7 +105,7 @@ mv "$DIR/third.blob" "$DIR/mbx-a/blobs/$THIRD"          # …and now it has
 wait_for "$DIR/mbx-b.log" "replicated blob $THIRD " 60
 echo "live" >&4
 wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 3 60
-grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9572/blobs/$THIRD" || { echo "FAIL: the retried copy was not used"; exit 1; }
+grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep >/dev/null "from=https://127.0.0.1:9572/blobs/$THIRD" || { echo "FAIL: the retried copy was not used"; exit 1; }
 
 echo "=== Bob's mailbox now takes blobs only up to 4 KiB, so the next one is not replicated"
 echo "offline" >&4; wait_nth "$DIR/b.log" "^OK offline" 4 20; crash "$MBX_B"
@@ -120,7 +120,7 @@ echo "=== the device's own fetch finds nothing, so it tries again until the blob
 wait_for "$DIR/b.log" "^AUDIO-PENDING .* attempt=1 retry_in=" 30
 mv "$DIR/long.blob" "$DIR/mbx-a/blobs/$LONG"            # …and now it has
 wait_nth "$DIR/b.log" "^RECV-AUDIO $ALICE purpose=voice-message" 4 60
-grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep -q "from=https://127.0.0.1:9571/blobs/" || { echo "FAIL: the second message did not come from the original"; exit 1; }
+grep "^RECV-AUDIO" "$DIR/b.log" | tail -1 | grep >/dev/null "from=https://127.0.0.1:9571/blobs/" || { echo "FAIL: the second message did not come from the original"; exit 1; }
 [ "$(grep '^RECV-AUDIO' "$DIR/b.log" | tail -1 | sed -E 's/.* sha256=([0-9a-f]+) .*/\1/')" = "$LONG_SHA" ] || { echo "FAIL: second audio differs"; exit 1; }
 sleep 1
 

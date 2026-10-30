@@ -26,7 +26,7 @@ if [ "$RUN3" = 1 ]; then
     --listening-ip=127.0.0.1 --listening-port=3478 --relay-ip=127.0.0.1 \
     --min-port=49160 --max-port=49200 --no-tls --allow-loopback-peers >/dev/null
   CID=dsip-run3-turn
-  for i in $(seq 1 20); do docker logs $CID 2>&1 | grep -q 'Relay ports initialization done' && break; sleep 0.3; done
+  for i in $(seq 1 20); do docker logs $CID 2>&1 | grep >/dev/null 'Relay ports initialization done' && break; sleep 0.3; done
   TURN_ARGS="--turn turn:127.0.0.1:3478 --turn-user test --turn-pass test --relay-only"
   RUN3ENV="env RUST_LOG=warn,forge_webrtc=info"   # surfaces the nominated pair
   echo "Run 3: media forced through TURN relay coturn @127.0.0.1:3478 (relay-only, no direct path)"; echo

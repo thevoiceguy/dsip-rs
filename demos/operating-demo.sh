@@ -24,7 +24,7 @@ cleanup() { kill $(jobs -p) 2>/dev/null || true; }
 trap cleanup EXIT
 fail() { echo "FAIL: $*"; for f in "$DIR"/*.log; do echo "--- $f"; tail -12 "$f"; done; exit 1; }
 wait_for() { # file pattern seconds
-  for _ in $(seq $((${3:-20} * 5))); do sed 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null | grep -qE "$2" && return 0; sleep 0.2; done
+  for _ in $(seq $((${3:-20} * 5))); do sed 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null | grep -E >/dev/null "$2" && return 0; sleep 0.2; done
   fail "timeout waiting for /$2/ in $1"
 }
 count() { sed 's/\x1b\[[0-9;]*m//g' "$1" | grep -cE "$2" || true; }
@@ -63,7 +63,7 @@ wait_for "$DIR/relay.log" "SIGHUP: certificate reloaded" 10
 [ "$(served)" = "$(fingerprint "$DIR/new.pem")" ] || fail "2: the renewed certificate is not served"
 echo "  ok: the next handshake gets the renewed certificate"
 [ "$(count "$DIR/relay.log" "bound device .* for identity $BOB")" = 1 ] || fail "2: Bob bound again"
-$B/dsip-relay admin --status $RS bindings | grep -q "^$BOB$" || fail "2: Bob is no longer bound"
+$B/dsip-relay admin --status $RS bindings | grep >/dev/null "^$BOB$" || fail "2: Bob is no longer bound"
 $B/dsip call --identity "$DIR/alice" --relay $U --ca "$DIR/new.pem" --to "$BOB" --media none --script "sleep 2; quit" >"$DIR/alice.log" 2>&1 || true
 grep -q "^← invite" "$DIR/bob.log" || fail "2: the call did not reach Bob on his binding"
 echo "  ok: Bob still bound on his first connection; Alice's call (trusting only the new certificate) reached him"

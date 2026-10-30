@@ -65,7 +65,9 @@ relay_keeps_state() { # tag port ca restart-command logs-command
   local starts; starts=$(eval "$logs" | grep -c "listening on")
   eval "$restart"
   until_ok 30 sh -c "[ \$($logs | grep -c 'listening on') -gt $starts ]" || fail "$tag: the relay did not come back"
-  eval "$logs" | grep -q "queue store: 1 envelopes held for 1 recipients" || fail "$tag: the restarted relay does not hold the invite"
+  # grep reads to the end: with -q it would leave at the match, the log's writer would die of SIGPIPE, and pipefail
+  # would fail the check (CI, 2026-10-30: the restarted relay held the invite and the check said it did not)
+  eval "$logs" | grep >/dev/null "queue store: 1 envelopes held for 1 recipients" || fail "$tag: the restarted relay does not hold the invite"
   [ "$(served "$port")" = "$before" ] || fail "$tag: the certificate changed across the restart"
   $B/dsip answer --identity "$D/bob" --relay "$url" --ca "$ca" --auto none --media none --script "sleep 3; quit" \
     >"$D/$tag-bob-1.log" 2>&1 || true
