@@ -49,6 +49,9 @@ use dsip_transport::{now_s, HELLO_TIMEOUT_S};
 
 mod error;
 mod status;
+
+/// The admin commands the status port answers (`dsip-relay admin …`: `bindings`).
+pub use status::ADMIN_COMMANDS;
 pub mod store;
 pub mod www;
 
@@ -140,6 +143,7 @@ impl RelayServer {
             seen: SeenIds::default(),
             devices: HashMap::new(),
             identities: HashMap::new(),
+            bound_at: HashMap::new(),
             tracker,
             queue_store: cfg.queue_store,
             touched: BTreeSet::new(),
@@ -235,6 +239,8 @@ struct State {
     seen: SeenIds,
     devices: HashMap<String, Tx>,
     identities: HashMap<String, HashSet<String>>,
+    /// Each bound device's identity, the address it bound from and when (`dsip-relay admin bindings`).
+    bound_at: HashMap<String, (String, String, i64)>,
     tracker: Relay,
     queue_store: Option<Arc<store::QueueStore>>,
     /// Recipients whose queues changed since the store was last written.
@@ -800,6 +806,7 @@ impl RelayServer {
             }
             st.identities.entry(identity.clone()).or_default().insert(device.clone());
             let now = now_s();
+            st.bound_at.insert(device.clone(), (identity.clone(), peer.to_string(), now));
             let hello = json!({
                 "dsip": version_block(&st.supported, &[]), "type": "hello", "id": Ulid::generate().as_str(),
                 "in_reply_to": hello_id, "from": st.key.did(),
@@ -912,6 +919,7 @@ impl RelayServer {
             return result;
         }
         st.devices.remove(&device);
+        st.bound_at.remove(&device);
         if let Some(set) = st.identities.get_mut(&identity) {
             set.remove(&device);
             if set.is_empty() {

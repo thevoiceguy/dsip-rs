@@ -219,6 +219,11 @@ jobs:
         # Self-verifying: a relay killed with an invite queued for an offline callee delivers it after a restart, and
         # still knows the callee (queued, not transport.unknown-recipient) after another.
         run: timeout 120 bash demos/relay-restart-demo.sh | tail -10
+      - name: operating the services (SIGHUP certificate reload, admin commands; service-nodes S5)
+        # Self-verifying: a renewed certificate is served after SIGHUP while a device stays bound and is called over its
+        # connection; a half-written one is refused and the old kept; admin bindings, enrolments and release work,
+        # and an admin POST without its header is refused.
+        run: timeout 120 bash demos/operating-demo.sh | tail -14
       - name: status pages (relay and mailbox --status-listen)
         # Self-verifying: the relay follows a call ringing → answered → ended by bye and counts a refusal; the mailbox
         # reports its --serve-any place taken, the owner's KeyPackages, a mailbox.not-served refusal and a blob 404.

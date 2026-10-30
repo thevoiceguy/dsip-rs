@@ -247,5 +247,48 @@ pub async fn render(state: std::sync::Arc<tokio::sync::Mutex<State>>, page: Page
     match page {
         Page::Status { detail } => (JSON_TYPE, format!("{:#}\n", status(&st, now, detail))),
         Page::Metrics => (METRICS_TYPE, metrics(&st, now)),
+        Page::Admin { command, .. } => (JSON_TYPE, format!("{:#}\n", admin(&st, &command, now))),
     }
+}
+
+/// The admin commands, for the binary's `admin` subcommand.
+pub const ADMIN_COMMANDS: &[dsip_transport::admin::Command] = &[dsip_transport::admin::Command {
+    name: "bindings",
+    about: "The devices bound now: identity, device, the address each bound from, and for how long",
+    arg: None,
+    write: false,
+    show: show_bindings,
+}];
+
+fn admin(st: &State, command: &str, now: i64) -> Value {
+    match command {
+        "bindings" => {
+            let mut rows: Vec<_> = st.bound_at.iter().filter(|(d, _)| st.devices.contains_key(*d)).collect();
+            rows.sort_by(|a, b| (&a.1 .0, a.0).cmp(&(&b.1 .0, b.0)));
+            json!({
+                "devices_bound": rows.len(),
+                "identities_bound": st.identities.values().filter(|d| !d.is_empty()).count(),
+                "bindings": rows.iter().map(|(device, (identity, peer, since))| json!({"identity": identity, "device": device,
+                    "peer": peer, "bound_s": now - since,
+                    "queued": st.tracker.inbox.get(*device).map_or(0, Vec::len)})).collect::<Vec<_>>(),
+            })
+        }
+        _ => json!({"error": format!("no admin command {command:?} (bindings)")}),
+    }
+}
+
+fn show_bindings(v: &Value) -> String {
+    let mut out = format!("{} devices bound, {} identities\n", v["devices_bound"], v["identities_bound"]);
+    let mut last = "";
+    for b in v["bindings"].as_array().into_iter().flatten() {
+        let identity = b["identity"].as_str().unwrap_or("?");
+        if identity != last {
+            out += &format!("{identity}\n");
+            last = identity;
+        }
+        let s = b["bound_s"].as_i64().unwrap_or(0);
+        let since = if s < 120 { format!("{s} s") } else if s < 7200 { format!("{} min", s / 60) } else { format!("{} h", s / 3600) };
+        out += &format!("  {}  from {}, bound {since}\n", b["device"].as_str().unwrap_or("?"), b["peer"].as_str().unwrap_or("?"));
+    }
+    out
 }

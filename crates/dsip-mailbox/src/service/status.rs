@@ -66,19 +66,19 @@ impl Stats {
 }
 
 /// One owner's numbers.
-struct OwnerRow {
-    identity: String,
-    configured: bool,
-    items: usize,
-    used_bytes: i64,
-    devices: usize,
-    devices_bound: usize,
-    groups: usize,
-    key_packages: i64,
-    last_hello_s: Option<i64>,
+pub(super) struct OwnerRow {
+    pub(super) identity: String,
+    pub(super) configured: bool,
+    pub(super) items: usize,
+    pub(super) used_bytes: i64,
+    pub(super) devices: usize,
+    pub(super) devices_bound: usize,
+    pub(super) groups: usize,
+    pub(super) key_packages: i64,
+    pub(super) last_hello_s: Option<i64>,
 }
 
-fn owners(st: &Service, now: i64) -> Vec<OwnerRow> {
+pub(super) fn owners(st: &Service, now: i64) -> Vec<OwnerRow> {
     let last: BTreeMap<&str, i64> = st.enrolment.entries().iter().map(|(i, t)| (i.as_str(), *t)).collect();
     st.owned
         .iter()
@@ -112,7 +112,7 @@ fn blob_dir(st: &Service) -> (usize, u64) {
         .unwrap_or((0, 0))
 }
 
-fn quota_pct(used: i64, quota: i64) -> f64 {
+pub(super) fn quota_pct(used: i64, quota: i64) -> f64 {
     if quota > 0 { (used as f64 * 1000.0 / quota as f64).round() / 10.0 } else { 0.0 }
 }
 
@@ -214,10 +214,11 @@ pub fn metrics(st: &Service, now: i64) -> String {
 /// Answer one status request.
 pub async fn render(service: std::sync::Arc<tokio::sync::Mutex<Service>>, page: Page) -> (&'static str, String) {
     // read-only: the machines' clocks advance on traffic and on the retry tick, not on a status read
-    let st = service.lock().await;
+    let mut st = service.lock().await;
     let now = dsip_transport::now_s();
     match page {
         Page::Status { detail } => (JSON_TYPE, format!("{:#}\n", status(&st, now, detail))),
         Page::Metrics => (METRICS_TYPE, metrics(&st, now)),
+        Page::Admin { command, args, write } => (JSON_TYPE, format!("{:#}\n", super::admin::answer(&mut st, &command, &args, write, now))),
     }
 }

@@ -26,7 +26,11 @@
 //! head of every unacknowledged fan-out queue at once, and after that any head left unacknowledged is re-sent with
 //! backoff; a member mailbox acknowledges a redelivery as a duplicate.
 
+mod admin;
 mod status;
+
+/// The admin commands the status port answers (`dsip-mailbox admin …`: `enrolments`, `release <did>`).
+pub use admin::COMMANDS as ADMIN_COMMANDS;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;

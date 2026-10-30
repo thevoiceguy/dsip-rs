@@ -56,7 +56,11 @@ stage that changes behaviour a vector can see starts with the vector in DSIP (CL
   than the whole state rewritten as JSON. A mailbox upgraded from the JSON file imports it once. Blobs stay files.
   `mailbox-restart-demo.sh` and the enrolment demo cover it, plus a load measurement like dsip-node's
   `store_stress` (items per second, disk per item).
-- **S5, operating.** Certificates reload on `SIGHUP` without dropping bound devices; the Let's Encrypt deploy hook
+- **S5, operating.** *Done: `dsip_transport::tls::Certificates` (SIGHUP re-reads the files; a bad renewal keeps
+  the certificate served), `dsip-relay admin bindings` and `dsip-mailbox admin enrolments | release <did>`
+  (`dsip_transport::admin`; a changing command is a POST with `x-dsip-admin`), `--log auto|journald|stderr`;
+  `demos/operating-demo.sh`. The deploy hook's `systemctl reload` and the units' `ExecReload` come with the packages
+  (S6); the testbed's hook, in DSIP's `node-setup.sh`, moves with S7.* Certificates reload on `SIGHUP` without dropping bound devices; the Let's Encrypt deploy hook
   sends `SIGHUP` instead of restarting. Add an admin command (`dsip-mailbox admin enrolments | release <did>`,
   `dsip-relay admin bindings`) on the loopback status port. Logs go to journald.
 - **S6, packages.** For each of `dsip-relay` and `dsip-mailbox`:

@@ -34,6 +34,25 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   42,000 deposits/s at 1,000, 10,000 and 100,000 items held, and about 1.45 KB on disk per 1 KB item.
   `dsip_messaging::mailbox::Mailbox` gains `changes`, `saved`, `all_stored`, `record` and
   `full_state_without_items`.
+- **Operating the relay and the mailbox** (S5).
+  - **Certificate reload on `SIGHUP`.** Both binaries read their certificate and key again on `SIGHUP`. New TLS
+    handshakes get the renewed certificate, and connections already open, and the devices bound on them, are
+    untouched. A renewal that does not load (a half-written file, a key that is not the certificate's) is logged
+    and the previous certificate stays in service. `dsip_transport::tls::Certificates`.
+  - **Admin commands on the status port.** `dsip-relay admin bindings` lists the bound devices, each with the
+    address it bound from and for how long. `dsip-mailbox admin enrolments` lists the enrolled identities against
+    `--serve-any` (storage, devices bound, last `hello`, when idle expiry releases them) and the configured owners.
+    `dsip-mailbox admin release <did>` ends an enrolment: everything held for the identity is deleted and its
+    bindings closed, as when it releases itself (M§4.1; the operator's end of an enrolment is spec-gap 164). The
+    commands find the service from `--status <addr>`, or from `status_listen` in its `--config` file, and print
+    JSON with `--json`. A command that changes state is a `POST` carrying an `x-dsip-admin` header, so a web page
+    cannot send one. `dsip_transport::admin`, `dsip_transport::status::request`;
+    `dsip_messaging::enrolment::Enrolment` gains `end` and `is_configured`.
+  - **journald.** `--log auto|journald|stderr`. When standard error is the journal (`JOURNAL_STREAM` names it),
+    `auto` logs to the journal natively, with each line's level as its priority, so `journalctl -p warning` works.
+    Elsewhere it logs to standard error, as before.
+    `dsip_transport::logging`.
+  - `demos/operating-demo.sh` runs in CI.
 
 ### Fixed
 
@@ -46,6 +65,8 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 - **Breaking:** `dsip_relay::RelayConfig` and `dsip_mailbox::MailboxConfig` gain a `did_web` field (`None` by
   default: the library fetches nothing unless asked), and `RelayConfig` a `queue_store` field (`None`: in memory, as
   before). Struct literals need them, or `..Default::default()`.
+- **Breaking:** `dsip_transport::status::Page` gains `Admin` and is no longer `Copy`; a service's status renderer
+  answers it.
 
 ## [2026-10-29] — workspace release
 

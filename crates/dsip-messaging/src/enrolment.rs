@@ -85,6 +85,24 @@ impl Enrolment {
         ]
     }
 
+    /// The operator ends `identity`'s enrolment (`dsip-mailbox admin release`): its place is free at once. Whether it
+    /// was enrolled; a configured identity is not, and ends by leaving the configuration.
+    ///
+    /// Impl (spec-gap 164): M§4.1 names two ends of an enrolment, the identity's release and idle expiry. An operator
+    /// ending one is a third, with the same effect as a release: everything held for the identity is deleted and its
+    /// bindings closed (the host acts on `true` as on `released`). Not a trace event; the vectors pin the two the spec
+    /// names.
+    pub fn end(&mut self, identity: &str) -> bool {
+        let Some(i) = self.enrolled.iter().position(|(e, _)| e == identity) else { return false };
+        self.enrolled.remove(i);
+        true
+    }
+
+    /// Whether `identity` is one of the operator's configured identities.
+    pub fn is_configured(&self, identity: &str) -> bool {
+        self.configured.iter().any(|c| c == identity)
+    }
+
     /// A verified `hello` of a device of `identity`.
     ///
     /// Spec: M§4.4 — the device is registered again for `mls_retention_s`. A binding alone enrols nothing (M§4.1).

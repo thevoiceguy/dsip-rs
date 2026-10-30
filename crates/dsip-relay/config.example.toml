@@ -40,4 +40,6 @@
 # turn_ttl = 3600
 
 # --- operating
-# status_listen = "127.0.0.1:9101"                 # GET /status and /metrics, plain HTTP: keep it on loopback
+# status_listen = "127.0.0.1:9101"                 # /status, /metrics, `dsip-relay admin --config <this file>`
+#                                                  #   (bindings); plain HTTP: keep it on loopback
+# log = "auto"                                     # auto (journald under systemd, else stderr), journald, stderr
