@@ -317,7 +317,7 @@ jobs:
         run: web/test/run.sh all
 
   packages:
-    name: "service packages build, install and run (dsip-node, dsip-relay, dsip-mailbox: static binaries, .debs under systemd, containers)"
+    name: "service packages build, install and run (dsip-node, dsip-relay, dsip-mailbox: static binaries, .debs under systemd, containers; one host)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -341,3 +341,13 @@ jobs:
         run: bash packaging/build.sh --image
       - name: test — both .debs on one systemd host, the certificate hook, the images locked down; state survives restarts
         run: bash packaging/test.sh
+      # the one-host recipe serves the browser client: its tarball, built here as the wasm job builds it
+      - name: install wasm-pack v0.15.0
+        run: |
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/wasm-pack"
+      - name: build — the dsip-web tarball
+        run: bash packaging/build.sh dsip-web
+      - name: test — one host, one name (docs/one-host.md) — the three .debs and coturn set up by configure, and the compose
+        run: bash packaging/one-host/test.sh

@@ -72,6 +72,17 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   both it checks that the relay's queued invite and certificate, and the mailbox's enrolment and service key,
   survive a crash and a restart. It also checks that a certificate renewal reaches the running relay. dsip-mailbox
   gains the feature `static`: SQLite and OpenSSL compiled in.
+- **One host, one name** (S7, `docs/one-host.md`). The relay, the mailbox, the hints node and coturn on one machine
+  behind one DNS name. The relay on 443 serves the browser client, `/config.json`, `/turn` and the hints node at
+  `/dsip/v1/`; the mailbox on 9443 uses the same certificate. Two ways to set it up:
+  - `packaging/one-host/configure` sets up the three installed `.deb`s and coturn. It writes the configs, the client's
+    defaults (naming the mailbox by its service DID), port 443's drop-in and one certbot hook for both services. Run
+    it again after a change: it restarts only what changed.
+  - `packaging/one-host/compose/` (`compose.yaml` and `./init`) runs the images. The relay, the mailbox and the node
+    share one network namespace, so they reach each other on loopback as on a host, and the node trusts the relay's
+    `X-Forwarded-For`.
+
+  `packaging/one-host/test.sh` runs both ways in CI, checking a renewal and an unchanged second run.
 
 ### Fixed
 

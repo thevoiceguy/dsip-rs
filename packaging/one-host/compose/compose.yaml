@@ -1,0 +1,79 @@
+# One host, one name, in containers (docs/one-host.md): the relay on 443 serving the browser client, the hints node
+# behind it at /dsip/v1/, TURN credentials at /turn, the mailbox on 9443 under the same certificate, and coturn.
+# Copy env.example to .env and set it, unpack the dsip-web tarball into ./www, then `./init --certificate <dir>`.
+name: dsip
+services:
+  # The network namespace the three services share, as on one host: they reach each other on 127.0.0.1, and the hints
+  # node trusts the relay's X-Forwarded-For (each browser's address, for its per-client limit) only from loopback. It
+  # holds the published ports, so a restarted service keeps its network.
+  net:
+    image: registry.k8s.io/pause:3.10
+    restart: unless-stopped
+    ports:
+      - "${DSIP_HTTPS_PORT:-443}:8443/tcp"       # the relay: wss, the client, /config.json, /turn, /dsip/v1/
+      - "${DSIP_MAILBOX_PORT:-9443}:9443/tcp"    # the mailbox: wss and the blob endpoint
+      - "${DSIP_OVERLAY_PORT:-4610}:4610/tcp"    # the hints node's overlay
+      - "${DSIP_MAINLINE_PORT:-6881}:6881/udp"   # and its Mainline DHT
+
+  dsip-node:
+    image: ${DSIP_IMAGES-ghcr.io/thevoiceguy/}dsip-node:${DSIP_VERSION:-latest}
+    network_mode: service:net
+    depends_on: [net]
+    restart: unless-stopped
+    volumes:
+      - ./node.toml:/etc/dsip-node/config.toml:ro
+      - dsip-node:/var/lib/dsip-node
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  dsip-mailbox:
+    image: ${DSIP_IMAGES-ghcr.io/thevoiceguy/}dsip-mailbox:${DSIP_VERSION:-latest}
+    network_mode: service:net
+    depends_on: [net]
+    restart: unless-stopped
+    command: ["--host", "${DSIP_NAME:?set DSIP_NAME in .env}", "--serve-any", "${DSIP_SERVE_ANY:-32}"]
+    volumes:
+      - ./mailbox.toml:/etc/dsip-mailbox/mailbox.toml:ro
+      - ./tls:/tls:ro
+      - dsip-mailbox:/var/lib/dsip-mailbox
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  dsip-relay:
+    image: ${DSIP_IMAGES-ghcr.io/thevoiceguy/}dsip-relay:${DSIP_VERSION:-latest}
+    network_mode: service:net
+    depends_on: [net, dsip-node]
+    restart: unless-stopped
+    command: ["--turn-uri", "turn:${DSIP_NAME:?set DSIP_NAME in .env}:3478"]
+    volumes:
+      - ./relay.toml:/etc/dsip-relay/relay.toml:ro
+      - ./client.json:/etc/dsip-relay/client.json:ro
+      - ./turn.secret:/etc/dsip-relay/turn.secret:ro
+      - ./tls:/tls:ro
+      - ./www:/www:ro
+      - dsip-relay:/var/lib/dsip-relay
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # STUN and TURN, on the host's network: it relays on a range of UDP ports at the public address (turnserver.conf,
+  # written by ./init from .env)
+  coturn:
+    image: ${DSIP_COTURN_IMAGE:-coturn/coturn:4.18}
+    network_mode: host
+    restart: unless-stopped
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    read_only: true
+    tmpfs: [/var/lib/coturn, /var/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]   # the image's turnserver carries it as a file capability: without it, exec fails
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  dsip-node:
+  dsip-mailbox:
+  dsip-relay:

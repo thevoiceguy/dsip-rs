@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# One host, one name, in containers (compose.yaml, docs/one-host.md): prepare this directory and start the services.
+# Run it from anywhere, as root (or a user who may run docker); run it again whenever: it is idempotent.
+#
+#   ./init --certificate <dir>     install fullchain.pem and privkey.pem from <dir> (certbot's live/<name>/), then
+#                                  start; a certificate that changed is reloaded (SIGHUP) by the running services.
+#                                  As certbot's deploy hook: --deploy-hook "<this dir>/init --certificate \$RENEWED_LINEAGE"
+#   ./init                         start with the certificate already installed
+#
+# It writes ./tls (the certificate, readable by the images' user 65532), ./turn.secret and ./turnserver.conf (once,
+# from .env), and ./client.json: the client's defaults, naming the mailbox by the service DID it made on first start.
+#
+# Spec: none (infrastructure).
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+die() { echo "init: $*" >&2; exit 1; }
+CERT_DIR=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --certificate) CERT_DIR=${2:?--certificate <dir>}; shift ;;
+    *) sed -n '5,9p' "$0" >&2; exit 2 ;;
+  esac
+  shift
+done
+[ -f .env ] || die "no .env: copy env.example to .env and set it"
+set -a; . ./.env; set +a
+[ -n "${DSIP_NAME:-}" ] && [ -n "${PUBLIC_IP:-}" ] || die "set DSIP_NAME and PUBLIC_IP in .env"
+[ -f www/index.html ] || die "no www/index.html: unpack the dsip-web tarball into ./www (tar -xzf dsip-web-<v>.tar.gz --strip-components 1 -C www)"
+# The images' users read ./tls, ./turn.secret and ./turnserver.conf: as root, by group (65532, distroless nonroot;
+# coturn's nobody, 65534); otherwise readable by everyone on this host, said once
+if [ "$(id -u)" = 0 ]; then
+  own() { install -m 0640 -g "$1" "$2" "$3"; }; TLS_DIR=(-m 0750 -g 65532)
+else
+  own() { install -m 0644 "$2" "$3"; }; TLS_DIR=(-m 0755)
+  echo "init: not root, so ./tls, ./turn.secret and ./turnserver.conf are readable by every user of this host" >&2
+fi
+
+RENEWED=
+if [ -n "$CERT_DIR" ]; then
+  for f in fullchain.pem privkey.pem; do [ -r "$CERT_DIR/$f" ] || die "no $CERT_DIR/$f"; done
+  install -d "${TLS_DIR[@]}" tls
+  for f in fullchain.pem privkey.pem; do
+    if ! cmp -s "$CERT_DIR/$f" "tls/$f" 2>/dev/null; then
+      # whole or not at all: written beside, then renamed over the old one (a bind-mounted directory sees the rename)
+      own 65532 "$CERT_DIR/$f" "tls/.$f.new" && mv -f "tls/.$f.new" "tls/$f"; RENEWED=1
+    fi
+  done
+fi
+[ -f tls/fullchain.pem ] && [ -f tls/privkey.pem ] || die "no certificate in ./tls: ./init --certificate <dir>"
+
+if [ ! -s turn.secret ]; then
+  head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > turn.secret.new
+  own 65532 turn.secret.new turn.secret; rm -f turn.secret.new
+fi
+# Bound to the public address itself, not 0.0.0.0: with a wildcard coturn maps its own external address back to the
+# wildcard and refuses it as a peer (403 Forbidden IP), so two relay-only clients of this server never meet
+cat > turnserver.conf.new <<CONF
+# coturn for $DSIP_NAME, written by ./init from .env. Credentials are the TURN REST API's: the relay mints them at
+# https://$DSIP_NAME/turn from the shared secret.
+listening-port=3478
+listening-ip=$PUBLIC_IP
+relay-ip=$PUBLIC_IP
+external-ip=$PUBLIC_IP
+allowed-peer-ip=$PUBLIC_IP
+min-port=49160
+max-port=49200
+fingerprint
+no-cli
+no-tls
+no-dtls
+use-auth-secret
+static-auth-secret=$(cat turn.secret)
+realm=$DSIP_NAME
+log-file=stdout
+pidfile=/var/tmp/turnserver.pid
+CONF
+own 65534 turnserver.conf.new turnserver.conf; rm -f turnserver.conf.new
+
+# the mailbox first: client.json names it by the service DID it makes on its first start
+docker compose up -d --quiet-pull net dsip-node dsip-mailbox
+DID=
+for _ in $(seq 150); do
+  DID=$(docker compose cp dsip-mailbox:/var/lib/dsip-mailbox/service.did - 2>/dev/null | tar -xO 2>/dev/null || true)
+  [ -n "$DID" ] && break; sleep 0.2
+done
+[ -n "$DID" ] || die "the mailbox made no service DID: docker compose logs dsip-mailbox"
+ORIGIN=https://$DSIP_NAME; [ "${DSIP_HTTPS_PORT:-443}" = 443 ] || ORIGIN=$ORIGIN:$DSIP_HTTPS_PORT
+cat > client.json.new <<JSON
+{
+  "nodes": ["$ORIGIN"],
+  "publish_hint": true,
+  "mailbox": {"uri": "wss://$DSIP_NAME:${DSIP_MAILBOX_PORT:-9443}/dsip", "did": "$DID"}
+}
+JSON
+CLIENT_CHANGED=
+cmp -s client.json.new client.json 2>/dev/null || CLIENT_CHANGED=1
+install -m 0644 client.json.new client.json; rm -f client.json.new
+
+WAS_UP=$(docker compose ps -q dsip-relay)
+docker compose up -d --quiet-pull
+# the relay reads client.json at start; both reload the certificate on SIGHUP, keeping their connections
+if [ -n "$WAS_UP" ]; then
+  [ -z "$CLIENT_CHANGED" ] || docker compose restart dsip-relay
+  [ -z "$RENEWED" ] || docker compose kill -s HUP dsip-relay dsip-mailbox >/dev/null 2>&1
+fi
+echo "One host, $DSIP_NAME: client $ORIGIN/, mailbox wss://$DSIP_NAME:${DSIP_MAILBOX_PORT:-9443}/dsip ($DID)"

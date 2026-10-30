@@ -1,0 +1,11 @@
+# dsip-mailbox in the one-host compose (compose.yaml; --host and --serve-any come from .env there). Every key: dsip-rs
+# crates/dsip-mailbox/config.example.toml.
+state = "/var/lib/dsip-mailbox"
+listen = "0.0.0.0:9443"
+status_listen = "127.0.0.1:9102"        # docker compose exec dsip-mailbox dsip-mailbox admin --config /etc/dsip-mailbox/mailbox.toml enrolments
+cert = "/tls/fullchain.pem"
+key = "/tls/privkey.pem"
+# owner = ["did:web:example.com"]       # identities whose documents name this mailbox
+release_idle = true                     # an enrolment idle for mls_retention ends, freeing its place (M§4.1)
+hints_node = ["http://127.0.0.1:8080"]
+log = "stderr"

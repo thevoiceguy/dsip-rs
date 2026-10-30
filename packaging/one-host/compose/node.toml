@@ -1,0 +1,26 @@
+# dsip-node in the one-host compose (compose.yaml). Every key: dsip-rs crates/dsip-node/config.example.toml.
+# A hints node is never authoritative (DSIP core §8.1).
+[node]
+state_dir = "/var/lib/dsip-node"
+
+[overlay]
+listen = ["/ip4/0.0.0.0/tcp/4610"]
+# your other hints nodes: /dns4/<name>/tcp/4610/p2p/<PeerId>
+bootstrap = []
+
+[mainline]
+enabled = true
+port = 6881
+server = true
+bootstrap = []
+
+[http]
+# reached through the relay at https://<name>/dsip/v1/, not published itself
+listen = "127.0.0.1:8080"
+
+[limits]
+ban_secs = 600
+ban_ip = false
+http_requests_per_ip_per_min = 120
+# the relay, on loopback, names each client's address; a header from anyone else is ignored
+trust_x_forwarded_for = true

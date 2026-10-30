@@ -1,0 +1,12 @@
+# dsip-relay in the one-host compose (compose.yaml; --turn-uri comes from .env there). Every key: dsip-rs
+# crates/dsip-relay/config.example.toml.
+listen = "0.0.0.0:8443"
+state = "/var/lib/dsip-relay"
+status_listen = "127.0.0.1:9101"        # docker compose exec dsip-relay dsip-relay admin --config /etc/dsip-relay/relay.toml bindings
+cert = "/tls/fullchain.pem"             # ./tls, installed by ./init --certificate; SIGHUP reloads it
+key = "/tls/privkey.pem"
+www = "/www"                            # ./www: the dsip-web tarball, unpacked
+client_config = "/etc/dsip-relay/client.json"   # ./client.json, written by ./init
+node_proxy = "127.0.0.1:8080"
+turn_secret_file = "/etc/dsip-relay/turn.secret"
+log = "stderr"

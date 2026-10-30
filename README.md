@@ -55,6 +55,8 @@ crates/
     dsip-testkit           an in-process network for tests: no sockets, no ports
 web/                       the browser client, on dsip-wasm (web/README.md)
 demos/                     self-verifying wire demos, each run in CI
+packaging/                 the services' .debs, images and tarballs (build.sh, test.sh); one-host/: the relay,
+                           mailbox, hints node and coturn on one host behind one name (docs/one-host.md)
 docs/                      the usage guide, the design note (build order, decisions), client and node plans
 spec/                      DSIP, as a git submodule at a tag: v1.0/ (spec text, schemas), impl/vectors/ (the suite)
 ```
