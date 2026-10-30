@@ -72,7 +72,8 @@ stage that changes behaviour a vector can see starts with the vector in DSIP (CL
     survives a restart in both.
 
   The browser client ships as `dsip-web`, a tarball of the built `web/`, which the relay serves with `--www`.
-- **S7, one host, one name.** A single-host recipe: the relay on 443, or 8443 behind a proxy, serving the client,
+- **S7, one host, one name.** *Done: `docs/one-host.md`; `packaging/one-host/configure` for the `.deb`s,
+  `packaging/one-host/compose/` (`./init`), `packaging/one-host/test.sh`. Decided: the relay on 443 (decision 6).* A single-host recipe: the relay on 443, or 8443 behind a proxy, serving the client,
   proxying the node at `/dsip/v1/`, minting TURN credentials; the mailbox; the hints node; coturn. It comes as a
   `compose.yaml`, and as an install guide for the three `.deb`s, with the DNS names, ports and certificates
   spelled out. `node-setup.sh` on the WAN testbed becomes a thin wrapper over the packages, and L1 and L2 are
@@ -100,6 +101,12 @@ anything else.
 4. **Release tags.** (a) The CalVer workspace release carries every service's artifacts (S8). (b) Per-service tags,
    as dsip-node does now. *Draft: (a),* so one name pins a server set that was tested together.
 5. **Container registry.** `ghcr.io/thevoiceguy/…`, which dsip-node's README already names. *Draft: yes.*
+6. **The relay's port on one host** (S7). (a) 443, the relay terminating TLS itself: the client's address has no port.
+   The unit gains `CAP_NET_BIND_SERVICE` and loses its private user namespace (exposure 1.1 → 1.5); in compose,
+   Docker publishes 8443 as 443. (b) 8443 behind a proxy on 443. *Chosen in S7: (a).* A proxy adds a service to
+   configure and renew for, and an HTTP proxy hides each client's address from the relay, which passes it on for the
+   hints node's per-client limit. `configure --port 8443` stays possible, as on the WAN testbed, whose identities
+   already name `:8443`.
 
 ## 5. Out of scope, and why
 

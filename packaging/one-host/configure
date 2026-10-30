@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# One host, one name (docs/one-host.md): configure the installed dsip-relay, dsip-mailbox and dsip-node packages to
+# run together behind one DNS name, with coturn if asked. Run as root after `apt install ./dsip-*.deb`; run it again
+# after changing an option: it rewrites what it owns, restarts only the services whose files changed, and leaves the
+# hints node's own settings (bootstrap nodes, ports) alone.
+#
+#   configure --name dsip.example.com --cert-dir /etc/letsencrypt/live/dsip.example.com --www /usr/local/share/dsip-web
+#             [--serve-any <n>] [--owner <did>]... [--release-idle]
+#             [--coturn --public-ip <ip>] | [--turn-uri <uri>... --turn-secret-file <file>]
+#             [--port 443] [--mailbox-port 9443] [--host <name>]... [--client-node <https url>]...
+#             [--resolver-file <did document>]... [--peers-ca <pem>]
+#
+# It writes:
+#   /etc/dsip-relay/relay.toml       the relay on --port, with the certificate, the client (--www), /config.json, the
+#                                    hints node at /dsip/v1/ and TURN credentials at /turn
+#   /etc/dsip-relay/client.json      the client's defaults: this origin's hints node and this mailbox (its service DID)
+#   /etc/dsip-mailbox/mailbox.toml   the mailbox on --mailbox-port under the same certificate
+#   /etc/dsip-node/config.toml       only trust_x_forwarded_for = true: the relay forwards each client's address
+#   /etc/systemd/system/dsip-relay.service.d/one-host.conf   CAP_NET_BIND_SERVICE for a port below 1024
+#   /var/lib/dsip-relay/turn.secret  a copy of the TURN secret the relay's DynamicUser can read (root's file it cannot)
+#   /etc/letsencrypt/renewal-hooks/deploy/dsip-one-host      a renewal of --name's certificate installs it into both
+#                                    services and reloads them (SIGHUP: bound devices stay bound)
+#   /etc/turnserver.conf, /etc/dsip-relay/turn.secret        with --coturn
+#
+# Spec: none (infrastructure).
+set -euo pipefail
+usage() { sed -n '7,12p' "$0" >&2; exit 2; }
+NAME=; CERT_DIR=; WWW=; SERVE_ANY=; RELEASE_IDLE=false; COTURN=; PUBLIC_IP=; TURN_SECRET_FILE=; PORT=443; MPORT=9443
+OWNERS=(); TURN_URIS=(); HOSTS=(); CLIENT_NODES=(); DOCS=(); PEERS_CA=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --name) NAME=$2; shift ;;
+    --cert-dir) CERT_DIR=$2; shift ;;
+    --www) WWW=$2; shift ;;
+    --serve-any) SERVE_ANY=$2; shift ;;
+    --owner) OWNERS+=("$2"); shift ;;
+    --release-idle) RELEASE_IDLE=true ;;
+    --coturn) COTURN=1 ;;
+    --public-ip) PUBLIC_IP=$2; shift ;;
+    --turn-uri) TURN_URIS+=("$2"); shift ;;
+    --turn-secret-file) TURN_SECRET_FILE=$2; shift ;;
+    --port) PORT=$2; shift ;;
+    --mailbox-port) MPORT=$2; shift ;;
+    --host) HOSTS+=("$2"); shift ;;
+    --client-node) CLIENT_NODES+=("$2"); shift ;;
+    --resolver-file) DOCS+=("$2"); shift ;;
+    --peers-ca) PEERS_CA=$2; shift ;;
+    -h|--help) usage ;;
+    *) echo "configure: unknown option $1" >&2; usage ;;
+  esac
+  shift
+done
+die() { echo "configure: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run as root"
+[ -n "$NAME" ] && [ -n "$CERT_DIR" ] && [ -n "$WWW" ] || usage
+for p in dsip-relay dsip-mailbox dsip-node; do dpkg -s "$p" >/dev/null 2>&1 || die "package $p is not installed"; done
+for f in fullchain.pem privkey.pem; do [ -r "$CERT_DIR/$f" ] || die "no $CERT_DIR/$f"; done
+[ -f "$WWW/index.html" ] || die "no $WWW/index.html: unpack the dsip-web tarball there"
+[ -n "$SERVE_ANY" ] || [ ${#OWNERS[@]} -gt 0 ] || die "give --owner <did> and/or --serve-any <n>: whom the mailbox serves"
+if [ -n "$COTURN" ]; then
+  command -v turnserver >/dev/null || die "--coturn needs coturn installed (apt install coturn)"
+  [ -n "$PUBLIC_IP" ] || die "--coturn needs --public-ip: the address coturn relays on"
+  [ -z "$TURN_SECRET_FILE" ] || die "--coturn makes its own secret; --turn-secret-file is for a TURN server elsewhere"
+  TURN_SECRET_FILE=/etc/dsip-relay/turn.secret
+  [ ${#TURN_URIS[@]} -gt 0 ] || TURN_URIS=("turn:$NAME:3478")
+fi
+[ ${#TURN_URIS[@]} -eq 0 ] || [ -n "$TURN_SECRET_FILE" ] || die "--turn-uri needs --turn-secret-file (or --coturn)"
+[ -z "$TURN_SECRET_FILE" ] || [ ${#TURN_URIS[@]} -gt 0 ] || die "--turn-secret-file needs --turn-uri"
+
+CHANGED=" "
+# put: write stdin to $1 if it differs, keeping the old file beside it; note the service it belongs to as changed.
+# Fed by a redirection, never a pipe: in a pipeline it would run in a subshell and the note would be lost
+put() { # file service [mode]
+  local new; new=$(mktemp "$1.XXXXXX")
+  cat > "$new"; chmod "${3:-0644}" "$new"
+  if [ -f "$1" ] && cmp -s "$1" "$new"; then rm -f "$new"; return; fi
+  [ -f "$1" ] && cp -p "$1" "$1.bak-$(date +%Y%m%d%H%M%S)"
+  mv -f "$new" "$1"; CHANGED="$CHANGED$2 "
+  echo "wrote $1"
+}
+toml_list() { local out="" x; for x in "$@"; do out="$out\"$x\", "; done; echo "[${out%, }]"; }
+changed() { [[ $CHANGED == *" $1 "* ]]; }
+wait_for() { # seconds description command...
+  local n=$1 what=$2; shift 2
+  for _ in $(seq $((n * 5))); do "$@" >/dev/null 2>&1 && return 0; sleep 0.2; done
+  die "$what (journalctl -u ${what%% *})"
+}
+restart() { # service: when its files changed, or when it is not running
+  if changed "$1" || ! systemctl is-active -q "$1"; then systemctl restart "$1"; echo "restarted $1"; fi
+}
+
+# ---- the certificate: one name, both TLS services ------------------------------------------------------------------
+for svc in dsip-relay dsip-mailbox; do
+  if ! cmp -s "$CERT_DIR/fullchain.pem" "/var/lib/private/$svc/tls/fullchain.pem" 2>/dev/null \
+     || ! cmp -s "$CERT_DIR/privkey.pem" "/var/lib/private/$svc/tls/privkey.pem" 2>/dev/null; then
+    "/usr/libexec/$svc/install-certificate" "$CERT_DIR"
+  fi
+done
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+put /etc/letsencrypt/renewal-hooks/deploy/dsip-one-host hook 0755 <<HOOK
+#!/bin/sh
+# certbot runs every deploy hook for every renewed certificate: act on $NAME's only. Written by dsip-rs
+# packaging/one-host/configure.
+[ "\$(basename "\${RENEWED_LINEAGE:-}")" = "$NAME" ] || exit 0
+/usr/libexec/dsip-relay/install-certificate "\$RENEWED_LINEAGE"
+/usr/libexec/dsip-mailbox/install-certificate "\$RENEWED_LINEAGE"
+HOOK
+
+# ---- the hints node: only the one key the relay in front of it needs ----------------------------------------------
+NODE_CONF=/etc/dsip-node/config.toml
+grep -q '^trust_x_forwarded_for *=' "$NODE_CONF" || die "no trust_x_forwarded_for in $NODE_CONF ([limits])"
+if ! grep -q '^trust_x_forwarded_for *= *true' "$NODE_CONF"; then
+  put "$NODE_CONF" dsip-node < <(sed 's/^trust_x_forwarded_for *=.*/trust_x_forwarded_for = true/' "$NODE_CONF")
+fi
+NODE_HTTP=$(sed -n '/^\[http\]/,/^\[/s/^listen *= *"\(.*\)".*/\1/p' "$NODE_CONF")
+[ -n "$NODE_HTTP" ] || die "no [http] listen in $NODE_CONF"
+NODE_PORT=${NODE_HTTP##*:}
+restart dsip-node
+wait_for 30 "dsip-node HTTP API on 127.0.0.1:$NODE_PORT" curl -sf "http://127.0.0.1:$NODE_PORT/dsip/v1/node"
+
+# ---- the mailbox ---------------------------------------------------------------------------------------------------
+put /etc/dsip-mailbox/mailbox.toml dsip-mailbox < <(
+  echo "# dsip-mailbox on $NAME, written by dsip-rs packaging/one-host/configure (run it again rather than editing this:"
+  echo "# it keeps the previous file as .bak-<time>). Every key: /usr/share/doc/dsip-mailbox/config.example.toml."
+  echo 'state = "/var/lib/dsip-mailbox"'
+  echo "listen = \"0.0.0.0:$MPORT\""
+  echo 'status_listen = "127.0.0.1:9102"'
+  echo 'cert = "/var/lib/dsip-mailbox/tls/fullchain.pem"'
+  echo 'key = "/var/lib/dsip-mailbox/tls/privkey.pem"'
+  echo "host = $(toml_list "$NAME" "${HOSTS[@]+"${HOSTS[@]}"}")             # the first: the blob endpoint's host (M§4.3)"
+  [ ${#OWNERS[@]} -eq 0 ] || echo "owner = $(toml_list "${OWNERS[@]}")"
+  [ -z "$SERVE_ANY" ] || echo "serve_any = $SERVE_ANY"
+  echo "release_idle = $RELEASE_IDLE"
+  echo "hints_node = [\"http://127.0.0.1:$NODE_PORT\"]   # a member with no DID document is found by its hint (M§4.2)"
+  [ ${#DOCS[@]} -eq 0 ] || echo "resolver_file = $(toml_list "${DOCS[@]}")"
+  [ -z "$PEERS_CA" ] || echo "ca = \"$PEERS_CA\""
+)
+restart dsip-mailbox
+wait_for 30 "dsip-mailbox service DID" test -s /var/lib/dsip-mailbox/service.did
+MAILBOX_DID=$(cat /var/lib/dsip-mailbox/service.did)
+
+# ---- coturn: STUN, and TURN with the REST API's shared secret ------------------------------------------------------
+if [ -n "$COTURN" ]; then
+  [ -s "$TURN_SECRET_FILE" ] || (umask 077; head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TURN_SECRET_FILE")
+  # Bound to the public address itself, not 0.0.0.0: with a wildcard coturn maps its own external address back to the
+  # wildcard and refuses it as a peer (403 Forbidden IP), so two relay-only clients of this server never meet
+  put /etc/turnserver.conf coturn 0640 <<CONF
+# coturn for $NAME, written by dsip-rs packaging/one-host/configure. Credentials are the TURN REST API's: the relay
+# mints them at https://$NAME/turn from the shared secret.
+listening-port=3478
+listening-ip=$PUBLIC_IP
+relay-ip=$PUBLIC_IP
+external-ip=$PUBLIC_IP
+allowed-peer-ip=$PUBLIC_IP
+min-port=49160
+max-port=49200
+fingerprint
+no-cli
+no-tls
+no-dtls
+use-auth-secret
+static-auth-secret=$(cat "$TURN_SECRET_FILE")
+realm=$NAME
+simple-log
+CONF
+  chgrp turnserver /etc/turnserver.conf 2>/dev/null || true
+  [ ! -f /etc/default/coturn ] || sed -i 's/^#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn
+  systemctl enable -q coturn
+  restart coturn
+fi
+
+# ---- the relay -----------------------------------------------------------------------------------------------------
+ORIGIN=https://$NAME; [ "$PORT" = 443 ] || ORIGIN=$ORIGIN:$PORT
+put /etc/dsip-relay/client.json dsip-relay < <(
+  # DIDs and URLs need no JSON escaping
+  nodes="\"$ORIGIN\""; for n in "${CLIENT_NODES[@]+"${CLIENT_NODES[@]}"}"; do [ "$n" = "$ORIGIN" ] || nodes="$nodes, \"$n\""; done
+  echo "{"
+  echo "  \"nodes\": [$nodes],"
+  echo "  \"publish_hint\": true,"
+  echo "  \"mailbox\": {\"uri\": \"wss://$NAME:$MPORT/dsip\", \"did\": \"$MAILBOX_DID\"}"
+  echo "}"
+)
+put /etc/dsip-relay/relay.toml dsip-relay < <(
+  echo "# dsip-relay on $NAME, written by dsip-rs packaging/one-host/configure (run it again rather than editing this:"
+  echo "# it keeps the previous file as .bak-<time>). Every key: /usr/share/doc/dsip-relay/config.example.toml."
+  echo "listen = \"0.0.0.0:$PORT\""
+  echo 'state = "/var/lib/dsip-relay"'
+  echo 'status_listen = "127.0.0.1:9101"'
+  echo 'cert = "/var/lib/dsip-relay/tls/fullchain.pem"'
+  echo 'key = "/var/lib/dsip-relay/tls/privkey.pem"'
+  echo "www = \"$WWW\""
+  echo 'client_config = "/etc/dsip-relay/client.json"'
+  echo "node_proxy = \"127.0.0.1:$NODE_PORT\""
+  if [ ${#TURN_URIS[@]} -gt 0 ]; then
+    echo "turn_uri = $(toml_list "${TURN_URIS[@]}")"
+    echo 'turn_secret_file = "/var/lib/dsip-relay/turn.secret"   # a copy of '"$TURN_SECRET_FILE"', made by configure'
+  fi
+)
+mkdir -p /etc/systemd/system/dsip-relay.service.d
+put /etc/systemd/system/dsip-relay.service.d/one-host.conf dsip-relay < <(
+  echo "# Written by dsip-rs packaging/one-host/configure."
+  echo "[Service]"
+  if [ "$PORT" -lt 1024 ]; then
+    echo "# port $PORT: the one capability, outside the private user namespace (a capability inside it cannot bind the"
+    echo "# host's ports)"
+    echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"
+    echo "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+    echo "PrivateUsers=no"
+  fi
+)
+systemctl daemon-reload
+# the TURN secret, where the relay's user can read it (as install-certificate does the certificate); the relay reads
+# it at start
+if [ -n "$TURN_SECRET_FILE" ]; then
+  install -d -m 0700 /var/lib/private /var/lib/private/dsip-relay
+  owner=$(stat -c %u:%g /var/lib/private/dsip-relay)
+  if ! cmp -s "$TURN_SECRET_FILE" /var/lib/private/dsip-relay/turn.secret 2>/dev/null; then
+    install -m 0600 -o "${owner%:*}" -g "${owner#*:}" "$TURN_SECRET_FILE" /var/lib/private/dsip-relay/.turn.secret.new
+    mv -f /var/lib/private/dsip-relay/.turn.secret.new /var/lib/private/dsip-relay/turn.secret
+    CHANGED="$CHANGED dsip-relay "; echo "installed the TURN secret for dsip-relay"
+  fi
+fi
+restart dsip-relay
+wait_for 30 "dsip-relay status on 127.0.0.1:9101" curl -sf http://127.0.0.1:9101/status
+
+echo
+echo "One host, $NAME:"
+echo "  client and relay   $ORIGIN/   wss://$NAME$([ "$PORT" = 443 ] || echo ":$PORT")/dsip"
+echo "  hints node         $ORIGIN/dsip/v1/node   (overlay 4610/tcp, Mainline 6881/udp)"
+echo "  mailbox            wss://$NAME:$MPORT/dsip   $MAILBOX_DID"
+[ ${#TURN_URIS[@]} -eq 0 ] || echo "  TURN               ${TURN_URIS[*]}   credentials at $ORIGIN/turn"
+echo "  certificate        $CERT_DIR, renewed by /etc/letsencrypt/renewal-hooks/deploy/dsip-one-host"
