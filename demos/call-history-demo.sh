@@ -92,8 +92,8 @@ wait_for "$DIR/bl.log" "^JOINED .* kind=direct" 30
 sleep 2
 echo "status" >&5; wait_for "$DIR/bl.log" "^STATUS " 10
 STATUS=$(grep "^STATUS " "$DIR/bl.log" | tail -1)
-echo "$STATUS" | grep -q "\"read_through\":{.*\"$ALICE\"" || { echo "FAIL: the laptop did not restore Alice's read receipt"; exit 1; }
-echo "$STATUS" | grep -q "\"read_through\":{.*\"$BOB\"" || { echo "FAIL: the laptop did not restore its own user's read position (spec-gap 68)"; exit 1; }
+echo "$STATUS" | grep >/dev/null "\"read_through\":{.*\"$ALICE\"" || { echo "FAIL: the laptop did not restore Alice's read receipt"; exit 1; }
+echo "$STATUS" | grep >/dev/null "\"read_through\":{.*\"$BOB\"" || { echo "FAIL: the laptop did not restore its own user's read position (spec-gap 68)"; exit 1; }
 if grep -q "^SENT-RECEIPT delivered" "$DIR/bl.log"; then echo "FAIL: the laptop sent receipts for restored history"; exit 1; fi
 
 for x in bl bp; do

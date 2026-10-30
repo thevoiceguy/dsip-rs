@@ -91,7 +91,7 @@ for _ in $(seq 50); do curl -sf localhost:$PORT/dsip/v1/node >/dev/null 2>&1 && 
 [ "$(curl -s localhost:$PORT/dsip/v1/node | python3 -c 'import json,sys; print(json.load(sys.stdin)["peer_id"])')" = "$PEER" ] \
   || fail "the PeerId changed across a container restart"
 curl -s localhost:$PORT/$Z | cmp -s - dist/.packet || fail "the packet did not survive the container restart"
-curl -s localhost:$PORT/metrics | grep -q '^dsip_node_pkarr_held 1$' || fail "metrics"
+curl -s localhost:$PORT/metrics | grep >/dev/null '^dsip_node_pkarr_held 1$' || fail "metrics"
 echo "  non-root (65532), read-only root, no capabilities; PeerId ${PEER:0:16}… and the held packet survived a restart"
 rm -f dist/.packet dist/.ct.toml dist/.config.toml
 echo

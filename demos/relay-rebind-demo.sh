@@ -18,8 +18,8 @@ plain() { sed 's/\x1b\[[0-9;]*m//g' "$D/relay.log"; }
 
 echo "=== Bob's phone binds"
 $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --script "sleep 20; quit" >"$D/first.log" 2>&1 & FIRST=$!
-for _ in $(seq 1 40); do plain | grep -q "bound device" && break; sleep 0.25; done
-plain | grep -q "bound device" || fail "the first connection did not bind"
+for _ in $(seq 1 40); do plain | grep >/dev/null "bound device" && break; sleep 0.25; done
+plain | grep >/dev/null "bound device" || fail "the first connection did not bind"
 OLD=$(plain | grep "bound device" | head -1 | sed -E 's/.*dsip_relay: ([0-9.:]+): bound.*/\1/')
 echo "  bound from $OLD"
 kill -STOP $FIRST   # frozen: it cannot see its connection close, nor reconnect
@@ -29,11 +29,11 @@ $B/dsip answer --identity "$D/bob" --relay $R --ca "$CA" --script "sleep 4; quit
 NEW=$(plain | grep "rebinding" | head -1 | sed -E 's/.*dsip_relay: ([0-9.:]+): rebinding.*/\1/')
 [ -n "$NEW" ] || fail "the relay did not see a rebinding"
 echo "  rebound from $NEW, replacing $OLD"
-plain | grep -q "$OLD: replaced connection" || fail "the relay did not close the replaced connection"
+plain | grep >/dev/null "$OLD: replaced connection" || fail "the relay did not close the replaced connection"
 echo "  the relay closed $OLD as replaced"
 ! grep -q "reconnected" "$D/second.log" || fail "the new connection was dropped with the old one and had to reconnect"
 [ "$(plain | grep -c ": unbound")" -eq 1 ] || fail "expected one unbind (the second process quitting), got: $(plain | grep unbound)"
-plain | grep -q "$NEW: unbound" || fail "the unbind was not the new connection's"
+plain | grep >/dev/null "$NEW: unbound" || fail "the unbind was not the new connection's"
 echo "  the new connection stayed bound until it quit: one unbind, no reconnect"
 kill -CONT $FIRST
 wait $FIRST && fail "the replaced process ran on to its script's end"

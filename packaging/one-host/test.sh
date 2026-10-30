@@ -60,16 +60,16 @@ one_host() { # tag relay-port mailbox-port service-did origin mailbox-port-in-it
   local tag=$1 rp=$2 mp=$3 did=$4 origin=$5 muri=$6 c
   # the hints node opens its HTTP API once it has joined Mainline
   until_ok 60 get "$rp" /dsip/v1/node || fail "$tag: the hints node is not at /dsip/v1/"
-  get "$rp" / | grep -q '<script type="module" src="app.js"' || fail "$tag: the client is not served at /"
+  get "$rp" / | grep >/dev/null '<script type="module" src="app.js"' || fail "$tag: the client is not served at /"
   get "$rp" /pkg/dsip_wasm_bg.wasm >"$D/$tag.wasm" && [ "$(od -An -c -N4 "$D/$tag.wasm" | tr -d ' ')" = '\0asm' ] \
     || fail "$tag: the engine is not served"
   c=$(get "$rp" /config.json) || fail "$tag: no /config.json"
   [ "$(echo "$c" | json 'd["mailbox"]["did"]')" = "$did" ] || fail "$tag: /config.json does not name the mailbox ($did): $c"
   [ "$(echo "$c" | json 'd["mailbox"]["uri"]')" = "wss://$NAME:$muri/dsip" ] || fail "$tag: the mailbox's uri: $c"
   [ "$(echo "$c" | json 'd["nodes"][0]')" = "$origin" ] || fail "$tag: the client's hints node is not $origin: $c"
-  get "$rp" /dsip/v1/node | json 'd["peer_id"]' | grep -q '^12D3' || fail "$tag: the hints node is not at /dsip/v1/"
+  get "$rp" /dsip/v1/node | json 'd["peer_id"]' | grep >/dev/null '^12D3' || fail "$tag: the hints node is not at /dsip/v1/"
   c=$(get "$rp" /turn) || fail "$tag: no TURN credentials at /turn"
-  echo "$c" | json '" ".join(d["iceServers"][0]["urls"]), d["iceServers"][0]["credential"]' | grep -q "^turn:$NAME:3478 ." \
+  echo "$c" | json '" ".join(d["iceServers"][0]["urls"]), d["iceServers"][0]["credential"]' | grep >/dev/null "^turn:$NAME:3478 ." \
     || fail "$tag: /turn: $c"
   [ "$(served "$rp")" = "$(served "$mp")" ] || fail "$tag: the relay and the mailbox serve different certificates"
   [ "$(served "$rp")" = "$(fingerprint "$D/tls")" ] || fail "$tag: the relay does not serve the installed certificate"
@@ -156,7 +156,7 @@ done
 did() { $CC cp dsip-mailbox:/var/lib/dsip-mailbox/service.did - | tar -xO; }
 until_ok 20 get $CR /config.json || fail "the relay did not come up"
 one_host compose $CR $CM "$(did)" "https://$NAME:$CR" $CM
-$CC ps --format '{{.Service}} {{.State}}' | grep -q '^coturn running' || fail "coturn is not running"
+$CC ps --format '{{.Service}} {{.State}}' | grep >/dev/null '^coturn running' || fail "coturn is not running"
 # the shared namespace: each restarted, the relay still reaches the node on loopback
 for svc in dsip-relay dsip-node; do
   $CC restart $svc >/dev/null
