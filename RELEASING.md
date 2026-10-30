@@ -82,8 +82,8 @@ only, so a bump never edits dependents' manifests.
 
 ```sh
 sha256sum -c SHA256SUMS
-gh attestation verify dsip-relay_0.1.0-1_amd64.deb --repo thevoiceguy/dsip-rs
-cosign verify ghcr.io/thevoiceguy/dsip-relay:2026.11.02 \
+gh attestation verify dsip-relay_0.2.0-1_amd64.deb --repo thevoiceguy/dsip-rs
+cosign verify ghcr.io/thevoiceguy/dsip-relay:2026.10.31 \
   --certificate-identity-regexp '^https://github.com/thevoiceguy/dsip-rs/.github/workflows/release.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

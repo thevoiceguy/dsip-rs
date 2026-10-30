@@ -7,6 +7,49 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+## [2026-10-31] — workspace release
+
+The service nodes: the relay, the mailbox and the hints node as products, from config files to signed release
+packages (`docs/dsip-service-nodes-plan.md`, S1–S8). DSIP spec: `poc-v1.0.1` (DSIP Core 1.0 with spec-gap 164;
+2,325 vectors, 0 failures).
+
+| Crate | Version |
+|---|---|
+| `dsip-broadcast` | 0.1.0 |
+| `dsip-cli` | 0.1.0 |
+| `dsip-core` | 0.1.0 |
+| `dsip-dht` | 0.1.0 |
+| `dsip-endpoint` | 0.1.0 |
+| `dsip-events` | 0.1.0 |
+| `dsip-gateway` | 0.1.0 |
+| `dsip-kt` | 0.1.0 |
+| `dsip-mailbox` | 0.2.0 (was 0.1.0) |
+| `dsip-media` | 0.1.0 |
+| `dsip-messaging` | 0.2.0 (was 0.1.0) |
+| `dsip-messaging-device` | 0.1.0 |
+| `dsip-messenger` | 0.1.0 |
+| `dsip-mls` | 0.1.0 |
+| `dsip-node` | 0.1.1 (was 0.1.0) |
+| `dsip-number` | 0.1.0 |
+| `dsip-phone` | 0.1.0 |
+| `dsip-recording` | 0.1.0 |
+| `dsip-relay` | 0.2.0 (was 0.1.0) |
+| `dsip-schema` | 0.1.0 |
+| `dsip-session` | 0.2.0 (was 0.1.0) |
+| `dsip-testkit` | 0.1.0 |
+| `dsip-transport` | 0.2.0 (was 0.1.0) |
+| `dsip-wasm` | 0.1.0 |
+| `dsip-webrtc-binding` | 0.1.0 |
+
+**Breaking changes:**
+- `dsip_relay::RelayConfig` and `dsip_mailbox::MailboxConfig` gain `did_web` (#4), and `RelayConfig` gains
+  `queue_store` (#5). Struct literals need them, or `..Default::default()`.
+- `dsip_mailbox::store::Store::retain` takes a predicate, `impl Fn(&str) -> bool`, instead of a slice of cursors (#6).
+- `dsip_transport::status::Page` gains `Admin` and is no longer `Copy` (#7).
+
+The service packages change their names with their versions: `dsip-relay_0.2.0-1_<arch>.deb`,
+`dsip-mailbox_0.2.0-1_<arch>.deb`, `dsip-node_0.1.1-1_<arch>.deb`.
+
 ### Added
 
 - **Config files for the relay and the mailbox** (service-nodes plan S1). `dsip-relay --config <file>` and
