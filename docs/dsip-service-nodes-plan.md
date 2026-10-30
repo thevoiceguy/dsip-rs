@@ -19,7 +19,7 @@ coturn (§5).
 |---|---|---|---|
 | Library | `dsip_node` | `RelayServer` (4a) | `MailboxServer` (4d-1) |
 | Configuration | TOML file; every key also a flag; unknown keys an error | flags only | flags only |
-| Packages | static musl binaries, `.deb`, container image, `SHA256SUMS`, release workflow (`dsip-node-v*` tags) | none: built from source by the WAN testbed's `node-setup.sh` | the same as the relay |
+| Packages | static musl binaries, `.deb`, container image, `SHA256SUMS`, release workflow (`dsip-node-v*` tags; S8: the workspace release) | none: built from source by the WAN testbed's `node-setup.sh` | the same as the relay |
 | systemd unit | shipped; `DynamicUser`, sandboxed (`systemd-analyze security`: 1.1) | written by `node-setup.sh`, runs as root | the same as the relay |
 | State on restart | kept: identity, peers, records (`redb`), Mainline routing | relay key and certificate kept; **the store-and-forward queue is lost** (memory only) | kept, but the **whole service state is one JSON file, rewritten after every change** (spec-gap 59) |
 | `did:web` identities | n/a | **document files only** (`--did-document`) | **document files only** (`--resolver-file`) |
@@ -78,7 +78,9 @@ stage that changes behaviour a vector can see starts with the vector in DSIP (CL
   `compose.yaml`, and as an install guide for the three `.deb`s, with the DNS names, ports and certificates
   spelled out. `node-setup.sh` on the WAN testbed becomes a thin wrapper over the packages, and L1 and L2 are
   re-provisioned from them as the check.
-- **S8, releases.** The CalVer workspace release builds and attaches every service's artifacts: tarballs, `.deb`s,
+- **S8, releases.** *Done: `.github/workflows/release.yml` on a `vYYYY.MM.DD` tag (a dry run on a pull request that
+  changes it, or by hand), `packaging/release-assets.sh` (the files, one `SHA256SUMS`, the notes); images signed with
+  cosign (keyless) and every file and image attested; `dsip-node-release.yml` removed.* The CalVer workspace release builds and attaches every service's artifacts: tarballs, `.deb`s,
   `SHA256SUMS` and images pushed to `ghcr.io/thevoiceguy/dsip-relay`, `-mailbox` and `-node`. That replaces
   dsip-node's own `dsip-node-v*` tags. The images are signed.
 

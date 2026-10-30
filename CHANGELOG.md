@@ -83,6 +83,20 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
     `X-Forwarded-For`.
 
   `packaging/one-host/test.sh` runs both ways in CI, checking a renewal and an unchanged second run.
+- **Releases carry the services** (S8). A `vYYYY.MM.DD` tag runs `.github/workflows/release.yml`. It builds and
+  tests every service's packages as CI does, then publishes:
+  - the GitHub release, its notes from the tag's changelog section;
+  - every service's tarballs and `.deb`s (amd64, arm64), the `dsip-web` tarball, `dsip-one-host-<release>.tar.gz`
+    and one `SHA256SUMS`, each file attested (`gh attestation verify`);
+  - the images `ghcr.io/thevoiceguy/dsip-relay`, `-mailbox` and `-node` for linux/amd64 and linux/arm64, tagged
+    with the release and `latest`, signed with cosign (keyless) and attested.
+
+  A pull request that changes the release, or a manual run, is a dry run. `packaging/release-assets.sh` gathers the
+  files and writes the notes.
+
+### Removed
+
+- **dsip-node's own releases.** The `dsip-node-v*` tags and `dsip-node-release.yml` give way to the workspace release.
 
 ### Fixed
 

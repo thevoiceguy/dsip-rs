@@ -17,3 +17,4 @@ web/pkg/
 web/node_modules/
 demos/browser/
 web/test/types/vectors.gen.ts
+/dist/

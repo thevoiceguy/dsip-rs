@@ -1,0 +1,142 @@
+name: release
+
+# A workspace release (RELEASING.md). On a CalVer tag vYYYY.MM.DD[.n]: build every service's packages, test them as
+# CI does, then publish:
+#   - the GitHub release, its notes from the tag's CHANGELOG section (packaging/release-assets.sh), with every
+#     service's static binaries (tarballs) and .debs for amd64 and arm64, the dsip-web tarball, the one-host recipe and
+#     one SHA256SUMS, each file with a build-provenance attestation;
+#   - the images ghcr.io/<owner>/dsip-relay, dsip-mailbox and dsip-node, linux/amd64 and linux/arm64, tagged with the
+#     release (2026.11.02) and latest, each signed (cosign, keyless) and attested.
+# Run by hand, or on a pull request that changes the release itself, it is a dry run: everything but the publishing,
+# the assets kept as the run's artifact.
+on:
+  push:
+    tags: ["v2[0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]*"]
+  workflow_dispatch: {}
+  pull_request:
+    paths: [".github/workflows/release.yml", "packaging/release-assets.sh"]
+
+defaults:
+  run:
+    shell: bash
+
+# The runner's CMake 4 refuses projects declaring cmake_minimum_required < 3.5 (vendored C in the build)
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+permissions:
+  contents: write       # the release
+  packages: write       # the images
+  id-token: write       # keyless signing and attestations
+  attestations: write
+
+jobs:
+  release:
+    name: "release: build, test and (on a tag) publish the service packages and images"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }   # spec/: DSIP at the pinned tag (schemas, vectors)
+      - name: what this run is
+        run: |
+          git -C spec fetch -q --depth=1 --tags origin   # for `describe`: the release names the DSIP spec tag
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            echo "TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"; echo "PUBLISH=1" >> "$GITHUB_ENV"
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+            # a release names the DSIP spec it conforms to: spec/ on a tag of its own, not between two
+            spec=$(git -C spec describe --tags --exact-match) || { echo "spec/ is at $(git -C spec describe --tags), not a DSIP tag"; exit 1; }
+            echo "SPEC=$spec" >> "$GITHUB_ENV"
+            # checkout makes the tag a lightweight one locally: fetch the tag object itself
+            git fetch -q --depth=1 origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+            [ "$(git cat-file -t "$GITHUB_REF_NAME")" = tag ] || { echo "$GITHUB_REF_NAME is not an annotated tag"; exit 1; }
+          else
+            echo "TAG=--dry-run" >> "$GITHUB_ENV"; echo "VERSION=0000.00.00-dry-run" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # ziglang: zig is cargo-zigbuild's C compiler on both musl targets; pynacl, cryptography: the packages' tests
+      - run: pip install ziglang==0.13.0 pynacl cryptography
+      - name: Rust, as pinned in rust-toolchain.toml, plus the musl targets
+        run: |
+          rustup toolchain install && rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-zigbuild@0.23,cargo-deb@3" }
+      - name: install wasm-pack v0.15.0
+        run: |
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/wasm-pack-v0.15.0-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/wasm-pack"
+
+      - name: build — every service (musl x86_64 and aarch64, tarballs, .debs, this machine's images) and dsip-web
+        run: |
+          bash crates/dsip-node/packaging/build.sh --image
+          bash packaging/build.sh --image dsip-relay dsip-mailbox dsip-web
+      - name: test — dsip-node's package and image
+        run: bash crates/dsip-node/packaging/test.sh
+      - name: test — dsip-relay's and dsip-mailbox's packages and images
+        run: bash packaging/test.sh
+      - name: test — one host, one name, the .debs and the compose
+        run: bash packaging/one-host/test.sh
+      - name: the release's files and notes
+        run: bash packaging/release-assets.sh "$TAG"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: env.PUBLISH
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      # The Containerfiles copy the static binaries built above (dist/<arch>/): no emulation for arm64
+      - name: the images, linux/amd64 and linux/arm64 (pushed on a tag)
+        id: images
+        run: |
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          for svc in dsip-relay dsip-mailbox dsip-node; do
+            image=ghcr.io/$owner/$svc
+            out=()
+            if [ -n "${PUBLISH:-}" ]; then out=(--push -t "$image:$VERSION" -t "$image:latest"); fi
+            docker buildx build --platform linux/amd64,linux/arm64 -f "crates/$svc/packaging/Containerfile" \
+              --metadata-file "$RUNNER_TEMP/$svc.json" "${out[@]}" "crates/$svc"
+            if [ -n "${PUBLISH:-}" ]; then
+              digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/$svc.json")
+              echo "${svc#dsip-}=$digest" >> "$GITHUB_OUTPUT"
+              echo "$image@$digest" >> "$RUNNER_TEMP/images"
+            fi
+          done
+      - uses: sigstore/cosign-installer@v3
+        if: env.PUBLISH
+      - name: "sign the images (keyless: this workflow's identity, recorded in Sigstore's transparency log)"
+        if: env.PUBLISH
+        run: xargs -n1 cosign sign --yes < "$RUNNER_TEMP/images"
+      - uses: actions/attest-build-provenance@v2
+        if: env.PUBLISH
+        with: { subject-name: "ghcr.io/${{ github.repository_owner }}/dsip-relay", subject-digest: "${{ steps.images.outputs.relay }}", push-to-registry: true }
+      - uses: actions/attest-build-provenance@v2
+        if: env.PUBLISH
+        with: { subject-name: "ghcr.io/${{ github.repository_owner }}/dsip-mailbox", subject-digest: "${{ steps.images.outputs.mailbox }}", push-to-registry: true }
+      - uses: actions/attest-build-provenance@v2
+        if: env.PUBLISH
+        with: { subject-name: "ghcr.io/${{ github.repository_owner }}/dsip-node", subject-digest: "${{ steps.images.outputs.node }}", push-to-registry: true }
+      - uses: actions/attest-build-provenance@v2
+        if: env.PUBLISH
+        with:
+          subject-path: |
+            dist/release/*.tar.gz
+            dist/release/*.deb
+            dist/release/SHA256SUMS
+      - name: the GitHub release
+        if: env.PUBLISH
+        env: { GH_TOKEN: "${{ github.token }}" }
+        working-directory: dist/release
+        run: |
+          files=(*.tar.gz *.deb SHA256SUMS)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # made by hand first: its notes stay, the files join it
+            gh release upload "$TAG" --clobber "${files[@]}"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG — workspace release (DSIP $SPEC)" --notes-file notes.md "${files[@]}"
+          fi
+      - name: the dry run's files
+        if: ${{ !env.PUBLISH }}
+        uses: actions/upload-artifact@v4
+        with: { name: release-dry-run, path: dist/release/, retention-days: 7 }
