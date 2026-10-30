@@ -50,7 +50,7 @@ mod events;
 use openmls::prelude::{GroupId, MlsGroup, OpenMlsProvider};
 
 #[derive(Parser)]
-#[command(name = "dsip-msg", about = "A DSIP messaging device (Messaging Profile 1.0)")]
+#[command(name = "dsip-msg", version, about = "A DSIP messaging device (Messaging Profile 1.0)")]
 struct Args {
     /// State directory (keys, and `device.sqlite`: MLS and delivery state).
     #[arg(long)]

@@ -7,6 +7,11 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+### Added
+
+- `dsip-mailbox --version` and `dsip-msg --version`, as `dsip-relay` and `dsip-node` have; the packaging test checks
+  that each installed service prints its package's version.
+
 ## [2026-10-31] — workspace release
 
 The service nodes: the relay, the mailbox and the hints node as products, from config files to signed release
