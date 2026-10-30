@@ -17,6 +17,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod db;
 pub mod http;
 pub mod service;
 pub mod store;

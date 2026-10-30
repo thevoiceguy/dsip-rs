@@ -25,9 +25,24 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   envelope's deadline, and a known, offline recipient stays known (§13.3). After each step only the queues it touched
   are rewritten, durably. `dsip_relay::store::QueueStore`; `dsip_session::fork::Relay` gains `known_recipients` and
   `restore` (`Known`; `Queued` is now serde). `demos/relay-restart-demo.sh` runs in CI.
+- **The mailbox's state in SQLite** (S4). `dsip-mailbox` keeps its state in `<state>/mailbox.sqlite` instead of
+  `mailbox-state.json`, which was rewritten whole after every change (spec-gap 59). Each stored item is a row,
+  holding the machine's record and the payload. It is written when the item is stored and deleted when the machine
+  drops it. The rest is saved as parts (per owner, per hubbed group, per kind), and only the parts that changed are
+  written, in one durable transaction. A mailbox upgraded from the JSON file imports it once and renames it
+  `mailbox-state.json.imported`. A save's cost no longer grows with the items held: `store_stress` measures about
+  42,000 deposits/s at 1,000, 10,000 and 100,000 items held, and about 1.45 KB on disk per 1 KB item.
+  `dsip_messaging::mailbox::Mailbox` gains `changes`, `saved`, `all_stored`, `record` and
+  `full_state_without_items`.
+
+### Fixed
+
+- **The mailbox kept every item's payload forever.** When the machine dropped an item (queue-mode deletion,
+  retention, pending-group expiry), its payload stayed in memory and in the saved state. It now goes with the item.
 
 ### Changed
 
+- `dsip_mailbox::store::Store::retain` takes a predicate. `Store` no longer has to be saved whole.
 - **Breaking:** `dsip_relay::RelayConfig` and `dsip_mailbox::MailboxConfig` gain a `did_web` field (`None` by
   default: the library fetches nothing unless asked), and `RelayConfig` a `queue_store` field (`None`: in memory, as
   before). Struct literals need them, or `..Default::default()`.

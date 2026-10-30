@@ -1439,6 +1439,7 @@ dependencies = [
  "openssl-sys",
  "rand 0.8.7",
  "reqwest",
+ "rusqlite",
  "rustls-pemfile",
  "serde",
  "serde_json",

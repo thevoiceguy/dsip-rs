@@ -6,7 +6,8 @@
 # cursor and gets it, once. Then Bob's mailbox goes down, Alice sends two messages, and Alice's mailbox — the
 # group's hub — is killed with both fan-outs unacknowledged and restarted: it reloads its queues and re-sends
 # the head until Bob's mailbox is back, then the rest in order. Alice rekeys: the hub validates the commit
-# against the public group view it reloaded. Self-verifying.
+# against the public group view it reloaded. Bob's first restart is an upgrade: from the state file a mailbox kept
+# before its database, imported once. Self-verifying.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -78,7 +79,38 @@ echo "offline" >&4; wait_for "$DIR/b.log" "OK offline" 10
 send_a "While you were away" >/dev/null
 sleep 1
 crash "$MBX_B"
+# Bob's mailbox comes back as an upgrade would: from the state file a mailbox kept before its database, which it
+# imports once (service-nodes plan S4). The file is written from the database, in that file's format.
+python3 - "$DIR/mbx-b" <<'PY'
+import json, os, sqlite3, sys
+d = sys.argv[1]
+db = sqlite3.connect(os.path.join(d, "mailbox.sqlite"))
+state = {"format": 2, "owners": {}, "hubs": {}, "views": {}}
+for key, text in db.execute("SELECT key, value FROM parts"):
+    kind, _, rest = key.partition("/")
+    v = json.loads(text)
+    if kind == "owner":
+        state["owners"][rest] = {"mailbox": v["mailbox"], "store": {"items": {}, "key_packages": v["key_packages"], "last_resort": v["last_resort"]}}
+    elif kind in ("hub", "view"):
+        state[kind + "s"][rest] = v
+    else:
+        state[key] = v
+for o in state["owners"].values():
+    o["mailbox"]["items"] = []
+for owner, cursor, record, item in db.execute("SELECT owner, cursor, record, item FROM items ORDER BY n"):
+    state["owners"][owner]["mailbox"]["items"].append(json.loads(record))
+    if item is not None:
+        state["owners"][owner]["store"]["items"][cursor] = json.loads(item)
+db.close()
+json.dump(state, open(os.path.join(d, "mailbox-state.json"), "w"))
+for f in ("mailbox.sqlite", "mailbox.sqlite-wal", "mailbox.sqlite-shm"):
+    if os.path.exists(os.path.join(d, f)):
+        os.remove(os.path.join(d, f))
+PY
 start_b; wait_nth "$DIR/mbx-b.log" "restored state: " 1 20
+grep -q "imported .*mailbox-state.json into mailbox.sqlite" "$DIR/mbx-b.log" || { echo "FAIL: the state file was not imported"; exit 1; }
+[ -f "$DIR/mbx-b/mailbox-state.json.imported" ] && [ ! -f "$DIR/mbx-b/mailbox-state.json" ] || { echo "FAIL: the state file was not set aside"; exit 1; }
+echo "    imported the state file once (kept as mailbox-state.json.imported)"
 echo "live" >&4; wait_for "$DIR/b.log" "^RECV $ALICE: While you were away" 30
 sleep 1
 [ "$(count "$DIR/b.log" "^RECV $ALICE: Before anything breaks")" = 1 ] || { echo "FAIL: Bob's resync replayed an old message"; exit 1; }

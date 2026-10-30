@@ -1,8 +1,8 @@
 //! The bytes behind the cursors.
 //!
 //! Spec: M§5.4 — `items` carries what was stored; the state machine owns cursors, retention and
-//! ordering, so this is only the payload side of the same records. Impl (spec-gap 59): held in memory and
-//! saved with the rest of the service state after every change ([`write_atomically`]).
+//! ordering, so this is only the payload side of the same records. Impl (spec-gap 59): held in memory, and each
+//! item written to the service's database when it is stored or dropped (`crate::db`), never the whole set again.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -156,9 +156,15 @@ impl Store {
         self.items.get(cursor)
     }
 
-    /// Forget cursors the state machine no longer lists (queue-mode deletion, pending-group expiry).
-    pub fn retain(&mut self, live: &[String]) {
-        self.items.retain(|c, _| live.iter().any(|l| l == c));
+    /// Forget the items whose cursor `live` no longer holds: a store loaded from a state file kept payloads its
+    /// machine had dropped.
+    pub fn retain(&mut self, live: impl Fn(&str) -> bool) {
+        self.items.retain(|c, _| live(c));
+    }
+
+    /// The KeyPackage bytes held, by device: `{key_packages, last_resort}` (written with the owner's machine).
+    pub fn key_package_value(&self) -> Value {
+        json!({"key_packages": self.key_packages, "last_resort": self.last_resort})
     }
 
     /// Add uploaded KeyPackages for a device.

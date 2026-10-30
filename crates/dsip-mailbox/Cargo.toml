@@ -39,6 +39,7 @@ x509-parser.workspace = true
 base64.workspace = true
 reqwest.workspace = true
 rand.workspace = true
+rusqlite = "0.37"
 openmls = "0.9.0"
 
 [[bin]]

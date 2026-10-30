@@ -19,8 +19,9 @@
 //! arrived on belongs to a mailbox. Welcomes a hub fans out carry the adder's deposit as `origin`,
 //! which the receiving mailbox verifies (M§14.2, spec-gap 46).
 //!
-//! Impl (spec-gap 59): everything but live connections is saved to `<state>/mailbox-state.json` after each change
-//! and reloaded at startup — the machines' full state, the hub's public MLS views, stored payloads and KeyPackages,
+//! Impl (spec-gap 59): everything but live connections is saved to `<state>/mailbox.sqlite` after each change
+//! (`crate::db`: each stored item a row, the rest in parts, only what changed written) and reloaded at startup — the
+//! machines' full state, the hub's public MLS views, stored payloads and KeyPackages,
 //! fan-out payloads still queued, hub references, revocations and the seen-id window. A restarted hub re-sends the
 //! head of every unacknowledged fan-out queue at once, and after that any head left unacknowledged is re-sent with
 //! backoff; a member mailbox acknowledges a redelivery as a duplicate.
@@ -42,7 +43,8 @@ use dsip_core::envelope::{self, Context, Envelope};
 use dsip_core::keys::KeyPair;
 use dsip_core::did::{DidDocument, Resolver, StaticResolver};
 use dsip_core::version::Supported;
-use crate::store::{write_atomically, Item, Store};
+use crate::db::Db;
+use crate::store::{Item, Store};
 use crate::verify::{delegated_identity, verify_frame};
 use crate::{http, wire, HELLO_TIMEOUT_S};
 use dsip_messaging::client::select_mailbox;
@@ -71,7 +73,10 @@ fn s_of(v: &Value) -> String {
 }
 
 /// The saved service state, in the state directory.
+/// The state file a mailbox kept before its database (imported once, then renamed `….imported`).
 const STATE_FILE: &str = "mailbox-state.json";
+/// The service's database (`crate::db`).
+const DB_FILE: &str = "mailbox.sqlite";
 /// `retry_after` on a deposit refused because the state could not be saved (spec-gap 99).
 const SAVE_RETRY_AFTER_S: i64 = 60;
 /// How long a mailbox found through a hint is used before the hint is looked up again, seconds: a member that moves
@@ -153,6 +158,7 @@ struct Service {
     quota_bytes: i64,
     /// Where [`STATE_FILE`] lives.
     state_dir: PathBuf,
+    db: Db,
     /// Unacknowledged fan-out heads by (group, member identity, class): (seq, next retry at, current delay). A welcome
     /// has its own queue (spec-gap 66), so it is tracked apart from the identity's sequenced items.
     retry: HashMap<(String, String, String), (i64, i64, i64)>,
@@ -204,31 +210,47 @@ impl Service {
         // A fan-out payload is kept while its seq is queued for some mailbox; group-info and ephemeral (-1) are the latest.
         self.fanout.retain(|(g, seq), _| *seq < 0 || queued.get(g).is_some_and(|q| q.contains(seq)));
         let compact = |e: &Envelope| format!("{}.{}.{}", e.protected, e.payload, e.signature);
-        let owners: serde_json::Map<String, Value> = self.owned.iter()
-            .map(|(id, o)| (id.clone(), json!({"mailbox": o.mailbox.full_state(), "store": serde_json::to_value(&o.store).unwrap_or(Value::Null)})))
-            .collect();
-        let state = json!({
-            "format": 2,
-            "service": self.key.did(),
-            "owners": owners,
-            "enrolment": self.enrolment.entries(),
-            "blob_owners": self.blob_owners,
-            "drop_box": self.drop_box.full_state(),
-            "hubs": self.hubs.iter().map(|(g, h)| (g.clone(), h.full_state())).collect::<serde_json::Map<_, _>>(),
-            "views": self.views.iter().map(|(g, v)| (g.clone(), serde_json::from_slice(&v.save()).unwrap_or(Value::Null)))
-                .collect::<serde_json::Map<_, _>>(),
-            "fanout": self.fanout.iter().map(|((g, seq), it)| json!([g, seq, it])).collect::<Vec<_>>(),
-            "conversations": self.conversations,
-            "hub_refs": self.hub_refs,
-            "revocations": self.revocations.iter().map(compact).collect::<Vec<_>>(),
-            "welcomes_sent": self.welcomes_sent.iter().map(|(id, (g, i, s))| json!([id, g, i, s])).collect::<Vec<_>>(),
-            "replicate_later": self.replicate_later.iter().map(|(o, e, n, at)| json!([o, e, n, at])).collect::<Vec<_>>(),
-            "seen": self.seen.entries(),
-        });
-        let bytes = serde_json::to_vec(&state).unwrap_or_default();
-        if let Err(e) = write_atomically(&self.state_dir.join(STATE_FILE), &bytes) {
+        let mut parts: Vec<(String, Value)> = vec![
+            ("service".into(), json!(self.key.did())),
+            ("enrolment".into(), json!(self.enrolment.entries())),
+            ("blob_owners".into(), json!(self.blob_owners)),
+            ("drop_box".into(), self.drop_box.full_state()),
+            ("fanout".into(), json!(self.fanout.iter().map(|((g, seq), it)| json!([g, seq, it])).collect::<Vec<_>>())),
+            ("conversations".into(), json!(self.conversations)),
+            ("hub_refs".into(), json!(self.hub_refs)),
+            ("revocations".into(), json!(self.revocations.iter().map(compact).collect::<Vec<_>>())),
+            ("welcomes_sent".into(), json!(self.welcomes_sent.iter().map(|(id, (g, i, s))| json!([id, g, i, s])).collect::<Vec<_>>())),
+            ("replicate_later".into(), json!(self.replicate_later.iter().map(|(o, e, n, at)| json!([o, e, n, at])).collect::<Vec<_>>())),
+            ("seen".into(), json!(self.seen.entries())),
+        ];
+        // each item is a row, written when stored and deleted when its machine drops it (queue-mode deletion,
+        // retention, expiry), its payload with it; the owner's part keeps the rest of the machine
+        let mut rows = vec![];
+        for (id, o) in self.owned.iter_mut() {
+            let (stored, dropped) = o.mailbox.changes();
+            let (stored, dropped) = (stored.to_vec(), dropped.to_vec());
+            for c in dropped {
+                o.store.remove(&c);
+                rows.push(crate::db::Row::Delete { owner: id.clone(), cursor: c });
+            }
+            for c in stored {
+                let Some(record) = o.mailbox.record(&c) else { continue }; // stored and dropped since the last save
+                let item = o.store.get(&c).map(|it| serde_json::to_string(it).unwrap_or_default());
+                let n = record["n"].as_i64().unwrap_or(0);
+                rows.push(crate::db::Row::Put { owner: id.clone(), cursor: c, n, record: record.to_string(), item });
+            }
+            let mut v = o.store.key_package_value();
+            v["mailbox"] = o.mailbox.full_state_without_items();
+            parts.push((format!("owner/{id}"), v));
+        }
+        parts.extend(self.hubs.iter().map(|(g, h)| (format!("hub/{g}"), h.full_state())));
+        parts.extend(self.views.iter().map(|(g, v)| (format!("view/{g}"), serde_json::from_slice(&v.save()).unwrap_or(Value::Null))));
+        if let Err(e) = self.db.write(parts, &rows) {
             tracing::warn!("saving state failed: {e}");
             return false;
+        }
+        for o in self.owned.values_mut() {
+            o.mailbox.saved();
         }
         true
     }
@@ -263,13 +285,40 @@ impl Service {
             "retry_after": SAVE_RETRY_AFTER_S}})]
     }
 
-    /// Reload what [`Service::persist`] saved. Returns false when there is nothing to reload.
+    /// Reload what [`Service::persist`] saved: the database, or on the first start after an upgrade the state file
+    /// a mailbox kept before it, imported once (written whole to the database, then renamed `….imported`). Returns
+    /// false when there is nothing to reload.
     fn restore(&mut self) -> Result<bool> {
         let path = self.state_dir.join(STATE_FILE);
+        if !self.db.is_empty().map_err(|e| bad(DB_FILE, e))? {
+            if path.exists() {
+                tracing::warn!("{} is ignored: the state is in {DB_FILE}", path.display());
+            }
+            let v = self.db.load().map_err(|e| bad(DB_FILE, e))?;
+            return self.restore_from(&v).map(|()| true);
+        }
         if !path.exists() {
             return Ok(false);
         }
         let v: Value = serde_json::from_slice(&std::fs::read(&path)?).map_err(|e| bad("saved state", e))?;
+        self.restore_from(&v)?;
+        for o in self.owned.values_mut() {
+            // written whole, once; payloads of items the machine had already dropped are not kept
+            let m = &o.mailbox;
+            o.store.retain(|c| m.record(c).is_some());
+            o.mailbox.all_stored();
+        }
+        if !self.persist() {
+            return Err(bad(DB_FILE, "importing the state file failed"));
+        }
+        let done = path.with_extension("json.imported");
+        std::fs::rename(&path, &done)?;
+        tracing::info!("imported {} into {DB_FILE} (kept as {})", path.display(), done.display());
+        Ok(true)
+    }
+
+    /// Load a saved state, as [`Db::load`] assembles it or as `mailbox-state.json` held it.
+    fn restore_from(&mut self, v: &Value) -> Result<()> {
         if v["format"] != 1 && v["format"] != 2 {
             return Err(bad("saved state", format!("unknown format {}", v["format"])));
         }
@@ -338,7 +387,7 @@ impl Service {
             self.welcomes_sent.insert(s_of(&w[0]), (s_of(&w[1]), s_of(&w[2]), w[3].as_i64().unwrap_or(0)));
         }
         self.seen = SeenIds::from_entries(serde_json::from_value(v["seen"].clone()).unwrap_or_default());
-        Ok(true)
+        Ok(())
     }
 
     /// Re-send fan-out heads nobody has acknowledged (M§6.5 rule 5, spec-gap 59): all of them at once after a restart,
@@ -1009,6 +1058,7 @@ impl MailboxServer {
             max_blob_bytes: cfg.max_blob_bytes,
             quota_bytes: cfg.quota_bytes,
             state_dir: cfg.state.clone(),
+            db: Db::open(&cfg.state.join(DB_FILE)).map_err(|e| bad(DB_FILE, e))?,
             retry: HashMap::new(),
             replicate: vec![],
             replicate_later: vec![],

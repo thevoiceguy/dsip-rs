@@ -50,7 +50,9 @@ stage that changes behaviour a vector can see starts with the vector in DSIP (CL
   `offline_retention_s`) is kept in a `redb` file in the state directory, as dsip-node keeps its records. A
   restarted relay delivers what it held, within each envelope's retention. A demo restarts a relay with a queued
   invite and an offline callee.
-- **S4, the mailbox store.** Items, cursors and enrolments are written per change to an embedded database, rather
+- **S4, the mailbox store.** *Done: `<state>/mailbox.sqlite` (`dsip_mailbox::db`): an item a row, the rest in parts
+  written when changed; the JSON imported once; `store_stress` about 42,000 deposits/s, flat from 1,000 to 100,000
+  items held, about 1.45 KB per 1 KB item. Payloads of dropped items were never freed before; now they are.* Items, cursors and enrolments are written per change to an embedded database, rather
   than the whole state rewritten as JSON. A mailbox upgraded from the JSON file imports it once. Blobs stay files.
   `mailbox-restart-demo.sh` and the enrolment demo cover it, plus a load measurement like dsip-node's
   `store_stress` (items per second, disk per item).
