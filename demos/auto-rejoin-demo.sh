@@ -67,21 +67,17 @@ echo "send After the rekey" >&3; wait_for "$DIR/a.log" "^OK rekeyed epoch=2 seq=
 echo "=== Bob's mailbox loses the message he never acknowledged (mls_retention_s)"
 sleep 2
 kill -9 "$MBX_B"; wait "$MBX_B" 2>/dev/null || true
-python3 - "$DIR/mbx-b/mailbox-state.json" "$DIR/gap.txt" <<'PY'
-import json, sys
+python3 - "$DIR/mbx-b/mailbox.sqlite" "$DIR/gap.txt" <<'PY'
+import json, sqlite3, sys
 path, out = sys.argv[1], sys.argv[2]
-s = json.load(open(path))
-# the mailbox's state: one owner's machine under "owners" (format 2, client stage 6), or "mailbox" (format 1)
-owned = next(iter(s["owners"].values())) if "owners" in s else s
-mbx, store = owned["mailbox"], owned["store"]
-items = mbx["items"]
+db = sqlite3.connect(path)
+# the mailbox's state: each stored item is a row of `items`, the machine's record of it beside the payload
+items = [dict(json.loads(r), _owner=o) for o, r in db.execute("SELECT owner, record FROM items ORDER BY n")]
 commit = max(i["seq"] for i in items if i["class"] == "handshake" and i.get("seq"))      # the rekey
 lost = max(i["seq"] for i in items if i["class"] == "application" and i.get("seq", 0) < commit)
-gone = [i["cursor"] for i in items if i.get("seq") == lost and i["class"] == "application"]
-mbx["items"] = [i for i in items if i["cursor"] not in gone]
-for c in gone:
-    store["items"].pop(c, None)
-json.dump(s, open(path, "w"))
+gone = [(i["_owner"], i["cursor"]) for i in items if i.get("seq") == lost and i["class"] == "application"]
+db.executemany("DELETE FROM items WHERE owner = ? AND cursor = ?", gone)
+db.commit()
 open(out, "w").write(str(commit))
 print(f"    dropped the item at seq {lost}; the rekey at seq {commit} now sits beyond a gap")
 PY

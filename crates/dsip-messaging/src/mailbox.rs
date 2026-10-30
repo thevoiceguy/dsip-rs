@@ -125,6 +125,16 @@ pub struct Mailbox {
     /// Introductions the owner sent and has no answer for yet (`mailbox-config` `introductions_sent`, spec-gap 81).
     #[serde(default)]
     introductions_sent: Vec<String>,
+    /// Cursors stored and dropped since the host last saved them ([`Mailbox::changes`]): not state.
+    #[serde(skip)]
+    changes: Changes,
+}
+
+/// What a host saving item by item needs: the cursors stored and those dropped, in order.
+#[derive(Clone, Default)]
+struct Changes {
+    stored: Vec<String>,
+    dropped: Vec<String>,
 }
 
 fn default_handover_wait() -> i64 {
@@ -224,6 +234,7 @@ impl Mailbox {
             inbox_cap: ctx["inbox_cap"].as_u64().unwrap_or(16) as usize,
             intro_log: HashMap::new(),
             introductions_sent: Vec::new(),
+            changes: Changes::default(),
         }
     }
 
@@ -312,6 +323,61 @@ impl Mailbox {
             && !self.revoked.contains(&s(&grant["id"]))
     }
 
+    /// Keep the items `keep` accepts, noting each dropped cursor for the host ([`Mailbox::changes`]).
+    fn drop_items(&mut self, keep: impl Fn(&Item) -> bool) {
+        let dropped = &mut self.changes.dropped;
+        self.items.retain(|it| {
+            let k = keep(it);
+            if !k {
+                dropped.push(it.cursor.clone());
+            }
+            k
+        });
+    }
+
+    /// The cursors stored and those dropped since [`Mailbox::saved`], for a host that saves item by item: its
+    /// payload for each cursor lives while the machine holds it (M§5.4). A cursor can be in both.
+    ///
+    /// Spec: none (infrastructure).
+    pub fn changes(&self) -> (&[String], &[String]) {
+        (&self.changes.stored, &self.changes.dropped)
+    }
+
+    /// The host has saved [`Mailbox::changes`].
+    ///
+    /// Spec: none (infrastructure).
+    pub fn saved(&mut self) {
+        self.changes = Changes::default();
+    }
+
+    /// Count every item held as stored since the last save: a host writing this machine whole, once.
+    ///
+    /// Spec: none (infrastructure).
+    pub fn all_stored(&mut self) {
+        self.changes.stored = self.items.iter().map(|it| it.cursor.clone()).collect();
+    }
+
+    /// The machine's record of the item at `cursor`, as [`Mailbox::full_state`] lists it under `items`.
+    ///
+    /// Spec: none (infrastructure).
+    pub fn record(&self, cursor: &str) -> Option<Value> {
+        let n = cursor_num(&json!(cursor))?;
+        // items are held in the order they were stored, which is cursor order
+        let i = self.items.binary_search_by_key(&n, |it| it.n).ok()?;
+        serde_json::to_value(&self.items[i]).ok()
+    }
+
+    /// [`Mailbox::full_state`] with `items` empty: what a host saving the items one by one ([`Mailbox::record`])
+    /// saves for the rest. [`Mailbox::from_full_state`] takes it back with the records put under `items`.
+    ///
+    /// Spec: none (infrastructure).
+    pub fn full_state_without_items(&mut self) -> Value {
+        let items = std::mem::take(&mut self.items);
+        let v = self.full_state();
+        self.items = items;
+        v
+    }
+
     /// Bytes held for the owner: the declared sizes of the retained items (spec-gap 99).
     pub fn used_bytes(&self) -> i64 {
         self.items.iter().map(|it| it.size).sum()
@@ -340,12 +406,13 @@ impl Mailbox {
     fn store(&mut self, class: &str, group: &str, depositor: Option<&str>) -> (String, Vec<Value>) {
         if class == "group-info" {
             // M§5.2: latest per group only
-            self.items.retain(|it| !(it.group == group && it.class == "group-info"));
+            self.drop_items(|it| !(it.group == group && it.class == "group-info"));
         }
         self.counter += 1;
         let c = cursor(self.counter);
         self.items.push(Item { cursor: c.clone(), n: self.counter, class: class.into(), group: group.into(), expires_at: None, seq: None,
             digest: None, size: 0 });
+        self.changes.stored.push(c.clone());
         let pushes =
             self.bound.iter().filter(|d| Some(d.as_str()) != depositor).map(|d| json!({"push": {"to": d, "cursor": c}})).collect();
         (c, pushes)
@@ -397,7 +464,7 @@ impl Mailbox {
     fn advance(&mut self, n: i64) -> Vec<Value> {
         self.now += n;
         let now = self.now;
-        self.items.retain(|it| it.expires_at.is_none_or(|t| t > now)); // §19.4: held until the envelope expires (at expires_at, spec-gap 141)
+        self.drop_items(|it| it.expires_at.is_none_or(|t| t > now)); // §19.4: held until the envelope expires (at expires_at, spec-gap 141)
         let expired: Vec<String> = self
             .groups
             .iter()
@@ -407,7 +474,7 @@ impl Mailbox {
         for g in expired {
             // M§6.6: an unconfirmed pending group is dropped with its items
             self.groups.remove(&g);
-            self.items.retain(|it| !(it.group == g && it.class != "archive"));
+            self.drop_items(|it| !(it.group == g && it.class != "archive"));
         }
         vec![]
     }
@@ -584,7 +651,7 @@ impl Mailbox {
             if self.mode == "queue" {
                 // M§4.4: deleted once every registered device has acknowledged
                 let floor = self.devices.iter().map(|d| self.acks.get(d).copied().unwrap_or(0)).min().unwrap_or(0);
-                self.items.retain(|it| it.n > floor);
+                self.drop_items(|it| it.n > floor);
             }
         }
         if e["live"].as_bool().unwrap_or(false) {
