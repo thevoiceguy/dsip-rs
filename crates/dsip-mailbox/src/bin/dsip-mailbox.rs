@@ -129,6 +129,7 @@ async fn main() -> Result<ExitCode> {
     // SIGHUP reads the certificate again (a renewal): new connections get it, bound devices stay bound
     let certs = tls::Certificates::load(&cert, &keyfile)?;
     certs.reload_on_sighup()?;
+    dsip_transport::shutdown::exit_on_terminate()?;
     anyhow::ensure!(!args.owners.is_empty() || args.serve_any.is_some(), "give --owner <did> (repeatable) and/or --serve-any <n>");
 
     let mut cfg = MailboxConfig::new(args.state.clone(), blob_endpoint(&args.listen, args.host.first().map(String::as_str)));

@@ -75,6 +75,10 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ### Fixed
 
+- **The services' images took 10 s to stop, and were then killed.** As PID 1 in a container, `dsip-relay`,
+  `dsip-mailbox` and `dsip-node` ignored `SIGTERM`, so `docker stop` waited out its timeout and sent `SIGKILL`. A
+  queued invite could expire in that window: the packages test caught it in CI. They now exit on `SIGTERM` or
+  `SIGINT` (`dsip_transport::shutdown`); each writes its state as it changes, so nothing is lost.
 - **The mailbox kept every item's payload forever.** When the machine dropped an item (queue-mode deletion,
   retention, pending-group expiry), its payload stayed in memory and in the saved state. It now goes with the item.
 
