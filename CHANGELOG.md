@@ -48,7 +48,7 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
     JSON with `--json`. A command that changes state is a `POST` carrying an `x-dsip-admin` header, so a web page
     cannot send one. `dsip_transport::admin`, `dsip_transport::status::request`;
     `dsip_messaging::enrolment::Enrolment` gains `end` and `is_configured`.
-  - **journald.** `--log auto|journald|stderr`. Under systemd, `auto` logs to the journal natively, with each
+  - **journald.** `--log auto|journald|stderr`. When standard error is the journal (`JOURNAL_STREAM` names it), `auto` logs to the journal natively, with each
     line's level as its priority, so `journalctl -p warning` works. Elsewhere it logs to standard error, as before.
     `dsip_transport::logging`.
   - `demos/operating-demo.sh` runs in CI.
