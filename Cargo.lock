@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-mailbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-messaging"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "dsip-core",
@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-node"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dsip-core",
  "proptest",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
