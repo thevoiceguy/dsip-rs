@@ -109,6 +109,8 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ### Changed
 
+- **`spec/` moves to DSIP `poc-v1.0.1`**, DSIP Core 1.0 with spec-gap 164 (M§4.1: a mailbox's operator MAY end an
+  enrolment), from a commit between tags. 2,325 vectors, 0 failures. The release workflow requires `spec/` on a tag.
 - `dsip_mailbox::store::Store::retain` takes a predicate. `Store` no longer has to be saved whole.
 - **Breaking:** `dsip_relay::RelayConfig` and `dsip_mailbox::MailboxConfig` gain a `did_web` field (`None` by
   default: the library fetches nothing unless asked), and `RelayConfig` a `queue_store` field (`None`: in memory, as
