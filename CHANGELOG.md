@@ -7,6 +7,14 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+### Fixed
+
+- The browser client's messages view rebuilt its conversation list, the group's member list and the add-member select
+  on every render, and it re-renders on each receipt and archive deposit. A Remove button replaced between press and
+  release got no click (Firefox fires none), and a member chosen to add could be reset. They are rebuilt only when what
+  they show changes now, as the contacts and requests views already were. This was `web/test/messaging-group.mjs`'s
+  intermittent 40-second timeout; the test now checks that a render which changes nothing keeps the buttons.
+
 ## [2026-11-01] — workspace release
 
 A maintenance release: the mailbox's `--version`, and the packaging tests' intermittent failures fixed. DSIP spec:
