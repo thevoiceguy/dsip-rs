@@ -1,7 +1,7 @@
 [package]
 name = "dsip-events"
 description = "DSIP Device Events Profile (draft): SNMP/syslog notifications to events, the alarm rule table, the alarm list and escalation"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

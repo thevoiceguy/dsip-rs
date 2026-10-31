@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-events"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-mailbox"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-messaging"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "dsip-core",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-messaging-device"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dsip-core",
  "dsip-endpoint",
