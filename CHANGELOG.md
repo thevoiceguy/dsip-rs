@@ -7,10 +7,54 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+## [2026-11-01] — workspace release
+
+A maintenance release: the mailbox's `--version`, and the packaging tests' intermittent failures fixed. DSIP spec:
+`poc-v1.0.1` (unchanged; 2,325 vectors, 0 failures).
+
+| Crate | Version |
+|---|---|
+| `dsip-broadcast` | 0.1.0 |
+| `dsip-cli` | 0.1.0 |
+| `dsip-core` | 0.1.0 |
+| `dsip-dht` | 0.1.0 |
+| `dsip-endpoint` | 0.1.0 |
+| `dsip-events` | 0.1.0 |
+| `dsip-gateway` | 0.1.0 |
+| `dsip-kt` | 0.1.0 |
+| `dsip-mailbox` | 0.2.1 (was 0.2.0) |
+| `dsip-media` | 0.1.0 |
+| `dsip-messaging` | 0.2.0 |
+| `dsip-messaging-device` | 0.1.0 |
+| `dsip-messenger` | 0.1.0 |
+| `dsip-mls` | 0.1.0 |
+| `dsip-node` | 0.1.1 |
+| `dsip-number` | 0.1.0 |
+| `dsip-phone` | 0.1.0 |
+| `dsip-recording` | 0.1.0 |
+| `dsip-relay` | 0.2.0 |
+| `dsip-schema` | 0.1.0 |
+| `dsip-session` | 0.2.0 |
+| `dsip-testkit` | 0.1.0 |
+| `dsip-transport` | 0.2.0 |
+| `dsip-wasm` | 0.1.0 |
+| `dsip-webrtc-binding` | 0.1.0 |
+
+**Breaking changes:** none.
+
+The mailbox package becomes `dsip-mailbox_0.2.1-1_<arch>.deb`; the relay and hints-node packages are unchanged
+(`dsip-relay_0.2.0-1`, `dsip-node_0.1.1-1`).
+
 ### Added
 
 - `dsip-mailbox --version` and `dsip-msg --version`, as `dsip-relay` and `dsip-node` have; the packaging test checks
-  that each installed service prints its package's version.
+  that each installed service prints its package's version (#15).
+
+### Fixed
+
+- The packaging tests and seven demos failed intermittently: a check `… | grep -q` under `set -o pipefail` failed when
+  `grep -q` stopped at its match and the writer died of SIGPIPE, though the line was there. They read to the end now
+  (`grep >/dev/null`) (#14). Tests only.
 
 ## [2026-10-31] — workspace release
 
