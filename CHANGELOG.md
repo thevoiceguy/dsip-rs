@@ -7,6 +7,50 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+## [2026-11-02] — workspace release
+
+The Device Events Profile becomes normative 1.0. DSIP spec: `poc-v1.0.2` (DSIP Core 1.0 with Device Events Profile
+1.0, spec-gaps 165–168; 2,359 vectors, 0 failures).
+
+| Crate | Version |
+|---|---|
+| `dsip-broadcast` | 0.1.0 |
+| `dsip-cli` | 0.1.0 |
+| `dsip-core` | 0.1.0 |
+| `dsip-dht` | 0.1.0 |
+| `dsip-endpoint` | 0.1.0 |
+| `dsip-events` | 0.2.0 (was 0.1.0) |
+| `dsip-gateway` | 0.1.0 |
+| `dsip-kt` | 0.1.0 |
+| `dsip-mailbox` | 0.3.0 (was 0.2.1) |
+| `dsip-media` | 0.1.0 |
+| `dsip-messaging` | 0.3.0 (was 0.2.0) |
+| `dsip-messaging-device` | 0.2.0 (was 0.1.0) |
+| `dsip-messenger` | 0.1.0 |
+| `dsip-mls` | 0.1.0 |
+| `dsip-node` | 0.1.1 |
+| `dsip-number` | 0.1.0 |
+| `dsip-phone` | 0.1.0 |
+| `dsip-recording` | 0.1.0 |
+| `dsip-relay` | 0.2.0 |
+| `dsip-schema` | 0.1.0 |
+| `dsip-session` | 0.2.0 |
+| `dsip-testkit` | 0.1.0 |
+| `dsip-transport` | 0.2.0 |
+| `dsip-wasm` | 0.1.0 |
+| `dsip-webrtc-binding` | 0.1.0 |
+
+**Breaking changes** (behaviour; no API is removed or changed):
+- A member refuses a `device-event` from a device whose delegation lacks `dsip.events` (spec-gap 165). A gateway on
+  this release asks for it (`dsip-msg --gateway`, implied by its listeners and `--heartbeat`), but an MLS leaf keeps
+  the delegation it joined with. **A gateway already in an alarm group must be removed and added again** (its new key
+  packages carry `dsip.events`); until then, members on this release refuse its events.
+- A `device-event` or `alarm-ack` whose body breaks E§5's shape is refused (`content-body`, spec-gap 166).
+- The gateway's SNMPv3 answers change (spec-gap 168, below).
+
+The packages: `dsip-mailbox_0.3.0-1_<arch>.deb`, `dsip-web-0.1.1.tar.gz`; `dsip-relay` (0.2.0) and `dsip-node`
+(0.1.1) are unchanged.
+
 ### Added
 
 - **Device Events Profile 1.0** (DSIP spec-gaps 165–168), its last rules before it became final:
