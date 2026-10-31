@@ -7,6 +7,27 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+### Added
+
+- **Device Events Profile 1.0** (DSIP spec-gaps 165–168), its last rules before it became final:
+  - A member refuses a `device-event` whose sender leaf's delegation lacks `dsip.events` (`delegation-capability`):
+    only a gateway raises alarms. `dsip_messaging::checks::check_object` reads the context's `leaf_capabilities`,
+    which `dsip-messaging-device` fills from the sender's MLS leaf. `dsip-msg --gateway` puts `dsip.events` in the
+    device's delegation, and any gateway listener or `--heartbeat` implies it.
+  - `device-event` and `alarm-ack` bodies have a minimal shape (`content-body`); the alarm list ignores an `alarm-ack`
+    whose state is neither `ack` nor `closed`.
+  - Hold-down: a report from an SNMP inform is never held, and drops a clear held for its alarm
+    (`dsip_events::HoldDown::report` takes `inform: true`); the gateway does this for every inform's event.
+  - `dsip_events::usm::snmp_answer` and the vector check `snmp-answer`: the gateway's SNMPv3 Reports and Responses
+    byte for byte.
+
+### Changed
+
+- **The gateway's SNMPv3 answers** (DSIP spec-gap 168): a Report's request-id is 0 (it was the request's when the
+  PDU could be read); a USM Response copies the inform's contextEngineID and contextName (it used the gateway's engine
+  ID and ""); a Response's `msgFlags` are the inform's auth and priv bits only (a TSM one kept other bits). pysnmp
+  accepts all three, at authNoPriv and authPriv with MD5, SHA and SHA-256.
+
 ### Fixed
 
 - The browser client's messages view rebuilt its conversation list, the group's member list and the add-member select

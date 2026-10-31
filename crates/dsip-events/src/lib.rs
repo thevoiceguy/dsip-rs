@@ -1,5 +1,5 @@
-//! `dsip-events` — the rules of the DSIP Device Events Profile (draft `device-events/0.1`,
-//! `v1.0/dsip-device-events-profile-v1.0-draft.md`, cited `E§n`). Pure: no SNMP stack, no network.
+//! `dsip-events` — the rules of the DSIP Device Events Profile 1.0 (`device-events/1.0`,
+//! `v1.0/dsip-device-events-profile-v1.0.md`, cited `E§n`). Pure: no SNMP stack, no network.
 //!
 //! Spec: sections owned by this crate — E§3 (a received notification becomes an event: RFC 3584 §3.1
 //! translation, the community never carried, the syslog severity table — [`normalize_trap`],
@@ -242,7 +242,8 @@ impl AlarmList {
         let k = key_of(&e["alarm"]);
         let state = e["state"].as_str().unwrap_or("").to_string();
         let Some(a) = self.alarms.get_mut(&k) else { return vec![] };
-        if a.operator == "closed" || a.operator == state {
+        // spec-gap 166: a state other than ack and closed is ignored
+        if !matches!(state.as_str(), "ack" | "closed") || a.operator == "closed" || a.operator == state {
             return vec![];
         }
         a.operator = state.clone();
@@ -407,7 +408,8 @@ impl HoldDown {
         HoldDown { now, hold: hold_s, held: BTreeMap::new() }
     }
 
-    /// An alarm report (`{resource, type, qualifier?, severity, cleared}`) the gateway would deposit: what to deposit now.
+    /// An alarm report (`{resource, type, qualifier?, severity, cleared, inform?}`) the gateway would deposit: what to
+    /// deposit now. Spec: E§4 (spec-gap 167): a report from an SNMP inform is never held, and drops a held clear.
     pub fn report(&mut self, report: &Value) -> Vec<Value> {
         let mut r = report.clone();
         if r.get("qualifier").is_none() {
@@ -418,6 +420,10 @@ impl HoldDown {
             r["type"].as_str().unwrap_or("").to_string(),
             r["qualifier"].as_str().unwrap_or("").to_string(),
         );
+        if r["inform"] == true {
+            self.held.remove(&k);
+            return vec![r];
+        }
         if r["cleared"] == true {
             if self.hold == 0 {
                 return vec![r];
@@ -468,6 +474,7 @@ pub fn run_vector(v: &Value) -> Value {
             syslog::parse_syslog(&b)
         }
         Some("usm-key") => usm::usm_key(i),
+        Some("snmp-answer") => usm::snmp_answer(i),
         Some("tsm" | "tls-frames" | "dtls-record" | "tsm-name") => tsm::run_check(i),
         Some(_) => json!({"error": "unknown check"}),
         None if v["context"]["component"] == "snmpv3" => usm::run_trace(v),

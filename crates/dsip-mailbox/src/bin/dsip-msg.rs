@@ -141,6 +141,10 @@ struct Args {
     /// sends no content or receipts and archives what it receives to `<state>/recorder-archive.jsonl`.
     #[arg(long)]
     recorder: bool,
+    /// This device is a Device Events gateway (E§2): its delegation also carries `dsip.events`, without which members
+    /// refuse its `device-event`s (spec-gap 165). Implied by any of the gateway's listeners and by --heartbeat.
+    #[arg(long)]
+    gateway: bool,
     /// TEST ONLY: a recorder that sends anyway, to show members dropping its content (C§5).
     #[arg(long, hide = true)]
     recorder_misbehave: bool,
@@ -187,6 +191,17 @@ struct Args {
     /// As a gateway, deposit a heartbeat every this many seconds (E§5).
     #[arg(long)]
     heartbeat: Option<i64>,
+}
+
+impl Args {
+    /// A Device Events gateway (E§2): asked for, or implied by a listener or a heartbeat.
+    fn is_gateway(&self) -> bool {
+        self.gateway
+            || self.heartbeat.is_some()
+            || [&self.snmp_listen, &self.syslog_listen, &self.syslog_tls_listen, &self.snmp_tls_listen, &self.snmp_dtls_listen]
+                .iter()
+                .any(|l| l.is_some())
+    }
 }
 
 /// The device's persistent keys: an identity controller key and a device key.
@@ -1438,9 +1453,16 @@ async fn main() -> Result<()> {
     }
 
     let now = now_s();
-    // C§5: a recorder device's delegation also carries dsip.record, which every member reads from its leaf
-    let caps: &[&str] = if args.recorder { &["dsip.signaling", "dsip.messaging", "dsip.record"] } else { &["dsip.signaling", "dsip.messaging"] };
-    let deleg = delegation_payload(&args.identity, &keys.device.did(), now - 60, now + 365 * 86_400, caps);
+    // C§5: a recorder device's delegation also carries dsip.record, which every member reads from its leaf; E§2
+    // (spec-gap 165): a gateway's carries dsip.events
+    let mut caps = vec!["dsip.signaling", "dsip.messaging"];
+    if args.recorder {
+        caps.push("dsip.record");
+    }
+    if args.is_gateway() {
+        caps.push("dsip.events");
+    }
+    let deleg = delegation_payload(&args.identity, &keys.device.did(), now - 60, now + 365 * 86_400, &caps);
     let delegation = sign(&deleg, &keys.controller, &format!("{}#key-1", args.identity));
     let r = resolver(&args.resolver_files);
     let mailbox = mailbox_of(&args.identity, &r)?;
