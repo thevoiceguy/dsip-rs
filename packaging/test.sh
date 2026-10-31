@@ -134,7 +134,9 @@ for svc in dsip-relay dsip-mailbox; do
   score=$(sd systemd-analyze security $svc --no-pager 2>/dev/null | awk '/Overall exposure level/ {print $(NF-2)}')
   python3 -c "import sys; sys.exit(0 if float('$score') <= 2.0 else 1)" || fail "$svc: exposure $score > 2.0"
   [ "$(sd stat -c %U /var/lib/private/$svc)" = "$svc" ] || fail "$svc: its state is not its DynamicUser's"
-  echo "  $svc: installed, enabled and started by dpkg; active under DynamicUser, exposure $score (systemd-analyze security)"
+  v=$(sd dpkg-query -W -f='${Version}' $svc); v=${v%-*}
+  [ "$(sd $svc --version)" = "$svc $v" ] || fail "$svc --version does not print its package's version $v"
+  echo "  $svc: installed, enabled and started by dpkg; active under DynamicUser, exposure $score (systemd-analyze security); --version $v"
 done
 [ "$(sd stat -c %a /var/lib/private/dsip-relay/key.pem)" = 600 ] || fail "the relay's TLS key is not private"
 

@@ -16,7 +16,7 @@ use dsip_transport::logging::LogTo;
 use dsip_transport::tls;
 
 #[derive(Parser)]
-#[command(name = "dsip-mailbox", about = "DSIP mailbox and hub service (Messaging Profile 1.0)",
+#[command(name = "dsip-mailbox", version, about = "DSIP mailbox and hub service (Messaging Profile 1.0)",
     after_help = "dsip-mailbox admin --help: operate a running mailbox (enrolments, release) through its status port")]
 struct Args {
     /// TOML config file: each key is one of these flags in snake_case (`config.example.toml`); a flag given here
