@@ -1,5 +1,5 @@
-//! `dsip-events` — the rules of the DSIP Device Events Profile (draft `device-events/0.1`,
-//! `v1.0/dsip-device-events-profile-v1.0-draft.md`, cited `E§n`). Pure: no SNMP stack, no network.
+//! `dsip-events` — the rules of the DSIP Device Events Profile 1.0 (`device-events/1.0`,
+//! `v1.0/dsip-device-events-profile-v1.0.md`, cited `E§n`). Pure: no SNMP stack, no network.
 //!
 //! Spec: sections owned by this crate — E§3 (a received notification becomes an event: RFC 3584 §3.1
 //! translation, the community never carried, the syslog severity table — [`normalize_trap`],
@@ -474,6 +474,7 @@ pub fn run_vector(v: &Value) -> Value {
             syslog::parse_syslog(&b)
         }
         Some("usm-key") => usm::usm_key(i),
+        Some("snmp-answer") => usm::snmp_answer(i),
         Some("tsm" | "tls-frames" | "dtls-record" | "tsm-name") => tsm::run_check(i),
         Some(_) => json!({"error": "unknown check"}),
         None if v["context"]["component"] == "snmpv3" => usm::run_trace(v),

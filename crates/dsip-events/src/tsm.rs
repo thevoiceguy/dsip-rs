@@ -153,7 +153,7 @@ impl Received {
     fn message(&self, context_engine: &[u8], varbind_list: &[u8]) -> Vec<u8> {
         let pdu = tlv(0xA2, &[int(self.request_id), int(0), int(0), varbind_list.to_vec()].concat());
         let scoped = tlv(0x30, &[tlv(0x04, context_engine), tlv(0x04, &self.context_name), pdu].concat());
-        let glob = tlv(0x30, &[int(self.msg_id), int(65_507), tlv(0x04, &[self.flags & !0x04]), int(4)].concat());
+        let glob = tlv(0x30, &[int(self.msg_id), int(65_507), tlv(0x04, &[self.flags & 0x03]), int(4)].concat());
         tlv(0x30, &[int(3), glob, tlv(0x04, &[]), scoped].concat())
     }
 
@@ -172,6 +172,17 @@ impl Received {
     pub fn discovery_response(&self, engine_id: &[u8]) -> Vec<u8> {
         let vb = tlv(0x30, &tlv(0x30, &[oid_tlv(SNMP_ENGINE_ID), tlv(0x04, engine_id)].concat()));
         self.message(&self.context_engine, &vb)
+    }
+}
+
+/// README `check: "snmp-answer"` for TSM: the `response` to an inform, or the `discovery` answer.
+///
+/// Spec: E§3 (spec-gap 168).
+pub(crate) fn snmp_answer(b: &[u8], answer: &str, engine_id: &[u8]) -> Value {
+    match (receive(b), answer) {
+        (Ok(r), "response") if matches!(r.kind, Kind::Inform) => json!({"answer": crate::usm::hex(&r.response())}),
+        (Ok(r), "discovery") if matches!(r.kind, Kind::Discovery) => json!({"answer": crate::usm::hex(&r.discovery_response(engine_id))}),
+        _ => json!({"error": "malformed"}),
     }
 }
 

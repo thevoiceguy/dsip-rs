@@ -325,18 +325,22 @@ fn ber_value(tag: u8, c: &[u8]) -> R<(&'static str, String)> {
 }
 
 /// A decoded PDU: its tag, request id, and varbinds (README shape).
+#[derive(Clone)]
 pub(crate) struct Pdu {
     pub(crate) tag: u8,
     pub(crate) request_id: i64,
     pub(crate) varbinds: Vec<Value>,
     /// The raw varbind-list SEQUENCE (tag, length and content), echoed in a Response.
     pub(crate) varbind_bytes: Vec<u8>,
+    /// The ScopedPDU's contextEngineID and contextName, which a Response copies (spec-gap 168).
+    pub(crate) context_engine: Vec<u8>,
+    pub(crate) context_name: Vec<u8>,
 }
 
 pub(crate) fn scoped_content(b: &[u8], s: usize, e: usize) -> R<Pdu> {
     let mut q = Rd::new(b, s, e);
-    q.octets()?;
-    q.octets()?;
+    let context_engine = q.octets()?.to_vec();
+    let context_name = q.octets()?.to_vec();
     let (tag, ps, pe) = q.next()?;
     q.finish()?;
     let mut p = Rd::new(b, ps, pe);
@@ -357,10 +361,10 @@ pub(crate) fn scoped_content(b: &[u8], s: usize, e: usize) -> R<Pdu> {
         let (typ, val) = ber_value(t, &b[cs..ce])?;
         varbinds.push(json!({"oid": ber_oid(&b[os..oe])?, "type": typ, "value": val}));
     }
-    Ok(Pdu { tag, request_id, varbinds, varbind_bytes: b[vl_start..ve].to_vec() })
+    Ok(Pdu { tag, request_id, varbinds, varbind_bytes: b[vl_start..ve].to_vec(), context_engine, context_name })
 }
 
-fn parse_scoped_pdu(b: &[u8]) -> R<Pdu> {
+pub(crate) fn parse_scoped_pdu(b: &[u8]) -> R<Pdu> {
     let mut r = Rd::new(b, 0, b.len());
     let (s, e) = r.expect(0x30)?;
     r.finish()?;
@@ -588,8 +592,7 @@ impl UsmReceiver {
             // RFC 3414 §4: discovery
             let report = m.reportable.then(|| {
                 self.counter_unknown_engine = self.counter_unknown_engine.wrapping_add(1);
-                let rid = m.pdu.as_ref().map(|p| p.request_id).unwrap_or(0);
-                self.report(m.msg_id, &m.user, None, rid, UNKNOWN_ENGINE_IDS, self.counter_unknown_engine)
+                self.report(m.msg_id, &m.user, None, UNKNOWN_ENGINE_IDS, self.counter_unknown_engine)
             });
             return Verdict::Refused { reason: "unknown-engine-id", report };
         }
@@ -614,8 +617,7 @@ impl UsmReceiver {
             if self.boots == MAX31 || m.boots != self.boots || (m.time - self.local_time()).abs() > WINDOW {
                 let report = m.reportable.then(|| {
                     self.counter_not_in_window = self.counter_not_in_window.wrapping_add(1);
-                    let rid = m.pdu.as_ref().map(|p| p.request_id).unwrap_or(0);
-                    self.report(m.msg_id, &m.user, Some((user.auth, &ak)), rid, NOT_IN_TIME_WINDOWS, self.counter_not_in_window)
+                    self.report(m.msg_id, &m.user, Some((user.auth, &ak)), NOT_IN_TIME_WINDOWS, self.counter_not_in_window)
                 });
                 return Verdict::Refused { reason: "not-in-time-window", report };
             }
@@ -680,64 +682,15 @@ impl UsmReceiver {
         self.salt.to_be_bytes()
     }
 
-    /// A whole SNMPv3 message from the gateway's engine: `flags` and the scoped PDU, authenticated (and encrypted)
-    /// with the given keys.
-    fn message(&mut self, msg_id: i64, user: &[u8], flags: u8, auth: Option<(Auth, &[u8])>, priv_key: Option<&[u8; 16]>, scoped: Vec<u8>) -> Vec<u8> {
-        let (boots, time) = (self.boots, self.local_time());
-        let mac_len = auth.map(|(a, _)| a.mac_len()).unwrap_or(0);
-        let (salt, data) = match priv_key {
-            Some(k) => {
-                let salt = self.next_salt();
-                let mut iv = [0u8; 16];
-                iv[..4].copy_from_slice(&(boots as u32).to_be_bytes());
-                iv[4..8].copy_from_slice(&(time as u32).to_be_bytes());
-                iv[8..].copy_from_slice(&salt);
-                (salt.to_vec(), tlv(0x04, &aes_cfb(k, &iv, &scoped, false)))
-            }
-            None => (vec![], scoped),
-        };
-        let mut sec_body = tlv(0x04, &self.engine);
-        sec_body.extend(int(boots));
-        sec_body.extend(int(time));
-        sec_body.extend(tlv(0x04, user));
-        sec_body.extend(tlv(0x04, &vec![0u8; mac_len]));
-        let priv_tlv = tlv(0x04, &salt);
-        sec_body.extend(&priv_tlv);
-        let sec = tlv(0x30, &sec_body);
-        let mut glob = int(msg_id);
-        glob.extend(int(65507));
-        glob.extend(tlv(0x04, &[flags]));
-        glob.extend(int(3));
-        let mut body = int(3);
-        body.extend(tlv(0x30, &glob));
-        let sec_wrapped = tlv(0x04, &sec);
-        body.extend(&sec_wrapped);
-        body.extend(&data);
-        let mut msg = tlv(0x30, &body);
-        if let Some((a, key)) = auth {
-            // the authParams content ends where the privParams TLV, the last thing in sec, begins
-            let sec_at = find(&msg, &sec).expect("sec is in msg");
-            let at = sec_at + sec.len() - priv_tlv.len() - mac_len;
-            let mac = a.mac(key, &msg);
-            msg[at..at + mac_len].copy_from_slice(&mac);
-        }
-        msg
-    }
-
-    fn report(&mut self, msg_id: i64, user: &[u8], auth: Option<(Auth, &[u8])>, request_id: i64, oid: &str, counter: u32) -> Vec<u8> {
-        let vb = tlv(0x30, &[oid_tlv(oid), tlv(0x41, &uint_body(counter as u64))].concat());
-        let pdu = tlv(0xA8, &[int(request_id), int(0), int(0), tlv(0x30, &vb)].concat());
-        let scoped = tlv(0x30, &[tlv(0x04, &self.engine), tlv(0x04, b""), pdu].concat());
-        let flags = if auth.is_some() { 0x01 } else { 0x00 };
-        self.message(msg_id, user, flags, auth, None, scoped)
+    fn report(&mut self, msg_id: i64, user: &[u8], auth: Option<(Auth, &[u8])>, oid: &str, counter: u32) -> Vec<u8> {
+        let clock = (self.engine.clone(), self.boots, self.local_time());
+        report(msg_id, user, auth, &clock, oid, counter)
     }
 
     fn response(&mut self, m: &Msg, user: &User, ak: &[u8], pk: Option<&[u8; 16]>, pdu: &Pdu) -> Vec<u8> {
-        let body = [int(pdu.request_id), int(0), int(0), pdu.varbind_bytes.clone()].concat();
-        let scoped = tlv(0x30, &[tlv(0x04, &self.engine), tlv(0x04, b""), tlv(0xA2, &body)].concat());
-        let flags = if m.priv_ { 0x03 } else { 0x01 };
-        let pk = if m.priv_ { pk } else { None };
-        self.message(m.msg_id, &m.user, flags, Some((user.auth, ak)), pk, scoped)
+        let clock = (self.engine.clone(), self.boots, self.local_time());
+        let privacy = if m.priv_ { pk.map(|k| (k, self.next_salt())) } else { None };
+        response(m.msg_id, &m.user, (user.auth, ak), privacy, &clock, pdu)
     }
 
     /// Run a `snmpv3` trace step (`receive` or `advance`).
@@ -758,10 +711,6 @@ impl UsmReceiver {
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 pub(crate) fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
@@ -814,6 +763,129 @@ pub(crate) fn oid_tlv(oid: &str) -> Vec<u8> {
 }
 
 /// Whether a datagram is an SNMPv3 message (its outer SEQUENCE starts with `INTEGER 3`), so a gateway routes it
+/// The gateway's engine and its clock now: `(engineID, boots, time)`.
+pub(crate) type Clock = (Vec<u8>, i64, i64);
+
+/// A whole SNMPv3 message from the gateway's engine: `flags` and the ScopedPDU, encrypted when a privacy key and salt
+/// are given (the IV the gateway's boots, time and salt), then authenticated over the whole message.
+///
+/// Spec: E§3 (spec-gap 168): the shortest lengths and integers, `msgMaxSize` 65507; RFC 3414 §3.1, RFC 3826 §3.1.2.1.
+fn usm_message(msg_id: i64, user: &[u8], flags: u8, auth: Option<(Auth, &[u8])>, privacy: Option<(&[u8; 16], [u8; 8])>, clock: &Clock, scoped: Vec<u8>) -> Vec<u8> {
+    let (engine, boots, time) = clock;
+    let mac_len = auth.map(|(a, _)| a.mac_len()).unwrap_or(0);
+    let (salt, data) = match privacy {
+        Some((k, salt)) => {
+            let mut iv = [0u8; 16];
+            iv[..4].copy_from_slice(&(*boots as u32).to_be_bytes());
+            iv[4..8].copy_from_slice(&(*time as u32).to_be_bytes());
+            iv[8..].copy_from_slice(&salt);
+            (salt.to_vec(), tlv(0x04, &aes_cfb(k, &iv, &scoped, false)))
+        }
+        None => (vec![], scoped),
+    };
+    let mut head = tlv(0x04, engine);
+    head.extend(int(*boots));
+    head.extend(int(*time));
+    head.extend(tlv(0x04, user));
+    let content = [head.clone(), tlv(0x04, &vec![0u8; mac_len]), tlv(0x04, &salt)].concat();
+    let sec = tlv(0x30, &content);
+    let glob = tlv(0x30, &[int(msg_id), int(65507), tlv(0x04, &[flags]), int(3)].concat());
+    let prefix = [int(3), glob].concat();
+    let body = [prefix.clone(), tlv(0x04, &sec), data].concat();
+    let mut msg = tlv(0x30, &body);
+    if let Some((a, key)) = auth {
+        // the outer header, the fields before securityParameters, its header, sec's header, the fields before
+        // authParams, and authParams' tag and one-byte length
+        let at = (msg.len() - body.len()) + prefix.len() + (tlv(0x04, &sec).len() - sec.len()) + (sec.len() - content.len()) + head.len() + 2;
+        let mac = a.mac(key, &msg);
+        msg[at..at + mac_len].copy_from_slice(&mac);
+    }
+    msg
+}
+
+/// A Report: `msgFlags` 00 (no `auth`) or 01, request-id 0 since the PDU was not read, the gateway's contextEngineID
+/// and an empty contextName, and the counter after it was incremented.
+///
+/// Spec: E§3 (spec-gap 168); RFC 3414 §3.2 steps 3b and 7a; RFC 3412 §7.1 step 3.
+pub(crate) fn report(msg_id: i64, user: &[u8], auth: Option<(Auth, &[u8])>, clock: &Clock, oid: &str, counter: u32) -> Vec<u8> {
+    let vb = tlv(0x30, &[oid_tlv(oid), tlv(0x41, &uint_body(counter as u64))].concat());
+    let pdu = tlv(0xA8, &[int(0), int(0), int(0), tlv(0x30, &vb)].concat());
+    let scoped = tlv(0x30, &[tlv(0x04, &clock.0), tlv(0x04, b""), pdu].concat());
+    let flags = if auth.is_some() { 0x01 } else { 0x00 };
+    usm_message(msg_id, user, flags, auth, None, clock, scoped)
+}
+
+/// The Response to an inform: its contextEngineID, contextName, request-id and VarBindList as received, error status
+/// and index 0, at its level (encrypted when `privacy` is given).
+///
+/// Spec: E§3 (spec-gap 168); RFC 3416 §4.2.7.
+pub(crate) fn response(msg_id: i64, user: &[u8], auth: (Auth, &[u8]), privacy: Option<(&[u8; 16], [u8; 8])>, clock: &Clock, pdu: &Pdu) -> Vec<u8> {
+    let body = [int(pdu.request_id), int(0), int(0), pdu.varbind_bytes.clone()].concat();
+    let scoped = tlv(0x30, &[tlv(0x04, &pdu.context_engine), tlv(0x04, &pdu.context_name), tlv(0xA2, &body)].concat());
+    let flags = if privacy.is_some() { 0x03 } else { 0x01 };
+    usm_message(msg_id, user, flags, Some(auth), privacy, clock, scoped)
+}
+
+/// README `check: "snmp-answer"` for USM: a Report (`unknown-engine-id`, `not-in-time-window`) or the `response` to
+/// an inform, from the vector's `local` clock, `user` keys, `counter` and `salt`.
+///
+/// Spec: E§3 (spec-gap 168).
+pub fn snmp_answer(i: &Value) -> Value {
+    let malformed = json!({"error": "malformed"});
+    let Some(b) = unhex_v(&i["message"]) else { return malformed };
+    let local = &i["local"];
+    let clock: Clock = (unhex_v(&local["engine_id"]).unwrap_or_default(), local["boots"].as_i64().unwrap_or(0), local["time"].as_i64().unwrap_or(0));
+    // a message that is not USM (msgSecurityModel 3) is answered as TSM
+    let m = match parse_v3(&b) {
+        Ok(m) if m.model == 3 => m,
+        _ => return crate::tsm::snmp_answer(&b, i["answer"].as_str().unwrap_or(""), &clock.0),
+    };
+    let u = &i["user"];
+    let auth = Auth::parse(u["auth"].as_str().unwrap_or(""));
+    let ak = unhex_v(&u["auth_key"]).unwrap_or_default();
+    let answer = match i["answer"].as_str() {
+        Some("unknown-engine-id") => report(m.msg_id, &m.user, None, &clock, UNKNOWN_ENGINE_IDS, i["counter"].as_u64().unwrap_or(0) as u32),
+        Some("not-in-time-window") => {
+            let Some(a) = auth else { return malformed };
+            report(m.msg_id, &m.user, Some((a, &ak)), &clock, NOT_IN_TIME_WINDOWS, i["counter"].as_u64().unwrap_or(0) as u32)
+        }
+        Some("response") => {
+            let Some(a) = auth else { return malformed };
+            let pk: Option<[u8; 16]> = unhex_v(&u["priv_key"]).and_then(|k| k.get(..16).and_then(|k| k.try_into().ok()));
+            let pdu = if m.priv_ {
+                let Some(pk) = pk else { return malformed };
+                let mut iv = [0u8; 16];
+                iv[..4].copy_from_slice(&(m.boots as u32).to_be_bytes());
+                iv[4..8].copy_from_slice(&(m.time as u32).to_be_bytes());
+                let Some(pp) = m.priv_params.get(..8) else { return malformed };
+                iv[8..].copy_from_slice(pp);
+                match parse_scoped_pdu(&aes_cfb(&pk, &iv, m.encrypted.as_deref().unwrap_or_default(), true)) {
+                    Ok(p) => p,
+                    Err(_) => return malformed,
+                }
+            } else {
+                match m.pdu {
+                    Some(ref p) => p.clone(),
+                    None => return malformed,
+                }
+            };
+            let salt: Option<[u8; 8]> = unhex_v(&i["salt"]).and_then(|s| s.try_into().ok());
+            let privacy = match (m.priv_, pk, salt) {
+                (true, Some(k), Some(s)) => Some((k, s)),
+                (true, _, _) => return malformed,
+                _ => None,
+            };
+            response(m.msg_id, &m.user, (a, &ak), privacy.as_ref().map(|(k, s)| (k, *s)), &clock, &pdu)
+        }
+        _ => return malformed,
+    };
+    json!({"answer": hex(&answer)})
+}
+
+fn unhex_v(v: &Value) -> Option<Vec<u8>> {
+    unhex(v.as_str()?)
+}
+
 /// to [`UsmReceiver`] rather than the community decoder.
 pub fn is_v3(b: &[u8]) -> bool {
     let mut top = Rd::new(b, 0, b.len());
@@ -869,7 +941,8 @@ mod tests {
         let vbs = tlv(0x30, &[tlv(0x30, &[oid_tlv("1.3.6.1.2.1.1.3.0"), tlv(0x43, &[1])].concat()),
                               tlv(0x30, &[oid_tlv("1.3.6.1.6.3.1.1.4.1.0"), oid_tlv("1.3.6.1.6.3.1.1.5.3")].concat())].concat());
         let scoped = tlv(0x30, &[tlv(0x04, &engine), tlv(0x04, b""), tlv(0xA6, &[int(77), int(0), int(0), vbs].concat())].concat());
-        let inform = gw.message(9, b"ops", 0x07, Some((Auth::Sha256, &ak)), pk.as_ref(), scoped);
+        let clock: Clock = (engine.clone(), 1, 500);
+        let inform = usm_message(9, b"ops", 0x07, Some((Auth::Sha256, &ak)), pk.as_ref().map(|k| (k, [0, 0, 0, 0, 0, 0, 0, 1])), &clock, scoped);
         let Verdict::Accepted { trap, response: Some(resp), .. } = gw.receive(&inform) else { panic!("inform refused") };
         assert_eq!(trap["inform"]["request_id"], 77);
         let m = parse_v3(&resp).ok().expect("response parses");
