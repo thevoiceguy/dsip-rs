@@ -67,6 +67,12 @@ try {
   // 4. Alice removes Carol: every device of her, a whole identity
   await alice.page.click('nav button[data-view=messages]');
   await alice.page.evaluate((g) => window.dsip.openConversation(g), ag.group);
+  // a render that changes nothing keeps the buttons: one rebuilt between press and release gets no click (Firefox)
+  const kept = await alice.page.evaluate(({ g, did }) => {
+    const remove = () => document.querySelector(`#group-member-list button[data-member="${did}"]`);
+    const before = remove(); window.dsip.openConversation(g); return !!before && remove() === before;
+  }, { g: ag.group, did: carol.did });
+  check('Alice: a render that changes nothing keeps the Remove buttons in place', kept);
   await alice.page.click(`#group-member-list button[data-member="${carol.did}"]`);
   await groupHas(alice, 2);
   await groupHas(bob, 2);

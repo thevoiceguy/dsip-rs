@@ -2200,6 +2200,14 @@ function groupName(c) {
   return others.length ? `group: ${others.map((m) => nameOf(m) || short(m)).join(', ')}` : 'group (only you)';
 }
 
+/** Rebuild `el` with `build` only when `key`, a digest of what it shows, has changed. A render that changes nothing
+ *  must leave the controls in place: a button replaced between a press and its release gets no click (the browser fires
+ *  none), and a select rebuilt between a choice and its button loses the choice. */
+function rebuildIf(el, key, build) {
+  if (el.dataset.shown === key) return;
+  el.dataset.shown = key; el.innerHTML = ''; build();
+}
+
 function renderMessages() {
   const mb = mailboxOf();
   const status = !mb ? 'no mailbox: set one under Settings → Network (the operator may serve a default)'
@@ -2208,18 +2216,26 @@ function renderMessages() {
     : `mailbox ${mb.uri} (${short(mb.did)}): bound · personal group ${messenger.personal() ? 'yes' : devices.length > 1 ? 'waiting to be added by another device (M§12.3)' : 'pending'} · this device's MLS state is kept in this browser's storage`;
   $('mailbox-status').textContent = status;
   const convs = messenger ? messenger.conversations(now()).filter((c) => c.kind !== 'personal') : [];
+  const rows = convs.map((c) => ({
+    group: c.group, active: c.group === activeConv,
+    name: c.peer ? nameOf(c.peer) || '(unnamed)' : c.kind === 'group' ? groupName(c) : c.kind,
+    did: c.peer || c.group,
+    meta: `${c.members.length} identit${c.members.length === 1 ? 'y' : 'ies'}, epoch ${c.epoch}${c.pending ? `, ${c.pending} pending` : ''}${c.hub_down ? ', hub unreachable' : ''}${c.predecessors?.length ? ', continued from a group whose hub is gone' : ''}`,
+  }));
   const ul = $('conv-list');
-  ul.innerHTML = convs.length ? '' : '<li class="muted small">none yet: open a contact and choose Message</li>';
-  for (const c of convs) {
-    const li = document.createElement('li');
-    li.className = c.group === activeConv ? 'active' : '';
-    li.innerHTML = '<span class="name"></span> <code class="did"></code> <span class="muted small meta"></span>';
-    li.querySelector('.name').textContent = c.peer ? nameOf(c.peer) || '(unnamed)' : c.kind === 'group' ? groupName(c) : c.kind;
-    li.querySelector('.did').textContent = c.peer || c.group;
-    li.querySelector('.meta').textContent = `${c.members.length} identit${c.members.length === 1 ? 'y' : 'ies'}, epoch ${c.epoch}${c.pending ? `, ${c.pending} pending` : ''}${c.hub_down ? ', hub unreachable' : ''}${c.predecessors?.length ? ', continued from a group whose hub is gone' : ''}`;
-    li.onclick = () => { activeConv = c.group; renderMessages(); };
-    ul.append(li);
-  }
+  rebuildIf(ul, JSON.stringify(rows), () => {
+    if (!rows.length) ul.innerHTML = '<li class="muted small">none yet: open a contact and choose Message</li>';
+    for (const r of rows) {
+      const li = document.createElement('li');
+      li.className = r.active ? 'active' : '';
+      li.innerHTML = '<span class="name"></span> <code class="did"></code> <span class="muted small meta"></span>';
+      li.querySelector('.name').textContent = r.name;
+      li.querySelector('.did').textContent = r.did;
+      li.querySelector('.meta').textContent = r.meta;
+      li.onclick = () => { activeConv = r.group; renderMessages(); };
+      ul.append(li);
+    }
+  });
   const rl = $('msg-request-list');
   const reqs = messenger ? Object.entries(/** @type {Record<string, IntroductionRequest>} */ (messenger.requests())) : [];
   rl.innerHTML = reqs.length ? '' : '<li class="muted small">none</li>';
@@ -2234,15 +2250,21 @@ function renderMessages() {
   const isGroup = conv?.kind === 'group';
   $('group-members').classList.toggle('hidden', !isGroup);
   if (isGroup) {
-    const ml = $('group-member-list'); ml.innerHTML = '';
-    for (const m of conv.members) {
-      const span = document.createElement('span'); span.className = 'member';
-      span.textContent = m === identity.identity ? 'you ' : `${nameOf(m) || short(m)} `;
-      if (m !== identity.identity) { const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Remove'; b.dataset.member = m; b.onclick = () => removeMember(conv.group, m); span.append(b); }
-      ml.append(span, ' ');
-    }
-    const sel = $('add-member-select'); sel.innerHTML = '';
-    for (const c of contacts.filter((c) => !conv.members.includes(c.did))) { const o = document.createElement('option'); o.value = c.did; o.textContent = c.name || short(c.did); sel.append(o); }
+    const members = conv.members.map((m) => [m, m === identity.identity ? 'you ' : `${nameOf(m) || short(m)} `]);
+    const ml = $('group-member-list');
+    rebuildIf(ml, JSON.stringify([conv.group, members]), () => {
+      for (const [m, label] of members) {
+        const span = document.createElement('span'); span.className = 'member';
+        span.textContent = label;
+        if (m !== identity.identity) { const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Remove'; b.dataset.member = m; b.onclick = () => removeMember(conv.group, m); span.append(b); }
+        ml.append(span, ' ');
+      }
+    });
+    const candidates = contacts.filter((c) => !conv.members.includes(c.did)).map((c) => [c.did, c.name || short(c.did)]);
+    const sel = $('add-member-select');
+    rebuildIf(sel, JSON.stringify([conv.group, candidates]), () => {
+      for (const [did, label] of candidates) { const o = document.createElement('option'); o.value = did; o.textContent = label; sel.append(o); }
+    });
     $('btn-add-member').disabled = !sel.options.length;
     $('btn-add-member').onclick = () => sel.value && addMember(conv.group, sel.value);
   }
