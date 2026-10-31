@@ -139,14 +139,16 @@ pub fn process<P: OpenMlsProvider>(mls: &Device<P>, group: Option<(&mut MlsGroup
     };
     let external = matches!(processed.sender(), Sender::NewMemberCommit);
     let from_recorder = who.as_ref().is_some_and(|w| w.is_recorder());
-    let (mut sender, sender_device) = who.map(|w| (w.identity, w.device)).unwrap_or_default();
+    let (mut sender, sender_device, sender_capabilities) = who.map(|w| (w.identity, w.device, w.capabilities)).unwrap_or_default();
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app) => {
             let obj: Value = serde_json::from_slice(&app.into_bytes()).map_err(mls_err("content json"))?;
             if let Some(device) = lapsed_leaf {
                 return Ok(Outcome::Unauthenticated(format!("{} from {device}: its delegation no longer verifies", obj["id"])));
             }
-            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender, "leaf_device": sender_device});
+            // E§2 (spec-gap 165): a device-event needs the sender leaf's delegation to carry dsip.events
+            let octx = json!({"conversation": conversation, "conversation_kind": kind, "leaf_identity": sender, "leaf_device": sender_device,
+                              "leaf_capabilities": sender_capabilities});
             let verdict = check_object(&obj, &octx);
             if verdict["verdict"] != "accept" {
                 return Ok(Outcome::Dropped(format!("{} {}", verdict["code"], obj["id"])));

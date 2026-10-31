@@ -307,6 +307,17 @@ impl Client {
                 self.c.inform_respond(&key).await;
             } else if e.get("deposit").is_some() {
                 println!("SNMP inform {from} rid={rid}: {}", raw["snmp"]["trap_oid"].as_str().unwrap_or("-"));
+                // E§4 (spec-gap 167): an inform's event is never held, and settles a clear held for its alarm
+                if let Some(alarm) = event.get("alarm") {
+                    let mut report = alarm.clone();
+                    report["inform"] = json!(true);
+                    self.c.events.hold_down.report(&report);
+                    let text = |f: &str| alarm[f].as_str().unwrap_or("").to_string();
+                    let key = (text("resource"), text("type"), text("qualifier"));
+                    if self.c.events.held_events.remove(&key).is_some() {
+                        println!("DROPPED held clear of {}/{}: settled by an inform's report   E§4", key.0, key.1);
+                    }
+                }
                 // answered when the hub accepts its event, whenever that is (M§9.4: an outage keeps it pending)
                 match self.deposit_event(event.clone()).await? {
                     Sent::Out(id) => {

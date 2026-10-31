@@ -242,7 +242,8 @@ impl AlarmList {
         let k = key_of(&e["alarm"]);
         let state = e["state"].as_str().unwrap_or("").to_string();
         let Some(a) = self.alarms.get_mut(&k) else { return vec![] };
-        if a.operator == "closed" || a.operator == state {
+        // spec-gap 166: a state other than ack and closed is ignored
+        if !matches!(state.as_str(), "ack" | "closed") || a.operator == "closed" || a.operator == state {
             return vec![];
         }
         a.operator = state.clone();
@@ -407,7 +408,8 @@ impl HoldDown {
         HoldDown { now, hold: hold_s, held: BTreeMap::new() }
     }
 
-    /// An alarm report (`{resource, type, qualifier?, severity, cleared}`) the gateway would deposit: what to deposit now.
+    /// An alarm report (`{resource, type, qualifier?, severity, cleared, inform?}`) the gateway would deposit: what to
+    /// deposit now. Spec: E§4 (spec-gap 167): a report from an SNMP inform is never held, and drops a held clear.
     pub fn report(&mut self, report: &Value) -> Vec<Value> {
         let mut r = report.clone();
         if r.get("qualifier").is_none() {
@@ -418,6 +420,10 @@ impl HoldDown {
             r["type"].as_str().unwrap_or("").to_string(),
             r["qualifier"].as_str().unwrap_or("").to_string(),
         );
+        if r["inform"] == true {
+            self.held.remove(&k);
+            return vec![r];
+        }
         if r["cleared"] == true {
             if self.hold == 0 {
                 return vec![r];

@@ -214,7 +214,7 @@ pub fn check_object(o: &Value, ctx: &Value) -> Value {
     }
     match name {
         "call-record" => check_call_record(o, ctx),
-        "content" => check_content(o),
+        "content" => check_content(o, ctx),
         "receipt" => {
             let kind = o["kind"].as_str().unwrap_or("");
             if !RECEIPT_KINDS.contains(&kind) {
@@ -283,12 +283,70 @@ fn truthy(v: Option<&Value>) -> bool {
     }
 }
 
-fn check_content(o: &Value) -> Value {
+/// A string, and, with `nonempty`, not the empty one.
+fn is_str(v: &Value, nonempty: bool) -> bool {
+    v.as_str().is_some_and(|s| !nonempty || !s.is_empty())
+}
+
+/// Absent, or a string.
+fn opt_str(o: &Value, f: &str) -> bool {
+    o.get(f).is_none_or(Value::is_string)
+}
+
+/// A `device-event`'s `event`: `source` (non-empty `address`, string `basis`) unless `heartbeat` is present; an
+/// `alarm`'s `resource`, non-empty `type`, `severity` (a string or null) and boolean `cleared`; `heartbeat.interval_s`
+/// an integer ≥ 1; `raw` and `syslog_gap` objects. Members not named, and token values, are not checked.
+///
+/// Spec: E§5 Bodies (spec-gap 166).
+fn device_event_body(e: &Value) -> bool {
+    if !e.is_object() {
+        return false;
+    }
+    if let Some(h) = e.get("heartbeat") {
+        if !h["interval_s"].as_i64().is_some_and(|n| n >= 1) {
+            return false;
+        }
+    }
+    if e.get("source").is_some() || e.get("heartbeat").is_none() {
+        let src = &e["source"];
+        if !src.is_object() || !is_str(&src["address"], true) || !is_str(&src["basis"], false) {
+            return false;
+        }
+    }
+    if let Some(a) = e.get("alarm") {
+        let severity_ok = a.get("severity").is_some_and(|s| s.is_null() || s.is_string());
+        if !a.is_object() || !is_str(&a["resource"], false) || !is_str(&a["type"], true) || !severity_ok
+            || !a["cleared"].is_boolean() || !opt_str(a, "qualifier") || !opt_str(a, "text")
+        {
+            return false;
+        }
+    }
+    ["raw", "syslog_gap"].iter().all(|f| e.get(*f).is_none_or(Value::is_object))
+}
+
+/// An `alarm-ack`: the alarm's `resource`, non-empty `type` and optional string `qualifier`, and a string `state`. An
+/// unknown state is accepted; the alarm list ignores it.
+///
+/// Spec: E§5 Bodies (spec-gap 166).
+fn alarm_ack_body(o: &Value) -> bool {
+    let a = &o["alarm"];
+    a.is_object() && is_str(&a["resource"], false) && is_str(&a["type"], true) && opt_str(a, "qualifier") && o["state"].is_string()
+}
+
+fn check_content(o: &Value, ctx: &Value) -> Value {
     let kind = o["kind"].as_str().unwrap_or("");
     let purpose = o["purpose"].as_str().unwrap_or("");
     let eff_kind = if CONTENT_KINDS.contains(&kind) {
         if kind_body(kind).iter().any(|f| o.get(f).is_none()) {
             return reject("content-body", None);
+        }
+        if kind == "device-event" && !device_event_body(&o["event"]) || kind == "alarm-ack" && !alarm_ack_body(o) {
+            return reject("content-body", None);
+        }
+        // E§2 (spec-gap 165): only a gateway, its delegation carrying dsip.events, raises alarms
+        let caps = ctx["leaf_capabilities"].as_array();
+        if kind == "device-event" && !caps.is_some_and(|c| c.iter().any(|x| x == "dsip.events")) {
+            return reject("delegation-capability", None);
         }
         kind
     } else if o.get("blob").is_some() {
