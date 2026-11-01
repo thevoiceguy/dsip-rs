@@ -40,6 +40,7 @@ crates/
     dsip-dht               signed reachability hints (§8.5); never authoritative
     dsip-number            Number Attestation (draft, N§)
     dsip-recording         Recording Profile consent (draft, C§)
+    dsip-wake              Wake Profile (draft, W§): registrations, wakes, the push gateway's checks, the sealed hint
     dsip-events            Device Events Profile (draft, E§)
     dsip-kt                alias transparency building blocks (draft, T§)
   Engines, sans-I/O
@@ -67,7 +68,7 @@ spec/                      DSIP, as a git submodule at a tag: v1.0/ (spec text, 
 git clone --recurse-submodules https://github.com/thevoiceguy/dsip-rs   # or: git submodule update --init
 cargo build --workspace
 cargo test --workspace
-cargo run -p dsip-cli -- vectors run         # the conformance suite: 2,323 vectors, 0 failures
+cargo run -p dsip-cli -- vectors run         # the conformance suite: 2,475 vectors, 0 failures
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 bash demos/echo-bot-demo.sh                   # any demo; CI runs them all
 web/build.sh && web/test/run.sh firefox       # the browser client and its tests

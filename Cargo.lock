@@ -1288,6 +1288,7 @@ dependencies = [
  "dsip-schema",
  "dsip-session",
  "dsip-transport",
+ "dsip-wake",
  "dsip-webrtc-binding",
  "futures-util",
  "libp2p",
@@ -1691,6 +1692,15 @@ dependencies = [
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dsip-wake"
+version = "0.1.0"
+dependencies = [
+ "dsip-core",
+ "jsonschema",
+ "serde_json",
 ]
 
 [[package]]
