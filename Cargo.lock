@@ -1587,6 +1587,7 @@ dependencies = [
 name = "dsip-phone"
 version = "0.2.0"
 dependencies = [
+ "dsip-broadcast",
  "dsip-core",
  "dsip-endpoint",
  "dsip-media",

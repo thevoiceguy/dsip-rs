@@ -12,6 +12,7 @@ use dsip_endpoint::{CallCommand, MediaRequest};
 use dsip_session::{Emission, Role, SessionState, UiEvent};
 use dsip_transport::agent::{Agent, AgentEvent};
 
+use crate::presence::Presence;
 use crate::{Call, CallState, Cmd, IncomingCall, Line, Media, Result};
 
 /// One call the handles follow.
@@ -28,8 +29,19 @@ pub(crate) struct Runner {
     line: Line,
     incoming: mpsc::UnboundedSender<IncomingCall>,
     calls: HashMap<String, Track>,
+    presence: Presence,
+    /// Wakes the task once a second while presence needs the clock.
+    ticker: Option<tokio::task::JoinHandle<()>>,
     #[cfg(feature = "media")]
     legs: legs::Legs,
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticker.take() {
+            t.abort();
+        }
+    }
 }
 
 /// What one batch of events said about calls, read before their states are.
@@ -48,7 +60,7 @@ struct Batch {
 
 impl Runner {
     pub(crate) fn new(agent: Agent, cmds: mpsc::UnboundedReceiver<Cmd>, line: Line, incoming: mpsc::UnboundedSender<IncomingCall>,
-                      media: Media) -> Runner {
+                      presence: watch::Sender<std::collections::BTreeMap<String, crate::Presence>>, media: Media) -> Runner {
         #[cfg(not(feature = "media"))]
         let _ = media;
         Runner {
@@ -59,6 +71,8 @@ impl Runner {
             line,
             incoming,
             calls: HashMap::new(),
+            presence: Presence::new(presence),
+            ticker: None,
         }
     }
 
@@ -82,6 +96,19 @@ impl Runner {
                     }
                     Ok(cmd) => self.command(cmd).await?,
                     Err(mpsc::error::TryRecvError::Empty) => break,
+                }
+            }
+            if self.presence.active() {
+                self.presence.tick(&mut self.agent).await;
+                if self.ticker.is_none() {
+                    let wake = self.line.wake.clone();
+                    self.ticker = Some(tokio::spawn(async move {
+                        let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+                        loop {
+                            every.tick().await;
+                            wake.notify_one();
+                        }
+                    }));
                 }
             }
             #[cfg(feature = "media")]
@@ -126,6 +153,17 @@ impl Runner {
                     tracing::warn!("hanging up: {e}");
                 }
             }
+            Cmd::SetPresence(state) => self.presence.set(&mut self.agent, state).await,
+            Cmd::Watch { target, via } => self.presence.watch(&mut self.agent, target, via),
+            Cmd::Unwatch(target) => self.presence.unwatch(&mut self.agent, &target),
+            Cmd::Grant { request, reply } => {
+                let r = request;
+                let granted = self.agent.grant_request(&r.introduction, &r.requester, r.scope, r.valid_until, None).await;
+                let _ = reply.send(granted.map_err(Into::into));
+            }
+            Cmd::HoldGrant { grant, reply } => {
+                let _ = reply.send(self.agent.hold_grant(&grant).map_err(Into::into));
+            }
             Cmd::Close => unreachable!("handled by run"),
         }
         Ok(())
@@ -142,6 +180,8 @@ impl Runner {
         let mut b = Batch::default();
         for ev in events {
             match ev {
+                AgentEvent::Received { payload, .. } if self.presence.received(&self.agent, &payload) => {}
+                AgentEvent::Reconnected { .. } => self.presence.bound(&mut self.agent).await,
                 AgentEvent::Received { message, identity, display_name, .. } => {
                     let sid = message.session_id().to_string();
                     if let Some(r) = &message.reason {

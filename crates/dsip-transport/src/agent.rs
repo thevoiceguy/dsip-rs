@@ -145,6 +145,8 @@ pub struct Agent {
     /// The sessions placed through another relay: its URL, when the route was made, and whether the session has been
     /// seen in the endpoint (an ended session is forgotten there).
     routes: std::collections::HashMap<String, (String, i64, bool)>,
+    /// Connections to other relays the host keeps open with no call through them ([`Agent::keep_peer`]).
+    kept: std::collections::HashSet<String>,
 }
 
 impl Agent {
@@ -184,7 +186,8 @@ impl Agent {
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let calls = cfg.calls.map(Calls::new);
         Ok(Agent { id, cfg, supported, resolver, conn, core, calls, events: vec![], did_resolver, resolved_tx, resolved_rx, replaced: false, replaced_closed: false,
-                   wake: Arc::new(tokio::sync::Notify::new()), peers: Default::default(), routes: Default::default() })
+                   wake: Arc::new(tokio::sync::Notify::new()), peers: Default::default(), routes: Default::default(),
+                   kept: Default::default() })
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -291,6 +294,30 @@ impl Agent {
         Ok(true)
     }
 
+    /// Answer an introduction from `requester` that reached us at our mailbox (M§14.1) with a grant of `scope` until
+    /// `valid_until`, issued as one answering an introduction through the relay is ([`Core::grant_request`]), and
+    /// saved. Returns the signed grant for the host to deposit at the requester's mailbox, or `None` when the engine
+    /// refused it. Spec: §19.4, M§14.1, P§6.
+    pub async fn grant_request(&mut self, introduction: &str, requester: &str, scope: Vec<String>, valid_until: i64,
+                               presence_audience: Option<String>) -> Result<Option<String>> {
+        let id = self.core.new_id(now_s());
+        let (grant, rest) = self.core.grant_request(introduction, requester, id, scope, valid_until, presence_audience, now_s())?;
+        self.dispatch(rest).await?;
+        self.save_contacts()?;
+        Ok(grant)
+    }
+
+    /// Hold a grant that reached us at our mailbox (M§14.1), as one received through the relay is, and save it:
+    /// presented when watching the granter's presence ([`Agent::presence_claims`]). Returns whether it verified and is
+    /// held ([`Core::hold_grant`]). Spec: §19.4, P§6.
+    pub fn hold_grant(&mut self, compact: &str) -> Result<bool> {
+        let held = self.core.hold_grant(compact, now_s());
+        if held {
+            self.save_contacts()?;
+        }
+        Ok(held)
+    }
+
     /// The held grants from `target` to present when watching its presence (`subscribe` `claims`). Spec: P§6.
     pub fn presence_claims(&self, target: &str) -> Vec<serde_json::Value> {
         self.core.presence_claims(target, now_s())
@@ -366,7 +393,53 @@ impl Agent {
         Ok(sid)
     }
 
-    /// The other relays this device is bound at for calls, by URL.
+    /// Sign an application-built payload without sending it (a `subscribe` for another relay, [`Agent::send_frame`]).
+    pub fn sign(&mut self, payload: serde_json::Value, ttl: i64) -> Result<String> {
+        Ok(self.core.sign_payload(payload, now_s(), ttl)?)
+    }
+
+    /// Bind at the relay at `url` unless bound there (our own relay's URL is ours), and return its DID: what a payload
+    /// addressed to it names in `to`. Spec: §13.2, §9.3.
+    pub async fn relay_at(&mut self, url: &str) -> Result<String> {
+        if url == self.cfg.relay_url {
+            return Ok(self.conn.relay.did.clone());
+        }
+        self.peer(url).await?;
+        Ok(self.peers[url].relay.did.clone())
+    }
+
+    /// Send a signed frame to the relay at `via` — bound there first ([`Agent::place_via`]'s connection, shared with
+    /// the calls through it) — or, with `None` or our own relay's URL, to ours. Returns the DID of the relay it went
+    /// to. A connection made for it closes once nothing uses it, unless kept ([`Agent::keep_peer`]).
+    /// Spec: §9.3 (spec-gap 143: a subscription at the relay that answers for the target), §8.1.
+    pub async fn send_frame(&mut self, frame: &str, via: Option<&str>) -> Result<String> {
+        let env = dsip_core::envelope::Envelope::from_frame(frame)?;
+        match via.filter(|u| *u != self.cfg.relay_url) {
+            Some(url) => {
+                self.peer(url).await?;
+                let c = self.peers.get_mut(url).expect("bound above");
+                c.send(&env).await?;
+                Ok(c.relay.did.clone())
+            }
+            None => {
+                self.conn.send(&env).await?;
+                Ok(self.conn.relay.did.clone())
+            }
+        }
+    }
+
+    /// Keep our connection to the relay at `url` open while no call uses it (`true`: a presence watch there), or let it
+    /// close once none does (`false`). A kept connection that drops is not redialled: it leaves
+    /// [`Agent::peer_relays`], and the host sends there again to bind anew.
+    pub fn keep_peer(&mut self, url: &str, keep: bool) {
+        if keep {
+            self.kept.insert(url.to_string());
+        } else {
+            self.kept.remove(url);
+        }
+    }
+
+    /// The other relays this device is bound at, for calls or kept ([`Agent::keep_peer`]), by URL.
     pub fn peer_relays(&self) -> Vec<String> {
         let mut v: Vec<String> = self.peers.keys().cloned().collect();
         v.sort();
@@ -414,7 +487,7 @@ impl Agent {
             None => !*seen && now - *since < ROUTE_GRACE_S,
         });
         let used: std::collections::HashSet<String> = self.routes.values().map(|(u, _, _)| u.clone()).collect();
-        let idle: Vec<String> = self.peers.keys().filter(|u| !used.contains(*u)).cloned().collect();
+        let idle: Vec<String> = self.peers.keys().filter(|u| !used.contains(*u) && !self.kept.contains(*u)).cloned().collect();
         for url in idle {
             if let Some(mut c) = self.peers.remove(&url) {
                 tracing::info!("closing our connection to their relay {url}: no call uses it");

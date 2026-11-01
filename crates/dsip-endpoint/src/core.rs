@@ -757,6 +757,62 @@ impl Core {
             .collect()
     }
 
+    /// Answer with grant `id` an introduction from `requester` that reached this device some other way than its relay
+    /// — deposited at its mailbox (M§14.1) and checked there — as [`LocalEvent::Grant`] answers one that came through
+    /// the relay: the grant is issued (§19.4; P§6, P§12.3), so it can be withdrawn or followed later. Returns the signed
+    /// grant as a compact serialization (`protected.payload.signature`, as M§14.1's deposit carries it), which the host delivers the way the introduction came (a deposit at the requester's mailbox), and the
+    /// rest of what issuing it emitted; no grant when the engine refused it (an `audience` that is not a P§6 token).
+    ///
+    /// Spec: §19.4, M§14.1 (a grant answers an introduction whichever way both travel). Impl: the introduction is
+    /// taken as the request the engine would have recorded had it come through the relay; the grant is not sent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_request(&mut self, introduction: &str, requester: &str, id: String, scope: Vec<String>, valid_until: i64,
+                         presence_audience: Option<String>, now: i64) -> Result<(Option<String>, Vec<CoreEvent>)> {
+        self.ep.contacts.requests.insert(introduction.to_string(), (requester.to_string(), requester.to_string()));
+        let ev = LocalEvent::Grant { introduction: introduction.to_string(), id, scope, valid_until, presence_audience };
+        let out = self.local(ev, now)?;
+        self.ep.contacts.requests.remove(introduction); // refused: no request is left behind
+        let mut grant = None;
+        let rest = out
+            .into_iter()
+            .filter_map(|e| match e {
+                CoreEvent::Send { frame, msg_type, .. } if msg_type == "grant" && grant.is_none() => {
+                    grant = Envelope::from_frame(&frame).ok().map(|e| format!("{}.{}.{}", e.protected, e.payload, e.signature));
+                    None
+                }
+                e => Some(e),
+            })
+            .collect();
+        Ok((grant, rest))
+    }
+
+    /// Hold a grant that reached this device some other way than its relay — deposited at its mailbox in answer to an
+    /// introduction (M§14.1) — as one received through the relay is held: presented where a grant admits, a presence
+    /// `subscribe` among them ([`Core::presence_claims`]). It is verified as a credential (its signature, and its
+    /// signer bound to the granter, §7.4) and must be addressed to this identity and live. `grant` is a compact
+    /// serialization or an envelope frame. Returns whether it is held.
+    ///
+    /// Spec: §19.4 (the grantee holds the signed grant), M§14.1, P§6. Impl: presence keys the grant carries are not
+    /// opened here (sealed presence, P§12.3, is not yet carried this way).
+    pub fn hold_grant(&mut self, grant: &str, now: i64) -> bool {
+        let compact = match Envelope::from_frame(grant) {
+            Ok(e) => format!("{}.{}.{}", e.protected, e.payload, e.signature),
+            Err(_) => grant.to_string(),
+        };
+        let compact = compact.as_str();
+        let ctx = Context::new(now, &self.resolver);
+        let Some(p) = dsip_core::grant::credential_compact(compact, &ctx) else { return false };
+        let (Some(id), Some(by)) = (p["id"].as_str(), p["from"].as_str()) else { return false };
+        let valid_until = p["valid_until"].as_i64().unwrap_or(0);
+        if p["to"] != self.keys.identity.as_str() || valid_until <= now {
+            return false;
+        }
+        let scope = p["scope"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+        self.ep.contacts.grants_held.insert(id.to_string(), Grant { identity: by.to_string(), scope, valid_until, ..Default::default() });
+        self.grant_frames.insert(id.to_string(), compact.to_string());
+        true
+    }
+
     /// A signed `grant-revocation` for a grant we issued, addressed to our authority (`to`), or `None` when we issued no
     /// grant `grant`. The host sends it before revoking the grant locally ([`LocalEvent::Revoke`]).
     ///

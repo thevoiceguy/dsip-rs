@@ -88,7 +88,14 @@ pub fn received(item: &Value, to: &str, ctx: &Context, now: i64, seed: Option<&[
             && dsip_core::delegation::check_binding(from, &ver.signer_did, &ver.header.delegations, ctx).ok()
     });
     let Some(ver) = checked else { return Received::DoesNotVerify };
-    let p = ver.payload;
+    let mut p = ver.payload;
+    if class == "grant" && p["from"] == json!(ver.signer_did) {
+        // §7.4: a grant a calling engine signs names its device in `from`; the granter is the identity the device's
+        // delegation binds it to, as wherever the grant is checked as a credential (dsip_core::grant)
+        if let Some(g) = dsip_core::grant::credential(&env, ctx) {
+            p["from"] = g["from"].clone();
+        }
+    }
     let s = |k: &str| p[k].as_str().unwrap_or("").to_string();
     let (id, from) = (s("id"), s("from"));
     if class == "introduction" {
@@ -114,5 +121,32 @@ pub fn received(item: &Value, to: &str, ctx: &Context, now: i64, seed: Option<&[
         }
         let envelope = format!("{}.{}.{}", env.protected, env.payload, env.signature);
         Received::Grant(Grant { from, envelope, scope, request: s("session") })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsip_core::envelope::{encode_payload, sign_bytes};
+    use dsip_core::keys::KeyPair;
+
+    const NOW: i64 = 1_790_000_000;
+
+    #[test]
+    fn a_grant_a_device_signs_in_its_own_name_is_the_identitys() {
+        // §7.4: a calling engine names its device in `from`; its delegation binds it to the identity that grants
+        let (identity, device) = (KeyPair::from_seed([1; 32]), KeyPair::from_seed([2; 32]));
+        let deleg = dsip_core::delegation::delegation_payload(&identity.did(), &device.did(), NOW - 60, NOW + 86_400, &["dsip.signaling"]);
+        let deleg = sign_bytes(&encode_payload(&deleg), &identity, &identity.kid(), vec![]);
+        let grantee = KeyPair::from_seed([3; 32]).did();
+        let p = json!({"type": "grant", "id": "01M6CNVZ51GZPHFE0WD2FGDNNC", "from": device.did(), "to": grantee, "session": "01M6CNVZ52H17DM49J4SAQPFW0",
+                       "scope": ["dsip.invite", "dsip.message", "dsip.subscribe"], "valid_until": NOW + 3600, "issued_at": NOW - 600, "expires_at": NOW - 570});
+        let env = sign_bytes(&encode_payload(&p), &device, &device.kid(), vec![deleg]);
+        let item = json!({"class": "grant", "envelope": format!("{}.{}.{}", env.protected, env.payload, env.signature)});
+        let resolver = dsip_core::did::StaticResolver::default();
+        match received(&item, &grantee, &Context::new(NOW, &resolver), NOW, None) {
+            Received::Grant(g) => assert_eq!((g.from, g.request), (identity.did(), "01M6CNVZ52H17DM49J4SAQPFW0".to_string())),
+            _ => panic!("not read as a grant"),
+        }
     }
 }

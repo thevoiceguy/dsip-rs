@@ -517,6 +517,12 @@ impl<S: Store> Messenger<S> {
         }
     }
 
+    /// The signed grant held from `identity` (compact), as received through the mailbox or set with
+    /// [`Messenger::set_grants`]: what a calling engine holds too, to present it where a grant admits (§19.4, P§6).
+    pub fn grant_held(&self, identity: &str) -> Option<&str> {
+        self.grants_held.get(identity).map(String::as_str)
+    }
+
     /// M§10.5: disclose read watermarks to the conversation (`true`) or keep them in the personal group (`false`,
     /// the default). Applies to every conversation's receipts machine.
     pub fn set_read_disclosed(&mut self, disclosed: bool, now: f64) {

@@ -7,6 +7,30 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+### Added
+
+- `dsip-phone`: presence (Presence Profile draft, in clear: `presence/0.1`). `Phone::set_presence` publishes this
+  device's state to its relay and keeps it fresh (P§3, P§8); `Phone::watch` follows another identity's, subscribing
+  at the relay that answers for it (a `did:key`'s hint names it, §8.1, over the connection a call there would use),
+  presenting the grants held from it (P§6), renewing before the hour's subscription lapses and asking again a minute
+  after a refusal; `Phone::presence` shows each watched identity as P§4 combines its devices (`Presence`: state,
+  token, and whether a record or the relay's claim says so). Sealed presence (P§12) is not yet run here.
+- Grants that travel through a mailbox (M§14.1) on the calling side too: `Core::grant_request` /
+  `Agent::grant_request` / `Phone::grant_request` answer an introduction that came another way with a grant issued
+  as one through the relay is (so it can be withdrawn or followed), returned compact for the host to deposit;
+  `Core::hold_grant` / `Agent::hold_grant` / `Phone::hold_grant` hold a grant received that way, checked as a
+  credential, so it is presented where a grant admits (a presence `subscribe`).
+- `dsip-transport`: `Agent::sign`, `Agent::relay_at` (bind at another relay and return its DID),
+  `Agent::send_frame` (to our relay or another), and `Agent::keep_peer` (keep a connection to another relay open
+  with no call through it).
+- `dsip-messaging-device`: `Messenger::grant_held`, the signed grant held from an identity.
+
+### Fixed
+
+- `dsip-messaging-device`: a grant read from the mailbox whose `from` is the signing device (as a calling engine
+  signs it) is the identity's that the device's delegation binds it to (§7.4), as wherever a grant is checked as a
+  credential; it was taken as the device's.
+
 ## [2026-11-04] — workspace release
 
 Native calls through another relay (app plan stage A2). DSIP spec: `poc-v1.0.3`, unchanged (DSIP Core 1.0 with the
