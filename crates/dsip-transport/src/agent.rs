@@ -11,13 +11,13 @@ use dsip_core::did::StaticResolver;
 use dsip_core::version::Supported;
 use dsip_endpoint::{CallCommand, CallEvent, CallOut, Calls, CallsConfig, Command, ContactFile, Core, CoreConfig, CoreEvent, IdentityKeys,
                     Invite, MediaRequest, MediaResult, PresenceSealing};
-use dsip_session::{Emission, Endpoint, LocalEvent, Message};
+use dsip_session::{Emission, Endpoint, LocalEvent, Message, SessionState};
 
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::conn::{ConnectParams, Connection, Dialer};
+use crate::conn::{ConnectParams, Connection, DialFuture, Dialer};
 use crate::resolver::{DidResolver, DidWebResolver};
 use crate::identity::Identity;
 use crate::verify::SeenIds;
@@ -98,7 +98,21 @@ pub struct AgentConfig {
     /// P§12: seal this device's presence records for these scopes (`main` and audience tags, [`audience_tag`]) and put
     /// keys in the grants it issues. `None` seals nothing; the keys of grants held open either way.
     pub presence: Option<PresenceSealing>,
+    /// How to reach another relay a call goes through ([`Agent::place_via`]): `None`, or a dialer that has no stream
+    /// for that URL, dials it over `wss` (an embedded relay; `dsip-testkit`).
+    pub peer_dialer: Option<Arc<dyn PeerDialer>>,
 }
+
+/// Streams to relays other than the host's own, by URL ([`AgentConfig::peer_dialer`]).
+pub trait PeerDialer: Send + Sync {
+    /// A fresh stream to the relay at `url`, or `None` to dial it over `wss`.
+    fn dial(&self, url: &str) -> Option<DialFuture>;
+}
+
+/// Seconds a connection to another relay may take to bind before the call goes through the host's own relay instead.
+pub const PEER_BIND_S: u64 = 8;
+/// Seconds a route waits for its session to exist (with media, the invite waits for the host's offer).
+pub const ROUTE_GRACE_S: i64 = 60;
 
 /// The wire tag of the audience `id`'s identity labels `label` (P§12.1): the label stays on the subject's devices.
 pub fn audience_tag(id: &Identity, label: &str) -> String {
@@ -126,6 +140,11 @@ pub struct Agent {
     replaced_closed: bool,
     /// Wakes [`Agent::next`] for the host ([`Agent::waker`]).
     wake: Arc<tokio::sync::Notify>,
+    /// Connections to other relays, by URL: this device bound there for the calls placed through them (§8.1).
+    peers: std::collections::HashMap<String, Connection>,
+    /// The sessions placed through another relay: its URL, when the route was made, and whether the session has been
+    /// seen in the endpoint (an ended session is forgotten there).
+    routes: std::collections::HashMap<String, (String, i64, bool)>,
 }
 
 impl Agent {
@@ -165,7 +184,7 @@ impl Agent {
         let (resolved_tx, resolved_rx) = mpsc::unbounded_channel();
         let calls = cfg.calls.map(Calls::new);
         Ok(Agent { id, cfg, supported, resolver, conn, core, calls, events: vec![], did_resolver, resolved_tx, resolved_rx, replaced: false, replaced_closed: false,
-                   wake: Arc::new(tokio::sync::Notify::new()) })
+                   wake: Arc::new(tokio::sync::Notify::new()), peers: Default::default(), routes: Default::default() })
     }
 
     fn params<'a>(id: &'a Identity, cfg: &AgentConfig, supported: &Supported) -> ConnectParams<'a> {
@@ -326,6 +345,84 @@ impl Agent {
         Ok(sid)
     }
 
+    /// Place a call through the relay at `relay_url`, the one the callee's hint names (§8.1: the hints tier says where
+    /// to try; it is not authority): this device binds there on a connection of its own, shared by every call placed
+    /// through it, and the session's envelopes go over it. Our own relay's URL, or a relay that does not bind us within
+    /// [`PEER_BIND_S`], places it as [`Agent::place`] does.
+    pub async fn place_via(&mut self, to: &str, invite: Invite, relay_url: &str) -> Result<String> {
+        if relay_url != self.cfg.relay_url {
+            if let Err(e) = self.peer(relay_url).await {
+                tracing::warn!("their relay {relay_url} did not bind us ({e}); calling through our own relay");
+            }
+        }
+        let routed = self.peers.contains_key(relay_url);
+        let Some(calls) = self.calls.as_mut() else { return Err(crate::Error::NoCalls) };
+        let (sid, out) = calls.place(&mut self.core, to, invite, now_s())?;
+        if routed {
+            tracing::info!("call {sid} to {to} through their relay {relay_url}");
+            self.routes.insert(sid.clone(), (relay_url.to_string(), now_s(), false));
+        }
+        self.act(out).await?;
+        Ok(sid)
+    }
+
+    /// The other relays this device is bound at for calls, by URL.
+    pub fn peer_relays(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.peers.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// The URL of the relay `session`'s envelopes go through, when it is not our own.
+    pub fn route_of(&self, session: &str) -> Option<&str> {
+        self.routes.get(session).map(|(u, _, _)| u.as_str())
+    }
+
+    /// Bind to the relay at `url`, unless bound there.
+    async fn peer(&mut self, url: &str) -> Result<()> {
+        if self.peers.contains_key(url) {
+            return Ok(());
+        }
+        let mut params = Self::params(&self.id, &self.cfg, &self.supported);
+        params.url = url.to_string();
+        let mut seen = SeenIds::default();
+        let stream = self.cfg.peer_dialer.as_ref().and_then(|d| d.dial(url));
+        let bind = async {
+            match stream {
+                Some(s) => Connection::over(s.await?, &params, &self.resolver, &mut seen).await,
+                None => Connection::connect(&params, &self.resolver, &mut seen).await,
+            }
+        };
+        let conn = tokio::time::timeout(Duration::from_secs(PEER_BIND_S), bind)
+            .await
+            .map_err(|_| crate::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{url} did not bind in {PEER_BIND_S} s"))))??;
+        tracing::info!("bound at their relay {url} ({})", conn.relay.did);
+        self.peers.insert(url.to_string(), conn);
+        Ok(())
+    }
+
+    /// Forget the routes of sessions that ended, and close the connections no call uses any more.
+    async fn prune_routes(&mut self) {
+        let now = now_s();
+        let ep = self.core.endpoint();
+        self.routes.retain(|sid, (_, since, seen)| match ep.session(sid) {
+            Some(s) => {
+                *seen = true;
+                s.state != SessionState::Ended
+            }
+            // gone: ended and forgotten, or never made (an invite that waited for an offer that never came)
+            None => !*seen && now - *since < ROUTE_GRACE_S,
+        });
+        let used: std::collections::HashSet<String> = self.routes.values().map(|(u, _, _)| u.clone()).collect();
+        let idle: Vec<String> = self.peers.keys().filter(|u| !used.contains(*u)).cloned().collect();
+        for url in idle {
+            if let Some(mut c) = self.peers.remove(&url) {
+                tracing::info!("closing our connection to their relay {url}: no call uses it");
+                c.close(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, "done").await;
+            }
+        }
+    }
+
     /// Do what the application asks of a call, through the call glue.
     pub async fn call(&mut self, cmd: CallCommand) -> Result<()> {
         let Some(calls) = self.calls.as_mut() else { return Err(crate::Error::NoCalls) };
@@ -382,7 +479,12 @@ impl Agent {
             match e {
                 CoreEvent::Send { frame, msg_type, session, to } => {
                     let env = dsip_core::envelope::Envelope::from_frame(&frame)?;
-                    self.conn.send(&env).await?;
+                    // a session placed through another relay goes over our connection there (§8.1)
+                    let peer = self.routes.get(&session).and_then(|(u, _, _)| self.peers.get_mut(u));
+                    match peer {
+                        Some(c) => c.send(&env).await?,
+                        None => self.conn.send(&env).await?,
+                    }
                     self.events.push(AgentEvent::Sent { msg_type, session, to });
                 }
                 CoreEvent::Emission(em) => self.events.push(AgentEvent::Emission(em)),
@@ -420,6 +522,9 @@ impl Agent {
     /// return the accumulated application events. Reconnects with backoff on connection loss.
     pub async fn next(&mut self) -> Result<Vec<AgentEvent>> {
         loop {
+            if !self.routes.is_empty() || !self.peers.is_empty() {
+                self.prune_routes().await;
+            }
             if !self.events.is_empty() {
                 return Ok(std::mem::take(&mut self.events));
             }
@@ -444,6 +549,18 @@ impl Agent {
                         self.reconnect().await?;
                     }
                 },
+                (url, frame) = Self::peer_recv(&mut self.peers), if !self.peers.is_empty() => match frame {
+                    Ok(Some(text)) => {
+                        let out = self.core.inbound(&text, now_s())?;
+                        self.dispatch(out).await?;
+                    }
+                    // a connection to another relay is not redialled: its calls go on, or end, by their timers
+                    Ok(None) | Err(_) => {
+                        tracing::info!("their relay {url} closed our connection");
+                        self.peers.remove(&url);
+                        self.routes.retain(|_, (u, _, _)| *u != url);
+                    }
+                },
                 Some((did, result)) = self.resolved_rx.recv() => {
                     if let Ok(doc) = &result {
                         self.resolver.insert(doc.clone()); // held for reconnects too (relay hello)
@@ -456,6 +573,12 @@ impl Agent {
             }
             self.tick_and_handle().await?;
         }
+    }
+
+    /// The next frame from any connection to another relay, with its URL.
+    async fn peer_recv(peers: &mut std::collections::HashMap<String, Connection>) -> (String, Result<Option<String>>) {
+        let recvs = peers.iter_mut().map(|(u, c)| Box::pin(async move { (u.clone(), c.recv().await) }));
+        futures_util::future::select_all(recvs).await.0
     }
 
     async fn reconnect(&mut self) -> Result<()> {

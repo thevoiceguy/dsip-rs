@@ -1692,6 +1692,7 @@ dependencies = [
  "dsip-relay",
  "dsip-session",
  "dsip-transport",
+ "serde_json",
  "tokio",
 ]
 
