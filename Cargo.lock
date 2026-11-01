@@ -1599,6 +1599,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsip-push"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.10.3",
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "dsip-core",
+ "dsip-endpoint",
+ "dsip-relay",
+ "dsip-session",
+ "dsip-transport",
+ "dsip-wake",
+ "rand 0.8.7",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "dsip-recording"
 version = "0.1.0"
 dependencies = [
@@ -1619,8 +1645,10 @@ dependencies = [
  "dsip-schema",
  "dsip-session",
  "dsip-transport",
+ "dsip-wake",
  "futures-util",
  "hmac 0.12.1",
+ "rand 0.8.7",
  "redb",
  "serde",
  "serde_json",
@@ -1675,6 +1703,7 @@ dependencies = [
  "dsip-endpoint",
  "dsip-schema",
  "dsip-session",
+ "dsip-wake",
  "futures-util",
  "rcgen",
  "reqwest",
@@ -5378,6 +5407,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

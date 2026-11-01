@@ -120,6 +120,13 @@ struct Args {
     /// on loopback (`dsipctl relay-status`).
     #[arg(long)]
     status_listen: Option<SocketAddr>,
+    /// Wake sleeping devices through their push gateways (Wake Profile, draft): answer `wake-register`, advertise
+    /// `wake` in the relay's `hello`, and ask a device's gateway to wake it when an invite is held for it.
+    #[arg(long)]
+    wake: bool,
+    /// A push gateway (its DID) devices may register through (repeatable). None given: any gateway (W§4.2).
+    #[arg(long, requires = "wake")]
+    wake_gateway: Vec<String>,
     /// Where log lines go: `auto` is journald under systemd, standard error elsewhere. `RUST_LOG` filters.
     #[arg(long, value_enum, default_value_t)]
     log: LogTo,
@@ -176,6 +183,29 @@ async fn main() -> Result<ExitCode> {
         Some(s) => tracing::info!("private relay: serving {} identities (§13.6)", s.len()),
         None => tracing::info!("open relay: serving every identity that binds (§13.6)"),
     }
+    let resolver = dsip_transport::resolver::build_resolver(&args.did_document, &[]).await?;
+    let wake = if args.wake {
+        // a gateway's document: the --did-document files, then (unless fetching is off) its did:web document
+        let held: Arc<dyn dsip_transport::DidResolver> = Arc::new(resolver.clone());
+        let docs: Arc<dyn dsip_transport::DidResolver> = if args.no_fetch_did_web {
+            held
+        } else {
+            let mut web = dsip_transport::DidWebResolver::new();
+            if let Some(ca) = &args.did_web_ca {
+                web = web.with_ca(&std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?)?;
+            }
+            Arc::new(dsip_transport::Chain(held, Arc::new(web)))
+        };
+        let mut client = dsip_transport::wake::WakeClient::new(docs);
+        if let Some(ca) = &args.did_web_ca {
+            client = client.with_ca(&std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?)?;
+        }
+        let gateways = (!args.wake_gateway.is_empty()).then(|| args.wake_gateway.clone());
+        tracing::info!("waking devices through {} (Wake Profile)", gateways.as_ref().map_or("any gateway".to_string(), |g| g.join(", ")));
+        Some(dsip_relay::wake::WakeConfig { client, gateways, store: Some(args.state.join("wake-registrations.json")) })
+    } else {
+        None
+    };
     let cfg = RelayConfig {
         intro_limit: args.intro_limit,
         intro_window: args.intro_window,
@@ -187,8 +217,8 @@ async fn main() -> Result<ExitCode> {
         offline_retention: args.offline_retention,
         did_web: dsip_transport::resolver::web_documents(!args.no_fetch_did_web, args.did_web_ttl, args.did_web_ca.as_deref())?,
         queue_store: Some(queue_store),
+        wake,
     };
-    let resolver = dsip_transport::resolver::build_resolver(&args.did_document, &[]).await?;
     let relay = RelayServer::new(key, resolver, cfg);
     relay.spawn_clock();
     if let Some(addr) = args.status_listen {

@@ -22,6 +22,7 @@ members = [
     "crates/dsip-broadcast",
     "crates/dsip-dht",
     "crates/dsip-relay",
+    "crates/dsip-push",
     "crates/dsip-cli",
     "crates/dsip-node",
     "crates/dsip-testkit",
@@ -63,6 +64,7 @@ dsip-messaging-device = { path = "crates/dsip-messaging-device" }
 dsip-mailbox = { path = "crates/dsip-mailbox" }
 dsip-broadcast = { path = "crates/dsip-broadcast" }
 dsip-relay = { path = "crates/dsip-relay" }
+dsip-push = { path = "crates/dsip-push" }
 dsip-testkit = { path = "crates/dsip-testkit" }
 dsip-phone = { path = "crates/dsip-phone" }
 dsip-messenger = { path = "crates/dsip-messenger" }
@@ -108,6 +110,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-journald = "0.3"
 libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "kad", "identify", "macros", "ed25519"] }
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [profile.release]

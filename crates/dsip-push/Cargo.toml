@@ -1,0 +1,39 @@
+[package]
+name = "dsip-push"
+description = "DSIP push gateway (Wake Profile, draft): enrolments, wakes, and their delivery through APNs and FCM"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "dsip-push"
+path = "src/main.rs"
+
+[dependencies]
+dsip-core.workspace = true
+dsip-wake.workspace = true
+dsip-transport = { workspace = true, features = ["cli"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+axum.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+rand.workspace = true
+ring.workspace = true
+reqwest = { workspace = true, features = ["http2"] }
+
+[dev-dependencies]
+dsip-relay.workspace = true
+dsip-endpoint.workspace = true
+dsip-session.workspace = true
+tokio-tungstenite.workspace = true

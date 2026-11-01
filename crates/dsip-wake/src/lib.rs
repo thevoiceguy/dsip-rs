@@ -290,6 +290,92 @@ pub fn open_hint(sealed: &Value, session: &str, secret: &[u8; 32]) -> Result<Val
     Ok(hint)
 }
 
+/// The `dsip` version block every message of this profile carries. Spec: W§2
+pub fn version() -> Value {
+    json!({"core": "1.0", "min_core": "1.0", "profiles": [PROFILE], "extensions": [], "critical": []})
+}
+
+fn message(msg_type: &str, from: &str, to: &str, now: i64, fields: Value) -> Value {
+    let mut p = json!({"dsip": version(), "type": msg_type, "id": dsip_core::ulid::Ulid::generate().as_str(), "from": from, "to": to});
+    if let Value::Object(f) = fields {
+        for (k, v) in f {
+            p[k] = v;
+        }
+    }
+    p["issued_at"] = json!(now);
+    p["expires_at"] = json!(now + 30);
+    p
+}
+
+/// A `wake-enrol` payload from the wake key `from` (its `did:key`) to `gateway`. Spec: W§3
+pub fn enrol_message(from: &str, gateway: &str, provider: &str, app: &str, token: &str, environment: Option<&str>, now: i64) -> Value {
+    let mut f = json!({"provider": provider, "app": app, "token": token});
+    if let Some(e) = environment {
+        f["environment"] = json!(e);
+    }
+    message("wake-enrol", from, gateway, now, f)
+}
+
+/// A `wake-accepted` payload answering `in_reply_to`, with the `handle` when it answers an enrolment. Spec: W§3,
+/// W§4.2, W§5.3
+pub fn accepted_message(from: &str, to: &str, in_reply_to: &str, handle: Option<&str>, now: i64) -> Value {
+    let mut f = json!({"in_reply_to": in_reply_to});
+    if let Some(h) = handle {
+        f["handle"] = json!(h);
+    }
+    message("wake-accepted", from, to, now, f)
+}
+
+/// A `WakeRegistration` credential payload: `waker` may ask `gateway` to wake `handle` until `expires_at`. Signed by
+/// the wake key `key`. Spec: W§4.1
+pub fn registration_payload(key: &str, waker: &str, gateway: &str, handle: &str, issued_at: i64, expires_at: i64) -> Value {
+    json!({"type": "WakeRegistration", "key": key, "waker": waker, "gateway": gateway, "handle": handle,
+           "issued_at": issued_at, "expires_at": expires_at})
+}
+
+/// A `wake-register` payload from `device` to `waker`, carrying a signed registration. Spec: W§4.2
+pub fn register_message(device: &str, waker: &str, registration: &Value, seal_key: Option<&[u8; 32]>, kinds: Option<&[&str]>, now: i64) -> Value {
+    let mut f = json!({"registration": registration});
+    if let Some(k) = seal_key {
+        f["seal_key"] = json!(b64::encode(k));
+    }
+    if let Some(k) = kinds {
+        f["kinds"] = json!(k);
+    }
+    message("wake-register", device, waker, now, f)
+}
+
+/// A `wake-register` payload ending `device`'s registration at `waker`. Spec: W§4.2
+pub fn remove_message(device: &str, waker: &str, now: i64) -> Value {
+    message("wake-register", device, waker, now, json!({"remove": true}))
+}
+
+/// The `wake` payload from `waker` to `gateway` for a [`Waker`]'s [`Emit::Wake`] (`None` for any other emission),
+/// with the sealed hint when there is one. Spec: W§5.2
+pub fn wake_message(waker: &str, gateway: &str, registration: &Value, emit: &Emit, sealed: Option<Value>, now: i64) -> Option<Value> {
+    let Emit::Wake { kind, session, deliver_by, .. } = emit else { return None };
+    let mut f = json!({"registration": registration, "kind": kind});
+    if let Some(s) = session {
+        f["session"] = json!(s);
+    }
+    if let Some(s) = sealed {
+        f["sealed"] = s;
+    }
+    f["deliver_by"] = json!(deliver_by);
+    Some(message("wake", waker, gateway, now, f))
+}
+
+/// The `DSIPWake` endpoint a gateway's DID document names: the first such service whose `serviceEndpoint` is an
+/// `https` URI.
+///
+/// Spec: W§2.
+pub fn wake_endpoint(doc: &dsip_core::did::DidDocument) -> Option<String> {
+    doc.service
+        .iter()
+        .filter(|s| s.service_type == "DSIPWake")
+        .find_map(|s| s.service_endpoint.as_str().filter(|u| u.starts_with("https://")).map(String::from))
+}
+
 /// What a [`Waker`] emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Emit {

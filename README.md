@@ -31,6 +31,7 @@ crates/
     dsip-mailbox           the mailbox and hub service (M§4), and dsip-msg, a console messaging client
     dsip-node              a deployable hints node: overlay, Mainline DHT (Pkarr), HTTP hints API
     dsip-gateway           SIP/PSTN gateway (Gateway Profile 1.0, G§); feature `host` for the B2BUA
+    dsip-push              the push gateway (Wake Profile, draft): enrolments, wakes, APNs and FCM
   Runtime and features
     dsip-transport         the tokio ws/1.0 binding (§13.2): connections, reconnects, the Agent
     dsip-media             native WebRTC media (forge-media or webrtc-rs)
