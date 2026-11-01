@@ -20,6 +20,7 @@ pub mod agent;
 pub mod config_file;
 pub mod conn;
 pub mod error;
+pub mod hints;
 pub mod identity;
 #[cfg(feature = "cli")]
 pub mod logging;

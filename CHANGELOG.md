@@ -32,6 +32,15 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   is installed disabled (it needs its DID, apps and credentials first; `install-credential` puts the APNs key or the
   FCM service account where the sandboxed service alone can read it), and the image `ghcr.io/thevoiceguy/dsip-push`, tested by
   `crates/dsip-push/packaging/test.sh` in CI and released with the others. It reads a `--config` file as the others do.
+- `dsip-transport`: `hints`, the hints tier for native clients over the hints nodes' HTTP API (DHT Hints Profile
+  §10). `HintsClient::lookup` returns the winning record of every node's (§8.3) and `publish` posts one;
+  `reachability` signs this device's hint (its relay, and for a `did:key` identity its mailbox, M§4.2), as the
+  browser client does.
+- `dsip-messenger`: `Messenger::discover_mailbox` finds another identity's mailbox in §8.1's order: the document files,
+  then its `did:web` document fetched (`with_did_web`), then for an identity with no document its hint
+  (`with_hints`), reused for 60 s. KeyPackage fetches and first contact use it, so a native client can message
+  `did:key` identities as the browser client does (`crates/dsip-mailbox/tests/discovery.rs`: two `did:key`
+  identities on two mailboxes, found through hints alone).
 - `dsip-transport`: `wake::WakeClient`, the HTTPS exchange with a gateway (its endpoint from its DID document, its
   signed answer verified), and `waker::Wakes`, a waker's registrations and the wakes it sends, shared by the relay
   and the mailbox.
