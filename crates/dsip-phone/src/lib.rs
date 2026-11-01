@@ -94,8 +94,9 @@ pub enum Outcome {
 }
 
 /// What the phone's task is asked to do.
+#[allow(clippy::large_enum_variant)] // a command is built once and consumed at once, as the agent's events are
 enum Cmd {
-    Place { to: String, invite: Invite, reply: oneshot::Sender<Result<Call>> },
+    Place { to: String, invite: Invite, via: Option<String>, reply: oneshot::Sender<Result<Call>> },
     Call(dsip_endpoint::CallCommand),
     HangUp(String),
     Close,
@@ -119,6 +120,8 @@ impl Line {
 /// A phone: one device bound to its relay.
 pub struct Phone {
     line: Line,
+    relay_url: String,
+    hints: Option<dsip_transport::hints::HintsClient>,
     incoming: Mutex<mpsc::UnboundedReceiver<IncomingCall>>,
     identity: String,
     device: String,
@@ -147,12 +150,29 @@ impl Phone {
     }
 
     /// Call `to` with what the host adds to the invite (claims, the PSTN number asked of a gateway).
+    ///
+    /// With [`PhoneBuilder::hints`], a callee that has no DID document (a `did:key`) is looked up on the hints tier
+    /// first (§8.1: discovery before the invite; a hint is used only for an identity with no document, rule 6): when
+    /// its hint names another relay, the call goes through that relay ([`Call::via`]).
     pub async fn call_with(&self, to: &str, invite: Invite) -> Result<Call> {
+        let via = self.relay_for(to).await;
         let (reply, answer) = oneshot::channel();
-        if !self.line.send(Cmd::Place { to: to.into(), invite, reply }) {
+        if !self.line.send(Cmd::Place { to: to.into(), invite, via, reply }) {
             return Err(Error::Closed);
         }
         answer.await.map_err(|_| Error::Closed)?
+    }
+
+    /// The relay a callee's hint names, when it is not ours (§8.1).
+    async fn relay_for(&self, to: &str) -> Option<String> {
+        let hints = self.hints.as_ref()?;
+        if !to.starts_with("did:key:") {
+            return None; // §8.1 rule 6: an identity with a document is reached as its document says, never by a hint
+        }
+        let hint = hints.lookup(to, &dsip_core::did::StaticResolver::default(), dsip_transport::now_s()).await?;
+        let relay = dsip_transport::hints::relay_of(&hint)?;
+        tracing::info!("hint for {to}: relay {relay}, seq {}, signed by {} (a hint, not authority, §8.1)", hint.seq, hint.signer);
+        (relay != self.relay_url).then_some(relay)
     }
 
     /// The next incoming call; `None` once the phone has closed.
@@ -181,6 +201,7 @@ pub struct PhoneBuilder {
     recording: Option<AcceptPolicy>,
     media: Media,
     configure: Option<Configure>,
+    hints: Option<dsip_transport::hints::HintsClient>,
 }
 
 /// An adjustment to the agent configuration ([`PhoneBuilder::configure`]).
@@ -229,6 +250,13 @@ impl PhoneBuilder {
         self
     }
 
+    /// Look callees up on these hints nodes before calling them: one bound to another relay is called through it
+    /// (§8.1, [`Phone::call_with`]).
+    pub fn hints(mut self, hints: dsip_transport::hints::HintsClient) -> PhoneBuilder {
+        self.hints = Some(hints);
+        self
+    }
+
     /// Adjust the agent configuration the builder made (timers, sealing, first contact) before it connects.
     pub fn configure(mut self, f: impl FnOnce(&mut AgentConfig) + Send + 'static) -> PhoneBuilder {
         self.configure = Some(Box::new(f));
@@ -243,6 +271,7 @@ impl PhoneBuilder {
             (None, Some(_)) => "wss://relay.invalid/dsip".into(),
             (None, None) => return Err(Error::Missing("relay")),
         };
+        let home = relay_url.clone();
         let has_media = !matches!(self.media, Media::None);
         let mut calls = dsip_endpoint::CallsConfig { media: has_media, answer: self.answer, ..Default::default() };
         if let Some(r) = self.recording {
@@ -261,6 +290,7 @@ impl PhoneBuilder {
             calls: Some(calls),
             dialer: self.dialer,
             presence: None,
+            peer_dialer: None,
         };
         if let Some(f) = self.configure {
             f(&mut cfg);
@@ -271,13 +301,14 @@ impl PhoneBuilder {
         let (incoming_tx, incoming) = mpsc::unbounded_channel();
         let line = Line { cmds, wake: agent.waker() };
         let task = tokio::spawn(run::Runner::new(agent, cmds_rx, line.clone(), incoming_tx, self.media).run());
-        Ok(Phone { line, incoming: Mutex::new(incoming), identity, device, task: Mutex::new(Some(task)) })
+        Ok(Phone { line, relay_url: home, hints: self.hints, incoming: Mutex::new(incoming), identity, device, task: Mutex::new(Some(task)) })
     }
 }
 
 /// A call, placed or taken.
 pub struct Call {
     session: String,
+    via: Option<String>,
     state: watch::Receiver<CallState>,
     error: Arc<std::sync::Mutex<Option<String>>>,
     heard: Arc<std::sync::atomic::AtomicBool>,
@@ -288,6 +319,11 @@ impl Call {
     /// The session id.
     pub fn session(&self) -> &str {
         &self.session
+    }
+
+    /// The relay the call goes through when it is not this phone's own: the one the callee's hint named (§8.1).
+    pub fn via(&self) -> Option<&str> {
+        self.via.as_deref()
     }
 
     /// Where the call is now.

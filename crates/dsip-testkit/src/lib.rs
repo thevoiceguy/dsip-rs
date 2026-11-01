@@ -24,6 +24,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod hints;
+pub use hints::hints_node;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,14 +38,16 @@ use dsip_core::keys::KeyPair;
 use dsip_endpoint::{AnswerPolicy, CallCommand, CallsConfig, Invite};
 use dsip_relay::{RelayConfig, RelayServer};
 use dsip_session::SessionState;
-use dsip_transport::agent::{Agent, AgentConfig, AgentEvent};
+use dsip_transport::agent::{Agent, AgentConfig, AgentEvent, PeerDialer};
 use dsip_transport::conn::{DialFuture, Dialer};
 use dsip_transport::identity::Identity;
 
 /// How long [`Device::expect`] waits before it fails the test.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The URL agents name their relay by; nothing resolves it, the [`Dialer`] supplies the stream.
+/// The URL agents name the first network's relay by; nothing resolves it, the [`Dialer`] supplies the stream. Every
+/// further [`Network`] in the process has its own ([`Network::url`]), so a test can route a call through another
+/// relay ([`Network::peers`]).
 pub const RELAY_URL: &str = "wss://relay.testkit.invalid/dsip";
 
 static NETWORKS: AtomicU64 = AtomicU64::new(0);
@@ -53,6 +58,7 @@ pub struct Network {
     clock: tokio::task::JoinHandle<()>,
     dir: PathBuf,
     names: AtomicU64,
+    url: String,
 }
 
 impl Network {
@@ -67,12 +73,24 @@ impl Network {
         let clock = relay.spawn_clock();
         let n = NETWORKS.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("dsip-testkit-{}-{n}", std::process::id()));
-        Network { relay, clock, dir, names: AtomicU64::new(0) }
+        let url = if n == 0 { RELAY_URL.to_string() } else { format!("wss://relay-{n}.testkit.invalid/dsip") };
+        Network { relay, clock, dir, names: AtomicU64::new(0), url }
     }
 
     /// The relay.
     pub fn relay(&self) -> &RelayServer {
         &self.relay
+    }
+
+    /// The URL agents name this relay by.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// A [`PeerDialer`] that reaches each of `nets`' relays by its [`Network::url`], for calls placed through another
+    /// relay ([`Agent::place_via`]).
+    pub fn peers(nets: &[&Network]) -> Arc<dyn PeerDialer> {
+        Arc::new(Peers(nets.iter().map(|n| (n.url.clone(), n.dialer())).collect()))
     }
 
     /// A [`Dialer`] to the relay: each dial is a fresh pipe and a fresh connection on the relay.
@@ -93,7 +111,7 @@ impl Network {
     /// An agent configuration that dials this relay, runs the call glue without media and rings incoming calls.
     pub fn config(&self) -> AgentConfig {
         AgentConfig {
-            relay_url: RELAY_URL.into(),
+            relay_url: self.url.clone(),
             tls: None,
             video: false,
             t_establish: None,
@@ -105,6 +123,7 @@ impl Network {
             calls: Some(CallsConfig { media: false, answer: AnswerPolicy::Ring, ..CallsConfig::default() }),
             dialer: Some(self.dialer()),
             presence: None,
+            peer_dialer: None,
         }
     }
 
@@ -155,6 +174,15 @@ impl Dialer for Pipe {
             let _ = relay.accept(theirs, &peer).await;
         });
         Box::pin(async move { Ok(Box::new(ours) as Box<dyn dsip_transport::conn::Io>) })
+    }
+}
+
+/// Several networks' relays by URL.
+struct Peers(Vec<(String, Arc<dyn Dialer>)>);
+
+impl PeerDialer for Peers {
+    fn dial(&self, url: &str) -> Option<DialFuture> {
+        self.0.iter().find(|(u, _)| u == url).map(|(_, d)| d.dial())
     }
 }
 

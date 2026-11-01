@@ -67,6 +67,7 @@ pub async fn run(f: Fork, mut stop: oneshot::Receiver<()>, mut paused: watch::Re
         did_resolver: None,
         calls: None,
         presence: None,
+        peer_dialer: None,
         dialer: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;

@@ -47,6 +47,7 @@ pub async fn run(identity: PathBuf, relay: String, ca: Option<PathBuf>, dir: Pat
         did_resolver: None,
         calls: None,
         presence: None,
+        peer_dialer: None,
         dialer: None,
     };
     let mut agent = Agent::connect(id, cfg, resolver).await?;

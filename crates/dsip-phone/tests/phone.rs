@@ -146,3 +146,36 @@ async fn two_phones_with_native_audio_hear_each_other() {
     .await;
     call.hang_up();
 }
+
+#[tokio::test]
+async fn a_did_key_bound_elsewhere_is_called_through_the_relay_its_hint_names() {
+    // §8.1: Bob has no document; his hint on the hints node names his relay, which is not Alice's
+    let (mine, theirs) = (Network::new(), Network::new());
+    let node = dsip_testkit::hints_node().await;
+    let hints = dsip_transport::hints::HintsClient::new(vec![node.clone()], None).unwrap();
+    let bob_id = theirs.identity("Bob");
+    let now = dsip_transport::now_s();
+    let endpoints = dsip_transport::hints::endpoints(Some(theirs.url()), None);
+    let hint = dsip_transport::hints::reachability(&bob_id.meta.identity, &bob_id.device, &bob_id.delegation, &endpoints, now, now, 3600);
+    hints.publish(&hint).await;
+    let bob = Phone::builder().identity(bob_id).relay(theirs.url()).dialer(theirs.dialer()).answer(AnswerPolicy::Ring).build().await.unwrap();
+
+    let peers = Network::peers(&[&mine, &theirs]);
+    let alice = Phone::builder()
+        .identity(mine.identity("Alice"))
+        .relay(mine.url())
+        .dialer(mine.dialer())
+        .hints(hints)
+        .configure(move |c| c.peer_dialer = Some(peers))
+        .build()
+        .await
+        .unwrap();
+    let mut call = alice.call(bob.identity()).await.unwrap();
+    assert_eq!(call.via(), Some(theirs.url()), "through Bob's relay, as his hint says");
+    let incoming = within("incoming call at Bob", bob.incoming()).await.unwrap();
+    assert_eq!(incoming.from, alice.identity());
+    let mut theirs_call = incoming.accept();
+    assert_eq!(within("answer", call.outcome()).await, Outcome::Answered { answered_by: "user".into() });
+    call.hang_up();
+    assert_eq!(within("bye at Bob", theirs_call.ended()).await, "user.hangup");
+}

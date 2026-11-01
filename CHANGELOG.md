@@ -7,6 +7,23 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+### Added
+
+- Calls through another relay (§8.1), as the browser client places them. `Agent::place_via(to, invite, relay)` binds
+  this device at the callee's relay, on one connection shared by every call through it, and sends the session's
+  envelopes over it; frames from every connection reach the one endpoint core. The connection closes once no call
+  uses it, and is not redialled if it drops. A relay that does not bind within 8 s leaves the call to our own.
+  `AgentConfig::peer_dialer` reaches other relays without `wss` (`dsip-testkit`: `Network::url`, `Network::peers`).
+  `Agent::route_of` and `Agent::peer_relays` say where calls go.
+- `dsip-phone`: `PhoneBuilder::hints` looks up a `did:key` callee's hint before the invite (§8.1 rule 6: never for an
+  identity with a document); when it names another relay, the call goes through it (`Call::via`).
+- `dsip-testkit`: `hints_node()`, a hints node's HTTP API in the test process; every network after the first has its
+  own relay URL.
+
+### Changed
+
+- `dsip_transport::agent::AgentConfig` gains `peer_dialer` (breaking for struct literals: add `peer_dialer: None`).
+
 ## [2026-11-03] — workspace release
 
 Waking a sleeping device (app plan stage A1), and native discovery through hints. DSIP spec: `poc-v1.0.3` (DSIP Core

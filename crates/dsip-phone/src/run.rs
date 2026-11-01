@@ -95,8 +95,17 @@ impl Runner {
 
     async fn command(&mut self, cmd: Cmd) -> Result<()> {
         match cmd {
-            Cmd::Place { to, invite, reply } => {
-                let placed = self.agent.place(&to, invite).await.map(|session| self.track(session, CallState::Calling));
+            Cmd::Place { to, invite, via, reply } => {
+                let placed = match &via {
+                    Some(relay) => self.agent.place_via(&to, invite, relay).await,
+                    None => self.agent.place(&to, invite).await,
+                };
+                let placed = placed.map(|session| {
+                    let via = self.agent.route_of(&session).map(String::from);
+                    let mut call = self.track(session, CallState::Calling);
+                    call.via = via;
+                    call
+                });
                 let _ = reply.send(placed.map_err(Into::into));
             }
             Cmd::Call(c) => {
@@ -126,7 +135,7 @@ impl Runner {
         let (tx, rx) = watch::channel(state);
         let (error, heard) = (std::sync::Arc::default(), std::sync::Arc::<std::sync::atomic::AtomicBool>::default());
         self.calls.insert(session.clone(), Track { state: tx, error: std::sync::Arc::clone(&error), heard: std::sync::Arc::clone(&heard) });
-        Call { session, state: rx, error, heard, line: self.line.clone() }
+        Call { session, via: None, state: rx, error, heard, line: self.line.clone() }
     }
 
     async fn observe(&mut self, events: Vec<AgentEvent>) -> Result<()> {
