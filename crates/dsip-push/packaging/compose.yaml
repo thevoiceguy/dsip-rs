@@ -1,0 +1,22 @@
+# One dsip-push on 8445 (TLS: a self-signed certificate in its volume until you mount a real one). Its signing key
+# seed, its handle key and its certificate live in the `dsip-push` volume. A did:web without a port is fetched from
+# 443: publish 443:8445, or put it behind a proxy that passes /wake and /.well-known/did.json through.
+services:
+  dsip-push:
+    image: ghcr.io/thevoiceguy/dsip-push:latest
+    restart: unless-stopped
+    ports:
+      - "8445:8445/tcp"
+    volumes:
+      - dsip-push:/var/lib/dsip-push
+      # the push credentials and a real certificate, readable by uid 65532
+      # - /srv/dsip-push/secrets:/secrets:ro
+      # - /srv/dsip-push/tls:/tls:ro
+    command: ["--did", "did:web:push.example.com", "--app", "fcm:example-project", "--record-to", "/var/lib/dsip-push/pushes.jsonl"]
+    # command: ["--did", "did:web:push.example.com", "--app", "fcm:example-project", "--fcm-service-account", "/secrets/fcm.json",
+    #           "--cert", "/tls/fullchain.pem", "--key", "/tls/privkey.pem"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+volumes:
+  dsip-push:

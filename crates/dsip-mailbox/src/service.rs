@@ -25,6 +25,11 @@
 //! fan-out payloads still queued, hub references, revocations and the seen-id window. A restarted hub re-sends the
 //! head of every unacknowledged fan-out queue at once, and after that any head left unacknowledged is re-sent with
 //! backoff; a member mailbox acknowledges a redelivery as a duplicate.
+//!
+//! Spec: W§4.2, W§4.4, W§5.1 (Wake Profile, draft: with [`MailboxConfig::wake`], `wake-register` is answered, `wake`
+//! is advertised, and an item stored for an identity wakes its registered devices that are not bound, `message`
+//! coalesced). Impl (spec-gap 176): `wake-register` is an owner operation (M§4.1): an identity this service does not
+//! serve enrols by it as by any other, or is refused `mailbox.not-served`.
 
 mod admin;
 mod status;
@@ -59,6 +64,7 @@ use dsip_mls::{digest, message_header, HubView};
 use dsip_transport::conn::{ConnectParams, Connection};
 use dsip_transport::resolver::{Over, WebDocuments};
 use dsip_transport::verify::SeenIds;
+use dsip_transport::waker::{Outgoing, WakeConfig, Wakes};
 use dsip_transport::{now_s, tls};
 
 /// The advertised `blob_endpoint` (M§4.3): the listen port on `host` (the first extra certificate host), else on the
@@ -182,6 +188,8 @@ struct Service {
     mls_retention: i64,
     /// Counters for the status page (`--status-listen`).
     stats: status::Stats,
+    /// Wake Profile (draft): registrations and the `message` wakes; `None` without [`MailboxConfig::wake`].
+    wakes: Option<Wakes>,
 }
 
 /// What goes out on a connection to a peer service.
@@ -472,6 +480,10 @@ impl Service {
                 }
             }
         }
+        let Service { wakes, key, .. } = self;
+        if let Some(w) = wakes.as_mut() {
+            w.settle(now, key); // W§4.3: registrations at their expires_at
+        }
     }
 
     /// Whether this service serves `identity`: configured, or enrolled (spec-gap 115).
@@ -550,6 +562,10 @@ impl Service {
             !owners.is_empty()
         });
         self.replicate_later.retain(|(owner, ..)| owner != identity);
+        let Service { wakes, key, .. } = self;
+        if let Some(w) = wakes.as_mut() {
+            w.forget_identity(identity, key, now_s()); // W§4.3: its devices are no longer registered devices (M§4.4)
+        }
         tracing::info!("released {identity} ({cause}): deleted its mailbox, {deleted} blob(s), closed {} binding(s)", devices.len());
         self.persist();
     }
@@ -799,13 +815,65 @@ impl Service {
                         let blobs = item.blobs.as_ref().and_then(Value::as_array).into_iter().flatten().cloned();
                         self.replicate.extend(blobs.map(|b| (owner.to_string(), b)));
                     }
+                    let class = item.class.clone();
                     if let Some(o) = self.owned.get_mut(owner) {
                         o.store.put(c, item.clone());
+                    }
+                    let Service { wakes, key, .. } = self;
+                    if let Some(w) = wakes.as_mut() {
+                        w.store(now_s(), owner, &class, key); // W§5.1: `message`, coalesced, never for `ephemeral`
                     }
                 }
                 return;
             }
         }
+    }
+}
+
+/// The kinds a mailbox sends. Spec: W§4.4, W§5.1
+const WAKE_KINDS: [&str; 1] = ["message"];
+
+/// The `type` a frame's payload claims, before it is verified (to choose the verification path).
+fn claimed_type(frame: &str) -> Option<String> {
+    Envelope::from_frame(frame).ok().and_then(|e| wire::payload_of(&e)).and_then(|p| p["type"].as_str().map(String::from))
+}
+
+impl Service {
+    /// A `wake-register` from bound `device` of `identity` (W§4.2): verified by stages 1–11 (the Messaging Profile's
+    /// message rules do not apply to it), then as an owner operation (M§4.1; spec-gap 176), then the profile's checks
+    /// by [`Wakes::register`]; answered `wake-accepted` or a signed `error`. Returns the frames for this connection.
+    fn wake_register(&mut self, frame: &str, device: &str, identity: &str, resolver: &Documents, now: i64) -> Vec<String> {
+        let verdict = {
+            let ctx = ctx_of(resolver, &self.seen, &self.supported, &self.revocations);
+            Envelope::from_frame(frame).and_then(|env| envelope::verify(&env, &ctx, Some(frame)))
+        };
+        let verified = match verdict {
+            Ok(v) => v,
+            Err(v) => {
+                let code = v.code.and_then(|c| serde_json::to_value(c).ok()).and_then(|c| c.as_str().map(String::from)).unwrap_or_default();
+                tracing::info!("refused wake-register from {device}: {code}");
+                let env = wire::error(&self.key, device, now, None, v.reason.unwrap_or("transport.routing-refused"), Some(&code));
+                return vec![env.frame()];
+            }
+        };
+        let p = &verified.payload;
+        let id = p["id"].as_str().unwrap_or("").to_string();
+        self.seen.insert(&id, now, now);
+        self.stats.frame_in("wake-register");
+        if verified.signer_did != device || p["to"] != self.key.did().as_str() {
+            let env = wire::error(&self.key, device, now, Some(&id), "transport.routing-refused", Some("wake-register is from the bound device to this mailbox"));
+            return vec![env.frame()];
+        }
+        if let Some(refused) = self.owner_op(identity, device, &id, now) {
+            return refused.into_iter().map(|o| match o { Out::Device(_, e) | Out::Identity(_, e) => e.frame() }).collect();
+        }
+        let did = self.key.did();
+        let Some(w) = self.wakes.as_mut() else { return vec![] };
+        let env = match w.register(p, device, identity, &did, now) {
+            Ok(()) => envelope::sign(&dsip_wake::accepted_message(&did, device, &id, None, now), &self.key, &self.key.kid()),
+            Err(reason) => wire::error(&self.key, device, now, Some(&id), reason, None),
+        };
+        vec![env.frame()]
     }
 }
 
@@ -900,6 +968,9 @@ pub struct MailboxConfig {
     pub drop_fanout_to: Option<String>,
     /// The advertised `https://…/blobs` (M§4.3; [`blob_endpoint`]).
     pub blob_endpoint: String,
+    /// Wake sleeping devices through their push gateways (Wake Profile, draft): `wake-register` is answered, the
+    /// service advertises `wake` in its `hello`, and an item stored for an identity wakes its devices. `None`: neither.
+    pub wake: Option<WakeConfig>,
 }
 
 impl MailboxConfig {
@@ -924,6 +995,7 @@ impl MailboxConfig {
             release_idle: false,
             drop_fanout_to: None,
             blob_endpoint,
+            wake: None,
         }
     }
 }
@@ -1001,6 +1073,8 @@ fn bad(what: &str, why: impl std::fmt::Display) -> Error {
 pub struct MailboxServer {
     service: Arc<Mutex<Service>>,
     did: String,
+    /// The wakes to send, taken by the sender task [`MailboxServer::spawn_tasks`] starts.
+    wake_rx: Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<Outgoing>>>>,
 }
 
 impl MailboxServer {
@@ -1071,7 +1145,13 @@ impl MailboxServer {
             release_idle: cfg.release_idle,
             mls_retention: cfg.mls_retention,
             stats: status::Stats::new(now_s()),
+            wakes: None,
         };
+        let wake_rx = cfg.wake.map(|w| {
+            let (w, rx) = Wakes::new(w, now_s());
+            st.wakes = Some(w);
+            rx
+        });
         std::fs::create_dir_all(cfg.state.join("blobs"))?;
         if st.restore()? {
             let items: usize = st.owned.values().map(|o| o.mailbox.snapshot()["items"].as_array().map_or(0, Vec::len)).sum();
@@ -1083,7 +1163,7 @@ impl MailboxServer {
                 st.ensure_owner(&id);
             }
         }
-        Ok(MailboxServer { service: Arc::new(Mutex::new(st)), did })
+        Ok(MailboxServer { service: Arc::new(Mutex::new(st)), did, wake_rx: Arc::new(std::sync::Mutex::new(wake_rx)) })
     }
 
     /// The service's DID: the `from` of its `hello`.
@@ -1092,8 +1172,27 @@ impl MailboxServer {
     }
 
     /// Run the service's clock: re-send unacknowledged fan-out (at once for what was queued before a restart),
-    /// release idle enrolments, and retry blob replication.
+    /// release idle enrolments, and retry blob replication. With [`MailboxConfig::wake`] it also starts sending wakes
+    /// to gateways, each on its own task (W§5.2).
     pub fn spawn_tasks(&self) -> tokio::task::JoinHandle<()> {
+        if let Some(mut rx) = self.wake_rx.lock().ok().and_then(|mut r| r.take()) {
+            let service = self.service.clone();
+            tokio::spawn(async move {
+                while let Some(out) = rx.recv().await {
+                    let Some(client) = service.lock().await.wakes.as_ref().map(|w| w.client.clone()) else { return };
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        if let Some(reason) = dsip_transport::waker::send(&client, &out).await {
+                            let mut st = service.lock().await;
+                            let Service { wakes, key, .. } = &mut *st;
+                            if let Some(w) = wakes.as_mut() {
+                                w.answered(&out.device, &reason, key, now_s()); // W§4.3
+                            }
+                        }
+                    });
+                }
+            });
+        }
         let service = self.service.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(RETRY_TICK_S));
@@ -1394,7 +1493,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(tls: http::Prefixed<S>, servic
         let (device, identity) = (inb.device().to_string(), inb.identity().to_string());
         let id = inb.payload()["id"].as_str().unwrap_or("").to_string();
         let hub = true;
-        let env = wire::service_hello(&st.key, &id, now_s(), wire::mailbox_capabilities(hub, &st.blob_endpoint, st.max_blob_bytes));
+        let mut caps = wire::mailbox_capabilities(hub, &st.blob_endpoint, st.max_blob_bytes);
+        if st.wakes.is_some() {
+            // W§4.4: the profile and the kinds this mailbox sends
+            caps["wake"] = json!({"profiles": [dsip_wake::PROFILE], "kinds": WAKE_KINDS});
+        }
+        let env = wire::service_hello(&st.key, &id, now_s(), caps);
         st.seen.insert(&id, now_s(), now_s());
         (device, identity, env)
     };
@@ -1418,6 +1522,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(tls: http::Prefixed<S>, servic
             // Every binding can be pushed to (its replies, and an enrolment later on this connection); only a served
             // identity's device is registered (M§4.4).
             st.bound.insert(device.clone(), tx.clone());
+            if let Some(w) = st.wakes.as_mut() {
+                w.bound(&device, true); // W§5.1: no wake while bound; the binding restarts the coalescing
+            }
             if st.serves(&identity) {
                 // M§4.4: a verified hello keeps the identity's device registered, and its enrolment alive (M§4.1)
                 st.enrolment.hello(&identity);
@@ -1477,6 +1584,8 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(tls: http::Prefixed<S>, servic
         if let Some(next) = st.standby.remove(&device).filter(|t| !t.is_closed()) {
             st.bound.insert(device.clone(), next);
             tracing::info!("bound {device} again on its later connection");
+        } else if let Some(w) = st.wakes.as_mut() {
+            w.bound(&device, false);
         }
     }
     result
@@ -1511,6 +1620,11 @@ async fn handle(service: &Arc<Mutex<Service>>, frame: String, sender: &str, boun
     let mut st = service.lock().await;
     st.catch_up(now);
     let resolver = st.resolver();
+    if st.wakes.is_some() && claimed_type(&frame).as_deref() == Some("wake-register") {
+        let replies = st.wake_register(&frame, sender, bound_identity, &resolver, now);
+        st.persist();
+        return replies;
+    }
     let inb = {
         let ctx = ctx_of(&resolver, &st.seen, &st.supported, &st.revocations);
         match verify_frame(&frame, &ctx) {
@@ -1791,6 +1905,12 @@ fn dispatch(
                 }
             }
             if !revoked_devices.is_empty() {
+                let Service { wakes, key, .. } = &mut *st;
+                if let Some(w) = wakes.as_mut() {
+                    for d in &revoked_devices {
+                        w.revoked(d, key, now); // W§4.3
+                    }
+                }
                 e["revoked_devices"] = json!(revoked_devices);
             }
             let emissions = st.mailbox_for(&identity).step(&json!({"config": e}));

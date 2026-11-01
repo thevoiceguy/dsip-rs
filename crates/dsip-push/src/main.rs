@@ -19,6 +19,10 @@ use tokio::net::TcpListener;
 #[derive(Parser, Debug)]
 #[command(name = "dsip-push", version)]
 struct Args {
+    /// TOML config file: each key is one of these flags in snake_case (`config.example.toml`); a flag given here
+    /// wins over the file.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// The gateway's DID, a did:web whose document this gateway serves (`did:web:push.example.com`).
     #[arg(long)]
     did: String,

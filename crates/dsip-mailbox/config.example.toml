@@ -23,6 +23,10 @@ state = "/var/lib/dsip-mailbox"                    # the service key, the self-s
 # did_web_ca = "/etc/dsip-mailbox/did-web-ca.pem"  # PEM roots trusted for did:web hosts, besides the public web PKI
 # hints_node = ["https://hints.example.com"]       # asked for the mailbox hint of a member with no DID document
 
+# --- waking devices (Wake Profile, draft)
+# wake = false                                     # true: answer wake-register, wake devices when items are stored
+# wake_gateway = ["did:web:push.dsip.example"]     # gateways devices may register through; unset: any
+
 # --- policy and limits (M§4.3, M§5.7, §19.4)
 # admit = "grant"                                  # or "open"
 # intro_limit = 5

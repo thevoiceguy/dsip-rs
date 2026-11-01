@@ -317,7 +317,7 @@ jobs:
         run: web/test/run.sh all
 
   packages:
-    name: "service packages build, install and run (dsip-node, dsip-relay, dsip-mailbox: static binaries, .debs under systemd, containers; one host)"
+    name: "service packages build, install and run (dsip-node, dsip-relay, dsip-mailbox, dsip-push: static binaries, .debs under systemd, containers; one host)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -337,10 +337,12 @@ jobs:
         run: bash crates/dsip-node/packaging/build.sh --image
       - name: test — the .deb under systemd, the image locked down; state survives restarts in both
         run: bash crates/dsip-node/packaging/test.sh
-      - name: build — dsip-relay and dsip-mailbox (musl x86_64 and aarch64, tarballs, .debs, images)
+      - name: build — dsip-relay, dsip-mailbox and dsip-push (musl x86_64 and aarch64, tarballs, .debs, images)
         run: bash packaging/build.sh --image
       - name: test — both .debs on one systemd host, the certificate hook, the images locked down; state survives restarts
         run: bash packaging/test.sh
+      - name: test — dsip-push's .deb installed disabled, configured under systemd with its credential, the image locked down
+        run: bash crates/dsip-push/packaging/test.sh
       # the one-host recipe serves the browser client: its tarball, built here as the wasm job builds it
       - name: install wasm-pack v0.15.0
         run: |

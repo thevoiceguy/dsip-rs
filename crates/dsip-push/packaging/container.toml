@@ -1,0 +1,8 @@
+# dsip-push in a container (the image's /etc/dsip-push/push.toml). Give the gateway its DID and apps as flags after
+# the image name (`--did did:web:push.example.com --app fcm:example-project`), or mount your own file over this one.
+# State lives in the /var/lib/dsip-push volume. Mount the push credentials read-only and name them
+# (`--fcm-service-account /secrets/fcm.json`); for a real certificate, mount it and set cert and key; after a renewal,
+# `docker kill -s HUP <container>` reloads it.
+listen = "0.0.0.0:8445"
+state = "/var/lib/dsip-push"
+log = "stderr"

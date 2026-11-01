@@ -14,6 +14,7 @@ dsip-schema.workspace = true
 dsip-session.workspace = true
 dsip-endpoint.workspace = true
 dsip-wake.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

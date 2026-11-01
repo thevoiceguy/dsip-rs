@@ -29,6 +29,7 @@ pub mod shutdown;
 pub mod status;
 pub mod tls;
 pub mod wake;
+pub mod waker;
 /// Inbound verification (re-exported from `dsip-endpoint`, where it is shared with the WASM build).
 pub use dsip_endpoint::verify;
 pub use dsip_endpoint::{calls, AnswerPolicy, CallCommand, CallEvent, CallsConfig, Command, Invite, InvitePatch, MediaRequest, MediaResult, PresenceSealing};

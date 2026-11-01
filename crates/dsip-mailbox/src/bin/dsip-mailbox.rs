@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -94,6 +95,14 @@ struct Args {
     /// `--serve-any` is freed. Configured `--owner` identities never expire.
     #[arg(long)]
     release_idle: bool,
+    /// Wake sleeping devices through their push gateways (Wake Profile, draft): answer `wake-register`, advertise
+    /// `wake` in the mailbox's `hello`, and ask a device's gateway to wake it when an item is stored for its identity
+    /// (`message`, at most one a minute per device). Registrations are kept in `<state>/wake-registrations.json`.
+    #[arg(long)]
+    wake: bool,
+    /// A gateway devices may register through (repeatable, W§4.2); unset: any.
+    #[arg(long, requires = "wake")]
+    wake_gateway: Vec<String>,
     /// Fault injection for demos: never deliver hub fan-out to this peer mailbox (a hub that dies before delivering).
     #[arg(long)]
     drop_fanout_to: Option<String>,
@@ -149,6 +158,26 @@ async fn main() -> Result<ExitCode> {
     cfg.mls_retention = args.mls_retention;
     cfg.release_idle = args.release_idle;
     cfg.drop_fanout_to = args.drop_fanout_to;
+    if args.wake {
+        // a gateway's document: the --resolver-file documents, then (unless fetching is off) its did:web document
+        let held: Arc<dyn dsip_transport::DidResolver> = Arc::new(dsip_transport::resolver::build_resolver(&cfg.resolver_files, &[]).await?);
+        let docs: Arc<dyn dsip_transport::DidResolver> = if args.no_fetch_did_web {
+            held
+        } else {
+            let mut web = dsip_transport::DidWebResolver::new();
+            if let Some(ca) = &args.did_web_ca {
+                web = web.with_ca(&std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?)?;
+            }
+            Arc::new(dsip_transport::Chain(held, Arc::new(web)))
+        };
+        let mut client = dsip_transport::wake::WakeClient::new(docs);
+        if let Some(ca) = &args.did_web_ca {
+            client = client.with_ca(&std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?)?;
+        }
+        let gateways = (!args.wake_gateway.is_empty()).then(|| args.wake_gateway.clone());
+        tracing::info!("waking devices through {} (Wake Profile)", gateways.as_ref().map_or("any gateway".to_string(), |g| g.join(", ")));
+        cfg.wake = Some(dsip_transport::waker::WakeConfig { client, gateways, store: Some(args.state.join("wake-registrations.json")) });
+    }
 
     // Bound before the state is reloaded: a connection waits in the backlog until the accept loop starts.
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("binding {}", args.listen))?;

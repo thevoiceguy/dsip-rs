@@ -32,6 +32,31 @@ rand.workspace = true
 ring.workspace = true
 reqwest = { workspace = true, features = ["http2"] }
 
+# The .deb (packaging/build.sh): the static binary, the hardened DynamicUser unit, the config as a conffile. The unit is
+# installed disabled: the gateway needs its DID, its apps and its push credentials first (packaging/config.toml).
+[package.metadata.deb]
+name = "dsip-push"
+maintainer = "DSIP PoC <thevoiceguy@users.noreply.github.com>"
+copyright = "the DSIP authors; MIT OR Apache-2.0"
+section = "net"
+priority = "optional"
+extended-description = """\
+A DSIP push gateway (Wake Profile, draft): an app's devices enrol their APNs or FCM token with it, and their relays \
+and mailboxes ask it to wake them for a call or a message. It keeps no table of devices: each handle it issues is \
+sealed under its own key."""
+depends = "procps"   # /bin/kill, for the unit's ExecReload (SIGHUP)
+conf-files = ["/etc/dsip-push/push.toml"]
+maintainer-scripts = "packaging/debian/"
+systemd-units = { unit-name = "dsip-push", enable = false, start = false, restart-after-upgrade = true }
+assets = [
+    ["target/release/dsip-push", "usr/bin/", "755"],
+    ["packaging/config.toml", "etc/dsip-push/push.toml", "644"],
+    ["../../packaging/install-certificate", "usr/libexec/dsip-push/install-certificate", "755"],
+    ["packaging/install-credential", "usr/libexec/dsip-push/install-credential", "755"],
+    ["config.example.toml", "usr/share/doc/dsip-push/config.example.toml", "644"],
+    ["packaging/compose.yaml", "usr/share/doc/dsip-push/compose.yaml", "644"],
+]
+
 [dev-dependencies]
 dsip-relay.workspace = true
 dsip-endpoint.workspace = true
