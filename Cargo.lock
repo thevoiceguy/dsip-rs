@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-endpoint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dsip-core",
  "dsip-recording",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-mailbox"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-messenger"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dsip-core",
  "dsip-messaging",
@@ -1636,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-relay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
