@@ -7,6 +7,14 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+### Added
+
+- `dsip-wake` 0.1.0: the rules of the Wake Profile (draft `wake/0.1`, spec-gaps 169–175), waking a sleeping device
+  through a push gateway (app plan stage A1). A waker's checks on a `wake-register` and its state (`Waker`: which
+  held invites and stored items wake which devices, and when a registration ends), the push gateway's checks on a
+  `wake-enrol` and a `wake` and the push it forwards, and the hint sealed to the device. Sans-I/O; the relay, the
+  mailbox and a `dsip-push` gateway come next. `dsip vectors run` runs the `wake/` vectors (2,475 in all).
+
 ## [2026-11-02] — workspace release
 
 The Device Events Profile becomes normative 1.0. DSIP spec: `poc-v1.0.2` (DSIP Core 1.0 with Device Events Profile

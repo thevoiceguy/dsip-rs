@@ -1,0 +1,13 @@
+[package]
+name = "dsip-wake"
+description = "DSIP Wake Profile (draft): enrolment at a push gateway, registrations, wakes, the sealed hint, a waker's state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsip-core.workspace = true
+serde_json.workspace = true
+jsonschema.workspace = true

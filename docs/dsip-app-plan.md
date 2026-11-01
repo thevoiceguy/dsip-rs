@@ -54,6 +54,9 @@ vectors first: a stage that needs protocol waits for its vectors, Python, impl-t
   phone; retries and expiry; what the relay does when the device does not bind in time (§12.10 T-Establish already
   ends the call). Delivered as a profile document, vectors, the three implementations, then the relay, the mailbox
   and a `dsip-push` gateway service packaged like the others.
+  *Status (2026-10-31):* the profile is DSIP's Wake Profile draft (`wake/0.1`, `W§n`; spec-gaps 169–175, all
+  decided as drafted), pinned by the `wake/` vectors on which the three implementations agree; its rules are the
+  `dsip-wake` crate. Next: the relay, the mailbox and `dsip-push`.
 - **A2. The running client (`dsip-app` crate).** The app as a long-lived thing, as Anvil's `anvil-app` is: it owns
   the identity, a `dsip-phone` and a `dsip-messenger`, keeps the state a screen shows (identity, devices, contacts and
   their grants, conversations, calls, presence, settings), and publishes every change on one stream. Commands go in;

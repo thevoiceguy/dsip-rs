@@ -261,7 +261,7 @@ The testkit has no mailbox yet. Messaging is tested by the demos, against `dsip-
 
 ## 8. Conformance
 
-dsip-rs is measured against the language-neutral test vectors in `spec/impl/vectors/`: 2,323 of them, run by the Rust
+dsip-rs is measured against the language-neutral test vectors in `spec/impl/vectors/`: 2,475 of them, run by the Rust
 runner here, and in DSIP by the Python harness and the independent TypeScript implementation, which must all agree. A change to the
 stack that changes behaviour shows up there first. If you build your own DSIP implementation, run the vectors
 (`spec/impl/vectors/README.md`). They are the contract, not this code.
