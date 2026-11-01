@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-phone"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dsip-core",
  "dsip-endpoint",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dsip-core",
  "dsip-endpoint",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "dsip-transport"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "clap",

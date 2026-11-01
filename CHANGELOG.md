@@ -7,6 +7,48 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+## [2026-11-04] — workspace release
+
+Native calls through another relay (app plan stage A2). DSIP spec: `poc-v1.0.3`, unchanged (DSIP Core 1.0 with the
+Wake Profile draft `wake/0.1`; 2,475 vectors, 0 failures).
+
+| Crate | Version |
+|---|---|
+| `dsip-broadcast` | 0.1.0 |
+| `dsip-cli` | 0.2.0 |
+| `dsip-core` | 0.1.0 |
+| `dsip-dht` | 0.1.0 |
+| `dsip-endpoint` | 0.2.0 |
+| `dsip-events` | 0.2.0 |
+| `dsip-gateway` | 0.1.0 |
+| `dsip-kt` | 0.1.0 |
+| `dsip-mailbox` | 0.4.0 |
+| `dsip-media` | 0.1.0 |
+| `dsip-messaging` | 0.3.0 |
+| `dsip-messaging-device` | 0.2.0 |
+| `dsip-messenger` | 0.2.0 |
+| `dsip-mls` | 0.1.0 |
+| `dsip-node` | 0.1.1 |
+| `dsip-number` | 0.1.0 |
+| `dsip-phone` | 0.2.0 (was 0.1.0) |
+| `dsip-push` | 0.1.0 |
+| `dsip-recording` | 0.1.0 |
+| `dsip-relay` | 0.3.0 |
+| `dsip-schema` | 0.1.0 |
+| `dsip-session` | 0.2.0 |
+| `dsip-testkit` | 0.2.0 (was 0.1.0) |
+| `dsip-transport` | 0.4.0 (was 0.3.0) |
+| `dsip-wake` | 0.1.0 |
+| `dsip-wasm` | 0.1.0 |
+| `dsip-webrtc-binding` | 0.1.0 |
+
+**Breaking changes** (API; no behaviour change for an agent that places no call through another relay):
+- `dsip_transport::agent::AgentConfig` gains a public field, `peer_dialer` (#27): a struct literal must add
+  `peer_dialer: None`.
+
+The services are unchanged: `dsip-relay` 0.3.0, `dsip-mailbox` 0.4.0, `dsip-push` 0.1.0, `dsip-node` 0.1.1 and
+`dsip-web` 0.1.1 are rebuilt from the same code.
+
 ### Added
 
 - Calls through another relay (§8.1), as the browser client places them. `Agent::place_via(to, invite, relay)` binds
@@ -19,10 +61,6 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   identity with a document); when it names another relay, the call goes through it (`Call::via`).
 - `dsip-testkit`: `hints_node()`, a hints node's HTTP API in the test process; every network after the first has its
   own relay URL.
-
-### Changed
-
-- `dsip_transport::agent::AgentConfig` gains `peer_dialer` (breaking for struct literals: add `peer_dialer: None`).
 
 ## [2026-11-03] — workspace release
 
