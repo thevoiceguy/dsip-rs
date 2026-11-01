@@ -1,0 +1,16 @@
+# dsip-push: a distroless image around the static (musl) binary. Build context: crates/dsip-push, with the binaries
+# staged at dist/<amd64|arm64>/dsip-push and the empty state directory at dist/state (packaging/build.sh). Nothing
+# is pulled from Docker Hub (crates/dsip-node/packaging/Containerfile says why).
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.title="dsip-push" \
+      org.opencontainers.image.description="DSIP push gateway (Wake Profile, draft): waking sleeping devices through APNs and FCM" \
+      org.opencontainers.image.source="https://github.com/thevoiceguy/dsip-rs" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+COPY --chmod=0755 dist/${TARGETARCH}/dsip-push /usr/bin/dsip-push
+COPY packaging/container.toml /etc/dsip-push/push.toml
+COPY --chown=65532:65532 --chmod=0700 dist/state /var/lib/dsip-push
+USER 65532:65532
+VOLUME ["/var/lib/dsip-push"]
+EXPOSE 8445/tcp
+ENTRYPOINT ["/usr/bin/dsip-push", "--config", "/etc/dsip-push/push.toml"]

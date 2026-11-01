@@ -1,0 +1,38 @@
+# dsip-push configuration: `dsip-push --config /etc/dsip-push/push.toml`.
+#
+# Each key is one of the gateway's flags in snake_case (`dsip-push --help` describes them all), and a flag given on the
+# command line wins over the file. A repeatable flag takes a list; a flag given on the command line replaces the
+# file's list. An unknown key is an error. Paths should be absolute. `did` and `app` are required; every other key
+# here is commented out at its default or at an example value.
+
+# --- who it is (W§2)
+did = "did:web:push.example.com"                   # it serves this DID's document, naming its DSIPWake endpoint
+# endpoint = "https://push.example.com/wake"       # default: https://<the DID's host>/wake
+# a did:web without a port is fetched from port 443: listen there (or behind a proxy that passes /wake and
+# /.well-known/did.json through)
+
+# --- listening and TLS
+# listen = "0.0.0.0:8445"
+# state = "/var/lib/dsip-push"                     # its signing key seed, its handle key, the self-signed certificate
+# cert = "/var/lib/dsip-push/tls/fullchain.pem"
+# key = "/var/lib/dsip-push/tls/privkey.pem"
+
+# --- the apps it pushes for, and their credentials (W§3, W§7)
+app = ["apns:com.example.dsip.voip", "fcm:example-project"]   # provider:app; an FCM app is its Firebase project id
+# apns_key = "/var/lib/dsip-push/credentials/apns-key.p8"   # AuthKey_XXXXXXXXXX.p8 (packaged: install-credential)
+# apns_key_id = "XXXXXXXXXX"
+# apns_team = "TEAMID1234"
+# fcm_service_account = "/var/lib/dsip-push/credentials/fcm.json"
+# record_to = "/var/lib/dsip-push/pushes.jsonl"    # deliver nothing, record each push (testing; not with the keys)
+
+# --- limits (W§5.3)
+# per_handle = 30                                  # wakes per handle per minute
+# per_waker = 3000                                 # wakes per waker per minute
+
+# --- verifying wakers (relays and mailboxes, §7.2)
+# did_document = ["/etc/dsip-push/docs/relay.example.com.json"]
+# no_fetch_did_web = false                         # true: never fetch did:web documents, only the files above verify
+# did_web_ca = "/etc/dsip-push/did-web-ca.pem"     # PEM roots trusted for did:web hosts, besides the public web PKI
+
+# --- operating
+# log = "auto"                                     # auto (journald under systemd, else stderr), journald, stderr

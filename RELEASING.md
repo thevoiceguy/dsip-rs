@@ -63,19 +63,20 @@ only, so a bump never edits dependents' manifests.
 7. The tag runs the release workflow (`.github/workflows/release.yml`, about 45 minutes). It refuses a tag that is
    not annotated, a tag without its changelog section, and a `spec/` that is not exactly on a DSIP tag. It then:
    - builds every service's packages and the browser client, and runs the packaging tests CI runs
-     (`crates/dsip-node/packaging/test.sh`, `packaging/test.sh`, `packaging/one-host/test.sh`);
+     (`crates/dsip-node/packaging/test.sh`, `packaging/test.sh`, `crates/dsip-push/packaging/test.sh`,
+     `packaging/one-host/test.sh`);
    - creates the GitHub release, its notes from `packaging/release-assets.sh`: the section's opening (spec tag,
      versions, breaking changes), the packages and images, how to verify them, the pinning snippet;
    - attaches each service's static-binary tarballs and `.deb`s for amd64 and arm64, `dsip-web-<v>.tar.gz`,
      `dsip-one-host-<release>.tar.gz` (`configure`, the compose directory pinned to this release's images, the guide)
      and one `SHA256SUMS`, each with a build-provenance attestation;
-   - pushes `ghcr.io/thevoiceguy/dsip-relay`, `dsip-mailbox` and `dsip-node` for linux/amd64 and linux/arm64, tagged
+   - pushes `ghcr.io/thevoiceguy/dsip-relay`, `dsip-mailbox`, `dsip-push` and `dsip-node` for linux/amd64 and linux/arm64, tagged
      `YYYY.MM.DD` and `latest`, signs each with cosign (keyless, the workflow's identity) and attests it.
 
    A release made by hand before the tag's run keeps its notes, and the files are added to it. A pull request that
    changes the workflow or `packaging/release-assets.sh`, or a manual run (Actions → release → Run workflow), is a dry
    run: everything but publishing, the files kept as the run's artifact.
-8. The first time an image is pushed, GitHub creates its package as private: make each of the three public
+8. The first time an image is pushed, GitHub creates its package as private: make each of them public
    (github.com/thevoiceguy?tab=packages → the package → Package settings → Change visibility).
 
 ## Verifying a release

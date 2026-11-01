@@ -5,7 +5,7 @@ name: release
 #   - the GitHub release, its notes from the tag's CHANGELOG section (packaging/release-assets.sh), with every
 #     service's static binaries (tarballs) and .debs for amd64 and arm64, the dsip-web tarball, the one-host recipe and
 #     one SHA256SUMS, each file with a build-provenance attestation;
-#   - the images ghcr.io/<owner>/dsip-relay, dsip-mailbox and dsip-node, linux/amd64 and linux/arm64, tagged with the
+#   - the images ghcr.io/<owner>/dsip-relay, dsip-mailbox, dsip-push and dsip-node, linux/amd64 and linux/arm64, tagged with the
 #     release (2026.11.02) and latest, each signed (cosign, keyless) and attested.
 # Run by hand, or on a pull request that changes the release itself, it is a dry run: everything but the publishing,
 # the assets kept as the run's artifact.
@@ -72,11 +72,13 @@ jobs:
       - name: build — every service (musl x86_64 and aarch64, tarballs, .debs, this machine's images) and dsip-web
         run: |
           bash crates/dsip-node/packaging/build.sh --image
-          bash packaging/build.sh --image dsip-relay dsip-mailbox dsip-web
+          bash packaging/build.sh --image dsip-relay dsip-mailbox dsip-push dsip-web
       - name: test — dsip-node's package and image
         run: bash crates/dsip-node/packaging/test.sh
       - name: test — dsip-relay's and dsip-mailbox's packages and images
         run: bash packaging/test.sh
+      - name: test — dsip-push's package and image
+        run: bash crates/dsip-push/packaging/test.sh
       - name: test — one host, one name, the .debs and the compose
         run: bash packaging/one-host/test.sh
       - name: the release's files and notes
@@ -91,7 +93,7 @@ jobs:
         id: images
         run: |
           owner=${GITHUB_REPOSITORY_OWNER,,}
-          for svc in dsip-relay dsip-mailbox dsip-node; do
+          for svc in dsip-relay dsip-mailbox dsip-push dsip-node; do
             image=ghcr.io/$owner/$svc
             out=()
             if [ -n "${PUBLISH:-}" ]; then out=(--push -t "$image:$VERSION" -t "$image:latest"); fi
@@ -117,6 +119,9 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         if: env.PUBLISH
         with: { subject-name: "ghcr.io/${{ github.repository_owner }}/dsip-node", subject-digest: "${{ steps.images.outputs.node }}", push-to-registry: true }
+      - uses: actions/attest-build-provenance@v2
+        if: env.PUBLISH
+        with: { subject-name: "ghcr.io/${{ github.repository_owner }}/dsip-push", subject-digest: "${{ steps.images.outputs.push }}", push-to-registry: true }
       - uses: actions/attest-build-provenance@v2
         if: env.PUBLISH
         with:

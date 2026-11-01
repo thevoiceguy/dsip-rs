@@ -11,6 +11,7 @@ __pycache__/
 crates/dsip-node/dist/
 crates/dsip-relay/dist/
 crates/dsip-mailbox/dist/
+crates/dsip-push/dist/
 web/dist/
 # Browser client
 web/pkg/

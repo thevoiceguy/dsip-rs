@@ -18,6 +18,7 @@ dsip-messaging-device = { workspace = true, features = ["sqlite"] }
 dsip-messenger.workspace = true
 dsip-mls = { workspace = true, features = ["sqlite"] }
 dsip-transport = { workspace = true, features = ["cli"] }
+dsip-wake.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -40,6 +41,10 @@ reqwest.workspace = true
 rand.workspace = true
 rusqlite = "0.37"
 openmls = "0.9.0"
+
+[dev-dependencies]
+# a push gateway with a recording provider, for tests/wake.rs
+dsip-push.workspace = true
 
 [features]
 # The packages' static (musl) binaries: SQLite and OpenSSL compiled in, not linked from the system

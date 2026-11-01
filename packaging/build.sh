@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build the service packages into crates/<service>/dist/, for dsip-relay and dsip-mailbox (or those named):
+# Build the service packages into crates/<service>/dist/, for dsip-relay, dsip-mailbox and dsip-push (or those named):
 #   static binaries (musl; x86_64 and aarch64) and their .tar.gz, the .deb for each, SHA256SUMS, and (with --image)
 #   the container image for this machine's architecture, loaded into the local Docker as <service>:<version> and
 #   <service>:dev. Named dsip-web, the browser client as web/dist/dsip-web-<version>.tar.gz, what the relay serves
 #   with --www (web/build.sh first, if web/pkg is not built).
-#   packaging/build.sh [--image] [dsip-relay] [dsip-mailbox] [dsip-web]
+#   packaging/build.sh [--image] [dsip-relay] [dsip-mailbox] [dsip-push] [dsip-web]
 # Needs: the musl targets (`rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`), cargo-zigbuild
 # with zig (`pip install ziglang`), cargo-deb, Docker for --image, wasm-pack for dsip-web. dsip-node builds with its own
 # crates/dsip-node/packaging/build.sh.
@@ -18,11 +18,11 @@ for a in "$@"; do
   case $a in
     --image) IMAGE=1 ;;
     dsip-web) WEB=1 ;;
-    dsip-relay|dsip-mailbox) SERVICES+=("$a") ;;
-    *) echo "usage: $0 [--image] [dsip-relay] [dsip-mailbox] [dsip-web]"; exit 2 ;;
+    dsip-relay|dsip-mailbox|dsip-push) SERVICES+=("$a") ;;
+    *) echo "usage: $0 [--image] [dsip-relay] [dsip-mailbox] [dsip-push] [dsip-web]"; exit 2 ;;
   esac
 done
-[ ${#SERVICES[@]} -gt 0 ] || [ -n "$WEB" ] || SERVICES=(dsip-relay dsip-mailbox)
+[ ${#SERVICES[@]} -gt 0 ] || [ -n "$WEB" ] || SERVICES=(dsip-relay dsip-mailbox dsip-push)
 # The runner's CMake 4 refuses projects declaring cmake_minimum_required < 3.5 (aws-lc-sys's build, vendored C)
 export CMAKE_POLICY_VERSION_MINIMUM=${CMAKE_POLICY_VERSION_MINIMUM:-3.5}
 version() {

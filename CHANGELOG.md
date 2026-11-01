@@ -23,8 +23,18 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   `wake` in its `hello`, keeps registrations across a restart, and when it holds an invite for a registered device
   that is not bound, it sends the device's gateway a `call` wake, with the caller sealed to the device, then
   `call-ended` if the invite is cancelled or expires before the device binds.
+- `dsip-mailbox`: `--wake` (and `--wake-gateway`) makes the mailbox a waker too. It answers `wake-register` (an owner
+  operation, so an identity it does not serve enrols by it or is refused `mailbox.not-served`; spec-gap 176),
+  advertises `wake` with the kind `message`, and when it stores an item for an identity it wakes that identity's
+  registered devices that are not bound, at most once a minute each (never for an `ephemeral` deposit). Revoking a
+  device's delegation, or releasing the identity, ends its registration.
+- `dsip-push` is packaged like the other services: static binaries for amd64 and arm64, a `.deb` whose hardened unit
+  is installed disabled (it needs its DID, apps and credentials first; `install-credential` puts the APNs key or the
+  FCM service account where the sandboxed service alone can read it), and the image `ghcr.io/thevoiceguy/dsip-push`, tested by
+  `crates/dsip-push/packaging/test.sh` in CI and released with the others. It reads a `--config` file as the others do.
 - `dsip-transport`: `wake::WakeClient`, the HTTPS exchange with a gateway (its endpoint from its DID document, its
-  signed answer verified).
+  signed answer verified), and `waker::Wakes`, a waker's registrations and the wakes it sends, shared by the relay
+  and the mailbox.
 - `dsip-endpoint`: `verify::verify_profile_frame`, the envelope pipeline for a companion profile's message types.
 
 ## [2026-11-02] — workspace release

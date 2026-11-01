@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Gather a workspace release's service artifacts into dist/release/ (after the packages are built: packaging/build.sh
-# dsip-relay dsip-mailbox dsip-web and crates/dsip-node/packaging/build.sh), with one SHA256SUMS over all of them and
+# dsip-relay dsip-mailbox dsip-push dsip-web and crates/dsip-node/packaging/build.sh), with one SHA256SUMS over all of them and
 # the release notes, notes.md: the changelog section's opening (spec tag, crate versions, breaking changes), the
 # packages and images, how to verify them, and the pinning snippet.
 #   packaging/release-assets.sh <tag>     e.g. v2026.11.02, whose section is "## [2026-11-02]"
@@ -22,7 +22,7 @@ OUT=dist/release; rm -rf "$OUT"; mkdir -p "$OUT"
 die() { echo "release-assets: $*" >&2; exit 1; }
 
 # every service's tarballs and .debs, both architectures, and the client
-for svc in dsip-relay dsip-mailbox dsip-node; do
+for svc in dsip-relay dsip-mailbox dsip-push dsip-node; do
   n=$(ls crates/$svc/dist/*.tar.gz crates/$svc/dist/*.deb 2>/dev/null | wc -l)
   [ "$n" = 4 ] || die "crates/$svc/dist has $n of its 4 tarballs and .debs (amd64, arm64): build them first"
   cp crates/$svc/dist/*.tar.gz crates/$svc/dist/*.deb "$OUT/"
@@ -50,12 +50,14 @@ SPEC=$(git -C spec describe --tags 2>/dev/null || echo "see spec/")
   echo
   echo "## Service packages"
   echo
-  echo "Built and tested together at this tag (packaging/test.sh, packaging/one-host/test.sh). The"
-  echo "[one-host guide](https://github.com/$OWNER/dsip-rs/blob/$TAG/docs/one-host.md) runs all three on one name."
+  echo "Built and tested together at this tag (packaging/test.sh, crates/dsip-push/packaging/test.sh,"
+  echo "packaging/one-host/test.sh). The"
+  echo "[one-host guide](https://github.com/$OWNER/dsip-rs/blob/$TAG/docs/one-host.md) runs the relay, the mailbox and"
+  echo "the hints node on one name."
   echo
   echo "| | Packages (amd64, arm64) | Image (linux/amd64, linux/arm64) |"
   echo "|---|---|---|"
-  for svc in dsip-relay dsip-mailbox dsip-node; do
+  for svc in dsip-relay dsip-mailbox dsip-push dsip-node; do
     echo "| $svc | \`$(cd "$OUT" && ls ${svc}_*_amd64.deb)\`, \`$(cd "$OUT" && ls $svc-*-linux-amd64.tar.gz)\` (and arm64) | \`ghcr.io/$OWNER/$svc:$VERSION\` |"
   done
   echo "| browser client | \`$(basename "$WEB")\`, for the relay's \`www\` | |"
