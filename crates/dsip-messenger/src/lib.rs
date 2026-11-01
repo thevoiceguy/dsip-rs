@@ -15,6 +15,10 @@
 //! whose hub is gone, retried with backoff), M§8.4 (blob fetch, verification, retries; spec-gap 106), §13.2
 //! (reconnect with exponential backoff and full jitter: 1 s, ×2, 60 s).
 //!
+//! M§4.2 discovery of another identity's mailbox, in §8.1's order: the DID document files, then the identity's
+//! `did:web` document fetched ([`Messenger::with_did_web`]), then, for an identity with no document, its reachability
+//! hint on the hints nodes ([`Messenger::with_hints`]); a hint is reused for [`HINT_REUSE_S`] at most.
+//!
 //! Impl: the state is written under the engine's keys (`messenger`, and `resume`, which the item transactions write
 //! too, spec-gap 44) and one key of the host's ([`Config::host_key`]): the blob fetches still to retry, beside what
 //! the host adds ([`Host::saved`]).
@@ -49,6 +53,9 @@ pub use error::{Error, Result};
 pub const REQUEST_TIMEOUT_S: u64 = 20;
 /// Seconds [`Messenger::settle`] waits at most.
 pub const SETTLE_S: u64 = 60;
+/// Seconds a mailbox found through a hint is used before the hint is looked up again: an identity that moves publishes
+/// a newer hint (§8.3), and what is sent to it follows soon after (as the mailbox service does).
+pub const HINT_REUSE_S: i64 = 60;
 
 /// Who the device is and where its mailbox is.
 pub struct Config {
@@ -210,6 +217,12 @@ pub struct Messenger<S: Store> {
     /// Blob fetches to try again (spec-gap 106): `{object, blobs, sender, attempt, next_at}`, persisted.
     pending_blobs: Vec<Value>,
     http: reqwest::Client,
+    /// `did:web` documents fetched for discovery (§7.2), after the files.
+    web: Option<Arc<dsip_transport::resolver::WebDocuments>>,
+    /// The hints tier, for identities with no document (M§4.2, §8.1 rule 6).
+    hints: Option<dsip_transport::hints::HintsClient>,
+    /// Mailboxes found through hints: `(DID, URI, reuse until)`.
+    hinted: HashMap<String, (String, String, i64)>,
 }
 
 /// The documents in `files` (each a DID document as JSON; unreadable ones are skipped).
@@ -313,9 +326,61 @@ impl<S: Store> Messenger<S> {
         let tls = dsip_transport::tls::client_config(cfg.ca.as_deref())?;
         let http = http_client(cfg.ca.as_deref())?;
         let mut mx = Messenger { m: engine, cfg, tls, conn: None, held_offline: false, reconnect_at: None, reconnect_ceiling: 1,
-                                 seen: SeenIds::default(), replies: HashMap::new(), jobs: vec![], pending_blobs, http };
+                                 seen: SeenIds::default(), replies: HashMap::new(), jobs: vec![], pending_blobs, http,
+                                 web: None, hints: None, hinted: HashMap::new() };
         mx.refresh_docs();
         Ok(mx)
+    }
+
+    /// Fetch the `did:web` documents of identities the files do not hold, to find their mailboxes (M§4.2, §7.2).
+    pub fn with_did_web(mut self, web: Arc<dsip_transport::resolver::WebDocuments>) -> Messenger<S> {
+        self.web = Some(web);
+        self
+    }
+
+    /// Look up the reachability hint of an identity with no document on these hints nodes (M§4.2, §8.1 rule 6).
+    pub fn with_hints(mut self, hints: dsip_transport::hints::HintsClient) -> Messenger<S> {
+        self.hints = Some(hints);
+        self
+    }
+
+    /// The mailbox of `identity`, `(DID, URI)` (M§4.2): from its DID document (the files, then fetched when it is a
+    /// `did:web`), else from its hint; a document's entries are never passed over for a hint (§8.1 rule 6).
+    pub async fn discover_mailbox(&mut self, identity: &str) -> Result<(String, String)> {
+        let files = resolver(&self.cfg.resolver_files);
+        let mut doc = dsip_core::did::Resolver::resolve(&files, identity);
+        if doc.is_none() && identity.starts_with("did:web:") {
+            if let Some(web) = &self.web {
+                web.fetch(&[identity.to_string()]).await;
+                doc = web.held(identity);
+                if let Some(d) = &doc {
+                    self.m.add_document(d.clone()); // §7.4: its delegations verify against it
+                }
+            }
+        }
+        if let Some(d) = doc {
+            let mut r = StaticResolver::default();
+            r.insert(d);
+            return mailbox_of(identity, &r);
+        }
+        let now = now_s();
+        if let Some((did, uri, until)) = self.hinted.get(identity) {
+            if *until > now {
+                return Ok((did.clone(), uri.clone()));
+            }
+        }
+        let hints = self.hints.as_ref().ok_or_else(|| Error::NoMailbox(format!("no document for {identity}, and no hints nodes")))?;
+        let hint = hints.lookup(identity, &files, now).await.ok_or_else(|| {
+            Error::NoMailbox(format!("no document for {identity}, and no verified hint on {} node(s)", hints.nodes().len()))
+        })?;
+        let entries = dsip_transport::hints::mailbox_entries(&hint);
+        let choice = dsip_messaging::client::select_mailbox(&json!({"hint_entries": entries}));
+        let did = choice["selected"].as_str().ok_or_else(|| Error::NoMailbox(format!("{identity}'s hint names no usable mailbox: {choice}")))?.to_string();
+        let uri = entries.iter().find(|e| e["mailbox"] == json!(did)).and_then(|e| e["uri"].as_str())
+            .ok_or_else(|| Error::NoMailbox(format!("{identity}'s hinted mailbox has no uri")))?
+            .to_string();
+        self.hinted.insert(identity.to_string(), (did.clone(), uri.clone(), hint.expires_at.min(now + HINT_REUSE_S)));
+        Ok((did, uri))
     }
 
     /// The engine.
@@ -663,8 +728,8 @@ impl<S: Store> Messenger<S> {
 
     /// A short-lived connection to another identity's mailbox (M§5.5 fetch, M§14.1 first contact).
     pub async fn peer_connect(&mut self, identity: &str) -> Result<Connection> {
+        let (did, uri) = self.discover_mailbox(identity).await?;
         let r = resolver(&self.cfg.resolver_files);
-        let (did, uri) = mailbox_of(identity, &r)?;
         let params = ConnectParams {
             url: uri,
             tls: self.tls.clone(),

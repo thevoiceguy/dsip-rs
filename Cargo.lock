@@ -1702,6 +1702,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "dsip-core",
+ "dsip-dht",
  "dsip-endpoint",
  "dsip-schema",
  "dsip-session",

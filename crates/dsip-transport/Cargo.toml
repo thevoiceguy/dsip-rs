@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 base64.workspace = true
 dsip-core.workspace = true
+# the hint records alone (no overlay node): the hints tier's client (`hints`)
+dsip-dht = { workspace = true, default-features = false }
 dsip-schema.workspace = true
 dsip-session.workspace = true
 dsip-endpoint.workspace = true
