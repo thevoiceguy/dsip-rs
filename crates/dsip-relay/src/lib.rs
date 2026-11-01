@@ -14,7 +14,8 @@
 //! §19.4 (introductions: mandatory per-sender and per-inbox rate limits; unknown
 //! and offline recipients treated identically — Impl, spec-gap 14), §13.6
 //! (service scope: open by default, private with [`RelayConfig::served`] — spec-gap 100), Presence Profile P§3 (a served
-//! device's `presence` record goes to this relay's authority, and notify bodies carry the signed record).
+//! device's `presence` record goes to this relay's authority, and notify bodies carry the signed record), Wake Profile
+//! W§4–W§6 (draft: with [`RelayConfig::wake`], `wake-register` and the wakes for held invites — [`wake`]).
 //!
 //! Envelopes are forwarded as the exact text frames received (§10.2: the
 //! signature covers the bytes; a relay never re-serializes).
@@ -53,6 +54,7 @@ mod status;
 /// The admin commands the status port answers (`dsip-relay admin …`: `bindings`).
 pub use status::ADMIN_COMMANDS;
 pub mod store;
+pub mod wake;
 pub mod www;
 
 pub use error::{Error, Result};
@@ -86,6 +88,9 @@ pub struct RelayConfig {
     /// Keep the store-and-forward queue, and the recipients the relay knows, on disk, so a restarted relay delivers
     /// what it held (§13.3). `None`: in memory only, lost on a restart.
     pub queue_store: Option<Arc<store::QueueStore>>,
+    /// Wake sleeping devices through their push gateways (Wake Profile, draft): `wake-register` is answered and the
+    /// relay advertises `wake` in its `hello`. `None`: neither.
+    pub wake: Option<wake::WakeConfig>,
 }
 
 impl Default for RelayConfig {
@@ -101,6 +106,7 @@ impl Default for RelayConfig {
             offline_retention: 86_400,
             did_web: None,
             queue_store: None,
+            wake: None,
         }
     }
 }
@@ -110,6 +116,8 @@ impl Default for RelayConfig {
 pub struct RelayServer {
     state: Arc<Mutex<State>>,
     did: String,
+    /// The wakes to send, taken by the sender task [`RelayServer::spawn_clock`] starts.
+    wake_rx: Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<wake::Outgoing>>>>,
 }
 
 impl RelayServer {
@@ -135,7 +143,15 @@ impl RelayServer {
                 Err(e) => tracing::warn!("{e}: starting with an empty queue"),
             }
         }
+        let (wakes, wake_rx) = match cfg.wake {
+            Some(w) => {
+                let (w, rx) = wake::Wakes::new(w, now_s());
+                (Some(w), Some(rx))
+            }
+            None => (None, None),
+        };
         let state = State {
+            wakes,
             key,
             supported: Supported::all_known(),
             resolver,
@@ -164,7 +180,7 @@ impl RelayServer {
             revocations: vec![],
             stats: status::Stats::new(now_s()),
         };
-        RelayServer { state: Arc::new(Mutex::new(state)), did }
+        RelayServer { state: Arc::new(Mutex::new(state)), did, wake_rx: Arc::new(std::sync::Mutex::new(wake_rx)) }
     }
 
     /// The relay's DID: the `from` of its `hello` and the address of what it is the authority for.
@@ -174,7 +190,26 @@ impl RelayServer {
 
     /// Run the relay's clock once a second, without traffic too: a leg that never answered expires with its invite
     /// and the initiator is told `transport.no-response` within a second of it (§12.7 rule 6, spec-gap 132).
+    /// With [`RelayConfig::wake`] it also starts sending wakes to gateways, each on its own task (W§5.2).
     pub fn spawn_clock(&self) -> tokio::task::JoinHandle<()> {
+        if let Some(mut rx) = self.wake_rx.lock().ok().and_then(|mut r| r.take()) {
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                while let Some(out) = rx.recv().await {
+                    let Some(client) = state.lock().await.wakes.as_ref().map(|w| w.client.clone()) else { return };
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        if let Some(reason) = wake::send(&client, &out).await {
+                            let mut st = state.lock().await;
+                            let State { wakes, key, .. } = &mut *st;
+                            if let Some(w) = wakes.as_mut() {
+                                w.answered(&out.device, &reason, key, now_s());
+                            }
+                        }
+                    });
+                }
+            });
+        }
         let state = self.state.clone();
         tokio::spawn(async move {
             let mut every = tokio::time::interval(Duration::from_secs(1));
@@ -232,6 +267,8 @@ impl RelayServer {
 type Tx = mpsc::UnboundedSender<String>;
 
 struct State {
+    /// Wake Profile (draft): registrations and the wakes for held invites; `None` without [`RelayConfig::wake`].
+    wakes: Option<wake::Wakes>,
     key: KeyPair,
     supported: Supported,
     resolver: StaticResolver,
@@ -436,6 +473,10 @@ impl State {
         if self.devices.remove(&revoked).is_some() {
             tracing::info!("closed the binding of revoked device {revoked}");
         }
+        let State { wakes, key, .. } = self;
+        if let Some(w) = wakes.as_mut() {
+            w.revoked(&revoked, key, now_s()); // W§4.3
+        }
     }
 
     /// Bytes of the envelopes currently queued for offline recipients (their frames are held in `frames`).
@@ -498,6 +539,10 @@ impl State {
         // P§3, §22.1: presence records past expires_at or their unbind grace, and lapsed subscriptions, end with notifies
         let em = self.authority.advance_to(now_s());
         self.apply_authority(em);
+        let State { wakes, key, .. } = self;
+        if let Some(w) = wakes.as_mut() {
+            w.settle(now_s(), key);
+        }
     }
 
     /// This binary's own tables follow what the tracker and the authority still hold, at most once a second (spec-gap
@@ -705,7 +750,70 @@ impl State {
         self.stats.observe(&t, &sid, sender_identity, &to_identity, now_s());
         let em = self.tracker.step(&RelayEvent::Recv { recv: msg });
         self.apply(em, Some(sender), Some(inbound), &sid);
+        self.wake_on(&t, &sid, &to, sender, sender_identity, p);
     }
+
+    /// W§5.1: an invite this relay now holds (an attempt, or a queued envelope) wakes the registered devices it is
+    /// held for; an initiator's `cancel` ends the call it woke them for.
+    fn wake_on(&mut self, t: &str, sid: &str, to: &str, sender: &str, sender_identity: &str, p: &Value) {
+        let held = t == "invite"
+            && (self.tracker.attempt_initiator(sid).is_some()
+                || self.tracker.inbox.get(to).is_some_and(|q| q.iter().any(|m| m.message.msg_type == "invite" && m.message.id == sid)));
+        let State { wakes, key, .. } = self;
+        let Some(w) = wakes.as_mut() else { return };
+        if held {
+            let devices = w.devices_for(to);
+            w.hold(now_s(), sid, &devices, p["expires_at"].as_i64().unwrap_or(0), (sender, sender_identity), key);
+        } else if t == "cancel" {
+            w.drop_invite(now_s(), sid, key);
+        }
+    }
+
+    /// A `wake-register` from bound `device` of `identity` (W§4.2): verified by stages 1–11 here, the profile's checks
+    /// by [`wake::Wakes::register`], answered `wake-accepted` or a signed `error`.
+    fn wake_register(&mut self, device: &str, identity: &str, frame: &str) {
+        let now = now_s();
+        let verdict = {
+            let State { resolver, web, seen, revocations, .. } = &mut *self;
+            dsip_transport::verify::verify_profile_frame(frame, now, &Over(resolver, web.as_deref()), revocations, seen)
+        };
+        let inb = match verdict {
+            Ok(inb) => inb,
+            Err(v) => {
+                let code = v.to_expect()["code"].as_str().unwrap_or("rejected").to_string();
+                let f = self.error_frame(device, v.reason.unwrap_or("transport.routing-refused"), None, None, Some(&code));
+                self.deliver(device, &f);
+                return;
+            }
+        };
+        let p = &inb.verified.payload;
+        let id = p["id"].as_str().unwrap_or("").to_string();
+        if inb.verified.signer_did != device || p["to"] != self.key.did() {
+            let f = self.error_frame(device, "transport.routing-refused", Some(&id), None, Some("wake-register is from the bound device to this relay"));
+            self.deliver(device, &f);
+            return;
+        }
+        let relay = self.key.did();
+        let Some(w) = self.wakes.as_mut() else { return };
+        match w.register(p, device, identity, &relay, now) {
+            Ok(()) => {
+                let a = dsip_wake::accepted_message(&relay, device, &id, None, now);
+                let f = sign(&a, &self.key, &self.key.kid()).frame();
+                self.deliver(device, &f);
+            }
+            Err(reason) => {
+                let f = self.error_frame(device, reason, Some(&id), None, None);
+                self.deliver(device, &f);
+            }
+        }
+    }
+}
+
+/// The `type` a frame's payload claims, before it is verified (to choose the verification path).
+fn claimed_type(frame: &str) -> Option<String> {
+    let env = Envelope::from_frame(frame).ok()?;
+    let p: Value = serde_json::from_slice(&dsip_core::b64::decode(&env.payload)?).ok()?;
+    p["type"].as_str().map(String::from)
 }
 
 /// The grants an unverified `subscribe` frame presents in `claims`, as frames; empty for anything else.
@@ -815,6 +923,11 @@ impl RelayServer {
                                  "rate_limit": {"envelopes_per_minute": 600, "invites_per_minute": 30}},
                 "issued_at": now, "expires_at": now + 30,
             });
+            let mut hello = hello;
+            if st.wakes.is_some() {
+                // W§4.4: the profile and the kinds this relay sends
+                hello["capabilities"]["wake"] = json!({"profiles": [dsip_wake::PROFILE], "kinds": wake::KINDS});
+            }
             let env: Envelope = sign(&hello, &st.key, &st.key.kid());
             ws.send(WsMessage::Text(env.frame().into())).await?;
             tracing::info!("{peer}: bound device {device} for identity {identity}");
@@ -827,6 +940,9 @@ impl RelayServer {
             st.touched.insert(device.clone());
             st.known_touched = true;
             st.apply(em, None, None, "");
+            if let Some(w) = st.wakes.as_mut() {
+                w.bound(&device, true);
+            }
             let em = st.authority.advance_to(now_s());
             st.apply_authority(em);
             let em = st.authority.step(&dsip_broadcast::AuthorityEvent::Relay(dsip_broadcast::authority::Binding::Bind { device: device.clone(), identity: identity.clone() }));
@@ -841,6 +957,10 @@ impl RelayServer {
                         Some(Ok(WsMessage::Text(t))) => {
                             self.fetch_documents(&t).await;
                             let mut st = state.lock().await;
+                            if st.wakes.is_some() && claimed_type(&t).as_deref() == Some("wake-register") {
+                                st.wake_register(&device, &identity, &t);
+                                continue;
+                            }
                             let sem = dsip_schema::SemanticContext { supported: st.supported.clone(), ..Default::default() };
                             let verdict = {
                                 let State { resolver, web, seen, revocations, .. } = &mut *st;
@@ -927,6 +1047,9 @@ impl RelayServer {
             }
         }
         let _ = st.tracker.step(&RelayEvent::Relay(RelayAction::Unbind { device: device.clone(), identity: identity.clone() }));
+        if let Some(w) = st.wakes.as_mut() {
+            w.bound(&device, false);
+        }
         st.known_touched = true;
         st.persist();
         // P§3: every device's unbind, not only the identity's last: its own record's grace starts from it

@@ -31,6 +31,10 @@
 # presence_grace = 60                              # seconds a presence record outlives its device's unbind (0–300)
 # presence_public = ["did:web:news.example.com"]   # identities whose presence anyone may watch
 
+# --- waking sleeping devices (Wake Profile, draft)
+# wake = false                                     # true: answer wake-register, wake devices through their gateways
+# wake_gateway = ["did:web:push.dsip.example"]     # gateways devices may register through; unset: any
+
 # --- the browser client on the same origin
 # www = "/usr/share/dsip-web"                      # static files served on the TLS port
 # client_config = "/etc/dsip-relay/client.json"    # served as /config.json: the operator's client defaults

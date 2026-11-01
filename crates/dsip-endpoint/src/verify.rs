@@ -121,6 +121,28 @@ pub fn verify_frame_with(
     Ok(Inbound { envelope, frame: frame.to_string(), verified, semantic })
 }
 
+/// Verify a frame carrying a companion profile's message, which the core schemas do not know: stages 1–11 (envelope,
+/// signature, binding, replay window, dedup, ULID) and the replay tracking, then nothing more. The caller applies the
+/// profile's own checks (for the Wake Profile, `dsip_wake::check_register`).
+///
+/// Spec: §10.2, §12.9, §13.2; §11.4 (a 1.x profile adds message types the core pipeline does not schema-check).
+pub fn verify_profile_frame(
+    frame: &str,
+    now: i64,
+    resolver: &dyn Resolver,
+    revocations: &[Envelope],
+    seen: &mut SeenIds,
+) -> Result<Inbound, Verdict> {
+    let envelope = Envelope::from_frame(frame)?;
+    seen.sweep(now);
+    let mut ctx = Context::new(now, resolver);
+    ctx.revocations = revocations.to_vec();
+    ctx.seen_ids = seen.set();
+    let verified = envelope::verify(&envelope, &ctx, Some(frame))?;
+    seen.insert(verified.payload["id"].as_str().unwrap_or(""), now, now);
+    Ok(Inbound { envelope, frame: frame.to_string(), verified, semantic: Verdict::accept() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

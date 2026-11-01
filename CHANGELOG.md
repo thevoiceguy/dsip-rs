@@ -14,6 +14,18 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   held invites and stored items wake which devices, and when a registration ends), the push gateway's checks on a
   `wake-enrol` and a `wake` and the push it forwards, and the hint sealed to the device. Sans-I/O; the relay, the
   mailbox and a `dsip-push` gateway come next. `dsip vectors run` runs the `wake/` vectors (2,475 in all).
+- `dsip-push` 0.1.0: the push gateway an app's publisher runs (Wake Profile W§2–W§5). A device enrols its APNs or
+  FCM token and gets a handle sealed under the gateway's key, so the gateway keeps no table; a waker's `wake` is
+  checked and handed to APNs (HTTP/2, an ES256 provider token) or FCM (HTTP v1, a service account); a token the
+  provider reports unknown ends its handle; wakes are rate-limited per handle and per waker. It serves its own
+  `did:web` document naming its `DSIPWake` endpoint. `--record-to FILE` delivers nothing and records each push.
+- `dsip-relay`: `--wake` (and `--wake-gateway`) makes the relay a waker. It answers `wake-register`, advertises
+  `wake` in its `hello`, keeps registrations across a restart, and when it holds an invite for a registered device
+  that is not bound, it sends the device's gateway a `call` wake, with the caller sealed to the device, then
+  `call-ended` if the invite is cancelled or expires before the device binds.
+- `dsip-transport`: `wake::WakeClient`, the HTTPS exchange with a gateway (its endpoint from its DID document, its
+  signed answer verified).
+- `dsip-endpoint`: `verify::verify_profile_frame`, the envelope pipeline for a companion profile's message types.
 
 ## [2026-11-02] — workspace release
 
