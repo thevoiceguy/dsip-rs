@@ -7,13 +7,57 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 
 ## [Unreleased]
 
+## [2026-11-03] — workspace release
+
+Waking a sleeping device (app plan stage A1), and native discovery through hints. DSIP spec: `poc-v1.0.3` (DSIP Core
+1.0 with the Wake Profile draft `wake/0.1`, spec-gaps 169–176; 2,475 vectors, 0 failures).
+
+| Crate | Version |
+|---|---|
+| `dsip-broadcast` | 0.1.0 |
+| `dsip-cli` | 0.2.0 (was 0.1.0) |
+| `dsip-core` | 0.1.0 |
+| `dsip-dht` | 0.1.0 |
+| `dsip-endpoint` | 0.2.0 (was 0.1.0) |
+| `dsip-events` | 0.2.0 |
+| `dsip-gateway` | 0.1.0 |
+| `dsip-kt` | 0.1.0 |
+| `dsip-mailbox` | 0.4.0 (was 0.3.0) |
+| `dsip-media` | 0.1.0 |
+| `dsip-messaging` | 0.3.0 |
+| `dsip-messaging-device` | 0.2.0 |
+| `dsip-messenger` | 0.2.0 (was 0.1.0) |
+| `dsip-mls` | 0.1.0 |
+| `dsip-node` | 0.1.1 |
+| `dsip-number` | 0.1.0 |
+| `dsip-phone` | 0.1.0 |
+| `dsip-push` | 0.1.0 (new) |
+| `dsip-recording` | 0.1.0 |
+| `dsip-relay` | 0.3.0 (was 0.2.0) |
+| `dsip-schema` | 0.1.0 |
+| `dsip-session` | 0.2.0 |
+| `dsip-testkit` | 0.1.0 |
+| `dsip-transport` | 0.3.0 (was 0.2.0) |
+| `dsip-wake` | 0.1.0 (new) |
+| `dsip-wasm` | 0.1.0 |
+| `dsip-webrtc-binding` | 0.1.0 |
+
+**Breaking changes** (API; no behaviour changes for a deployment that does not turn waking on):
+- `dsip_relay::RelayConfig` and `dsip_mailbox::MailboxConfig` gain a public field, `wake` (#23, #24): a struct literal
+  that names every field must add `wake: None`. `RelayConfig::default()` and `MailboxConfig::new` set it.
+
+The packages: `dsip-relay_0.3.0-1_<arch>.deb`, `dsip-mailbox_0.4.0-1_<arch>.deb`, and the new
+`dsip-push_0.1.0-1_<arch>.deb` and image `ghcr.io/thevoiceguy/dsip-push`. The push gateway's unit is installed
+disabled: it needs its DID, apps and credentials first (`/etc/dsip-push/push.toml`). `dsip-node` (0.1.1) and
+`dsip-web` (0.1.1) are unchanged. Waking is off unless `--wake` is given to the relay or the mailbox.
+
 ### Added
 
 - `dsip-wake` 0.1.0: the rules of the Wake Profile (draft `wake/0.1`, spec-gaps 169–175), waking a sleeping device
   through a push gateway (app plan stage A1). A waker's checks on a `wake-register` and its state (`Waker`: which
   held invites and stored items wake which devices, and when a registration ends), the push gateway's checks on a
-  `wake-enrol` and a `wake` and the push it forwards, and the hint sealed to the device. Sans-I/O; the relay, the
-  mailbox and a `dsip-push` gateway come next. `dsip vectors run` runs the `wake/` vectors (2,475 in all).
+  `wake-enrol` and a `wake` and the push it forwards, and the hint sealed to the device. Sans-I/O: the relay, the
+  mailbox and `dsip-push` below run it. `dsip vectors run` (`dsip-cli`) runs the `wake/` vectors (2,475 in all).
 - `dsip-push` 0.1.0: the push gateway an app's publisher runs (Wake Profile W§2–W§5). A device enrols its APNs or
   FCM token and gets a handle sealed under the gateway's key, so the gateway keeps no table; a waker's `wake` is
   checked and handed to APNs (HTTP/2, an ES256 provider token) or FCM (HTTP v1, a service account); a token the
