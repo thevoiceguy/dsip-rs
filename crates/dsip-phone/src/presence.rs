@@ -4,10 +4,14 @@
 //! Spec: P§3 (records to the authority; the subscriber verifies each itself), P§4 (several devices combined), P§5
 //! (states), P§6 (the grants held from a target admit its watcher), P§8 (refresh and the publish interval), P§9 (a
 //! refusal), §9.3 (subscribe, notify, a `reject` that looks the same for unknown and not allowed, renewal before
-//! `expires_in`), §8.1 (a target's relay from its hint).
+//! `expires_in`), §8.1 (a target's relay from its hint), P§12.2 (a sealed scope's records sealed at its epoch), P§12.4
+//! (watches list `presence/0.2`; sealed records open with the keys our grants carried), P§12.5 (a sealing device
+//! watches its own identity for its siblings' epochs, and sends its record again under a new key).
 //!
-//! Impl: records go in clear (`presence/0.1`); sealed presence (P§12) is not yet run here. A watch whose subscription
-//! is refused, or whose relay drops us, is tried again after [`RETRY_S`].
+//! Impl: a watch whose subscription is refused, or whose relay drops us, is tried again after [`RETRY_S`]. The own
+//! watch is not shown unless the host watches its own identity too. An authority that keeps one subscription per
+//! subscriber identity (spec-gap 177) lets only the last of an identity's devices to subscribe hold it, so a sibling's
+//! epoch reaches that device alone.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -37,6 +41,8 @@ struct Watched {
     watch: Watch,
     /// When to subscribe (again): `0` at once.
     due: i64,
+    /// Shown in [`crate::Phone::presence`]: the host watches it (not only the own watch, P§12.5).
+    shown: bool,
 }
 
 pub(crate) struct Presence {
@@ -45,12 +51,14 @@ pub(crate) struct Presence {
     state: Option<String>,
     watched: HashMap<String, Watched>,
     sent: VecDeque<String>,
+    /// Our siblings' records from the own watch, verified, for the engine to read their epochs (P§12.5).
+    siblings: Vec<Value>,
     shown: watch::Sender<BTreeMap<String, crate::Presence>>,
 }
 
 impl Presence {
     pub(crate) fn new(shown: watch::Sender<BTreeMap<String, crate::Presence>>) -> Presence {
-        Presence { publisher: None, state: None, watched: HashMap::new(), sent: VecDeque::new(), shown }
+        Presence { publisher: None, state: None, watched: HashMap::new(), sent: VecDeque::new(), siblings: vec![], shown }
     }
 
     /// Whether anything needs the clock: a record to refresh, or a watch.
@@ -75,6 +83,11 @@ impl Presence {
             None => None,
         };
         self.send(agent, out).await;
+        if agent.presence_sealed(None) {
+            // P§12.5: our own identity, admitted by P§6 rule 1, shows the epochs our siblings seal at
+            let me = agent.identity_did().to_string();
+            self.watched.entry(me.clone()).or_insert_with(|| Watched { via: None, sub: None, watch: Watch::new(&me), due: 0, shown: false });
+        }
         for w in self.watched.values_mut().filter(|w| w.via.is_none()) {
             w.due = 0;
         }
@@ -95,7 +108,7 @@ impl Presence {
         if let Some(url) = &via {
             agent.keep_peer(url, true);
         }
-        let old = self.watched.insert(target.clone(), Watched { via, sub: None, watch: Watch::new(&target), due: 0 });
+        let old = self.watched.insert(target.clone(), Watched { via, sub: None, watch: Watch::new(&target), due: 0, shown: true });
         if let Some(url) = old.and_then(|o| o.via) {
             self.release(agent, &url);
         }
@@ -103,7 +116,12 @@ impl Presence {
 
     /// Stop watching `target`: nothing more is shown for it (its subscription lapses at the authority).
     pub(crate) fn unwatch(&mut self, agent: &mut Agent, target: &str) {
-        if let Some(url) = self.watched.remove(target).and_then(|w| w.via) {
+        if target == agent.identity_did() && agent.presence_sealed(None) {
+            // the own watch stays (P§12.5), unshown
+            if let Some(w) = self.watched.get_mut(target) {
+                w.shown = false;
+            }
+        } else if let Some(url) = self.watched.remove(target).and_then(|w| w.via) {
             self.release(agent, &url);
         }
         self.shown.send_if_modified(|m| m.remove(target).is_some());
@@ -118,6 +136,11 @@ impl Presence {
 
     /// Once a second: records due (P§8), watches to ask or renew, and records that expired since (P§4).
     pub(crate) async fn tick(&mut self, agent: &mut Agent) {
+        for record in std::mem::take(&mut self.siblings) {
+            if let Err(e) = agent.own_record(&record).await {
+                tracing::warn!("a sibling's presence record: {e}");
+            }
+        }
         let now = now_s();
         for _ in 0..4 {
             let out = self.publisher.as_mut().and_then(|p| p.tick(now));
@@ -159,7 +182,9 @@ impl Presence {
             None => agent.relay().did.clone(),
         };
         let supported = dsip_core::version::Supported::all_known();
-        let mut p = json!({"dsip": dsip_core::version::version_block(&supported, &[dsip_broadcast::PROFILE]), "type": "subscribe",
+        // P§12.4: sealed records come too, opened with the keys our grants carried
+        let profiles = [dsip_broadcast::PROFILE, dsip_core::presence_seal::PROFILE];
+        let mut p = json!({"dsip": dsip_core::version::version_block(&supported, &profiles), "type": "subscribe",
                            "to": authority, "target": target, "events": ["presence"], "expires_in": SUBSCRIBE_S});
         // P§6: presence is private by default; the grants the target gave us admit us
         let claims = agent.presence_claims(target);
@@ -195,6 +220,14 @@ impl Presence {
                 let Some((target, w)) = self.watched.iter_mut().find(|(_, w)| w.sub.as_deref() == Some(sub)) else { return false };
                 if !w.watch.notify(payload, |f| agent.verify_record(f)) {
                     return true; // stale (§9.3)
+                }
+                if target == agent.identity_did() {
+                    // P§12.5: our siblings' records, verified, each signed by the device it is about
+                    let frames = payload["body"]["records"].as_array().into_iter().flatten().filter_map(|r| r["frame"].as_str());
+                    let me = (agent.identity_did(), agent.device_did());
+                    self.siblings.extend(frames.filter_map(|f| agent.verify_record(f)).filter_map(|(rec, identity)| {
+                        (identity == me.0 && rec["device"] == rec["from"] && rec["device"] != me.1).then_some(rec)
+                    }));
                 }
                 if w.watch.terminated() {
                     // P§7: the share that admitted us ended, or the subscription did; asked again, and shown again
@@ -240,7 +273,7 @@ impl Presence {
         let views: Vec<(String, crate::Presence)> = self
             .watched
             .iter()
-            .filter(|(_, w)| w.sub.is_some() && w.watch.notified())
+            .filter(|(_, w)| w.shown && w.sub.is_some() && w.watch.notified())
             .map(|(t, w)| {
                 let (c, unreadable) = w.watch.view(now, |kid| agent.presence_key(t, kid));
                 (t.clone(), crate::Presence { state: c.state, token: c.token, source: c.source.to_string(), unreadable: unreadable.len() })
@@ -256,6 +289,19 @@ impl Presence {
             }
             changed
         });
+    }
+
+    /// The epoch of `scope` (`main`, or an audience tag) rose: our record for it goes again, sealed under the new key,
+    /// so the grantees given that key read us without waiting for the next refresh. Spec: P§12.5, P§8 (the interval may
+    /// hold it back; [`Publisher::tick`] sends it then).
+    pub(crate) async fn rekeyed(&mut self, agent: &mut Agent, scope: &str) {
+        let audience = (scope != dsip_core::presence_seal::MAIN).then_some(scope);
+        let now = now_s();
+        let out = self.publisher.as_mut().and_then(|p| {
+            let state = p.state_for(audience)?.to_string();
+            p.set_for(audience, Some(&state), now)
+        });
+        self.send(agent, out).await;
     }
 
     async fn send(&mut self, agent: &mut Agent, out: Option<Value>) {
