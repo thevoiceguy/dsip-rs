@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+dsip-broadcast.workspace = true
 dsip-core.workspace = true
 dsip-endpoint.workspace = true
 dsip-session.workspace = true

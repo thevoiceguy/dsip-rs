@@ -22,8 +22,14 @@
 //! [`IncomingCall`]s to accept, screen or decline. Every protocol decision stays where it was: the endpoint core and
 //! the call glue (`dsip_endpoint::calls`) choose what is sent, when media starts, and how a call answers by policy.
 //!
+//! Presence rides on the same task: [`Phone::set_presence`] publishes this device's state to its relay, and
+//! [`Phone::watch`] follows another identity's, shown in [`Phone::presence`]. Watching needs a grant from that
+//! identity with `dsip.subscribe` in its scope (P§6): one that came through the relay, or one held with
+//! [`Phone::hold_grant`]; [`Phone::grant_request`] issues one.
+//!
 //! Spec: §12.4 (a call's states: placed, ringing, answered, ended), §12.11 (cancel before the answer, bye after),
-//! §14.1 (media only after the signed answer, done by the call glue), §14.3 (`answered_by`), §14.4 (screening).
+//! §14.1 (media only after the signed answer, done by the call glue), §14.3 (`answered_by`), §14.4 (screening),
+//! P§3–P§6 and §9.3 (presence), §19.4 (grants).
 //!
 //! Impl: a call's state is read from the endpoint's session after each step; the reason it ended is the `reason` of
 //! the message that ended it, or the engine's `Ended` emission in that step, or `unknown`.
@@ -42,6 +48,7 @@ pub use dsip_transport::conn::Dialer;
 pub use dsip_transport::identity::Identity;
 
 mod error;
+mod presence;
 mod run;
 
 pub use error::{Error, Result};
@@ -93,12 +100,45 @@ pub enum Outcome {
     },
 }
 
+/// A watched identity's presence, as P§4 combines its devices' records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Presence {
+    /// The effective state, a registered `dsip-presence-state` value: `available`, `busy`, `away`, `dnd`, `offline`.
+    pub state: String,
+    /// The token that won, which differs from `state` when it is unknown here (P§5: shown raw beside its fallback).
+    pub token: String,
+    /// Where the winner came from: `record` (a device of theirs signed it), `assertion` (their relay says they are
+    /// bound, rendered as the relay's claim, §9.3) or `none`.
+    pub source: String,
+    /// How many of their devices' records are sealed and could not be read (P§12.4).
+    pub unreadable: usize,
+}
+
+/// A grant to issue in answer to an introduction ([`Phone::grant_request`]).
+#[derive(Debug, Clone)]
+pub struct GrantRequest {
+    /// The introduction's id.
+    pub introduction: String,
+    /// The identity that asked.
+    pub requester: String,
+    /// What it lets the requester do: `dsip.invite`, `dsip.message`, `dsip.subscribe` (presence, P§6).
+    pub scope: Vec<String>,
+    /// Until when (Unix seconds).
+    pub valid_until: i64,
+}
+
 /// What the phone's task is asked to do.
 #[allow(clippy::large_enum_variant)] // a command is built once and consumed at once, as the agent's events are
 enum Cmd {
     Place { to: String, invite: Invite, via: Option<String>, reply: oneshot::Sender<Result<Call>> },
     Call(dsip_endpoint::CallCommand),
     HangUp(String),
+    SetPresence(Option<String>),
+    Watch { target: String, via: Option<String> },
+    Unwatch(String),
+    Grant { request: GrantRequest, reply: oneshot::Sender<Result<Option<String>>> },
+    HoldGrant { grant: String, reply: oneshot::Sender<Result<bool>> },
     Close,
 }
 
@@ -123,6 +163,7 @@ pub struct Phone {
     relay_url: String,
     hints: Option<dsip_transport::hints::HintsClient>,
     incoming: Mutex<mpsc::UnboundedReceiver<IncomingCall>>,
+    presence: watch::Receiver<std::collections::BTreeMap<String, Presence>>,
     identity: String,
     device: String,
     task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
@@ -173,6 +214,54 @@ impl Phone {
         let relay = dsip_transport::hints::relay_of(&hint)?;
         tracing::info!("hint for {to}: relay {relay}, seq {}, signed by {} (a hint, not authority, §8.1)", hint.seq, hint.signer);
         (relay != self.relay_url).then_some(relay)
+    }
+
+    /// Publish `state` as this device's presence (`available`, `busy`, `away`, `dnd`, or `offline`: invisible), or
+    /// with `None` publish nothing (the last record lapses, and the relay says available while bound). Sent to our
+    /// relay now and kept fresh. Spec: P§3, P§5, P§8.
+    pub fn set_presence(&self, state: Option<&str>) {
+        self.line.send(Cmd::SetPresence(state.map(String::from)));
+    }
+
+    /// Follow `identity`'s presence, shown in [`Phone::presence`] once its relay admits us: it subscribes at the relay
+    /// that answers for it (with [`PhoneBuilder::hints`], the one a `did:key`'s hint names, §8.1), presenting the
+    /// grants held from it (P§6), and renews before the subscription lapses. A refusal is tried again later.
+    /// Spec: §9.3, P§6.
+    pub async fn watch(&self, identity: &str) {
+        let via = self.relay_for(identity).await;
+        self.line.send(Cmd::Watch { target: identity.into(), via });
+    }
+
+    /// Stop following `identity`'s presence.
+    pub fn unwatch(&self, identity: &str) {
+        self.line.send(Cmd::Unwatch(identity.into()));
+    }
+
+    /// The presence of every identity watched and admitted, by identity; changes as notifies arrive and records
+    /// expire (P§4).
+    pub fn presence(&self) -> watch::Receiver<std::collections::BTreeMap<String, Presence>> {
+        self.presence.clone()
+    }
+
+    /// Answer an introduction that reached us some other way than the relay (at our mailbox, M§14.1) with a grant,
+    /// issued as one answering an introduction through the relay is (§19.4), and saved. Returns the signed grant (a
+    /// compact envelope) to deliver the way the introduction came, or `None` when the engine refused it.
+    pub async fn grant_request(&self, request: GrantRequest) -> Result<Option<String>> {
+        let (reply, answer) = oneshot::channel();
+        if !self.line.send(Cmd::Grant { request, reply }) {
+            return Err(Error::Closed);
+        }
+        answer.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Hold a grant that reached us some other way than the relay (at our mailbox, M§14.1), so it is presented where a
+    /// grant admits: watching its granter's presence (P§6). Returns whether it verified (§7.4) and is held.
+    pub async fn hold_grant(&self, grant: &str) -> Result<bool> {
+        let (reply, answer) = oneshot::channel();
+        if !self.line.send(Cmd::HoldGrant { grant: grant.into(), reply }) {
+            return Err(Error::Closed);
+        }
+        answer.await.map_err(|_| Error::Closed)?
     }
 
     /// The next incoming call; `None` once the phone has closed.
@@ -299,9 +388,11 @@ impl PhoneBuilder {
         let (identity, device) = (agent.identity_did().to_string(), agent.device_did().to_string());
         let (cmds, cmds_rx) = mpsc::unbounded_channel();
         let (incoming_tx, incoming) = mpsc::unbounded_channel();
+        let (presence_tx, presence) = watch::channel(Default::default());
         let line = Line { cmds, wake: agent.waker() };
-        let task = tokio::spawn(run::Runner::new(agent, cmds_rx, line.clone(), incoming_tx, self.media).run());
-        Ok(Phone { line, relay_url: home, hints: self.hints, incoming: Mutex::new(incoming), identity, device, task: Mutex::new(Some(task)) })
+        let task = tokio::spawn(run::Runner::new(agent, cmds_rx, line.clone(), incoming_tx, presence_tx, self.media).run());
+        Ok(Phone { line, relay_url: home, hints: self.hints, incoming: Mutex::new(incoming), presence, identity, device,
+                   task: Mutex::new(Some(task)) })
     }
 }
 
