@@ -25,11 +25,15 @@
 //! Presence rides on the same task: [`Phone::set_presence`] publishes this device's state to its relay, and
 //! [`Phone::watch`] follows another identity's, shown in [`Phone::presence`]. Watching needs a grant from that
 //! identity with `dsip.subscribe` in its scope (P§6): one that came through the relay, or one held with
-//! [`Phone::hold_grant`]; [`Phone::grant_request`] issues one.
+//! [`Phone::hold_grant`]; [`Phone::grant_request`] issues one. With [`PhoneBuilder::seal_presence`] this device's
+//! records are sealed (P§12): only the holders of its grants read them, never the relay. The keys travel in the grants;
+//! when a grant ends ([`Phone::revoke_grants_to`], or its `valid_until`) the keys rotate, and every other grant is
+//! followed by one carrying the new keys, which [`Phone::issued_grant`] hands the host to deliver the way the first
+//! went.
 //!
 //! Spec: §12.4 (a call's states: placed, ringing, answered, ended), §12.11 (cancel before the answer, bye after),
 //! §14.1 (media only after the signed answer, done by the call glue), §14.3 (`answered_by`), §14.4 (screening),
-//! P§3–P§6 and §9.3 (presence), §19.4 (grants).
+//! P§3–P§6 and §9.3 (presence), P§12 (sealed presence), §19.4 (grants).
 //!
 //! Impl: a call's state is read from the endpoint's session after each step; the reason it ended is the `reason` of
 //! the message that ended it, or the engine's `Ended` emission in that step, or `unknown`.
@@ -128,6 +132,17 @@ pub struct GrantRequest {
     pub valid_until: i64,
 }
 
+/// A grant the phone issued that the host delivers: one following a grant it issued earlier, with new presence keys
+/// (P§12.5). It went through the relay too; a grantee reached at its mailbox (M§14.1) needs it deposited there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IssuedGrant {
+    /// The grantee identity.
+    pub to: String,
+    /// The signed grant, compact (`protected.payload.signature`).
+    pub grant: String,
+}
+
 /// What the phone's task is asked to do.
 #[allow(clippy::large_enum_variant)] // a command is built once and consumed at once, as the agent's events are
 enum Cmd {
@@ -139,6 +154,7 @@ enum Cmd {
     Unwatch(String),
     Grant { request: GrantRequest, reply: oneshot::Sender<Result<Option<String>>> },
     HoldGrant { grant: String, reply: oneshot::Sender<Result<bool>> },
+    Revoke { identity: String, reply: oneshot::Sender<Result<usize>> },
     Close,
 }
 
@@ -163,6 +179,7 @@ pub struct Phone {
     relay_url: String,
     hints: Option<dsip_transport::hints::HintsClient>,
     incoming: Mutex<mpsc::UnboundedReceiver<IncomingCall>>,
+    issued: Mutex<mpsc::UnboundedReceiver<IssuedGrant>>,
     presence: watch::Receiver<std::collections::BTreeMap<String, Presence>>,
     identity: String,
     device: String,
@@ -255,13 +272,30 @@ impl Phone {
     }
 
     /// Hold a grant that reached us some other way than the relay (at our mailbox, M§14.1), so it is presented where a
-    /// grant admits: watching its granter's presence (P§6). Returns whether it verified (§7.4) and is held.
+    /// grant admits: watching its granter's presence (P§6), whose sealed records the keys it carries open (P§12.3). One
+    /// that follows a grant held replaces it. Returns whether it verified (§7.4) and is held.
     pub async fn hold_grant(&self, grant: &str) -> Result<bool> {
         let (reply, answer) = oneshot::channel();
         if !self.line.send(Cmd::HoldGrant { grant: grant.into(), reply }) {
             return Err(Error::Closed);
         }
         answer.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Withdraw every live grant issued to `identity`: each, with its rotation chain, is revoked at our relay, which
+    /// ends what they admitted (P§7), and the presence keys they carried rotate (P§12.5). Returns how many were
+    /// withdrawn.
+    pub async fn revoke_grants_to(&self, identity: &str) -> Result<usize> {
+        let (reply, answer) = oneshot::channel();
+        if !self.line.send(Cmd::Revoke { identity: identity.into(), reply }) {
+            return Err(Error::Closed);
+        }
+        answer.await.map_err(|_| Error::Closed)?
+    }
+
+    /// The next grant the phone issued for the host to deliver ([`IssuedGrant`]); `None` once the phone has closed.
+    pub async fn issued_grant(&self) -> Option<IssuedGrant> {
+        self.issued.lock().await.recv().await
     }
 
     /// The next incoming call; `None` once the phone has closed.
@@ -291,6 +325,7 @@ pub struct PhoneBuilder {
     media: Media,
     configure: Option<Configure>,
     hints: Option<dsip_transport::hints::HintsClient>,
+    seal_presence: bool,
 }
 
 /// An adjustment to the agent configuration ([`PhoneBuilder::configure`]).
@@ -346,6 +381,14 @@ impl PhoneBuilder {
         self
     }
 
+    /// Seal this device's presence records (P§12): the relay routes them without reading them, and the grants this
+    /// phone issues carry the keys. The device also watches its own identity, to seal at the epoch its siblings reached
+    /// (P§12.5).
+    pub fn seal_presence(mut self) -> PhoneBuilder {
+        self.seal_presence = true;
+        self
+    }
+
     /// Adjust the agent configuration the builder made (timers, sealing, first contact) before it connects.
     pub fn configure(mut self, f: impl FnOnce(&mut AgentConfig) + Send + 'static) -> PhoneBuilder {
         self.configure = Some(Box::new(f));
@@ -378,7 +421,8 @@ impl PhoneBuilder {
             did_resolver: None,
             calls: Some(calls),
             dialer: self.dialer,
-            presence: None,
+            // P§12.6: sealing is per audience; the phone publishes only the records with none
+            presence: self.seal_presence.then(|| dsip_transport::PresenceSealing { sealed: ["main".to_string()].into(), t_rotate: None }),
             peer_dialer: None,
         };
         if let Some(f) = self.configure {
@@ -388,10 +432,11 @@ impl PhoneBuilder {
         let (identity, device) = (agent.identity_did().to_string(), agent.device_did().to_string());
         let (cmds, cmds_rx) = mpsc::unbounded_channel();
         let (incoming_tx, incoming) = mpsc::unbounded_channel();
+        let (issued_tx, issued) = mpsc::unbounded_channel();
         let (presence_tx, presence) = watch::channel(Default::default());
         let line = Line { cmds, wake: agent.waker() };
-        let task = tokio::spawn(run::Runner::new(agent, cmds_rx, line.clone(), incoming_tx, presence_tx, self.media).run());
-        Ok(Phone { line, relay_url: home, hints: self.hints, incoming: Mutex::new(incoming), presence, identity, device,
+        let task = tokio::spawn(run::Runner::new(agent, cmds_rx, line.clone(), incoming_tx, issued_tx, presence_tx, self.media).run());
+        Ok(Phone { line, relay_url: home, hints: self.hints, incoming: Mutex::new(incoming), issued: Mutex::new(issued), presence, identity, device,
                    task: Mutex::new(Some(task)) })
     }
 }

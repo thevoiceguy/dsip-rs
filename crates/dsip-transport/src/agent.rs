@@ -42,6 +42,15 @@ pub enum AgentEvent {
         /// Destination.
         to: String,
     },
+    /// We issued a grant and sent it through our relay: one that follows a grant we issued, with new presence keys
+    /// (P§12.5), or answers an introduction that came through the relay. A grantee reached another way (its mailbox,
+    /// M§14.1) gets it from the host, `grant` being its compact serialization (`protected.payload.signature`).
+    GrantIssued {
+        /// The grantee identity.
+        to: String,
+        /// The signed grant, compact.
+        grant: String,
+    },
     /// A verified inbound message was handed to the engine.
     Received {
         /// The abbreviated message.
@@ -308,10 +317,11 @@ impl Agent {
     }
 
     /// Hold a grant that reached us at our mailbox (M§14.1), as one received through the relay is, and save it:
-    /// presented when watching the granter's presence ([`Agent::presence_claims`]). Returns whether it verified and is
-    /// held ([`Core::hold_grant`]). Spec: §19.4, P§6.
-    pub fn hold_grant(&mut self, compact: &str) -> Result<bool> {
-        let held = self.core.hold_grant(compact, now_s());
+    /// presented when watching the granter's presence ([`Agent::presence_claims`]), its presence keys opened. Returns
+    /// whether it verified and is held ([`Core::hold_grant`]). Spec: §19.4, P§6, P§12.3.
+    pub async fn hold_grant(&mut self, compact: &str) -> Result<bool> {
+        let (held, out) = self.core.hold_grant(compact, now_s())?;
+        self.dispatch(out).await?;
         if held {
             self.save_contacts()?;
         }
@@ -344,6 +354,11 @@ impl Agent {
     /// The key `kid` of `subject`'s presence records: ours derived, a grantor's from its grants (P§12.4).
     pub fn presence_key(&self, subject: &str, kid: &str) -> Option<[u8; 32]> {
         self.core.presence_key(subject, kid)
+    }
+
+    /// Whether this device seals its records for `audience` (`None`: the records with no audience). Spec: P§12.6.
+    pub fn presence_sealed(&self, audience: Option<&str>) -> bool {
+        self.core.presence_sealed(audience)
     }
 
     /// The wire tag of the audience our identity labels `label` (P§12.1).
@@ -557,6 +572,10 @@ impl Agent {
                     match peer {
                         Some(c) => c.send(&env).await?,
                         None => self.conn.send(&env).await?,
+                    }
+                    if msg_type == "grant" {
+                        let grant = format!("{}.{}.{}", env.protected, env.payload, env.signature);
+                        self.events.push(AgentEvent::GrantIssued { to: to.clone(), grant });
                     }
                     self.events.push(AgentEvent::Sent { msg_type, session, to });
                 }

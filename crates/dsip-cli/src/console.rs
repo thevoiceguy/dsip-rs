@@ -617,6 +617,8 @@ pub async fn run(opts: ConsoleOpts, mode: Mode) -> Result<()> {
             events = agent.next() => {
                 for ev in events? {
                     match ev {
+                        // the grant's Sent follows and is printed
+                        AgentEvent::GrantIssued { .. } => {}
                         AgentEvent::Sent { msg_type, session, to } => {
                             println!("→ {msg_type:<8} to {}  session …{}", short(&to), sid8(&session));
                             print_state(&agent, &session);

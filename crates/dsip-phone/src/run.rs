@@ -13,7 +13,7 @@ use dsip_session::{Emission, Role, SessionState, UiEvent};
 use dsip_transport::agent::{Agent, AgentEvent};
 
 use crate::presence::Presence;
-use crate::{Call, CallState, Cmd, IncomingCall, Line, Media, Result};
+use crate::{Call, CallState, Cmd, IncomingCall, IssuedGrant, Line, Media, Result};
 
 /// One call the handles follow.
 struct Track {
@@ -28,6 +28,7 @@ pub(crate) struct Runner {
     cmds: mpsc::UnboundedReceiver<Cmd>,
     line: Line,
     incoming: mpsc::UnboundedSender<IncomingCall>,
+    issued: mpsc::UnboundedSender<IssuedGrant>,
     calls: HashMap<String, Track>,
     presence: Presence,
     /// Wakes the task once a second while presence needs the clock.
@@ -60,7 +61,7 @@ struct Batch {
 
 impl Runner {
     pub(crate) fn new(agent: Agent, cmds: mpsc::UnboundedReceiver<Cmd>, line: Line, incoming: mpsc::UnboundedSender<IncomingCall>,
-                      presence: watch::Sender<std::collections::BTreeMap<String, crate::Presence>>, media: Media) -> Runner {
+                      issued: mpsc::UnboundedSender<IssuedGrant>, presence: watch::Sender<std::collections::BTreeMap<String, crate::Presence>>, media: Media) -> Runner {
         #[cfg(not(feature = "media"))]
         let _ = media;
         Runner {
@@ -70,6 +71,7 @@ impl Runner {
             cmds,
             line,
             incoming,
+            issued,
             calls: HashMap::new(),
             presence: Presence::new(presence),
             ticker: None,
@@ -162,7 +164,26 @@ impl Runner {
                 let _ = reply.send(granted.map_err(Into::into));
             }
             Cmd::HoldGrant { grant, reply } => {
-                let _ = reply.send(self.agent.hold_grant(&grant).map_err(Into::into));
+                let _ = reply.send(self.agent.hold_grant(&grant).await.map_err(Into::into));
+            }
+            Cmd::Revoke { identity, reply } => {
+                let now = dsip_transport::now_s();
+                let ids: Vec<String> = self.agent.endpoint().contacts.grants_issued.iter()
+                    .filter(|(_, g)| g.identity == identity && g.valid_until > now)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let mut n = 0;
+                for id in ids {
+                    match self.agent.revoke_grant(&id).await {
+                        Ok(true) => n += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            let _ = reply.send(Err(e.into()));
+                            return Ok(());
+                        }
+                    }
+                }
+                let _ = reply.send(self.agent.save_contacts().map(|_| n).map_err(Into::into));
             }
             Cmd::Close => unreachable!("handled by run"),
         }
@@ -211,6 +232,15 @@ impl Runner {
                         }
                         _ => {}
                     }
+                }
+                AgentEvent::GrantIssued { to, grant } => {
+                    self.agent.save_contacts()?;
+                    let _ = self.issued.send(IssuedGrant { to, grant });
+                }
+                AgentEvent::Emission(Emission::Keys { scope, .. }) => {
+                    // P§12.5: the scope's epoch rose; our record goes again under the new key
+                    self.agent.save_contacts()?;
+                    self.presence.rekeyed(&mut self.agent, &scope).await;
                 }
                 AgentEvent::Emission(Emission::Ui(UiEvent::Ended { reason })) => b.ended.push_back(reason),
                 AgentEvent::Emission(Emission::Ui(UiEvent::Answered { answered_by })) => b.answered.push_back(answered_by),

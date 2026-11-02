@@ -14,7 +14,7 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   at the relay that answers for it (a `did:key`'s hint names it, §8.1, over the connection a call there would use),
   presenting the grants held from it (P§6), renewing before the hour's subscription lapses and asking again a minute
   after a refusal; `Phone::presence` shows each watched identity as P§4 combines its devices (`Presence`: state,
-  token, and whether a record or the relay's claim says so). Sealed presence (P§12) is not yet run here.
+  token, and whether a record or the relay's claim says so).
 - Grants that travel through a mailbox (M§14.1) on the calling side too: `Core::grant_request` /
   `Agent::grant_request` / `Phone::grant_request` answer an introduction that came another way with a grant issued
   as one through the relay is (so it can be withdrawn or followed), returned compact for the host to deposit;
@@ -24,6 +24,21 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
   `Agent::send_frame` (to our relay or another), and `Agent::keep_peer` (keep a connection to another relay open
   with no call through it).
 - `dsip-messaging-device`: `Messenger::grant_held`, the signed grant held from an identity.
+- `dsip-phone`: sealed presence (P§12, `presence/0.2`). `PhoneBuilder::seal_presence` seals this device's records,
+  so the relay routes them without reading them, and puts the keys in the grants the phone issues (P§12.3); watches
+  list `presence/0.2` and open sealed records with the keys held grants carried (`Presence::unreadable` counts the
+  ones they do not open, P§12.4). `Phone::revoke_grants_to` withdraws a grantee's grants at the relay (P§7), which
+  rotates the keys; every other grant is then followed by one carrying the new keys (P§12.5), handed to the host by
+  `Phone::issued_grant` to deliver the way the first went, and the record goes again under the new key. A sealing
+  phone watches its own identity and seals at the epoch a sibling rotated to.
+- `dsip-transport`: `AgentEvent::GrantIssued` (a grant the agent sent, compact, for a host that also delivers it
+  another way) and `Agent::presence_sealed`.
+
+### Changed
+
+- `dsip-endpoint`: `Core::hold_grant` opens the presence keys a grant carries and takes a grant that follows one
+  held (§19.4, spec-gap 150), as one through the relay is; it returns what holding it emitted with whether it is held.
+  `Agent::hold_grant` is async.
 
 ### Fixed
 

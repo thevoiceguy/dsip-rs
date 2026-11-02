@@ -787,30 +787,53 @@ impl Core {
     }
 
     /// Hold a grant that reached this device some other way than its relay — deposited at its mailbox in answer to an
-    /// introduction (M§14.1) — as one received through the relay is held: presented where a grant admits, a presence
-    /// `subscribe` among them ([`Core::presence_claims`]). It is verified as a credential (its signature, and its
-    /// signer bound to the granter, §7.4) and must be addressed to this identity and live. `grant` is a compact
-    /// serialization or an envelope frame. Returns whether it is held.
+    /// introduction, or following a grant held (M§14.1) — as one received through the relay is held: presented where a
+    /// grant admits, a presence `subscribe` among them ([`Core::presence_claims`]), and the presence keys it carries
+    /// opened ([`Core::presence_key`]). It is verified as a credential (its signature, and its signer bound to the
+    /// granter, §7.4) and must be addressed to this identity and live. `grant` is a compact serialization or an envelope
+    /// frame. Returns whether it is held, and what holding it emitted.
     ///
-    /// Spec: §19.4 (the grantee holds the signed grant), M§14.1, P§6. Impl: presence keys the grant carries are not
-    /// opened here (sealed presence, P§12.3, is not yet carried this way).
-    pub fn hold_grant(&mut self, grant: &str, now: i64) -> bool {
+    /// Spec: §19.4 (the grantee holds the signed grant; one that follows a held grant replaces it, spec-gap 150), M§14.1,
+    /// P§6, P§12.3, P§12.4 (the keys of the two highest epochs per scope). Impl: a grant that follows none held is taken
+    /// as the answer to an introduction the host sent (the mailbox's `introductions_sent`, not the engine's); keys that do
+    /// not open are ignored (spec-gap 162).
+    pub fn hold_grant(&mut self, grant: &str, now: i64) -> Result<(bool, Vec<CoreEvent>)> {
         let compact = match Envelope::from_frame(grant) {
             Ok(e) => format!("{}.{}.{}", e.protected, e.payload, e.signature),
             Err(_) => grant.to_string(),
         };
         let compact = compact.as_str();
         let ctx = Context::new(now, &self.resolver);
-        let Some(p) = dsip_core::grant::credential_compact(compact, &ctx) else { return false };
-        let (Some(id), Some(by)) = (p["id"].as_str(), p["from"].as_str()) else { return false };
-        let valid_until = p["valid_until"].as_i64().unwrap_or(0);
-        if p["to"] != self.keys.identity.as_str() || valid_until <= now {
-            return false;
+        let Some(p) = dsip_core::grant::credential_compact(compact, &ctx) else { return Ok((false, vec![])) };
+        let (Some(id), Some(by)) = (p["id"].as_str().map(String::from), p["from"].as_str().map(String::from)) else { return Ok((false, vec![])) };
+        if p["to"] != self.keys.identity.as_str() || p["valid_until"].as_i64().unwrap_or(0) <= now {
+            return Ok((false, vec![]));
         }
-        let scope = p["scope"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
-        self.ep.contacts.grants_held.insert(id.to_string(), Grant { identity: by.to_string(), scope, valid_until, ..Default::default() });
-        self.grant_frames.insert(id.to_string(), compact.to_string());
-        true
+        let Some(mut msg) = Message::from_payload(&p) else { return Ok((false, vec![])) };
+        // P§12.3: the AAD names the grant's `from` as signed (a device, for a grant its engine issued), so the keys open
+        // against the payload as it is, not the credential's
+        let opened = (p.get("presence_keys").is_some())
+            .then(|| compact.split('.').nth(1).and_then(dsip_core::b64::decode).and_then(|b| serde_json::from_slice::<Value>(&b).ok()))
+            .flatten()
+            .and_then(|raw| presence_seal::open_grant_keys(&raw, &self.identity_secret()?).ok());
+        msg.presence_keys = opened.as_ref().map(|k| k.keys().cloned().collect());
+        let session = msg.session.clone().unwrap_or_default();
+        if !self.ep.contacts.grants_held.contains_key(&session) {
+            self.ep.contacts.pending_sent.insert(session.clone(), by.clone());
+        }
+        let mut out = self.tick(now)?;
+        let em = self.ep.step(&Event::Recv { recv: msg });
+        self.ep.contacts.pending_sent.remove(&session);
+        let held = self.ep.contacts.grants_held.contains_key(&id);
+        if held {
+            self.grant_frames.insert(id.clone(), compact.to_string());
+            if let Some(keys) = opened {
+                self.held_keys.entry(identity_of_grant(&self.ep, &id)).or_default().extend(keys);
+                self.prune_held_keys();
+            }
+        }
+        out.extend(self.handle(em, now)?);
+        Ok((held, out))
     }
 
     /// A signed `grant-revocation` for a grant we issued, addressed to our authority (`to`), or `None` when we issued no
