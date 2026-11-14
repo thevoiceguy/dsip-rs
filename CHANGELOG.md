@@ -10,8 +10,8 @@ CalVer workspace tags over per-crate [Semantic Versioning](https://semver.org/sp
 ## [2026-11-14] — workspace release
 
 Video in the media leg: a call can carry H.264 or VP8 next to its audio, on the forge backend, with loss repair and
-keyframe requests; an answer now describes only the media its SDP accepted; and a voicemail offer says whether it may
-be video (DSIP spec-gaps 181–184). DSIP spec: `poc-v1.0.7` (was `poc-v1.0.6`).
+keyframe requests, chosen per call (`Phone::video_call`); an answer now describes only the media its SDP accepted; and
+a voicemail offer says whether it may be video (DSIP spec-gaps 181–184). DSIP spec: `poc-v1.0.7` (was `poc-v1.0.6`).
 
 | Crate | Version |
 |---|---|
@@ -19,7 +19,7 @@ be video (DSIP spec-gaps 181–184). DSIP spec: `poc-v1.0.7` (was `poc-v1.0.6`).
 | `dsip-cli` | 0.3.0 |
 | `dsip-core` | 0.2.0 |
 | `dsip-dht` | 0.2.0 |
-| `dsip-endpoint` | 0.4.1 (was 0.4.0) |
+| `dsip-endpoint` | 0.5.0 (was 0.4.0) |
 | `dsip-events` | 0.2.0 |
 | `dsip-gateway` | 0.1.0 |
 | `dsip-kt` | 0.1.0 |
@@ -46,7 +46,8 @@ be video (DSIP spec-gaps 181–184). DSIP spec: `poc-v1.0.7` (was `poc-v1.0.6`).
 **Breaking changes**: `dsip-media`: `MediaConfig` and `Stats` gain fields (`video`; `video_frames_in`,
 `video_frames_out`, `keyframes_asked`), so struct literals without `..Default::default()` stop compiling (#62).
 `dsip-wasm`: `voicemail_offer` takes a fifth argument, `call_video` (optional in JavaScript), and its result gains
-`kind` (#61). `dsip-messaging` and `dsip-phone` take minor bumps for new behaviour and API (#61, #62).
+`kind` (#61). `dsip-endpoint`: `InvitePatch` and `MediaRequest::Offer` gain fields (`video`) (#64).
+`dsip-messaging` and `dsip-phone` take minor bumps for new behaviour and API (#61, #62, #64).
 
 ### Added and changed
 
